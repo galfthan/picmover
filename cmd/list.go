@@ -2,10 +2,11 @@ package cmd
 
 import (
     "fmt"
+    "io"
     "os"
     "path/filepath"
     "time"
-
+    "github.com/cespare/xxhash"
     "github.com/rwcarlsen/goexif/exif"
     "github.com/spf13/cobra"
 )
@@ -38,8 +39,15 @@ func listImages(directory string) {
             if err != nil {
                 fmt.Printf("Error reading EXIF data from %s: %v\n", path, err)
             } else {
-                fmt.Printf("Date: %s, File: %s\n", dateTime.Format(time.RFC3339), path)
+                hash, err := computeXXHash(path)
+                if err != nil {
+                    fmt.Printf("Error computing xxHash for %s: %v\n", path, err)
+                } else {
+                    fmt.Printf("Date: %s, xxHash: %016x, File: %s\n", dateTime.Format(time.RFC3339), hash, path)
+                }
             }
+
+          
         }
 
         return nil
@@ -78,4 +86,19 @@ func getExifDateTime(path string) (time.Time, error) {
     }
 
     return dateTime, nil
+}
+
+func computeXXHash(path string) (uint64, error) {
+    file, err := os.Open(path)
+    if err != nil {
+        return 0, err
+    }
+    defer file.Close()
+
+    hash := xxhash.New()
+    if _, err := io.Copy(hash, file); err != nil {
+        return 0, err
+    }
+
+    return hash.Sum64(), nil
 }

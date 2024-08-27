@@ -3,6 +3,7 @@ module picmover
 go 1.18
 
 require (
+	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/dsoprea/go-exif/v3 v3.0.1 // indirect
 	github.com/dsoprea/go-logging v0.0.0-20200710184922-b02d349568dd // indirect
 	github.com/dsoprea/go-utility/v2 v2.0.0-20221003172846-a3e1774ef349 // indirect
