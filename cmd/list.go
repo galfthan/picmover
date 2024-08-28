@@ -2,12 +2,9 @@ package cmd
 
 import (
     "fmt"
-    "io"
     "os"
     "path/filepath"
     "time"
-    "github.com/cespare/xxhash"
-    "github.com/rwcarlsen/goexif/exif"
     "github.com/spf13/cobra"
 )
 

@@ -7,9 +7,9 @@ import (
     "os"
     "path/filepath"
     "time"
-
     "github.com/spf13/cobra"
     _ "github.com/mattn/go-sqlite3"
+
 )
 
 var importCmd = &cobra.Command{
@@ -25,7 +25,7 @@ var importCmd = &cobra.Command{
 }
 
 func init() {
-    rootCmd.AddCommand(importCmd)
+   rootCmd.AddCommand(importCmd)
 }
 
 func importImages(sourceDir, destDir string) {
@@ -95,7 +95,7 @@ func initDB() (*sql.DB, error) {
     _, err = db.Exec(`
     CREATE TABLE IF NOT EXISTS images (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hash TEXT UNIQUE,
+        hash INTEGER UNIQUE,
         original_path TEXT,
         new_path TEXT,
         date_taken DATETIME
@@ -109,7 +109,7 @@ func initDB() (*sql.DB, error) {
 
 func checkDuplicate(db *sql.DB, hash uint64) (bool, error) {
     var count int
-    err := db.QueryRow("SELECT COUNT(*) FROM images WHERE hash = ?", hash).Scan(&count)
+    err := db.QueryRow("SELECT COUNT(*) FROM images WHERE hash = ?", int64(hash)).Scan(&count)
     return count > 0, err
 }
 
@@ -142,6 +142,6 @@ func copyFile(src, dst string) error {
 
 func storeInDB(db *sql.DB, hash uint64, originalPath, newPath string, dateTaken time.Time) error {
     _, err := db.Exec("INSERT INTO images (hash, original_path, new_path, date_taken) VALUES (?, ?, ?, ?)",
-        hash, originalPath, newPath, dateTaken)
+        int64(hash), originalPath, newPath, dateTaken)
     return err
 }
