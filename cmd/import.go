@@ -32,11 +32,13 @@ var importCmd = &cobra.Command{
         importImages(sourceDir, destDir)
     },
 }
-
+var (
+    minDimension int
+)
 func init() {  
    rootCmd.AddCommand(importCmd)
+   importCmd.Flags().IntVar(&minDimension, "min-dimension", 0, "Minimum dimension (width or height) for imported images. 0 means no limit.")
 }
-
 func importImages(sourceDir, destDir string) {
     db, err := initDB(destDir)
     if err != nil {
@@ -46,35 +48,38 @@ func importImages(sourceDir, destDir string) {
     defer db.Close()
 
     var stats struct {
-        Imported        int
-        SkippedInDB     int
-        SkippedNotInDB  int
-        Errors          int
+        Imported       int
+        SkippedInDB    int
+        SkippedNotInDB int
+        SkippedSmall   int
+        Errors         int
     }
-
 
     err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
         if err != nil {
             return err
         }
-        if !info.IsDir(){
-            if _,ismedia:= isMediaFile(path); ismedia {
+        if !info.IsDir() {
+            if _, isMedia := isMediaFile(path); isMedia {
                 result := processAndMoveMedia(path, destDir, db)
                 switch result.Status {
-                case  "imported":
-                   fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
+                case "imported":
+                    fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
                     stats.Imported++
                 case "skipped_in_db":
-                 fmt.Printf("Skipped (in DB): %s\n", result.OriginalPath)
-                   stats.SkippedInDB++
+                    fmt.Printf("Skipped (in DB): %s\n", result.OriginalPath)
+                    stats.SkippedInDB++
                 case "skipped_not_in_db":
                     fmt.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
-                   stats.SkippedNotInDB++
+                    stats.SkippedNotInDB++
+                case "skipped_small":
+                    fmt.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
+                    stats.SkippedSmall++
                 case "error":
                     fmt.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
-                  stats.Errors++
-                }     
-            }   
+                    stats.Errors++
+                }
+            }
         }
         return nil
     })
@@ -82,10 +87,12 @@ func importImages(sourceDir, destDir string) {
     if err != nil {
         fmt.Printf("Error walking through directory: %v\n", err)
     }
+
     fmt.Printf("\nImport Summary:\n")
     fmt.Printf("Imported: %d\n", stats.Imported)
     fmt.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
     fmt.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
+    fmt.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
     fmt.Printf("Errors: %d\n", stats.Errors)
 }
 
@@ -101,6 +108,21 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error reading metadata: %v", err), OriginalPath: sourcePath}
     }
 
+    // Check dimensions for images
+    if fileType == "image" && minDimension > 0 {
+        width, height, err := parseResolution(metadata.Resolution)
+        if err != nil {
+            return ImportResult{Status: "error", Message: fmt.Sprintf("Error parsing resolution: %v", err), OriginalPath: sourcePath}
+        }
+        if width < minDimension && height < minDimension {
+            return ImportResult{
+                Status:       "skipped_small",
+                Message:      fmt.Sprintf("Image dimensions (%dx%d) smaller than minimum (%dx%d)", width, height, minDimension, minDimension),
+                OriginalPath: sourcePath,
+            }
+        }
+    }
+   
     hash, err := computeXXHash(sourcePath)
     if err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error computing hash: %v", err), OriginalPath: sourcePath}
@@ -141,6 +163,14 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
 }
 
 
+func parseResolution(resolution string) (int, int, error) {
+    var width, height int
+    _, err := fmt.Sscanf(resolution, "%dx%d", &width, &height)
+    if err != nil {
+        return 0, 0, err
+    }
+    return width, height, nil
+}
 
 func generateUniqueFilename(path string) string {
     dir, file := filepath.Split(path)
