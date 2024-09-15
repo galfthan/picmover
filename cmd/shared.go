@@ -32,7 +32,6 @@ type MediaMetadata struct {
     FileType     string
     Resolution   string
 }
-
 func getMediaMetadata(path string) (MediaMetadata, error) {
     file, err := os.Open(path)
     if err != nil {
@@ -49,12 +48,7 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
         FileType: fileType,
     }
 
-    if fileType == "image" {
-        // Try to get resolution from image first
-        resolution, err := getImageResolution(path)
-        if err == nil {
-            metadata.Resolution = resolution
-        }
+    if fileType == "image" || fileType == "image_raw" {
         x, err := exif.Decode(file)
         if err == nil {
             metadata.DateTime, _ = getExifDateTime(x)
@@ -62,18 +56,40 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
             metadata.CameraModel, _ = getExifTag(x, exif.Model)
             metadata.CameraMake, _ = getExifTag(x, exif.Make)
             metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
-             // If we couldn't get resolution from image, try EXIF
-             if metadata.Resolution == "" {
-                metadata.Resolution, _ = getExifResolution(x)
-            }
-    
+        }    else {
+            fmt.Printf("Warning: Could not read EXIF data for %s: %v\n", path, err)
         }
+        // For standard image files, try to get resolution from image 
+        if fileType == "image" {
+            // Seek back to the start of the file
+            _, err = file.Seek(0, 0)
+            if err != nil {
+                fmt.Printf("Warning: Could not seek file %s: %v\n", path, err)
+            }
+            metadata.Resolution, _ = getImageResolution(path)
+            if err != nil || metadata.Resolution == "" {
+                if x != nil {
+                    // For standard image files, try to get resolution from  EXIF if image failed failed
+                    metadata.Resolution, _ = getExifResolution(x)
+                }
+            }
+        } else { // fileType == "image_raw"
+            if x != nil {
+                   // for raw read exif always
+                metadata.Resolution, err = getExifResolution(x)
+                if err != nil {
+                    fmt.Printf("Warning: Could not get resolution from EXIF for RAW file %s: %v\n", path, err)
+                }
+            }
+        }
+       
+
         // If we still don't have a resolution, log an error or set a default value
         if metadata.Resolution == "" {
             fmt.Printf("Warning: Could not determine resolution for %s\n", path)
             metadata.Resolution = "unknown"
         }
-        
+
         // If DateTime is not set, fall back to file modification time
         if metadata.DateTime.IsZero() {
             metadata.DateTime, _ = getModificationTime(file)
@@ -87,6 +103,7 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
 
     return metadata, nil
 }
+
 
 
 func getImageResolution(path string) (string, error) {
@@ -147,6 +164,9 @@ func getExifTag(x *exif.Exif, tag exif.FieldName) (string, error) {
 
 
 func getExifResolution(x *exif.Exif) (string, error) {
+    if x == nil {
+        return "", fmt.Errorf("nil EXIF data")
+    }
     width, err := x.Get(exif.PixelXDimension)
     if err != nil {
         return "", err
@@ -213,20 +233,21 @@ func determineCameraType(model, make string) string {
 }
 
 
-
-
-
-func isMediaFile(path string) (string, bool) {
+func isMediaFile(path string) (fileType string, isMedia bool) {
     ext := strings.ToLower(filepath.Ext(path))
     switch ext {
-    case ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".cr2", ".crw", ".cr3",".dng":
+    case ".jpg", ".jpeg", ".png", ".tiff", ".tif":
         return "image", true
+    case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw":
+        return "image_raw", true
     case ".mp4", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv":
         return "video", true
     default:
         return "", false
     }
 }
+
+
 func getModificationTime(file *os.File) (time.Time, error) {
     // Get file modification time 
     fileInfo, err := file.Stat()
