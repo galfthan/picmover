@@ -1,12 +1,17 @@
 package cmd
 
 import (
+    "image"
+    _ "image/jpeg"
+    _ "image/png"
     "io"
     "os"
+    "os/exec"
     "path/filepath"
     "time"
     "strings"
     "fmt"
+    "encoding/json"
     "github.com/cespare/xxhash"
     "github.com/rwcarlsen/goexif/exif"
     "github.com/rwcarlsen/goexif/mknote"
@@ -52,18 +57,43 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
             metadata.CameraMake, _ = getExifTag(x, exif.Make)
             metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
             metadata.Resolution, _ = getExifResolution(x)
-        } else {
-            // If EXIF parsing fails, fall back to file info
+        }
+        
+        // If EXIF parsing fails or doesn't contain resolution, fall back to image package
+        if metadata.Resolution == "" {
+            metadata.Resolution, _ = getImageResolution(path)
+        }
+        
+        // If DateTime is not set, fall back to file modification time
+        if metadata.DateTime.IsZero() {
             metadata.DateTime, _ = getModificationTime(file)
         }
-    } else {
-        // For video files, use file modification time and other file properties
-        metadata.DateTime, _ = getModificationTime(file)
-        // You might want to add video-specific metadata extraction here
+    } else if fileType == "video" {
+        metadata, err = getVideoMetadata(path)
+        if err != nil {
+            return MediaMetadata{}, fmt.Errorf("failed to extract video metadata: %w", err)
+        }
     }
 
     return metadata, nil
 }
+
+
+func getImageResolution(path string) (string, error) {
+    file, err := os.Open(path)
+    if err != nil {
+        return "", err
+    }
+    defer file.Close()
+
+    img, _, err := image.DecodeConfig(file)
+    if err != nil {
+        return "", err
+    }
+
+    return fmt.Sprintf("%dx%d", img.Width, img.Height), nil
+}
+
 
 func getExifDateTime(x *exif.Exif) (time.Time, error) {
     for _, tag := range []string{"DateTimeOriginal", "CreateDate", "DateTime", "ModifyDate"} {
@@ -175,6 +205,91 @@ func parseExifDate(date string) (time.Time, error) {
     }
 
     return time.Time{}, fmt.Errorf("unable to parse date: %s", date)
+}
+
+
+type FFProbeOutput struct {
+    Streams []struct {
+        CodecType string `json:"codec_type"`
+        Width     int    `json:"width"`
+        Height    int    `json:"height"`
+        Tags      struct {
+            CreationTime string `json:"creation_time"`
+        } `json:"tags"`
+    } `json:"streams"`
+    Format struct {
+        Filename string `json:"filename"`
+        Tags     struct {
+            CreationTime     string `json:"creation_time"`
+            AndroidVersion   string `json:"com.android.version"`
+            AndroidCaptureFPS string `json:"com.android.capture.fps"`
+        } `json:"tags"`
+    } `json:"format"`
+}
+
+func getVideoMetadata(path string) (MediaMetadata, error) {
+    metadata := MediaMetadata{
+        FileType: "video",
+    }
+
+    cmd := exec.Command("ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        path)
+
+    output, err := cmd.Output()
+    if err != nil {
+        return metadata, fmt.Errorf("ffprobe failed: %w", err)
+    }
+
+    var ffprobeData FFProbeOutput
+    if err := json.Unmarshal(output, &ffprobeData); err != nil {
+        return metadata, fmt.Errorf("failed to parse ffprobe output: %w", err)
+    }
+
+    // Extract resolution
+    for _, stream := range ffprobeData.Streams {
+        if stream.CodecType == "video" {
+            metadata.Resolution = fmt.Sprintf("%dx%d", stream.Width, stream.Height)
+            break
+        }
+    }
+
+    // Extract creation time
+    creationTime := ffprobeData.Format.Tags.CreationTime
+    if creationTime == "" && len(ffprobeData.Streams) > 0 {
+        creationTime = ffprobeData.Streams[0].Tags.CreationTime
+    }
+
+    if creationTime != "" {
+        t, err := time.Parse(time.RFC3339Nano, creationTime)
+        if err == nil {
+            metadata.DateTime = t
+        }
+    }
+
+    // If DateTime is still not set, fall back to file modification time
+    if metadata.DateTime.IsZero() {
+        file, err := os.Open(path)
+        if err == nil {
+            metadata.DateTime, _ = getModificationTime(file)
+            file.Close()
+        }
+    }
+
+    // Check for Android information
+    if ffprobeData.Format.Tags.AndroidVersion != "" {
+        metadata.CameraModel = "Android Device"
+        metadata.CameraMake = "Android"
+        metadata.CameraType = "phone"
+    }
+
+    // Extract location if available (this would require parsing GPS metadata if present)
+    // metadata.Location = ... (if GPS data is available and can be extracted)
+
+    return metadata, nil
 }
 
 
