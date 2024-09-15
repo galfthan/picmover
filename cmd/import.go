@@ -10,6 +10,7 @@ import (
     "time"
     "github.com/spf13/cobra"
     _ "github.com/mattn/go-sqlite3"
+    "archive/zip"
 
 )
 
@@ -39,6 +40,7 @@ func init() {
    rootCmd.AddCommand(importCmd)
    importCmd.Flags().IntVar(&minDimension, "min-dimension", 0, "Minimum dimension (width or height) for imported images. 0 means no limit.")
 }
+
 func importImages(sourceDir, destDir string) {
     db, err := initDB(destDir)
     if err != nil {
@@ -59,28 +61,20 @@ func importImages(sourceDir, destDir string) {
         if err != nil {
             return err
         }
-        if !info.IsDir() {
-            if _, isMedia := isMediaFile(path); isMedia {
-                result := processAndMoveMedia(path, destDir, db)
-                switch result.Status {
-                case "imported":
-                    fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
-                    stats.Imported++
-                case "skipped_in_db":
-                    fmt.Printf("Skipped (in DB): %s\n", result.OriginalPath)
-                    stats.SkippedInDB++
-                case "skipped_not_in_db":
-                    fmt.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
-                    stats.SkippedNotInDB++
-                case "skipped_small":
-                    fmt.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
-                    stats.SkippedSmall++
-                case "error":
-                    fmt.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
-                    stats.Errors++
-                }
-            }
+        if info.IsDir() {
+            return nil
         }
+
+        if filepath.Ext(path) == ".zip" {
+            err = processZipFile(path, destDir, db, &stats)
+            if err != nil {
+                fmt.Printf("Error processing zip file %s: %v\n", path, err)
+                stats.Errors++
+            }
+        } else {
+            processFile(path, destDir, db, &stats)
+        }
+
         return nil
     })
 
@@ -94,6 +88,116 @@ func importImages(sourceDir, destDir string) {
     fmt.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
     fmt.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
     fmt.Printf("Errors: %d\n", stats.Errors)
+}
+
+func processZipFile(zipPath, destDir string, db *sql.DB, stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    Errors         int
+}) error {
+    reader, err := zip.OpenReader(zipPath)
+    if err != nil {
+        return err
+    }
+    defer reader.Close()
+    // Use the zip file name as the temp folder name
+    zipBaseName := filepath.Base(zipPath)
+    tempDir, err := os.MkdirTemp("", fmt.Sprintf("%s_", zipBaseName))
+
+    if err != nil {
+        return fmt.Errorf("failed to create temp directory: %w", err)
+    }
+    defer os.RemoveAll(tempDir) // Clean up temp directory when done
+
+    for _, file := range reader.File {
+        if file.FileInfo().IsDir() {
+            continue
+        }
+
+        err := extractAndProcessFile(file, tempDir, destDir, db, stats)
+        if err != nil {
+            fmt.Printf("Error processing file %s from zip: %v\n", file.Name, err)
+            stats.Errors++
+        }
+    }
+
+    return nil
+}
+
+
+func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    Errors         int
+}) error {
+    // Create a temporary file with the original name
+    tempFilePath := filepath.Join(tempDir, filepath.Base(file.Name))
+    tempFile, err := os.Create(tempFilePath)
+    if err != nil {
+        return fmt.Errorf("failed to create temp file: %w", err)
+    }
+    defer tempFile.Close()
+    defer os.Remove(tempFilePath) // Clean up temp file when done
+
+    // Extract the file
+    zippedFile, err := file.Open()
+    if err != nil {
+        return fmt.Errorf("failed to open zipped file: %w", err)
+    }
+    defer zippedFile.Close()
+
+    _, err = io.Copy(tempFile, zippedFile)
+    if err != nil {
+        return fmt.Errorf("failed to extract file: %w", err)
+    }
+
+    // Process the extracted file
+    result := processAndMoveMedia(tempFilePath, destDir, db)
+    updateStats(result, stats)
+
+    return nil
+}
+func updateStats(result ImportResult, stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    Errors         int
+}) {
+    switch result.Status {
+    case "imported":
+        fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
+        stats.Imported++
+    case "skipped_in_db":
+        fmt.Printf("Skipped (in DB): %s\n", result.OriginalPath)
+        stats.SkippedInDB++
+    case "skipped_not_in_db":
+        fmt.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
+        stats.SkippedNotInDB++
+    case "skipped_small":
+        fmt.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
+        stats.SkippedSmall++
+    case "error":
+        fmt.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
+        stats.Errors++
+    }
+}
+
+func processFile(path, destDir string, db *sql.DB, stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    Errors         int
+}) {
+    if _, isMedia := isMediaFile(path); isMedia {
+        result := processAndMoveMedia(path, destDir, db)
+        updateStats(result, stats)
+    }
 }
 
 

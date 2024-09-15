@@ -56,13 +56,13 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
             metadata.CameraModel, _ = getExifTag(x, exif.Model)
             metadata.CameraMake, _ = getExifTag(x, exif.Make)
             metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
-            metadata.Resolution, _ = getExifResolution(x)
+           // metadata.Resolution, _ = getExifResolution(x)
         }
         
-        // If EXIF parsing fails or doesn't contain resolution, fall back to image package
-        if metadata.Resolution == "" {
-            metadata.Resolution, _ = getImageResolution(path)
-        }
+        //  if metadata.Resolution == "" {
+        // always read resolution from image
+        metadata.Resolution, _ = getImageResolution(path)
+        //}
         
         // If DateTime is not set, fall back to file modification time
         if metadata.DateTime.IsZero() {
@@ -171,7 +171,7 @@ func isMediaFile(path string) (string, bool) {
     switch ext {
     case ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".cr2":
         return "image", true
-    case ".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv":
+    case ".mp4", ".mov", ".avi", ".mkv", ".flv", ",3gp", ".wmv":
         return "video", true
     default:
         return "", false
