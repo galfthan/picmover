@@ -11,6 +11,7 @@ import (
     "time"
     "strings"
     "fmt"
+    "regexp"
     "encoding/json"
     "github.com/cespare/xxhash"
     "github.com/rwcarlsen/goexif/exif"
@@ -153,15 +154,55 @@ func getExifResolution(x *exif.Exif) (string, error) {
 func determineCameraType(model, make string) string {
     lowerModel := strings.ToLower(model)
     lowerMake := strings.ToLower(make)
-    
-    phoneKeywords := []string{"iphone", "android", "smartphone", "phone"}
+
+    // Known phone manufacturers and keywords
+    phoneManufacturers := []string{
+        "apple", "samsung", "huawei", "xiaomi", "oppo", "vivo", "oneplus", "lg", 
+        "motorola", "nokia", "sony", "htc", "google", "asus", "lenovo", "alcatel",
+        "zte", "blackberry", "meizu", "realme", "hmd global",
+    }
+
+    phoneKeywords := []string{
+        "iphone", "android", "smartphone", "phone", "galaxy", "pixel", "xperia",
+        "redmi", "poco", "mi ", "honor",
+    }
+
+    // Known camera manufacturers
+    cameraManufacturers := []string{
+        "canon", "nikon", "sony", "fujifilm", "olympus", "panasonic", "leica",
+        "hasselblad", "pentax", "kodak",
+    }
+
+    // Check for phone manufacturers
+    for _, manufacturer := range phoneManufacturers {
+        if strings.Contains(lowerMake, manufacturer) {
+            return "phone"
+        }
+    }
+
+    // Check for phone keywords
     for _, keyword := range phoneKeywords {
         if strings.Contains(lowerModel, keyword) || strings.Contains(lowerMake, keyword) {
             return "phone"
         }
     }
-    return "camera"
+
+    // Check for camera manufacturers
+    for _, manufacturer := range cameraManufacturers {
+        if strings.Contains(lowerMake, manufacturer) {
+            return "camera"
+        }
+    }
+
+    // Check for specific model patterns
+    if matched, _ := regexp.MatchString(`^(SM-|LG-|XT\d{4}|FRD-|LE\d{4}|AC\d{4})`, model); matched {
+        return "phone"
+    }
+
+    // If we can't determine, return "unknown"
+    return "unknown"
 }
+
 
 
 
@@ -169,9 +210,9 @@ func determineCameraType(model, make string) string {
 func isMediaFile(path string) (string, bool) {
     ext := strings.ToLower(filepath.Ext(path))
     switch ext {
-    case ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".cr2":
+    case ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".cr2", ".crw", ".cr3",".dng":
         return "image", true
-    case ".mp4", ".mov", ".avi", ".mkv", ".flv", ",3gp", ".wmv":
+    case ".mp4", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv":
         return "video", true
     default:
         return "", false
