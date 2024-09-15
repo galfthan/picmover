@@ -50,8 +50,6 @@ func queryDatabase(destDir string) {
         displayRecentFiles(db)
     }
 }
-
-
 func displaySummary(db *sql.DB) {
     rows, err := db.Query(`
         SELECT 
@@ -59,7 +57,10 @@ func displaySummary(db *sql.DB) {
             SUM(CASE WHEN file_type = 'image' THEN 1 ELSE 0 END) as images,
             SUM(CASE WHEN file_type = 'video' THEN 1 ELSE 0 END) as videos,
             MIN(date_taken) as earliest,
-            MAX(date_taken) as latest
+            MAX(date_taken) as latest,
+            COUNT(DISTINCT camera_model) as unique_cameras,
+            COUNT(DISTINCT camera_make) as unique_makes,
+            COUNT(DISTINCT CASE WHEN location != '' THEN location END) as locations_with_gps
         FROM media
     `)
     if err != nil {
@@ -69,9 +70,9 @@ func displaySummary(db *sql.DB) {
     defer rows.Close()
 
     if rows.Next() {
-        var total, images, videos int
+        var total, images, videos, uniqueCameras, uniqueMakes, locationsWithGPS int
         var earliest, latest string
-        err := rows.Scan(&total, &images, &videos, &earliest, &latest)
+        err := rows.Scan(&total, &images, &videos, &earliest, &latest, &uniqueCameras, &uniqueMakes, &locationsWithGPS)
         if err != nil {
             fmt.Printf("Error scanning row: %v\n", err)
             return
@@ -81,8 +82,12 @@ func displaySummary(db *sql.DB) {
         fmt.Printf("Images: %d\n", images)
         fmt.Printf("Videos: %d\n", videos)
         fmt.Printf("Date range: %s to %s\n", earliest, latest)
+        fmt.Printf("Unique camera models: %d\n", uniqueCameras)
+        fmt.Printf("Unique camera makes: %d\n", uniqueMakes)
+        fmt.Printf("Files with GPS data: %d\n", locationsWithGPS)
     }
 }
+
 
 func displayRecentFiles(db *sql.DB) {
     fmt.Printf("\nMost Recent Files:\n")
@@ -109,10 +114,9 @@ func displayRecentFiles(db *sql.DB) {
         fmt.Printf("%s - %s (%s)\n", dateTaken, filepath.Base(path), fileType)
     }
 }
-
 func displayFileList(db *sql.DB) {
     query := `
-        SELECT id, hash, original_path, new_path, date_taken, file_type
+        SELECT id, hash, original_path, new_path, date_taken, file_type, location, camera_model, camera_make, camera_type, resolution
         FROM media
         ORDER BY date_taken DESC
     `
@@ -133,21 +137,21 @@ func displayFileList(db *sql.DB) {
     defer rows.Close()
 
     fmt.Println("File List:")
-    fmt.Println("ID | Hash | Original Path | New Path | Date Taken | File Type")
-    fmt.Println("------------------------------------------------------------")
+    fmt.Println("ID | Hash | Original Path | New Path | Date Taken | File Type | Location | Camera Model | Camera Make | Camera Type | Resolution")
+    fmt.Println("-------------------------------------------------------------------------------------------------------------------")
 
     count := 0
     for rows.Next() {
         var id int
         var hash int64
-        var originalPath, newPath, dateTaken, fileType string
-        err := rows.Scan(&id, &hash, &originalPath, &newPath, &dateTaken, &fileType)
+        var originalPath, newPath, dateTaken, fileType, location, cameraModel, cameraMake, cameraType, resolution string
+        err := rows.Scan(&id, &hash, &originalPath, &newPath, &dateTaken, &fileType, &location, &cameraModel, &cameraMake, &cameraType, &resolution)
         if err != nil {
             fmt.Printf("Error scanning row: %v\n", err)
             continue
         }
-        fmt.Printf("%d | %d | %s | %s | %s | %s\n",
-            id, hash, originalPath, newPath, dateTaken, fileType)
+        fmt.Printf("%d | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s\n",
+            id, hash, originalPath, newPath, dateTaken, fileType, location, cameraModel, cameraMake, cameraType, resolution)
         count++
     }
 

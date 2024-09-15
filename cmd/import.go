@@ -90,14 +90,13 @@ func importImages(sourceDir, destDir string) {
 }
 
 
-
 func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
     fileType, isMedia := isMediaFile(sourcePath)
     if !isMedia {
         return ImportResult{Status: "error", Message: "Not a supported media file", OriginalPath: sourcePath}
     }
 
-    dateTime, err := getMediaDateTime(sourcePath)
+    metadata, err := getMediaMetadata(sourcePath)
     if err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error reading metadata: %v", err), OriginalPath: sourcePath}
     }
@@ -115,7 +114,7 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
         return ImportResult{Status: "skipped_in_db", Message: "Duplicate media found in database", OriginalPath: sourcePath, InDatabase: true}
     }
 
-    newPath := generateNewPath(sourcePath, dateTime, destDir, fileType)
+    newPath := generateNewPath(sourcePath, metadata.DateTime, destDir, fileType)
     
     if _, err := os.Stat(newPath); err == nil {
         existingHash, err := computeXXHash(newPath)
@@ -134,12 +133,13 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error copying file: %v", err), OriginalPath: sourcePath}
     }
 
-    if err := storeInDB(db, hash, sourcePath, newPath, dateTime, fileType); err != nil {
+    if err := storeInDB(db, hash, sourcePath, newPath, metadata); err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error storing in database: %v", err), OriginalPath: sourcePath, NewPath: newPath}
     }
 
     return ImportResult{Status: "imported", Message: "File successfully imported", OriginalPath: sourcePath, NewPath: newPath}
 }
+
 
 
 func generateUniqueFilename(path string) string {
@@ -159,8 +159,6 @@ func generateUniqueFilename(path string) string {
         counter++
     }
 }
-
-
 func initDB(destDir string) (*sql.DB, error) {
     dbPath := filepath.Join(destDir, "media.db")
     db, err := sql.Open("sqlite3", dbPath)
@@ -175,7 +173,12 @@ func initDB(destDir string) (*sql.DB, error) {
         original_path TEXT,
         new_path TEXT,
         date_taken DATETIME,
-        file_type TEXT
+        file_type TEXT,
+        location TEXT,
+        camera_model TEXT,
+        camera_make TEXT,
+        camera_type TEXT,
+        resolution TEXT
     )`)
     if err != nil {
         db.Close()
@@ -186,14 +189,14 @@ func initDB(destDir string) (*sql.DB, error) {
 }
 
 
-
-func storeInDB(db *sql.DB, hash uint64, originalPath, newPath string, dateTaken time.Time, fileType string) error {
+func storeInDB(db *sql.DB, hash uint64, originalPath, newPath string, metadata MediaMetadata) error {
     _, err := db.Exec(`
-        INSERT INTO media (hash, original_path, new_path, date_taken, file_type) 
-        VALUES (?, ?, ?, ?, ?)`,
-        int64(hash), originalPath, newPath, dateTaken, fileType)
+        INSERT INTO media (hash, original_path, new_path, date_taken, file_type, location, camera_model, camera_make, camera_type, resolution) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        int64(hash), originalPath, newPath, metadata.DateTime, metadata.FileType, metadata.Location, metadata.CameraModel, metadata.CameraMake, metadata.CameraType, metadata.Resolution)
     return err
 }
+
 
 
 func checkDuplicate(db *sql.DB, hash uint64) (bool, error) {
