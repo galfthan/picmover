@@ -50,6 +50,11 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
     }
 
     if fileType == "image" {
+        // Try to get resolution from image first
+        resolution, err := getImageResolution(path)
+        if err == nil {
+            metadata.Resolution = resolution
+        }
         x, err := exif.Decode(file)
         if err == nil {
             metadata.DateTime, _ = getExifDateTime(x)
@@ -57,13 +62,17 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
             metadata.CameraModel, _ = getExifTag(x, exif.Model)
             metadata.CameraMake, _ = getExifTag(x, exif.Make)
             metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
-           // metadata.Resolution, _ = getExifResolution(x)
+             // If we couldn't get resolution from image, try EXIF
+             if metadata.Resolution == "" {
+                metadata.Resolution, _ = getExifResolution(x)
+            }
+    
         }
-        
-        //  if metadata.Resolution == "" {
-        // always read resolution from image
-        metadata.Resolution, _ = getImageResolution(path)
-        //}
+        // If we still don't have a resolution, log an error or set a default value
+        if metadata.Resolution == "" {
+            fmt.Printf("Warning: Could not determine resolution for %s\n", path)
+            metadata.Resolution = "unknown"
+        }
         
         // If DateTime is not set, fall back to file modification time
         if metadata.DateTime.IsZero() {

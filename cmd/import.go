@@ -173,7 +173,7 @@ func updateStats(result ImportResult, stats *struct {
         fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
         stats.Imported++
     case "skipped_in_db":
-        fmt.Printf("Skipped (in DB): %s\n", result.OriginalPath)
+        fmt.Printf("Skipped (in DB): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedInDB++
     case "skipped_not_in_db":
         fmt.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
@@ -231,14 +231,19 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
     if err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error computing hash: %v", err), OriginalPath: sourcePath}
     }
-
-    isDuplicate, err := checkDuplicate(db, hash)
+    isDuplicate, existingPath, err := checkDuplicate(db, hash)
     if err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error checking for duplicates: %v", err), OriginalPath: sourcePath}
     }
     if isDuplicate {
-        return ImportResult{Status: "skipped_in_db", Message: "Duplicate media found in database", OriginalPath: sourcePath, InDatabase: true}
+        return ImportResult{
+            Status:       "skipped_in_db",
+            Message:      fmt.Sprintf("Duplicate media found in database. Hash: %x, Existing file: %s", hash, existingPath),
+            OriginalPath: sourcePath,
+            InDatabase:   true,
+        }
     }
+  
 
     newPath := generateNewPath(sourcePath, metadata.DateTime, destDir, fileType)
     
@@ -331,13 +336,18 @@ func storeInDB(db *sql.DB, hash uint64, originalPath, newPath string, metadata M
     return err
 }
 
-
-
-func checkDuplicate(db *sql.DB, hash uint64) (bool, error) {
-    var count int
-    err := db.QueryRow("SELECT COUNT(*) FROM media WHERE hash = ?", int64(hash)).Scan(&count)
-    return count > 0, err
+func checkDuplicate(db *sql.DB, hash uint64) (bool, string, error) {
+    var existingPath string
+    err := db.QueryRow("SELECT new_path FROM media WHERE hash = ?", int64(hash)).Scan(&existingPath)
+    if err == sql.ErrNoRows {
+        return false, "", nil
+    }
+    if err != nil {
+        return false, "", err
+    }
+    return true, existingPath, nil
 }
+
 
 
 func generateNewPath(sourcePath string, dateTime time.Time, destDir string, fileType string) string {
