@@ -11,7 +11,6 @@
 
 5. Configuration: moving some of the hardcoded values (like supported file extensions in isMediaFile) to a configuration file for easier maintenance.
 
-
 6. Adding a way to cleanly break the importing process. Can implement this using a combination of signal handling and a cancellation mechanism. 
 
 7. Optimization: DB Indexing: Ensure your hash column is indexed for fast duplicate checks.
@@ -28,10 +27,14 @@
 
 13. Optimize: minimize io, in memory image processing (read once)
 
-14. Add sigma raw, x3f support
 
 15. Use `filepath.WalkDir` instead of `filepath.Walk`:
       - `WalkDir` is more efficient as it doesn't call `os.Stat` for each file.
+
+
+DONE
+
+14. Add sigma raw, x3f support
 
 16. Preserve the file creation date during the copy process. Modify the copyFile function in the import.go file to preserve both the modification time and the creation time (where supported by the operating system). 
   => first check why some files have wrong date and some not

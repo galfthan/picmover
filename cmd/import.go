@@ -5,8 +5,12 @@ import (
     "fmt"
     "io"
     "os"
+    "os/signal"  
+    "context" 
     "strings"
     "path/filepath"
+    "sync"
+    "syscall"
     "time"
     "github.com/spf13/cobra"
     _ "github.com/mattn/go-sqlite3"
@@ -49,6 +53,27 @@ func importImages(sourceDir, destDir string) {
     }
     defer db.Close()
 
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // Set up signal handling to catch ctrl+c and sigterm
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    
+    var wg sync.WaitGroup
+    wg.Add(1)
+
+    go func() {
+        defer wg.Done()
+        select {
+        case <-sigChan:
+            fmt.Println("\nReceived interrupt signal. Cancelling import...")
+            cancel()
+        case <-ctx.Done():
+        }
+    }()
+
+
     var stats struct {
         Imported       int
         SkippedInDB    int
@@ -61,27 +86,38 @@ func importImages(sourceDir, destDir string) {
         if err != nil {
             return err
         }
-        if info.IsDir() {
+
+        select {
+        case <-ctx.Done():
+            return context.Canceled
+        default:
+            if info.IsDir() {
+                return nil
+            }
+
+            if filepath.Ext(path) == ".zip" {
+                err = processZipFile(path, destDir, db, &stats)
+                if err != nil {
+                    fmt.Printf("Error processing zip file %s: %v\n", path, err)
+                    stats.Errors++
+                }
+            } else {
+                processFile(path, destDir, db, &stats)
+            }
+
             return nil
         }
-
-        if filepath.Ext(path) == ".zip" {
-            err = processZipFile(path, destDir, db, &stats)
-            if err != nil {
-                fmt.Printf("Error processing zip file %s: %v\n", path, err)
-                stats.Errors++
-            }
-        } else {
-            processFile(path, destDir, db, &stats)
-        }
-
-        return nil
     })
 
     if err != nil {
-        fmt.Printf("Error walking through directory: %v\n", err)
+        if err == context.Canceled {
+            fmt.Println("Import cancelled.")
+        } else {
+            fmt.Printf("Error walking through directory: %v\n", err)
+        }
     }
 
+ 
     fmt.Printf("\nImport Summary:\n")
     fmt.Printf("Imported: %d\n", stats.Imported)
     fmt.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
