@@ -231,21 +231,21 @@ func determineCameraType(model, make string) string {
     // If we can't determine, return "unknown"
     return "unknown"
 }
-
-
 func isMediaFile(path string) (fileType string, isMedia bool) {
     ext := strings.ToLower(filepath.Ext(path))
     switch ext {
     case ".jpg", ".jpeg", ".png", ".tiff", ".tif":
         return "image", true
-    case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw", ".x3f":
+    case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw", ".x3f", ".orf", ".rw2", ".raf", ".pef", ".srw", ".raw":
         return "image_raw", true
-    case ".mp4", ".mpg", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv", ".mts":
+    case ".mp4", ".mpg", ".mpeg", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv", ".mts", ".m2ts", ".ts", ".webm", ".asf", ".m4v":
         return "video", true
     default:
         return "", false
     }
 }
+
+
 
 
 func getModificationTime(file *os.File) (time.Time, error) {
