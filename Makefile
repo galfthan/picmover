@@ -20,7 +20,7 @@ all: build
 build: build-linux build-windows
 
 build-linux:
-	CGO_ENABLED=0 $(GOBUILD) -o $(BINARY_UNIX)
+	CGO_ENABLED=1 $(GOBUILD) -o $(BINARY_UNIX)
 
 build-windows:
 	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=$(CC_WINDOWS) $(GOBUILD) -o $(BINARY_WIN)
