@@ -96,8 +96,11 @@ func importImages(sourceDir, destDir string) {
             }
 
             if filepath.Ext(path) == ".zip" {
-                err = processZipFile(path, destDir, db, &stats)
+                err = processZipFile(ctx, path, destDir, db, &stats)
                 if err != nil {
+                    if err == context.Canceled {
+                        return err
+                    }   
                     fmt.Printf("Error processing zip file %s: %v\n", path, err)
                     stats.Errors++
                 }
@@ -126,7 +129,7 @@ func importImages(sourceDir, destDir string) {
     fmt.Printf("Errors: %d\n", stats.Errors)
 }
 
-func processZipFile(zipPath, destDir string, db *sql.DB, stats *struct {
+func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, stats *struct {
     Imported       int
     SkippedInDB    int
     SkippedNotInDB int
@@ -148,14 +151,19 @@ func processZipFile(zipPath, destDir string, db *sql.DB, stats *struct {
     defer os.RemoveAll(tempDir) // Clean up temp directory when done
 
     for _, file := range reader.File {
-        if file.FileInfo().IsDir() {
-            continue
-        }
+        select {
+        case <-ctx.Done():
+            return context.Canceled
+        default:
+            if file.FileInfo().IsDir() {
+                continue
+            }
 
-        err := extractAndProcessFile(file, tempDir, destDir, db, stats)
-        if err != nil {
-            fmt.Printf("Error processing file %s from zip: %v\n", file.Name, err)
-            stats.Errors++
+            err := extractAndProcessFile(file, tempDir, destDir, db, stats)
+            if err != nil {
+                fmt.Printf("Error processing file %s from zip: %v\n", file.Name, err)
+                stats.Errors++
+            }
         }
     }
 
