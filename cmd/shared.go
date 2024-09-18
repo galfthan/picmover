@@ -238,9 +238,9 @@ func isMediaFile(path string) (fileType string, isMedia bool) {
     switch ext {
     case ".jpg", ".jpeg", ".png", ".tiff", ".tif":
         return "image", true
-    case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw":
+    case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw", ".x3f":
         return "image_raw", true
-    case ".mp4", ".mpg", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv":
+    case ".mp4", ".mpg", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv", ".mts":
         return "video", true
     default:
         return "", false

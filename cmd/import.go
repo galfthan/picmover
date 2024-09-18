@@ -155,12 +155,28 @@ func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, 
         return fmt.Errorf("failed to extract file: %w", err)
     }
 
+    // Ensure all data is written to disk
+    err = tempFile.Sync()
+    if err != nil {
+        return fmt.Errorf("failed to sync temp file: %w", err)
+    }
+
+    // Close the file to ensure we can modify its timestamps
+    tempFile.Close()
+
+    // Set the modification time of the temporary file to match the original file in the ZIP
+    err = os.Chtimes(tempFilePath, time.Now(), file.Modified)
+    if err != nil {
+        return fmt.Errorf("failed to set file times: %w", err)
+    }
+
     // Process the extracted file
     result := processAndMoveMedia(tempFilePath, destDir, db)
     updateStats(result, stats)
 
     return nil
 }
+
 func updateStats(result ImportResult, stats *struct {
     Imported       int
     SkippedInDB    int
@@ -363,18 +379,48 @@ func copyFile(src, dst string) error {
     }
     defer sourceFile.Close()
 
+    // Get file information
+    sourceInfo, err := sourceFile.Stat()
+    if err != nil {
+        return err
+    }
+
+    // Ensure the destination directory exists
     err = os.MkdirAll(filepath.Dir(dst), os.ModePerm)
     if err != nil {
         return err
     }
 
+    // Create the destination file
     destFile, err := os.Create(dst)
     if err != nil {
         return err
     }
     defer destFile.Close()
 
+    // Copy the contents
     _, err = io.Copy(destFile, sourceFile)
-    return err
+    if err != nil {
+        return err
+    }
+
+    // Sync to ensure write is complete
+    err = destFile.Sync()
+    if err != nil {
+        return err
+    }
+
+    // Close the destination file before setting times
+    destFile.Close()
+
+    // Preserve modification time
+    err = os.Chtimes(dst, sourceInfo.ModTime(), sourceInfo.ModTime())
+    if err != nil {
+        return err
+    }
+
+    
+
+    return nil
 }
 
