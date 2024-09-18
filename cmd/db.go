@@ -3,7 +3,6 @@ package cmd
 import (
     "database/sql"
     "fmt"
-
     "path/filepath"
 
 
@@ -37,7 +36,7 @@ func init() {
 func queryDatabase(destDir string) {
     dbPath := filepath.Join(destDir, "media.db")
     db, err := sql.Open("sqlite3", dbPath)
-    if err != nil {
+    if err != nil { 
         fmt.Printf("Error opening database: %v\n", err)
         return
     }
@@ -157,3 +156,5 @@ func displayFileList(db *sql.DB) {
 
     fmt.Printf("\nTotal files displayed: %d\n", count)
 }
+
+

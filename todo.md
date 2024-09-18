@@ -1,4 +1,4 @@
-#todo
+#Todo
 
 1. restructure the processAndMoveMedia function to perform the hash check first:
 
@@ -25,3 +25,15 @@
 11. add gui
 
 12. Fix dng bug: Warning: Could not get resolution from EXIF for RAW file /mnt/d/images/2012/10/07/IMG_4508.dng: exif: tag "PixelXDimension" is not present
+
+13. Optimize: minimize io, in memory image processing (read once)
+
+14. Add sigma raw, x3f support
+
+15. Use `filepath.WalkDir` instead of `filepath.Walk`:
+      - `WalkDir` is more efficient as it doesn't call `os.Stat` for each file.
+
+16. Preserve the file creation date during the copy process. Modify the copyFile function in the import.go file to preserve both the modification time and the creation time (where supported by the operating system). 
+  => first check why some files have wrong date and some not
+
+

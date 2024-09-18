@@ -240,7 +240,7 @@ func isMediaFile(path string) (fileType string, isMedia bool) {
         return "image", true
     case ".cr2", ".crw", ".cr3", ".dng", ".nef", ".arw":
         return "image_raw", true
-    case ".mp4", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv":
+    case ".mp4", ".mpg", ".mov", ".avi", ".mkv", ".flv", ".3gp", ".wmv":
         return "video", true
     default:
         return "", false
@@ -278,7 +278,6 @@ func parseExifDate(date string) (time.Time, error) {
     return time.Time{}, fmt.Errorf("unable to parse date: %s", date)
 }
 
-
 type FFProbeOutput struct {
     Streams []struct {
         CodecType string `json:"codec_type"`
@@ -291,13 +290,19 @@ type FFProbeOutput struct {
     Format struct {
         Filename string `json:"filename"`
         Tags     struct {
-            CreationTime     string `json:"creation_time"`
-            AndroidVersion   string `json:"com.android.version"`
-            AndroidCaptureFPS string `json:"com.android.capture.fps"`
+            CreationTime             string `json:"creation_time"`
+            Software                 string `json:"software"`
+            Location                 string `json:"location"`
+            LocationEng              string `json:"location-eng"`
+            AndroidVersion           string `json:"com.android.version"`
+            AndroidCaptureFPS        string `json:"com.android.capture.fps"`
+            AppleQuicktimeMake       string `json:"com.apple.quicktime.make"`
+            AppleQuicktimeModel      string `json:"com.apple.quicktime.model"`
+            AppleQuicktimeLocationDate string `json:"com.apple.quicktime.location.date"`
+            AppleQuicktimeLocationISO6709 string `json:"com.apple.quicktime.location.ISO6709"`
         } `json:"tags"`
     } `json:"format"`
 }
-
 func getVideoMetadata(path string) (MediaMetadata, error) {
     metadata := MediaMetadata{
         FileType: "video",
@@ -330,14 +335,23 @@ func getVideoMetadata(path string) (MediaMetadata, error) {
 
     // Extract creation time
     creationTime := ffprobeData.Format.Tags.CreationTime
-    if creationTime == "" && len(ffprobeData.Streams) > 0 {
-        creationTime = ffprobeData.Streams[0].Tags.CreationTime
+    if creationTime == "" {
+        creationTime = ffprobeData.Format.Tags.AppleQuicktimeLocationDate
     }
-
     if creationTime != "" {
-        t, err := time.Parse(time.RFC3339Nano, creationTime)
-        if err == nil {
-            metadata.DateTime = t
+        // Try parsing with multiple formats
+        formats := []string{
+            "2006-01-02T15:04:05.000000Z",
+            "2006-01-02T15:04:05Z",
+            "2006-01-02 15:04:05",
+            time.RFC3339Nano,
+            "2006-01-02T15:04:05.999999999Z07:00",
+        }
+        for _, format := range formats {
+            if t, err := time.Parse(format, creationTime); err == nil {
+                metadata.DateTime = t
+                break
+            }
         }
     }
 
@@ -350,19 +364,42 @@ func getVideoMetadata(path string) (MediaMetadata, error) {
         }
     }
 
-    // Check for Android information
-    if ffprobeData.Format.Tags.AndroidVersion != "" {
-        metadata.CameraModel = "Android Device"
-        metadata.CameraMake = "Android"
-        metadata.CameraType = "phone"
+    // Extract location
+    location := ffprobeData.Format.Tags.Location
+    if location == "" {
+        location = ffprobeData.Format.Tags.LocationEng
+    }
+    if location == "" {
+        location = ffprobeData.Format.Tags.AppleQuicktimeLocationISO6709
+    }
+    if location != "" {
+        metadata.Location = strings.TrimSuffix(location, "/")
     }
 
-    // Extract location if available (this would require parsing GPS metadata if present)
-    // metadata.Location = ... (if GPS data is available and can be extracted)
-
+    // Check for camera information
+    if ffprobeData.Format.Tags.AppleQuicktimeMake != "" {
+        metadata.CameraMake = ffprobeData.Format.Tags.AppleQuicktimeMake
+        metadata.CameraModel = ffprobeData.Format.Tags.AppleQuicktimeModel
+        metadata.CameraType = "camera"
+    } else if ffprobeData.Format.Tags.AndroidVersion != "" {
+        metadata.CameraModel = fmt.Sprintf("Android %s", ffprobeData.Format.Tags.AndroidVersion)
+        metadata.CameraMake = "Android"
+        metadata.CameraType = "phone"
+        if fps := ffprobeData.Format.Tags.AndroidCaptureFPS; fps != "" {
+            metadata.CameraModel += fmt.Sprintf(" (FPS: %s)", fps)
+        }
+    }  else if ffprobeData.Format.Tags.Software != "" {
+        if strings.HasPrefix(ffprobeData.Format.Tags.Software, "Canon") {
+            metadata.CameraMake = "Canon"
+            metadata.CameraModel = ffprobeData.Format.Tags.Software
+            metadata.CameraType = "camera"
+        } else {
+            metadata.CameraModel = ffprobeData.Format.Tags.Software
+        } 
+    }    
+    
     return metadata, nil
 }
-
 
 func computeXXHash(path string) (uint64, error) {
     file, err := os.Open(path)
