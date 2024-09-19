@@ -15,7 +15,7 @@ import (
     "github.com/spf13/cobra"
     _ "github.com/mattn/go-sqlite3"
     "archive/zip"
-
+    "log"
 )
 
 type ImportResult struct {
@@ -39,6 +39,8 @@ var importCmd = &cobra.Command{
 }
 var (
     minDimension int
+    logFile      *os.File
+    logger       *log.Logger
 )
 func init() {  
    rootCmd.AddCommand(importCmd)
@@ -46,8 +48,18 @@ func init() {
 }
 
 func importImages(sourceDir, destDir string) {
+    var err error
+    logFile, err = os.Create(filepath.Join(destDir, "import.log"))
+    if err != nil {
+        fmt.Printf("Error creating log file: %v\n", err)
+        return
+    }
+    defer logFile.Close()
+    logger = log.New(logFile, "", log.LstdFlags)
+  
     db, err := initDB(destDir)
     if err != nil {
+        logger.Printf("Error initializing database: %v\n", err)
         fmt.Printf("Error initializing database: %v\n", err)
         return
     }
@@ -68,6 +80,7 @@ func importImages(sourceDir, destDir string) {
         select {
         case <-sigChan:
             fmt.Println("\nReceived interrupt signal. Cancelling import...")
+            logger.Println("\nReceived interrupt signal. Cancelling import...")
             cancel()
         case <-ctx.Done():
         }
@@ -102,7 +115,7 @@ func importImages(sourceDir, destDir string) {
                     if err == context.Canceled {
                         return err
                     }   
-                    fmt.Printf("Error processing zip file %s: %v\n", path, err)
+                    logger.Printf("Error processing zip file %s: %v\n", path, err)
                     stats.Errors++
                 }
             } else {
@@ -115,13 +128,42 @@ func importImages(sourceDir, destDir string) {
 
     if err != nil {
         if err == context.Canceled {
+            logger.Println("Import cancelled.")
             fmt.Println("Import cancelled.")
         } else {
+            logger.Printf("Error walking through directory: %v\n", err)
             fmt.Printf("Error walking through directory: %v\n", err)
         }
     }
+    logSummary(&stats)
+    printSummary(&stats)
+}
+func logSummary(stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    NonMedia       int 
+    Errors         int
+}) {
+    logger.Printf("\nImport Summary:\n")
+    logger.Printf("Imported: %d\n", stats.Imported)
+    logger.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
+    logger.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
+    logger.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
+    logger.Printf("Skipped (not media file): %d\n", stats.NonMedia)
+    logger.Printf("Errors: %d\n", stats.Errors)
+}
 
- 
+
+func printSummary(stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    NonMedia       int 
+    Errors         int
+}) {
     fmt.Printf("\nImport Summary:\n")
     fmt.Printf("Imported: %d\n", stats.Imported)
     fmt.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
@@ -130,6 +172,21 @@ func importImages(sourceDir, destDir string) {
     fmt.Printf("Skipped (not media file): %d\n", stats.NonMedia)
     fmt.Printf("Errors: %d\n", stats.Errors)
 }
+
+func updateDisplay(stats *struct {
+    Imported       int
+    SkippedInDB    int
+    SkippedNotInDB int
+    SkippedSmall   int
+    NonMedia       int 
+    Errors         int
+}) {
+    // Clear the current line and move cursor to beginning
+    fmt.Print("\033[2K\r")
+    fmt.Printf("Imported: %d | Skipped (in DB): %d | Skipped (not in DB): %d | Skipped (small): %d | Non-media: %d | Errors: %d",
+        stats.Imported, stats.SkippedInDB, stats.SkippedNotInDB, stats.SkippedSmall, stats.NonMedia, stats.Errors)
+}
+
 
 func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, stats *struct {
     Imported       int
@@ -164,9 +221,11 @@ func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, st
 
             err := extractAndProcessFile(file, tempDir, destDir, db, stats)
             if err != nil {
+                logger.Printf("Error processing file %s from zip: %v\n", file.Name, err)
                 fmt.Printf("Error processing file %s from zip: %v\n", file.Name, err)
                 stats.Errors++
             }
+            updateDisplay(stats)
         }
     }
 
@@ -221,7 +280,7 @@ func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, 
     // Process the extracted file
     result := processAndMoveMedia(tempFilePath, destDir, db)
     updateStats(result, stats)
-
+    updateDisplay(stats)
     return nil
 }
 
@@ -235,22 +294,22 @@ func updateStats(result ImportResult, stats *struct {
 }) {
     switch result.Status {
     case "imported":
-        fmt.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
+        logger.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
         stats.Imported++
     case "skipped_in_db":
-        fmt.Printf("Skipped (in DB): %s (%s)\n", result.OriginalPath, result.Message)
+        logger.Printf("Skipped (in DB): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedInDB++
     case "skipped_not_in_db":
-        fmt.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
+        logger.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedNotInDB++
     case "skipped_small":
-        fmt.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
+        logger.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedSmall++
     case "non_media":
-        fmt.Printf("Skipped (non media): %s (%s)\n", result.OriginalPath, result.Message)
+        logger.Printf("Skipped (non media): %s (%s)\n", result.OriginalPath, result.Message)
         stats.NonMedia++
     case "error":
-        fmt.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
+        logger.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
         stats.Errors++
     }
 }
