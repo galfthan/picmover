@@ -266,6 +266,24 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
     if !isMedia {
         return ImportResult{Status: "error", Message: "Not a supported media file", OriginalPath: sourcePath}
     }
+    hash, err := computeXXHash(sourcePath)
+    if err != nil {
+        return ImportResult{Status: "error", Message: fmt.Sprintf("Error computing hash: %v", err), OriginalPath: sourcePath}
+    }
+    isDuplicate, existingPath, err := checkDuplicate(db, hash)
+    if err != nil {
+        return ImportResult{Status: "error", Message: fmt.Sprintf("Error checking for duplicates: %v", err), OriginalPath: sourcePath}
+    }
+
+    if isDuplicate {
+        return ImportResult{
+            Status:       "skipped_in_db",
+            Message:      fmt.Sprintf("Duplicate media found in database. Hash: %x, Existing file: %s", hash, existingPath),
+            OriginalPath: sourcePath,
+            InDatabase:   true,
+        }
+    }
+  
 
     metadata, err := getMediaMetadata(sourcePath)
     if err != nil {
@@ -287,23 +305,8 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
         }
     }
    
-    hash, err := computeXXHash(sourcePath)
-    if err != nil {
-        return ImportResult{Status: "error", Message: fmt.Sprintf("Error computing hash: %v", err), OriginalPath: sourcePath}
-    }
-    isDuplicate, existingPath, err := checkDuplicate(db, hash)
-    if err != nil {
-        return ImportResult{Status: "error", Message: fmt.Sprintf("Error checking for duplicates: %v", err), OriginalPath: sourcePath}
-    }
-    if isDuplicate {
-        return ImportResult{
-            Status:       "skipped_in_db",
-            Message:      fmt.Sprintf("Duplicate media found in database. Hash: %x, Existing file: %s", hash, existingPath),
-            OriginalPath: sourcePath,
-            InDatabase:   true,
-        }
-    }
-  
+
+    
 
     newPath := generateNewPath(sourcePath, metadata.DateTime, destDir, fileType)
     

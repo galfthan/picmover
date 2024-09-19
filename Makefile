@@ -29,3 +29,7 @@ clean:
 	$(GOCLEAN)
 	rm -f $(BINARY_UNIX)
 	rm -f $(BINARY_WIN)
+
+install: build
+	mv $(BINARY_UNIX) /home/alfthan/bin
+	mv $(BINARY_WIN) /mnt/c/Users/galft/bin/
