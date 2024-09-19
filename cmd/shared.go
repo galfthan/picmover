@@ -16,7 +16,7 @@ import (
     "github.com/cespare/xxhash"
     "github.com/rwcarlsen/goexif/exif"
     "github.com/rwcarlsen/goexif/mknote"
-   
+    "log"
 )
 
 func init() {
@@ -57,14 +57,14 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
             metadata.CameraMake, _ = getExifTag(x, exif.Make)
             metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
         }    else {
-            fmt.Printf("Warning: Could not read EXIF data for %s: %v\n", path, err)
+            logger.Printf("Warning: Could not read EXIF data for %s: %v\n", path, err)
         }
         // For standard image files, try to get resolution from image 
         if fileType == "image" {
             // Seek back to the start of the file
             _, err = file.Seek(0, 0)
             if err != nil {
-                fmt.Printf("Warning: Could not seek file %s: %v\n", path, err)
+                logger.Printf("Warning: Could not seek file %s: %v\n", path, err)
             }
             metadata.Resolution, _ = getImageResolution(path)
             if err != nil || metadata.Resolution == "" {
@@ -78,7 +78,7 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
                    // for raw read exif always
                 metadata.Resolution, err = getExifResolution(x)
                 if err != nil {
-                    fmt.Printf("Warning: Could not get resolution from EXIF for RAW file %s: %v\n", path, err)
+                    logger.Printf("Warning: Could not get resolution from EXIF for RAW file %s: %v\n", path, err)
                 }
             }
         }
@@ -86,7 +86,7 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
 
         // If we still don't have a resolution, log an error or set a default value
         if metadata.Resolution == "" {
-            fmt.Printf("Warning: Could not determine resolution for %s\n", path)
+            logger.Printf("Warning: Could not determine resolution for %s\n", path)
             metadata.Resolution = "unknown"
         }
 
