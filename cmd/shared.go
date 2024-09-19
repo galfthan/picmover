@@ -16,7 +16,7 @@ import (
     "github.com/cespare/xxhash"
     "github.com/rwcarlsen/goexif/exif"
     "github.com/rwcarlsen/goexif/mknote"
-    "log"
+
 )
 
 func init() {

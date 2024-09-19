@@ -1,6 +1,5 @@
-#Todo
+Todo
 
-1. restructure the processAndMoveMedia function to perform the hash check first:
 
 
 2. Database Transactions: For database operations that involve multiple steps (like in processAndMoveMedia), consider using transactions to ensure atomicity.
@@ -10,8 +9,6 @@
 4. bug: In processAndMoveMedia, if copyFile fails, you might want to delete the entry from the database to maintain consistency
 
 5. Configuration: moving some of the hardcoded values (like supported file extensions in isMediaFile) to a configuration file for easier maintenance.
-
-6. Adding a way to cleanly break the importing process. Can implement this using a combination of signal handling and a cancellation mechanism. 
 
 7. Optimization: DB Indexing: Ensure your hash column is indexed for fast duplicate checks.
 
@@ -27,12 +24,18 @@
 
 13. Optimize: minimize io, in memory image processing (read once)
 
+16. creating a dedicated type for our stats.
+
+wONTFIX
 
 15. Use `filepath.WalkDir` instead of `filepath.Walk`:
       - `WalkDir` is more efficient as it doesn't call `os.Stat` for each file.
 
 
 DONE
+1. restructure the processAndMoveMedia function to perform the hash check first:
+
+6. Adding a way to cleanly break the importing process. Can implement this using a combination of signal handling and a cancellation mechanism. 
 
 14. Add sigma raw, x3f support
 

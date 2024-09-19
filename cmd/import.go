@@ -48,15 +48,24 @@ func init() {
 }
 
 func importImages(sourceDir, destDir string) {
-    var err error
-    logFile, err = os.Create(filepath.Join(destDir, "import.log"))
+    timestamp := time.Now().Format("2006-01-02_15-04-05")
+    logFileName := fmt.Sprintf("import_%s.log", timestamp)
+    logFilePath := filepath.Join(destDir, logFileName)
+
+    logFile, err := os.Create(logFilePath)
     if err != nil {
         fmt.Printf("Error creating log file: %v\n", err)
         return
     }
     defer logFile.Close()
+    
     logger = log.New(logFile, "", log.LstdFlags)
-  
+    
+    logger.Printf("Import session started at %s\n", time.Now().Format(time.RFC3339))
+    logger.Printf("Source directory: %s\n", sourceDir)
+    logger.Printf("Destination directory: %s\n", destDir)
+
+    
     db, err := initDB(destDir)
     if err != nil {
         logger.Printf("Error initializing database: %v\n", err)
@@ -325,6 +334,8 @@ func processFile(path, destDir string, db *sql.DB, stats *struct {
     if _, isMedia := isMediaFile(path); isMedia {
         result := processAndMoveMedia(path, destDir, db)
         updateStats(result, stats)
+        updateDisplay(stats)
+
     }
 }
 
