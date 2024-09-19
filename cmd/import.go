@@ -19,7 +19,7 @@ import (
 )
 
 type ImportResult struct {
-    Status      string  // "imported", "skipped_in_db", "skipped_not_in_db", "error"
+    Status      string  // "imported", "skipped_in_db", "skipped_not_in_db", "non_media","error"
     Message     string
     OriginalPath string
     NewPath      string
@@ -79,6 +79,7 @@ func importImages(sourceDir, destDir string) {
         SkippedInDB    int
         SkippedNotInDB int
         SkippedSmall   int
+        NonMedia       int 
         Errors         int
     }
 
@@ -126,6 +127,7 @@ func importImages(sourceDir, destDir string) {
     fmt.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
     fmt.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
     fmt.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
+    fmt.Printf("Skipped (not media file): %d\n", stats.NonMedia)
     fmt.Printf("Errors: %d\n", stats.Errors)
 }
 
@@ -134,6 +136,7 @@ func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, st
     SkippedInDB    int
     SkippedNotInDB int
     SkippedSmall   int
+    NonMedia       int
     Errors         int
 }) error {
     reader, err := zip.OpenReader(zipPath)
@@ -176,6 +179,7 @@ func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, 
     SkippedInDB    int
     SkippedNotInDB int
     SkippedSmall   int
+    NonMedia       int
     Errors         int
 }) error {
     // Create a temporary file with the original name
@@ -226,6 +230,7 @@ func updateStats(result ImportResult, stats *struct {
     SkippedInDB    int
     SkippedNotInDB int
     SkippedSmall   int
+    NonMedia       int
     Errors         int
 }) {
     switch result.Status {
@@ -241,6 +246,9 @@ func updateStats(result ImportResult, stats *struct {
     case "skipped_small":
         fmt.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedSmall++
+    case "non_media":
+        fmt.Printf("Skipped (non media): %s (%s)\n", result.OriginalPath, result.Message)
+        stats.NonMedia++
     case "error":
         fmt.Printf("Error processing %s: %s\n", result.OriginalPath, result.Message)
         stats.Errors++
@@ -252,6 +260,7 @@ func processFile(path, destDir string, db *sql.DB, stats *struct {
     SkippedInDB    int
     SkippedNotInDB int
     SkippedSmall   int
+    NonMedia       int
     Errors         int
 }) {
     if _, isMedia := isMediaFile(path); isMedia {
@@ -264,7 +273,7 @@ func processFile(path, destDir string, db *sql.DB, stats *struct {
 func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
     fileType, isMedia := isMediaFile(sourcePath)
     if !isMedia {
-        return ImportResult{Status: "error", Message: "Not a supported media file", OriginalPath: sourcePath}
+        return ImportResult{Status: "non_media", Message: "Not a supported media file", OriginalPath: sourcePath}
     }
     hash, err := computeXXHash(sourcePath)
     if err != nil {
