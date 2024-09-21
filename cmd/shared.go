@@ -133,7 +133,7 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
         }
     }
 
-    logMediaMetadata(path, metadata)
+  //  logMediaMetadata(path, metadata)
     return metadata, nil
 }
 

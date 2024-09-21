@@ -26,6 +26,17 @@ type ImportResult struct {
     InDatabase    bool
 }
 
+type ImportStats struct {
+    Imported         int
+    ImportedExisting int
+    SkippedInDB      int
+    SkippedSmall     int
+    NonMedia         int
+    Errors           int
+}
+
+
+
 var importCmd = &cobra.Command{
     Use:   "import [source_directory] [destination_directory]",
     Short: "Import and organize images into a new directory structure",
@@ -39,12 +50,15 @@ var importCmd = &cobra.Command{
 }
 var (
     minDimension int
+    moveFiles    bool    
     logFile      *os.File
     logger       *log.Logger
 )
 func init() {  
    rootCmd.AddCommand(importCmd)
    importCmd.Flags().IntVar(&minDimension, "min-dimension", 0, "Minimum dimension (width or height) for imported images. 0 means no limit.")
+   importCmd.Flags().BoolVar(&moveFiles, "move", false, "Move files instead of copying")
+
 }
 
 func importImages(sourceDir, destDir string) {
@@ -94,16 +108,9 @@ func importImages(sourceDir, destDir string) {
         case <-ctx.Done():
         }
     }()
+    
 
-
-    var stats struct {
-        Imported       int
-        SkippedInDB    int
-        SkippedNotInDB int
-        SkippedSmall   int
-        NonMedia       int 
-        Errors         int
-    }
+    var stats ImportStats
 
     err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
         if err != nil {
@@ -144,67 +151,40 @@ func importImages(sourceDir, destDir string) {
             fmt.Printf("Error walking through directory: %v\n", err)
         }
     }
-    logSummary(&stats)
-    printSummary(&stats)
+    stats.logSummary()
+    stats.printSummary()
 }
-func logSummary(stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int 
-    Errors         int
-}) {
+
+func (s *ImportStats) logSummary() {
     logger.Printf("\nImport Summary:\n")
-    logger.Printf("Imported: %d\n", stats.Imported)
-    logger.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
-    logger.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
-    logger.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
-    logger.Printf("Skipped (not media file): %d\n", stats.NonMedia)
-    logger.Printf("Errors: %d\n", stats.Errors)
+    logger.Printf("Imported: %d\n", s.Imported)
+    logger.Printf("Imported Existing: %d\n", s.ImportedExisting)
+    logger.Printf("Skipped (in DB): %d\n", s.SkippedInDB)
+    logger.Printf("Skipped (too small): %d\n", s.SkippedSmall)
+    logger.Printf("Skipped (not media file): %d\n", s.NonMedia)
+    logger.Printf("Errors: %d\n", s.Errors)
 }
 
-
-func printSummary(stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int 
-    Errors         int
-}) {
+func (s *ImportStats) printSummary() {
     fmt.Printf("\nImport Summary:\n")
-    fmt.Printf("Imported: %d\n", stats.Imported)
-    fmt.Printf("Skipped (in DB): %d\n", stats.SkippedInDB)
-    fmt.Printf("Skipped (not in DB): %d\n", stats.SkippedNotInDB)
-    fmt.Printf("Skipped (too small): %d\n", stats.SkippedSmall)
-    fmt.Printf("Skipped (not media file): %d\n", stats.NonMedia)
-    fmt.Printf("Errors: %d\n", stats.Errors)
+    fmt.Printf("Imported: %d\n", s.Imported)
+    fmt.Printf("Imported Existing: %d\n", s.ImportedExisting)
+    fmt.Printf("Skipped (in DB): %d\n", s.SkippedInDB)
+    fmt.Printf("Skipped (too small): %d\n", s.SkippedSmall)
+    fmt.Printf("Skipped (not media file): %d\n", s.NonMedia)
+    fmt.Printf("Errors: %d\n", s.Errors)
 }
 
-func updateDisplay(stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int 
-    Errors         int
-}) {
+func (s *ImportStats) updateDisplay() {
     // Clear the current line and move cursor to beginning
     fmt.Print("\033[2K\r")
-    fmt.Printf("Imported: %d | Skipped (in DB): %d | Skipped (not in DB): %d | Skipped (small): %d | Non-media: %d | Errors: %d",
-        stats.Imported, stats.SkippedInDB, stats.SkippedNotInDB, stats.SkippedSmall, stats.NonMedia, stats.Errors)
+    fmt.Printf("Imported: %d | Imported Existing: %d | Skipped (in DB): %d | Skipped (small): %d | Non-media: %d | Errors: %d",
+        s.Imported, s.ImportedExisting, s.SkippedInDB, s.SkippedSmall, s.NonMedia, s.Errors)
 }
 
 
-func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int
-    Errors         int
-}) error {
+
+func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, stats *ImportStats) error {
     reader, err := zip.OpenReader(zipPath)
     if err != nil {
         return err
@@ -234,7 +214,7 @@ func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, st
                 fmt.Printf("Error processing file %s from zip: %v\n", file.Name, err)
                 stats.Errors++
             }
-            updateDisplay(stats)
+            stats.updateDisplay()
         }
     }
 
@@ -242,14 +222,7 @@ func processZipFile(ctx context.Context, zipPath, destDir string, db *sql.DB, st
 }
 
 
-func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int
-    Errors         int
-}) error {
+func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, stats *ImportStats) error {
     // Create a temporary file with the original name
     tempFilePath := filepath.Join(tempDir, filepath.Base(file.Name))
     tempFile, err := os.Create(tempFilePath)
@@ -289,28 +262,23 @@ func extractAndProcessFile(file *zip.File, tempDir, destDir string, db *sql.DB, 
     // Process the extracted file
     result := processAndMoveMedia(tempFilePath, destDir, db)
     updateStats(result, stats)
-    updateDisplay(stats)
+    stats.updateDisplay()
     return nil
 }
 
-func updateStats(result ImportResult, stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int
-    Errors         int
-}) {
+
+
+func updateStats(result ImportResult, stats *ImportStats) {
     switch result.Status {
     case "imported":
         logger.Printf("Imported: %s -> %s\n", result.OriginalPath, result.NewPath)
         stats.Imported++
+    case "imported_existing":
+        logger.Printf("Imported existing: %s (%s)\n", result.OriginalPath, result.Message)
+        stats.ImportedExisting++
     case "skipped_in_db":
         logger.Printf("Skipped (in DB): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedInDB++
-    case "skipped_not_in_db":
-        logger.Printf("Skipped (not in DB): %s (%s)\n", result.OriginalPath, result.Message)
-        stats.SkippedNotInDB++
     case "skipped_small":
         logger.Printf("Skipped (too small): %s (%s)\n", result.OriginalPath, result.Message)
         stats.SkippedSmall++
@@ -323,18 +291,11 @@ func updateStats(result ImportResult, stats *struct {
     }
 }
 
-func processFile(path, destDir string, db *sql.DB, stats *struct {
-    Imported       int
-    SkippedInDB    int
-    SkippedNotInDB int
-    SkippedSmall   int
-    NonMedia       int
-    Errors         int
-}) {
+func processFile(path, destDir string, db *sql.DB, stats *ImportStats) {
     if _, isMedia := isMediaFile(path); isMedia {
         result := processAndMoveMedia(path, destDir, db)
         updateStats(result, stats)
-        updateDisplay(stats)
+        stats.updateDisplay()
 
     }
 }
@@ -398,16 +359,19 @@ func processAndMoveMedia(sourcePath, destDir string, db *sql.DB) ImportResult {
         if hash != existingHash {
             newPath = generateUniqueFilename(newPath)
         } else {
-            return ImportResult{Status: "skipped_not_in_db", Message: "Identical file already exists at destination but not in database", OriginalPath: sourcePath, NewPath: newPath, InDatabase: false}
+            // We have an identical file in the correct place. This is great, let's use it. Copyfile will handle this well (ignore)
         }
-    }
-
-    if err := copyFile(sourcePath, newPath); err != nil {
-        return ImportResult{Status: "error", Message: fmt.Sprintf("Error copying file: %v", err), OriginalPath: sourcePath}
     }
 
     if err := storeInDB(db, hash, sourcePath, newPath, metadata); err != nil {
         return ImportResult{Status: "error", Message: fmt.Sprintf("Error storing in database: %v", err), OriginalPath: sourcePath, NewPath: newPath}
+    }
+    if sourcePath == newPath {
+        return ImportResult{Status: "imported_existing", Message: "Existing file added to DB", OriginalPath: sourcePath, NewPath: newPath}
+    }
+
+    if err := copyFile(sourcePath, newPath); err != nil {
+        return ImportResult{Status: "error", Message: fmt.Sprintf("Error copying file: %v", err), OriginalPath: sourcePath}
     }
 
     return ImportResult{Status: "imported", Message: "File successfully imported", OriginalPath: sourcePath, NewPath: newPath}
@@ -499,6 +463,33 @@ func generateNewPath(sourcePath string, dateTime time.Time, destDir string, file
 
 
 func copyFile(src, dst string) error {
+    if src == dst {
+        //it already is in the correct place, nothing to be done
+        return nil
+    }
+
+    // Ensure the destination directory exists
+    err := os.MkdirAll(filepath.Dir(dst), os.ModePerm)
+    if err != nil {
+       return err    
+    } 
+    
+    if moveFiles {
+        // Attempt to move the file
+        err := os.Rename(src, dst)
+        if err == nil {
+            return nil // Successfully moved
+        }
+        // Check if the error is due to cross-device link
+        if linkErr, ok := err.(*os.LinkError); ok && linkErr.Err == syscall.EXDEV {
+            // Fall through to copy-and-delete for cross-device moves
+            logger.Printf("Can't move file from %s to %s (cross-device link). Falling back to copy-and-delete.", src, dst)
+        }  else {
+            return fmt.Errorf("failed to move file from %s to %s: %w", src, dst, err)
+        }
+    }
+
+
     sourceFile, err := os.Open(src)
     if err != nil {
         return err
@@ -511,12 +502,7 @@ func copyFile(src, dst string) error {
         return err
     }
 
-    // Ensure the destination directory exists
-    err = os.MkdirAll(filepath.Dir(dst), os.ModePerm)
-    if err != nil {
-        return err
-    }
-
+  
     // Create the destination file
     destFile, err := os.Create(dst)
     if err != nil {
@@ -545,7 +531,15 @@ func copyFile(src, dst string) error {
         return err
     }
 
-    
+    // If we're moving, delete the source file after successful copy
+    if moveFiles {
+        err = os.Remove(src)
+        if err != nil {
+            // If we can't remove the source, we should try to remove the destination to avoid duplication
+            os.Remove(dst)
+            return fmt.Errorf("failed to remove source file after copy: %w", err)
+        }
+    }
 
     return nil
 }
