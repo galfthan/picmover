@@ -32,6 +32,14 @@ type MediaMetadata struct {
     FileType     string
     Resolution   string
 }
+
+func logMediaMetadata(path string, metadata MediaMetadata ) (error) {
+    logger.Printf("Info: EXIF for %s: DateTime %s Location %s CameraModel %s CameraMake %s CameraType %s FileType %s Resolution %s \n", 
+         path, metadata.DateTime, metadata.Location, metadata.CameraModel, metadata.CameraMake, metadata.CameraType, metadata.FileType, metadata.Resolution);
+    return nil
+
+}
+
 func getMediaMetadata(path string) (MediaMetadata, error) {
     file, err := os.Open(path)
     if err != nil {
@@ -50,41 +58,62 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
 
     if fileType == "image" || fileType == "image_raw" {
         x, err := exif.Decode(file)
-        if err == nil {
-            metadata.DateTime, _ = getExifDateTime(x)
-            metadata.Location, _ = getExifLocation(x)
-            metadata.CameraModel, _ = getExifTag(x, exif.Model)
-            metadata.CameraMake, _ = getExifTag(x, exif.Make)
-            metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
-        }    else {
-            logger.Printf("Warning: Could not read EXIF data for %s: %v\n", path, err)
+        if err != nil {
+            logger.Printf("Warning: Could not read full EXIF data for %s (has some content %t): %v\n", path, x!=nil, err)
+            // Even if full EXIF decoding fails, try to read individual fields
         }
+        
+        if x != nil {
+
+            metadata.DateTime, err = getExifDateTime(x)
+            if err != nil {
+                logger.Printf("Warning: Could not read DateTime from EXIF for %s: %v\n", path, err)
+            }
+            
+            metadata.Location, err = getExifLocation(x)
+            if err != nil {
+                logger.Printf("Warning: Could not read Location from EXIF for %s: %v\n", path, err)
+            }
+            
+            metadata.CameraModel, err = getExifTag(x, exif.Model)
+            if err != nil {
+                logger.Printf("Warning: Could not read CameraModel from EXIF for %s: %v\n", path, err)
+            }
+            
+            metadata.CameraMake, err = getExifTag(x, exif.Make)
+            if err != nil {
+                logger.Printf("Warning: Could not read CameraMake from EXIF for %s: %v\n", path, err)
+            }
+            
+            metadata.CameraType = determineCameraType(metadata.CameraModel, metadata.CameraMake)
+        }
+
         // For standard image files, try to get resolution from image 
         if fileType == "image" {
-            // Seek back to the start of the file
             _, err = file.Seek(0, 0)
             if err != nil {
                 logger.Printf("Warning: Could not seek file %s: %v\n", path, err)
             }
-            metadata.Resolution, _ = getImageResolution(path)
-            if err != nil || metadata.Resolution == "" {
+            metadata.Resolution, err = getImageResolution(path)
+            if err != nil {
+                logger.Printf("Warning: Could not get resolution from image for %s: %v\n", path, err)
                 if x != nil {
-                    // For standard image files, try to get resolution from  EXIF if image failed failed
-                    metadata.Resolution, _ = getExifResolution(x)
+                    metadata.Resolution, err = getExifResolution(x)
+                    if err != nil {
+                        logger.Printf("Warning: Could not get resolution from EXIF for %s: %v\n", path, err)
+                    }
                 }
             }
         } else { // fileType == "image_raw"
             if x != nil {
-                   // for raw read exif always
                 metadata.Resolution, err = getExifResolution(x)
                 if err != nil {
                     logger.Printf("Warning: Could not get resolution from EXIF for RAW file %s: %v\n", path, err)
                 }
             }
         }
-       
 
-        // If we still don't have a resolution, log an error or set a default value
+        // If we still don't have a resolution, set a default value
         if metadata.Resolution == "" {
             logger.Printf("Warning: Could not determine resolution for %s\n", path)
             metadata.Resolution = "unknown"
@@ -92,7 +121,10 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
 
         // If DateTime is not set, fall back to file modification time
         if metadata.DateTime.IsZero() {
-            metadata.DateTime, _ = getModificationTime(file)
+            metadata.DateTime, err = getModificationTime(file)
+            if err != nil {
+                logger.Printf("Warning: Could not get modification time for %s: %v\n", path, err)
+            }
         }
     } else if fileType == "video" {
         metadata, err = getVideoMetadata(path)
@@ -101,9 +133,9 @@ func getMediaMetadata(path string) (MediaMetadata, error) {
         }
     }
 
+    logMediaMetadata(path, metadata)
     return metadata, nil
 }
-
 
 
 func getImageResolution(path string) (string, error) {
