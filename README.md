@@ -99,4 +99,4 @@ For more details on the GPL v3 license, please visit: https://www.gnu.org/licens
 
 ## Contact
 
-Sebastian von Alfthan <galfthan@gmail.com>
+Sebastian von Alfthan
