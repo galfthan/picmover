@@ -1,0 +1,317 @@
+// Package library models a picmover media library: a root directory that
+// holds media files in a date-based layout, the catalog database (media.db)
+// and a .picmover directory for temp files and logs.
+//
+// Paths stored in the catalog are relative to the root and use forward
+// slashes, so one library can be used from Linux, Windows and macOS.
+package library
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cespare/xxhash/v2"
+)
+
+const (
+	// DBName is the catalog file name at the library root.
+	DBName = "media.db"
+	// MetaDir holds picmover's own files (temp files, logs).
+	MetaDir = ".picmover"
+)
+
+// ErrHashMismatch is returned by CopyVerified when the bytes written do not
+// hash to the expected value.
+var ErrHashMismatch = errors.New("hash mismatch after copy")
+
+// Library is an opened media library.
+type Library struct {
+	root string
+}
+
+// Open returns the library rooted at dir, creating it and its internal
+// directories if needed.
+func Open(dir string) (*Library, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	l := &Library{root: filepath.Clean(abs)}
+	for _, d := range []string{l.root, l.TempDir(), l.LogDir()} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return nil, fmt.Errorf("create %s: %w", d, err)
+		}
+	}
+	return l, nil
+}
+
+// Attach returns the library rooted at dir without creating anything. It
+// fails when dir does not exist or is not a directory. Read-only commands
+// use it so that a mistyped path never creates an empty library; Open is
+// for commands that write (import).
+func Attach(dir string) (*Library, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	root := filepath.Clean(abs)
+	fi, err := os.Stat(root)
+	if err != nil {
+		return nil, fmt.Errorf("library %s: %w", root, err)
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("library %s: not a directory", root)
+	}
+	return &Library{root: root}, nil
+}
+
+// Root returns the absolute library root.
+func (l *Library) Root() string { return l.root }
+
+// DBPath returns the absolute path of the catalog database.
+func (l *Library) DBPath() string { return filepath.Join(l.root, DBName) }
+
+// TempDir returns the directory used for in-progress copies and extractions.
+// It lives inside the library so that renames into place stay on one volume.
+func (l *Library) TempDir() string { return filepath.Join(l.root, MetaDir, "tmp") }
+
+// LogDir returns the directory for import logs.
+func (l *Library) LogDir() string { return filepath.Join(l.root, MetaDir, "logs") }
+
+// Abs converts a catalog path (relative, forward slashes) to an absolute OS path.
+func (l *Library) Abs(rel string) string {
+	return filepath.Join(l.root, filepath.FromSlash(rel))
+}
+
+// Rel converts an absolute OS path inside the library to catalog form.
+func (l *Library) Rel(abs string) (string, error) {
+	rel, err := filepath.Rel(l.root, abs)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is outside library %s", abs, l.root)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// Contains reports whether abs lies inside the library root.
+func (l *Library) Contains(abs string) bool {
+	_, err := l.Rel(abs)
+	return err == nil
+}
+
+// IsInternal reports whether abs is a file picmover manages itself: the
+// catalog (media.db, media.db-wal, -shm, -journal), its v1 backups
+// (media.db.v1-*.bak and their .tmp files), import_*.log at the root, and
+// everything under the .picmover directory. Importers skip these when the source
+// overlaps the library.
+func (l *Library) IsInternal(abs string) bool {
+	rel, err := l.Rel(abs)
+	if err != nil {
+		return false
+	}
+	if rel == MetaDir || strings.HasPrefix(rel, MetaDir+"/") {
+		return true
+	}
+	if path.Dir(rel) != "." {
+		return false
+	}
+	base := path.Base(rel)
+	switch base {
+	case DBName, DBName + "-wal", DBName + "-shm", DBName + "-journal":
+		return true
+	}
+	if isBackupName(base) {
+		return true
+	}
+	return strings.HasPrefix(base, "import_") && strings.HasSuffix(base, ".log")
+}
+
+// isBackupName matches the v1 catalog backups written by the catalog
+// migration, media.db.v1-*.bak, and their in-progress temp files
+// media.db.v1-*.bak.*.tmp.
+func isBackupName(base string) bool {
+	const prefix = DBName + ".v1-"
+	if !strings.HasPrefix(base, prefix) {
+		return false
+	}
+	if strings.HasSuffix(base, ".bak") {
+		return true
+	}
+	return strings.HasSuffix(base, ".tmp") && strings.Contains(base[len(prefix):], ".bak.")
+}
+
+// CleanTemp removes everything in the temp directory. Only one importer may
+// use a library at a time.
+func (l *Library) CleanTemp() error {
+	entries, err := os.ReadDir(l.TempDir())
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(l.TempDir(), e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LayoutPath returns the catalog path "<type>/YYYY/MM/<name>" for a file
+// taken at t. t is formatted in its own zone, so pass wall-clock time.
+func LayoutPath(fileType string, t time.Time, name string) string {
+	return path.Join(fileType, t.Format("2006"), t.Format("01"), name)
+}
+
+// maxUniqueAttempts bounds the candidates UniqueName tries.
+const maxUniqueAttempts = 10000
+
+// UniqueName returns rel unchanged when taken(rel) is false, otherwise the
+// first of stem_1.ext, stem_2.ext, ... that is not taken. It returns the
+// first error from taken, and an error when no free name is found within
+// maxUniqueAttempts candidates.
+func UniqueName(rel string, taken func(string) (bool, error)) (string, error) {
+	t, err := taken(rel)
+	if err != nil {
+		return "", err
+	}
+	if !t {
+		return rel, nil
+	}
+	ext := path.Ext(rel)
+	stem := strings.TrimSuffix(rel, ext)
+	for i := 1; i < maxUniqueAttempts; i++ {
+		c := fmt.Sprintf("%s_%d%s", stem, i, ext)
+		t, err := taken(c)
+		if err != nil {
+			return "", err
+		}
+		if !t {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("library: no free name for %s after %d attempts", rel, maxUniqueAttempts)
+}
+
+var bufPool = sync.Pool{New: func() any {
+	b := make([]byte, 1<<20)
+	return &b
+}}
+
+// HashFile returns the xxhash64 digest of the file at p and its size.
+func HashFile(p string) (uint64, int64, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	h := xxhash.New()
+	n, err := copyBuffered(context.Background(), h, f)
+	if err != nil {
+		return 0, 0, err
+	}
+	return h.Sum64(), n, nil
+}
+
+// CopyVerified copies src to dst, an absolute path inside the library, via a
+// temp file on the same volume. The bytes written are hashed and must equal
+// want; the temp file is fsynced, closed, and only then renamed into place.
+// The source mtime is preserved. On failure nothing is left at dst.
+func (l *Library) CopyVerified(ctx context.Context, src, dst string, want uint64) (int64, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return 0, err
+	}
+	tmp, err := os.CreateTemp(l.TempDir(), "copy-*.part")
+	if err != nil {
+		return 0, err
+	}
+	tmpName := tmp.Name()
+	fail := func(err error) (int64, error) {
+		tmp.Close()
+		os.Remove(tmpName)
+		return 0, err
+	}
+	h := xxhash.New()
+	n, err := copyBuffered(ctx, io.MultiWriter(tmp, h), in)
+	if err != nil {
+		return fail(err)
+	}
+	if n != info.Size() {
+		return fail(fmt.Errorf("short copy of %s: %d of %d bytes", src, n, info.Size()))
+	}
+	if got := h.Sum64(); got != want {
+		return fail(fmt.Errorf("%w: %s (want %016x, got %016x)", ErrHashMismatch, src, want, got))
+	}
+	// CreateTemp makes the file 0600; imported files should be readable
+	// like the rest of the library. Chmod is a no-op on Windows.
+	if err := tmp.Chmod(0o644); err != nil && runtime.GOOS != "windows" {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return 0, err
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		os.Remove(tmpName)
+		return 0, fmt.Errorf("destination already exists: %s", dst)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		os.Remove(tmpName)
+		return 0, err
+	}
+	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+	syncDir(filepath.Dir(dst))
+	return n, nil
+}
+
+// copyBuffered is io.Copy with a pooled 1 MiB buffer and cancellation
+// checked between reads.
+func copyBuffered(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	bp := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bp)
+	buf := *bp
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			total += int64(nw)
+			if werr != nil {
+				return total, werr
+			}
+			if nw != nr {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
+}

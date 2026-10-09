@@ -1,0 +1,6 @@
+dist/
+/picmover
+*.exe
+*.db
+*.db-*
+.picmover/

@@ -1,35 +1,41 @@
-# Makefile for cross-platform Go builds
+# Makefile for picmover: test/vet and cross-platform builds
 
-# Go parameters
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GOCLEAN=$(GOCMD) clean
+GO        ?= go
+BINARY    := picmover
+DIST      := dist
+BUILD_FLAGS := -trimpath -ldflags '-s -w'
 
-# Build parameters
-BINARY_NAME=picmover
-BINARY_UNIX=$(BINARY_NAME)
-BINARY_WIN=$(BINARY_NAME)-win64.exe
+.PHONY: build test vet build-all build-linux build-windows build-darwin clean install
 
-# Cross-compilation parameters
-CC_WINDOWS=x86_64-w64-mingw32-gcc
+build:
+	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o $(BINARY) .
 
-.PHONY: all build clean build-linux build-windows
+test:
+	$(GO) test ./...
 
-all: build
+vet:
+	$(GO) vet ./...
 
-build: build-linux build-windows
+build-all: build-linux build-windows build-darwin
 
 build-linux:
-	CGO_ENABLED=1 $(GOBUILD) -o $(BINARY_UNIX)
+	mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(DIST)/picmover-linux-amd64 .
 
 build-windows:
-	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=$(CC_WINDOWS) $(GOBUILD) -o $(BINARY_WIN)
+	mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(DIST)/picmover-windows-amd64.exe .
+
+build-darwin:
+	mkdir -p $(DIST)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build $(BUILD_FLAGS) -o $(DIST)/picmover-darwin-arm64 .
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build $(BUILD_FLAGS) -o $(DIST)/picmover-darwin-amd64 .
 
 clean:
-	$(GOCLEAN)
-	rm -f $(BINARY_UNIX)
-	rm -f $(BINARY_WIN)
+	rm -rf dist picmover
 
-install: build
-	mv $(BINARY_UNIX) /home/alfthan/bin
-	mv $(BINARY_WIN) /mnt/c/Users/galft/bin/
+# Author's personal convenience target: copies the Linux and Windows builds
+# into the author's bin directories.
+install: build-linux build-windows
+	cp $(DIST)/picmover-linux-amd64 /home/alfthan/bin/picmover
+	cp $(DIST)/picmover-windows-amd64.exe /mnt/c/Users/galft/bin/picmover-win64.exe
