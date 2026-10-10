@@ -88,7 +88,7 @@ type scrubCursor struct {
 // has the content). Every run also walks the set to list files without a
 // row (unknown) and rows without a file (missing).
 func Scrub(ctx context.Context, set *Set, opts ScrubOptions) (ScrubStats, error) {
-	var st ScrubStats
+	st := ScrubStats{Damaged: []Damaged{}, Missing: []string{}, Unknown: []string{}}
 	started := time.Now()
 	m := newMeter(opts.OnProgress)
 	stop := m.run()

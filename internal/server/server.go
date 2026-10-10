@@ -244,6 +244,12 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("POST /api/l/{lib}/trash/delete", s.handleTrashDelete)
 	scoped("GET /api/l/{lib}/similar", s.handleSimilar)
 	scoped("POST /api/l/{lib}/similar/ignore", s.handleSimilarIgnore)
+	scoped("GET /api/l/{lib}/backups", s.handleBackups)
+	scoped("POST /api/l/{lib}/backups/targets", s.handleTargetAdd)
+	scoped("POST /api/l/{lib}/backups/targets/{id}", s.handleTargetUpdate)
+	scoped("POST /api/l/{lib}/backups/targets/{id}/forget", s.handleTargetForget)
+	scoped("GET /api/l/{lib}/backups/targets/{id}/plan", s.handleTargetPlan)
+	scoped("GET /api/l/{lib}/backups/targets/{id}/runs", s.handleTargetRuns)
 
 	mux.HandleFunc("GET /api/fs", s.handleFS)
 	mux.HandleFunc("GET /api/jobs", s.handleJobList)

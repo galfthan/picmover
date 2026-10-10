@@ -305,6 +305,34 @@ func FindSet(ctx context.Context, t *Target, libraryID string) (string, error) {
 	return "", nil
 }
 
+// ResolveSetName returns the set of the library libraryID on t: stored
+// when the library remembers one; else the set on t that belongs to the
+// library (found by its library_id, so a renamed library folder keeps
+// its set); else the default name for libDir (DefaultSetName), which
+// must not belong to another library (ErrOtherLibrary).
+func ResolveSetName(ctx context.Context, t *Target, stored, libraryID, libDir string) (string, error) {
+	if stored != "" {
+		if !ValidSetName(stored) {
+			return "", fmt.Errorf("%w: %q", ErrInvalidSetName, stored)
+		}
+		return stored, nil
+	}
+	if name, err := FindSet(ctx, t, libraryID); err != nil {
+		return "", err
+	} else if name != "" {
+		return name, nil
+	}
+	name := DefaultSetName(libDir)
+	owner, err := SetOwner(ctx, t, name)
+	if err != nil {
+		return "", err
+	}
+	if owner != "" && owner != libraryID {
+		return "", ErrOtherLibrary
+	}
+	return name, nil
+}
+
 // SetOwner returns the library id of the set called name on t: "" when
 // the set does not exist or has no owner yet.
 func SetOwner(ctx context.Context, t *Target, name string) (string, error) {

@@ -118,7 +118,7 @@ var crashAfter func(done int) bool
 // backup.db failed) or was cancelled (ctx.Err(); the rows of the files
 // done are written).
 func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error) {
-	var st Stats
+	st := Stats{Symlinks: []string{}, Missing: []string{}, Failures: []Failure{}}
 	started := time.Now()
 	workers := opts.Workers
 	if workers <= 0 {

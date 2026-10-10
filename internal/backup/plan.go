@@ -40,16 +40,27 @@ type Plan struct {
 	// Items are the moved, changed and new files: moves first (they are
 	// renames on the target), then copies in the library's order (newest
 	// first).
-	Items    []Item
-	Extras   []FileRow // sorted by path
-	Symlinks []string
-	Missing  []string // catalog rows whose file is missing in the library
-	Invalid  []string // catalog rows whose path is not a library path
+	Items  []Item
+	Extras []FileRow // sorted by path
+	// CurrentPaths are the first MaxExamples current files.
+	CurrentPaths []string
+	Symlinks     []string
+	Missing      []string // catalog rows whose file is missing in the library
+	Invalid      []string // catalog rows whose path is not a library path
 	// LibraryHashes is every content hash the library has: the catalog
 	// (live and trashed) and the non-media files with a known hash.
 	LibraryHashes map[uint64]struct{}
 	// LibraryPaths are the NOCASE keys of the library's set paths.
 	LibraryPaths map[string]struct{}
+}
+
+// MaxExamples caps the example paths a plan keeps per class.
+const MaxExamples = 500
+
+func (p *Plan) addCurrent(rel string) {
+	if len(p.CurrentPaths) < MaxExamples {
+		p.CurrentPaths = append(p.CurrentPaths, rel)
+	}
 }
 
 // CopyBytes is the number of bytes a run copies: new and changed files.
@@ -104,9 +115,11 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 		switch {
 		case r != nil && e.Media && r.Hash == e.Hash:
 			p.Current.add(e.Size)
+			p.addCurrent(e.Rel)
 		case r != nil && !e.Media && r.Size == e.Size && r.MTime == e.MTime:
 			e.Hash, e.HashKnown = r.Hash, true
 			p.Current.add(e.Size)
+			p.addCurrent(e.Rel)
 		case r != nil:
 			p.Changed.add(e.Size)
 			copies = append(copies, Item{Class: ClassChanged, Entry: e, Row: r})

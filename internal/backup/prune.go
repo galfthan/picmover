@@ -122,7 +122,7 @@ type PruneOptions struct {
 // empty. Nothing else on the target and nothing in the library is
 // touched.
 func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneStats, error) {
-	var st PruneStats
+	st := PruneStats{Failures: []Failure{}}
 	started := time.Now()
 	keep := opts.Keep
 	if keep <= 0 {

@@ -252,9 +252,10 @@ type BackupSummary struct {
 	Targets      int       // attached targets
 	LastBackupAt time.Time // newest last_backup_at; zero: never
 	LastLabel    string    // the label of that target
+	LastID       string    // and its id
 }
 
-// Summary returns the backup summary from an open database.
+// BackupSummary returns the backup summary from an open database.
 func (d *DB) BackupSummary(ctx context.Context) (BackupSummary, error) {
 	return backupSummary(ctx, d.db)
 }
@@ -266,17 +267,19 @@ func backupSummary(ctx context.Context, q interface {
 		s     BackupSummary
 		last  sql.NullInt64
 		label sql.NullString
+		id    sql.NullString
 	)
 	err := q.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM backup_targets),
 		(SELECT last_backup_at FROM backup_targets WHERE last_backup_at IS NOT NULL ORDER BY last_backup_at DESC LIMIT 1),
-		(SELECT label FROM backup_targets WHERE last_backup_at IS NOT NULL ORDER BY last_backup_at DESC LIMIT 1)`).
-		Scan(&s.Targets, &last, &label)
+		(SELECT label FROM backup_targets WHERE last_backup_at IS NOT NULL ORDER BY last_backup_at DESC LIMIT 1),
+		(SELECT id FROM backup_targets WHERE last_backup_at IS NOT NULL ORDER BY last_backup_at DESC LIMIT 1)`).
+		Scan(&s.Targets, &last, &label, &id)
 	if err != nil {
 		return BackupSummary{}, fmt.Errorf("userdata: backup summary: %w", err)
 	}
 	if last.Valid {
 		s.LastBackupAt = time.Unix(last.Int64, 0)
-		s.LastLabel = label.String
+		s.LastLabel, s.LastID = label.String, id.String
 	}
 	return s, nil
 }

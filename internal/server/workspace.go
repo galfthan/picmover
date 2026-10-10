@@ -86,6 +86,10 @@ type libEntry struct {
 	lockInfo os.FileInfo // the lock file as it was when the lock was taken
 	stale    bool        // the folder was replaced: close the handles once inflight drops to 0
 	inflight int         // requests using the handles
+
+	// planMu guards plans, the cached backup plans by target id.
+	planMu sync.Mutex
+	plans  map[string]cachedPlan
 }
 
 // libHandles are the open handles of a library for one request.

@@ -79,7 +79,7 @@ func (s *RestoreStats) ExitCode() int {
 // user.db.bak-<time> first; the caller must have it closed).
 // NeedsRebuild is set when the library has no media.db afterwards.
 func Restore(ctx context.Context, set *Set, lib *library.Library, opts RestoreOptions) (RestoreStats, error) {
-	var st RestoreStats
+	st := RestoreStats{Failures: []Failure{}}
 	started := time.Now()
 	if opts.Mode == "" {
 		opts.Mode = ModeMissing
