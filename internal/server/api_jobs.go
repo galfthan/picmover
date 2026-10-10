@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -135,7 +136,15 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 		p.Source = filepath.Clean(p.Source)
 		st, err := os.Stat(p.Source)
 		if err != nil {
-			return nil, fmt.Errorf("source: %w", err)
+			// No raw OS error text in the answer.
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				return nil, errors.New("source: the path does not exist")
+			case errors.Is(err, fs.ErrPermission):
+				return nil, errors.New("source: permission denied")
+			}
+			s.log.Info("import source refused", "source", p.Source, "err", err)
+			return nil, errors.New("source: the path cannot be read")
 		}
 		if !st.IsDir() && !st.Mode().IsRegular() {
 			return nil, fmt.Errorf("source %s is not a directory or a file", p.Source)
