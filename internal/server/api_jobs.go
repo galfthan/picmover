@@ -52,6 +52,12 @@ func (s *Server) handleLibraryJobStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state, h := e.snapshot()
+	if state == libClosed {
+		// A catalog that cannot even be peeked counts as unreadable.
+		if _, err := s.ws.peek(r.Context(), filepath.Join(e.path, library.DBName)); err != nil {
+			state = libError
+		}
+	}
 	switch state {
 	case libOpen:
 		s.startJob(w, r, e, h.lib)
