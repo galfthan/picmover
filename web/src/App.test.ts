@@ -209,6 +209,7 @@ describe('App smoke test', () => {
       'Trash',
       'Duplicates',
       'Import',
+      'Backups',
       'Library',
     ]);
     expect(document.querySelector('.pill')?.textContent).toContain('Importing 1,234 files');

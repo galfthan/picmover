@@ -5,6 +5,21 @@
   import { libPath } from '../lib/routes';
   import { libraries } from '../lib/libraries.svelte';
   import { library } from '../lib/library.svelte';
+  import { isBackupKind } from '../lib/api';
+  import { progressFraction } from '../lib/backupinfo';
+
+  function backupPillVerb(kind: string): string {
+    switch (kind) {
+      case 'scrub':
+        return 'Scrubbing';
+      case 'prune':
+        return 'Pruning';
+      case 'restore':
+        return 'Restoring';
+      default:
+        return 'Backing up';
+    }
+  }
 
   const job = $derived(jobs.active);
   const libName = $derived(job?.library ? (libraries.find(job.library)?.name ?? job.library) : '');
@@ -22,6 +37,12 @@
       if (p?.phase === 'load' && p.items) return `Finding duplicates in ${formatCount(p.items)} images…`;
       return 'Finding duplicates…';
     }
+    if (isBackupKind(job.kind)) {
+      const p = job.phase;
+      const what = backupPillVerb(job.kind);
+      if (p && p.totalFiles) return `${what} ${formatCount(p.files ?? 0)} of ${formatCount(p.totalFiles)} files…`;
+      return `${what}…`;
+    }
     if (job.kind === 'rebuild') {
       return s.scanned > 0 ? `Recording ${formatCount(s.scanned)} files…` : 'Recording files in place…';
     }
@@ -38,10 +59,12 @@
     const lib = j.library ?? library.id;
     if (lib === null) return;
     if (j.kind === 'rebuild') navigate(libraries.mode === 'workspace' ? '/' : libPath(lib, 'library'));
+    else if (isBackupKind(j.kind)) navigate(libPath(lib, 'backups'));
     else navigate(libPath(lib, j.kind === 'import' ? 'import' : j.kind === 'similar' ? 'similar' : 'library'));
   }
 
   const fraction = $derived.by(() => {
+    if (job && isBackupKind(job.kind)) return progressFraction(job.phase);
     if (!job || job.kind !== 'import') return null;
     const s = job.stats;
     if (s.scanned <= 0) return null;

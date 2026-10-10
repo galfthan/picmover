@@ -9,6 +9,8 @@
   import JobProgress from '../components/JobProgress.svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import { joinPath } from '../lib/paths';
+  import { backups } from '../lib/backups.svelte';
+  import { untrack } from 'svelte';
 
   interface Props {
     lib: string;
@@ -40,6 +42,17 @@
 
   // Discover jobs started elsewhere while idle.
   $effect(() => jobs.watch());
+
+  // The backup status line; loaded on arrival and after every job.
+  $effect(() => {
+    const id = lib;
+    void jobs.doneCount;
+    untrack(() => {
+      backups.select(id);
+      void backups.load();
+    });
+  });
+  const backupStatus = $derived(backups.status);
 
   // A running job's duration ticks once a second.
   let now = $state(Date.now());
@@ -108,6 +121,16 @@
         {#if s.earliest || s.latest}
           <p class="muted range">From {formatWallDate(s.earliest)} to {formatWallDate(s.latest)}</p>
         {/if}
+        <p class="backup small">
+          {#if backupStatus}
+            <span class="tone-{backupStatus.tone}" class:stale={backupStatus.stale}>{backupStatus.stale ? '⚠ ' : ''}{backupStatus.text}</span>
+          {:else if backups.error}
+            <span class="muted">Backup status unavailable: {backups.error}</span>
+          {:else}
+            <span class="muted">Backup status…</span>
+          {/if}
+          · <a href={libHref(lib, 'backups')}>{backupStatus && backupStatus.text.startsWith('No backup target') ? 'Add a backup target' : 'Backups'}</a>
+        </p>
       </section>
 
       <section class="card">
@@ -272,6 +295,12 @@
   }
   .range {
     margin: 12px 0 0;
+  }
+  .backup {
+    margin: 8px 0 0;
+  }
+  .stale {
+    font-weight: 600;
   }
   .actions {
     margin-top: 14px;

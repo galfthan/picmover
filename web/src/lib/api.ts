@@ -186,6 +186,20 @@ export interface Lib {
   cover?: string | null;
   holder?: Holder | null;
   error?: string | null;
+  /** Backup summary, when the server provides it (step 5); absent otherwise. */
+  backup?: LibBackup | null;
+}
+
+/** The workspace listing's per-library backup summary (docs/design/backups.md "Frontend"). */
+export interface LibBackup {
+  /** Newest backup over all targets: Unix seconds, RFC 3339 or a wall-clock string; null when never. */
+  lastBackupAt?: number | string | null;
+  /** Files not backed up yet (a count, or the `behind` object of a set). */
+  behind?: number | BackupBehind | null;
+  /** Number of targets (or the list of them). */
+  targets?: number | unknown[] | null;
+  /** Label of the target of the newest backup, when sent. */
+  label?: string | null;
 }
 
 /** A plain subfolder of the workspace root (no media.db); its id is its name. */
@@ -239,9 +253,82 @@ export interface SimilarPage {
   distance: number | null;
 }
 
+// ---- Backups (docs/design/backups.md "HTTP API") ----
+
+/** What the library has that the set lacks (from the cached plan). */
+export interface BackupBehind {
+  new: number;
+  changed: number;
+  moved: number;
+  bytes: number;
+}
+
+/** One library's copy on one target, as summarized by GET …/backups. */
+export interface BackupSet {
+  files: number;
+  bytes: number;
+  /** null until a plan has been computed (or the target is not reachable). */
+  behind: BackupBehind | null;
+  extras: number;
+  damaged: number;
+  unverified: number;
+}
+
+export interface BackupTarget {
+  /** Marker id, 16 hex digits. */
+  id: string;
+  label: string;
+  /** Where the target was last seen on this machine. */
+  path: string;
+  reachable: boolean;
+  /** Unix seconds, RFC 3339 or a wall-clock string (see `parseWhen`); null when never. */
+  lastBackupAt: number | string | null;
+  lastScrubAt: number | string | null;
+  /** null when the target holds no set of this library yet (or is not reachable). */
+  set: BackupSet | null;
+}
+
+export type PlanClassName = 'current' | 'moved' | 'changed' | 'new' | 'extra';
+export const PLAN_CLASSES: readonly PlanClassName[] = ['new', 'changed', 'moved', 'extra', 'current'];
+
+export interface PlanClass {
+  count: number;
+  bytes: number;
+  /** Up to 500 example paths (relative to the set), as sent. */
+  paths: string[];
+}
+
+export type BackupPlan = Record<PlanClassName, PlanClass>;
+
+export type BackupRunKind = 'backup' | 'scrub' | 'prune' | 'restore';
+
+export interface BackupRun {
+  id: number;
+  kind: BackupRunKind | string;
+  startedAt: number | string | null;
+  finishedAt: number | string | null;
+  /** The run's counters as recorded in backup.db (`runs.stats`); see backupinfo.ts for the fields read. */
+  stats: Record<string, unknown>;
+}
+
+/** Progress of a backup, scrub, prune or restore job (SSE `progress`, or the job's `progress`). */
+export interface BackupProgressEvent {
+  phase: 'plan' | 'copy' | 'snapshot' | 'scrub' | 'prune' | 'restore' | string;
+  files?: number;
+  bytes?: number;
+  totalFiles?: number;
+  totalBytes?: number;
+  /** The file being worked on (relative path). */
+  current?: string;
+  /** Files that failed so far (a count). */
+  failed?: number;
+}
+
 // ---- Jobs ----
 
-export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild';
+export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild' | BackupRunKind;
+export const BACKUP_KINDS: readonly string[] = ['backup', 'scrub', 'prune', 'restore'];
+export const isBackupKind = (k: string): k is BackupRunKind => BACKUP_KINDS.includes(k);
 export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 
 export interface JobStats {
@@ -258,8 +345,12 @@ export interface JobStats {
   thumbsFailed: number;
 }
 
-/** Phase-style progress (the similar job): {phase:"load", items} … {phase:"done", pairs}. */
-export interface JobPhase {
+/**
+ * Phase-style progress: the similar job's {phase:"load", items} …
+ * {phase:"done", pairs}, and the backup kinds' {phase, files, bytes,
+ * totalFiles, totalBytes, current, failed}.
+ */
+export interface JobPhase extends Omit<BackupProgressEvent, 'phase'> {
   phase: string;
   items?: number;
   bands?: number;
@@ -282,6 +373,8 @@ export interface Job {
   error: string | null;
   exitCode?: number | null;
   distance?: number;
+  /** Target id of a backup-kind job, when the server sends it. */
+  target?: string;
   /** Server-side phase progress of a running similar job (also in listings). */
   progress?: JobPhase | null;
   /** Client-side: the last phase-style progress event (or `progress`). */
@@ -313,7 +406,39 @@ export interface RebuildJobRequest {
   noThumbs?: boolean;
 }
 
-export type JobRequest = ImportJobRequest | ThumbsJobRequest | SimilarJobRequest | RebuildJobRequest;
+export interface BackupJobRequest {
+  kind: 'backup';
+  target: string;
+  partial?: boolean;
+  workers?: number;
+}
+
+export interface ScrubJobRequest {
+  kind: 'scrub';
+  target: string;
+  /** Seconds; omitted for the whole target. */
+  budget?: number;
+  repair?: boolean;
+}
+
+export interface PruneJobRequest {
+  kind: 'prune';
+  target: string;
+  keepDays?: number;
+  confirm: true;
+  /** The extras count of the plan the user confirmed. */
+  expected: number;
+}
+
+export interface RestoreJobRequest {
+  kind: 'restore';
+  target: string;
+  mode: 'missing' | 'user-data';
+}
+
+export type BackupJobKindRequest = BackupJobRequest | ScrubJobRequest | PruneJobRequest | RestoreJobRequest;
+
+export type JobRequest = ImportJobRequest | ThumbsJobRequest | SimilarJobRequest | RebuildJobRequest | BackupJobKindRequest;
 
 export type ResultStatus = 'imported' | 'imported_existing' | 'duplicate' | 'skipped_small' | 'error';
 
@@ -564,6 +689,14 @@ export interface LibApi {
   getSimilar(offset: number, limit: number, signal?: AbortSignal): Promise<SimilarPage>;
   /** Ignores the whole current group that contains `hash` (any size; the server finds the group). */
   ignoreSimilarGroup(hash: string): Promise<{ ignored: number }>;
+
+  /** The library's targets; `plan` asks the server to recompute `behind` now. */
+  getBackups(plan?: boolean, signal?: AbortSignal): Promise<BackupTarget[]>;
+  addTarget(path: string, label: string): Promise<BackupTarget>;
+  updateTarget(id: string, patch: { label?: string; path?: string }): Promise<BackupTarget>;
+  forgetTarget(id: string): Promise<void>;
+  getPlan(id: string, signal?: AbortSignal): Promise<BackupPlan>;
+  getRuns(id: string, signal?: AbortSignal): Promise<BackupRun[]>;
 }
 
 function versioned(base: string, kind: 'thumb' | 'preview', ref: ThumbRef): string {
@@ -728,7 +861,119 @@ function makeLibApi(id: string): LibApi {
       const r = await post<{ ignored?: number }>('/similar/ignore', { group: hash });
       return { ignored: num(r.ignored) };
     },
+
+    async getBackups(plan = false, signal) {
+      const r = await get<{ targets?: unknown }>(plan ? '/backups?plan=1' : '/backups', signal);
+      return Array.isArray(r.targets) ? r.targets.filter(isRecord).map(toTarget) : [];
+    },
+    async addTarget(path, label) {
+      return toTarget(await post<unknown>('/backups/targets', { path, label }));
+    },
+    async updateTarget(tid, patch) {
+      return toTarget(await post<unknown>(`/backups/targets/${encTarget(tid)}`, patch));
+    },
+    async forgetTarget(tid) {
+      await post<unknown>(`/backups/targets/${encTarget(tid)}/forget`, {});
+    },
+    async getPlan(tid, signal) {
+      return toPlan(await get<unknown>(`/backups/targets/${encTarget(tid)}/plan`, signal));
+    },
+    async getRuns(tid, signal) {
+      const r = await get<{ runs?: unknown }>(`/backups/targets/${encTarget(tid)}/runs`, signal);
+      return Array.isArray(r.runs) ? r.runs.filter(isRecord).map(toRun) : [];
+    },
   };
+}
+
+// ---- Backup shapes ----
+
+const TARGET_ID_RE = /^[0-9a-f]{16}$/;
+
+/** Marker ids are 16 lower-case hex digits; anything else never reaches a URL. */
+export function isTargetId(v: unknown): v is string {
+  return typeof v === 'string' && TARGET_ID_RE.test(v);
+}
+
+function encTarget(id: string): string {
+  if (!isTargetId(id)) throw new ApiError(400, `invalid target id ${JSON.stringify(id)}`);
+  return id;
+}
+
+const when = (v: unknown): number | string | null => (typeof v === 'number' || (typeof v === 'string' && v !== '') ? v : null);
+
+function toBehind(v: unknown): BackupBehind | null {
+  if (!isRecord(v)) return null;
+  return { new: num(v.new), changed: num(v.changed), moved: num(v.moved), bytes: num(v.bytes) };
+}
+
+function toSet(v: unknown): BackupSet | null {
+  if (!isRecord(v)) return null;
+  return {
+    files: num(v.files),
+    bytes: num(v.bytes),
+    behind: toBehind(v.behind),
+    extras: num(v.extras),
+    damaged: num(v.damaged),
+    unverified: num(v.unverified),
+  };
+}
+
+/** A target object with every field present (missing ones defaulted). */
+export function toTarget(v: unknown): BackupTarget {
+  const r = isRecord(v) ? (isRecord(v.target) ? v.target : v) : {};
+  return {
+    id: typeof r.id === 'string' ? r.id : '',
+    label: typeof r.label === 'string' ? r.label : '',
+    path: typeof r.path === 'string' ? r.path : '',
+    reachable: r.reachable === true,
+    lastBackupAt: when(r.lastBackupAt),
+    lastScrubAt: when(r.lastScrubAt),
+    set: toSet(r.set),
+  };
+}
+
+/** An example path: a string, or an object naming it (`path`, `relPath`, or a move's `to`). */
+export function pathOf(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (!isRecord(v)) return '';
+  if (typeof v.path === 'string') return v.path;
+  if (typeof v.relPath === 'string') return v.relPath;
+  if (typeof v.to === 'string') return typeof v.from === 'string' ? `${v.from} → ${v.to}` : v.to;
+  return '';
+}
+
+function toClass(v: unknown): PlanClass {
+  if (typeof v === 'number') return { count: v, bytes: 0, paths: [] };
+  if (!isRecord(v)) return { count: 0, bytes: 0, paths: [] };
+  const list = Array.isArray(v.paths) ? v.paths : Array.isArray(v.examples) ? v.examples : [];
+  return { count: num(v.count), bytes: num(v.bytes), paths: list.map(pathOf).filter((p) => p !== '') };
+}
+
+/** The plan: one entry per class, from `{new: {count, bytes, paths}, …}` (also under `classes`). */
+export function toPlan(v: unknown): BackupPlan {
+  const r = isRecord(v) ? (isRecord(v.classes) ? v.classes : isRecord(v.plan) ? v.plan : v) : {};
+  return {
+    current: toClass(r.current),
+    moved: toClass(r.moved),
+    changed: toClass(r.changed),
+    new: toClass(r.new),
+    extra: toClass(r.extra ?? r.extras),
+  };
+}
+
+function toRun(v: Record<string, unknown>): BackupRun {
+  let stats: Record<string, unknown> = {};
+  if (isRecord(v.stats)) stats = v.stats;
+  else if (typeof v.stats === 'string') {
+    // backup.db keeps the stats as JSON text; accept it unparsed too.
+    try {
+      const parsed: unknown = JSON.parse(v.stats);
+      if (isRecord(parsed)) stats = parsed;
+    } catch {
+      // leave empty
+    }
+  }
+  return { id: num(v.id), kind: typeof v.kind === 'string' ? v.kind : '', startedAt: when(v.startedAt), finishedAt: when(v.finishedAt), stats };
 }
 
 const clients = new Map<string, LibApi>();
@@ -854,8 +1099,10 @@ export function subscribeJob(id: number, h: JobEventHandlers): () => void {
     const d = parseData(ev);
     if (!isRecord(d)) return;
     if (isRecord(d.stats)) h.onProgress?.(d.stats as unknown as JobStats);
-    // The similar job reports {phase, items|bands|pairs}, at the top level or under `progress`.
-    const p = isRecord(d.progress) ? d.progress : d;
+    // The similar job reports {phase, items|bands|pairs}, the backup kinds
+    // {phase, files, bytes, totalFiles, totalBytes, current, failed}: at the
+    // top level, under `progress`, or (backup kinds) under `stats`.
+    const p = isRecord(d.progress) ? d.progress : isRecord(d.stats) && typeof d.stats.phase === 'string' ? d.stats : d;
     if (typeof p.phase === 'string') h.onPhase?.(p as unknown as JobPhase);
   });
   es.addEventListener('result', (ev) => {
