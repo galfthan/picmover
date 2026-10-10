@@ -35,7 +35,8 @@ var ErrHashMismatch = errors.New("hash mismatch after copy")
 
 // Library is an opened media library.
 type Library struct {
-	root string
+	root  string // absolute, symlinks resolved
+	alias string // the absolute path it was opened as, when that differs from root
 }
 
 // Open returns the library rooted at dir, creating it and its internal
@@ -45,11 +46,36 @@ func Open(dir string) (*Library, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Library{root: filepath.Clean(abs)}
-	for _, d := range []string{l.root, l.TempDir(), l.LogDir()} {
+	root := filepath.Clean(abs)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, fmt.Errorf("create %s: %w", root, err)
+	}
+	l, err := newLibrary(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range []string{l.TempDir(), l.LogDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", d, err)
 		}
+	}
+	return l, nil
+}
+
+// newLibrary returns the library at the existing directory abs (absolute,
+// clean), with every symlink in the root resolved: paths found by walking
+// the library (the importer resolves its source the same way) must share
+// this spelling for Rel, Contains and IsInternal to recognise them. The
+// unresolved spelling is kept as an alias that Rel also accepts. When the
+// path cannot be resolved (EvalSymlinks has gaps on some Windows volumes),
+// the library keeps the unresolved path, as before.
+func newLibrary(abs string) (*Library, error) {
+	l := &Library{root: abs}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		l.root = filepath.Clean(resolved)
+	}
+	if abs != l.root {
+		l.alias = abs
 	}
 	return l, nil
 }
@@ -71,10 +97,10 @@ func Attach(dir string) (*Library, error) {
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("library %s: not a directory", root)
 	}
-	return &Library{root: root}, nil
+	return newLibrary(root)
 }
 
-// Root returns the absolute library root.
+// Root returns the absolute library root, with symlinks resolved.
 func (l *Library) Root() string { return l.root }
 
 // DBPath returns the absolute path of the catalog database.
@@ -93,8 +119,20 @@ func (l *Library) Abs(rel string) string {
 }
 
 // Rel converts an absolute OS path inside the library to catalog form.
+// abs may be spelled through the resolved root (Root) or through the path
+// the library was opened with when that contains a symlink.
 func (l *Library) Rel(abs string) (string, error) {
-	rel, err := filepath.Rel(l.root, abs)
+	rel, err := l.lexicalRel(l.root, abs)
+	if err != nil && l.alias != "" {
+		if r, aerr := l.lexicalRel(l.alias, abs); aerr == nil {
+			return r, nil
+		}
+	}
+	return rel, err
+}
+
+func (l *Library) lexicalRel(root, abs string) (string, error) {
+	rel, err := filepath.Rel(root, abs)
 	if err != nil {
 		return "", err
 	}
@@ -111,8 +149,8 @@ func (l *Library) Contains(abs string) bool {
 }
 
 // IsInternal reports whether abs is a file picmover manages itself: the
-// catalog (media.db, media.db-wal, -shm, -journal), its v1 backups
-// (media.db.v1-*.bak and their .tmp files), import_*.log at the root, and
+// catalog (media.db, media.db-wal, -shm, -journal), its backups
+// (media.db.bak-YYYYMMDD-HHMMSS[-wal|-shm|-journal], and the v1 media.db.v1-*.bak and their .tmp files), import_*.log at the root, and
 // everything under the .picmover directory. Importers skip these when the source
 // overlaps the library.
 func (l *Library) IsInternal(abs string) bool {
@@ -137,10 +175,15 @@ func (l *Library) IsInternal(abs string) bool {
 	return strings.HasPrefix(base, "import_") && strings.HasSuffix(base, ".log")
 }
 
-// isBackupName matches the v1 catalog backups written by the catalog
-// migration, media.db.v1-*.bak, and their in-progress temp files
-// media.db.v1-*.bak.*.tmp.
+// isBackupName matches the catalog backups written by "picmover rebuild",
+// media.db.bak-YYYYMMDD-HHMMSS (optionally followed by -wal, -shm or
+// -journal), and the v1 backups of step 1's migration, media.db.v1-*.bak,
+// and their in-progress temp files media.db.v1-*.bak.*.tmp. A user file such
+// as media.db.bak-holiday.jpg is not a backup.
 func isBackupName(base string) bool {
+	if strings.HasPrefix(base, DBName+".bak-") {
+		return IsCatalogBackup(base)
+	}
 	const prefix = DBName + ".v1-"
 	if !strings.HasPrefix(base, prefix) {
 		return false
@@ -149,6 +192,46 @@ func isBackupName(base string) bool {
 		return true
 	}
 	return strings.HasSuffix(base, ".tmp") && strings.Contains(base[len(prefix):], ".bak.")
+}
+
+// IsCatalogBackup reports whether base, a file name at the library root, is
+// a catalog backup written by "picmover rebuild":
+// media.db.bak-YYYYMMDD-HHMMSS, optionally followed by -wal, -shm or
+// -journal.
+func IsCatalogBackup(base string) bool {
+	ts, ok := strings.CutPrefix(base, DBName+".bak-")
+	if !ok {
+		return false
+	}
+	for _, s := range []string{"-wal", "-shm", "-journal"} {
+		if t, ok := strings.CutSuffix(ts, s); ok {
+			ts = t
+			break
+		}
+	}
+	return isBackupStamp(ts)
+}
+
+// BackupStampLayout is the time layout of the suffix of catalog backups,
+// media.db.bak-<stamp>.
+const BackupStampLayout = "20060102-150405"
+
+// isBackupStamp reports whether s is 8 digits, a dash and 6 digits (the
+// 14 digits of BackupStampLayout).
+func isBackupStamp(s string) bool {
+	if len(s) != len(BackupStampLayout) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if i == 8 {
+			if s[i] != '-' {
+				return false
+			}
+		} else if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CleanTemp removes everything in the temp directory. Only one importer may

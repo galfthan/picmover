@@ -19,6 +19,7 @@ import (
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 	"picmover/internal/testimg"
+	"picmover/internal/thumbs"
 )
 
 type env struct {
@@ -568,7 +569,7 @@ func TestCommitLostHashRaceUndoesCopy(t *testing.T) {
 	e := newEnv(t)
 	data := jpegAt(date(2020, 3, 5), 1)
 	p := pendingCopy(t, e, "image/2020/03/a_1.jpg", data)
-	if _, err := e.db.InsertMedia(context.Background(), nil, &catalog.Media{Hash: p.hash, RelPath: "image/2020/03/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
+	if _, err := e.db.InsertMedia(context.Background(), nil, &catalog.Media{Hash: p.hash, Size: p.media.Size, RelPath: "image/2020/03/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
 		t.Fatal(err)
 	}
 	c := &collector{}
@@ -615,7 +616,7 @@ func TestCommitLostHashRaceUndoesMove(t *testing.T) {
 	p := pendingCopy(t, e, "image/2020/03/a_1.jpg", jpegAt(date(2020, 3, 5), 1))
 	os.Remove(p.src) // as after a rename
 	p.copied, p.moved, p.deleteSrc = false, true, false
-	if _, err := e.db.InsertMedia(context.Background(), nil, &catalog.Media{Hash: p.hash, RelPath: "image/2020/03/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
+	if _, err := e.db.InsertMedia(context.Background(), nil, &catalog.Media{Hash: p.hash, Size: p.media.Size, RelPath: "image/2020/03/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
 		t.Fatal(err)
 	}
 	im := New(e.lib, e.db, Options{})
@@ -832,4 +833,214 @@ func TestSymlinkedSourceDirIsWalked(t *testing.T) {
 		t.Errorf("stats = %+v, want 1 imported", st)
 	}
 	e.assertFiles("image/2020/03/a.jpg")
+}
+
+// --- Thumbnail stage ---
+
+func openStore(t *testing.T, lib *library.Library) *thumbs.Store {
+	t.Helper()
+	s, err := thumbs.OpenStore(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+// assertThumbOK checks the catalog row, the thumbs.db row and the preview
+// file of one imported file.
+func assertThumbOK(t *testing.T, store *thumbs.Store, m catalog.Media) {
+	t.Helper()
+	if m.ThumbState != catalog.ThumbStateOK || m.ThumbError != "" || m.PHash == 0 || m.ThumbAt.IsZero() {
+		t.Errorf("%s: state %q error %q phash %x at %v", m.RelPath, m.ThumbState, m.ThumbError, m.PHash, m.ThumbAt)
+	}
+	thumb, preview, err := store.Has(context.Background(), m.Hash)
+	if err != nil || !thumb || !preview {
+		t.Errorf("%s: cache thumb=%v preview=%v err=%v", m.RelPath, thumb, preview, err)
+	}
+	if fi, err := os.Stat(store.PreviewPath(m.Hash)); err != nil || fi.Size() == 0 {
+		t.Errorf("%s: preview file: %v", m.RelPath, err)
+	}
+}
+
+func TestImportGeneratesThumbs(t *testing.T) {
+	e := newEnv(t)
+	writeFile(t, filepath.Join(e.src, "a.jpg"), jpegAt(date(2020, 3, 5), 1))
+	writeFile(t, filepath.Join(e.src, "b.png"), testimg.PNG(40, 30, 2))
+	writeFile(t, filepath.Join(e.src, "c.webp"), testimg.WebP(48, 32, 3))
+	var last Stats
+	o := e.opts()
+	o.OnProgress = func(s Stats) { last = s }
+	st, _ := e.mustRun(o)
+	if st.Imported != 3 || st.ThumbsDone != 3 || st.ThumbsUnsupported != 0 || st.ThumbsFailed != 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+	if last.ThumbsDone != 3 {
+		t.Errorf("last progress = %+v", last)
+	}
+	store := openStore(t, e.lib)
+	rows := e.rows()
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	for _, m := range rows {
+		assertThumbOK(t, store, m)
+	}
+	if n, _, err := store.Stats(context.Background()); err != nil || n != 3 {
+		t.Errorf("store count = %d %v", n, err)
+	}
+	// A rerun imports nothing and has no thumbnails to make.
+	st, _ = e.mustRun(e.opts())
+	if st.ThumbsDone+st.ThumbsUnsupported+st.ThumbsFailed != 0 {
+		t.Errorf("rerun stats = %+v", st)
+	}
+}
+
+func TestNoThumbsThenRunThumbs(t *testing.T) {
+	e := newEnv(t)
+	for i := range 3 {
+		writeFile(t, filepath.Join(e.src, "f"+string(rune('a'+i))+".jpg"), jpegAt(date(2020, 3, 5), byte(i)))
+	}
+	writeFile(t, filepath.Join(e.src, "garbage.jpg"), []byte("this is not a JPEG at all"))
+	o := e.opts()
+	o.NoThumbs = true
+	st, c, err := e.run(o)
+	if err != nil || st.Imported != 4 || st.ThumbsDone+st.ThumbsFailed != 0 {
+		t.Fatalf("Run = %+v, %v (results %+v)", st, err, c.results)
+	}
+	if p, ok, _, _, err := e.db.ThumbStats(context.Background()); err != nil || p != 4 || ok != 0 {
+		t.Fatalf("ThumbStats after --no-thumbs: pending %d ok %d %v", p, ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(e.lib.Root(), library.MetaDir, thumbs.DBName)); err == nil {
+		t.Errorf("thumbs.db created with NoThumbs")
+	}
+
+	st, err = New(e.lib, e.db, Options{ThumbWorkers: 2}).RunThumbs(context.Background(), 0, false)
+	if err != nil || st.ThumbsDone != 3 || st.ThumbsFailed != 1 || st.ThumbsUnsupported != 0 || st.Imported != 0 {
+		t.Fatalf("RunThumbs = %+v, %v", st, err)
+	}
+	store := openStore(t, e.lib)
+	for rel, m := range e.rows() {
+		if strings.HasSuffix(rel, "garbage.jpg") {
+			if m.ThumbState != catalog.ThumbStateError || m.ThumbError == "" || m.PHash != 0 {
+				t.Errorf("garbage: state %q error %q phash %x", m.ThumbState, m.ThumbError, m.PHash)
+			}
+			continue
+		}
+		assertThumbOK(t, store, m)
+	}
+	// Nothing pending: a second pass only retries the failed row; force
+	// redoes every row.
+	if st, err := New(e.lib, e.db, Options{}).RunThumbs(context.Background(), 0, false); err != nil ||
+		st.ThumbsDone+st.ThumbsUnsupported != 0 || st.ThumbsFailed != 1 {
+		t.Errorf("second RunThumbs = %+v, %v", st, err)
+	}
+	if st, err := New(e.lib, e.db, Options{}).RunThumbs(context.Background(), 0, true); err != nil ||
+		st.ThumbsDone != 3 || st.ThumbsFailed != 1 {
+		t.Errorf("forced RunThumbs = %+v, %v", st, err)
+	}
+	// ThumbLimit bounds the rows processed.
+	if st, err := New(e.lib, e.db, Options{ThumbLimit: 2}).RunThumbs(context.Background(), 0, true); err != nil ||
+		st.ThumbsDone+st.ThumbsFailed != 2 {
+		t.Errorf("limited RunThumbs = %+v, %v", st, err)
+	}
+}
+
+func TestThumbsCancellationLeavesPending(t *testing.T) {
+	e := newEnv(t)
+	for i := range 30 {
+		writeFile(t, filepath.Join(e.src, "f"+string(rune('a'+i/10))+string(rune('0'+i%10))+".jpg"),
+			testimg.JPEG(testimg.Options{Width: 400, Height: 300, DateTime: date(2020, 3, 5), Seed: byte(i)}))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := e.opts()
+	o.ThumbWorkers = 1
+	o.ProgressInterval = time.Millisecond
+	o.OnProgress = func(s Stats) {
+		if s.ThumbsDone > 0 {
+			cancel()
+		}
+	}
+	st, err := New(e.lib, e.db, o).Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run err = %v (stats %+v)", err, st)
+	}
+	if st.Imported != 30 || st.ThumbsFailed != 0 || st.ThumbsUnsupported != 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+	pending, ok, unsupported, failed, err := e.db.ThumbStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("after cancel: stats %+v; pending %d ok %d", st, pending, ok)
+	if pending == 0 || ok == 0 || unsupported+failed != 0 || pending+ok != 30 || ok != st.ThumbsDone {
+		t.Fatalf("ThumbStats = pending %d ok %d unsupported %d failed %d; stats %+v", pending, ok, unsupported, failed, st)
+	}
+	e.assertTempEmpty()
+
+	// A later pass finishes the rest.
+	st, err = New(e.lib, e.db, Options{}).RunThumbs(context.Background(), 0, false)
+	if err != nil || st.ThumbsDone != pending {
+		t.Fatalf("RunThumbs = %+v, %v; want %d done", st, err, pending)
+	}
+	if p, ok, _, _, _ := e.db.ThumbStats(context.Background()); p != 0 || ok != 30 {
+		t.Errorf("after RunThumbs: pending %d ok %d", p, ok)
+	}
+}
+
+// Rebuilding a catalog (import of the library onto itself into a new
+// media.db) reuses the cache and reproduces the perceptual hashes.
+func TestRebuildReusesThumbCache(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "lib")
+	e := newEnvAt(t, root, root)
+	writeFile(t, e.lib.Abs("image/2020/03/a.jpg"), jpegAt(date(2020, 3, 5), 1))
+	writeFile(t, e.lib.Abs("image/2021/07/b.png"), testimg.PNG(40, 30, 2))
+	if err := os.Chtimes(e.lib.Abs("image/2021/07/b.png"), date(2021, 7, 1), date(2021, 7, 1)); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := e.mustRun(e.opts())
+	if st.Existing != 2 || st.ThumbsDone != 2 {
+		t.Fatalf("first run = %+v", st)
+	}
+	before := e.rows()
+	store := openStore(t, e.lib)
+	mtimes := map[string]time.Time{}
+	for rel, m := range before {
+		fi, err := os.Stat(store.PreviewPath(m.Hash))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mtimes[rel] = fi.ModTime()
+	}
+
+	e.db.Close()
+	for _, s := range []string{"", "-wal", "-shm"} {
+		os.Remove(e.lib.DBPath() + s)
+	}
+	db, err := catalog.Open(context.Background(), e.lib.DBPath(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	e.db = db
+	time.Sleep(10 * time.Millisecond)
+	st, _ = e.mustRun(e.opts())
+	if st.Existing != 2 || st.ThumbsDone != 2 {
+		t.Fatalf("rebuild = %+v", st)
+	}
+	after := e.rows()
+	for rel, m := range before {
+		a, ok := after[rel]
+		if !ok {
+			t.Errorf("%s missing after rebuild", rel)
+			continue
+		}
+		if a.Hash != m.Hash || a.PHash != m.PHash || a.Width != m.Width || a.Height != m.Height || a.ThumbState != catalog.ThumbStateOK {
+			t.Errorf("%s: before %+v after %+v", rel, m, a)
+		}
+		if fi, err := os.Stat(store.PreviewPath(m.Hash)); err != nil || !fi.ModTime().Equal(mtimes[rel]) {
+			t.Errorf("%s: preview rewritten (%v)", rel, err)
+		}
+	}
 }

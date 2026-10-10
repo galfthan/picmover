@@ -1,5 +1,6 @@
 // Package catalog is the SQLite catalog (media.db) of a picmover library:
-// schema v2, migration from the legacy v1 schema, and queries.
+// schema v3 and queries. There is no migration: a catalog of another schema
+// version is refused with ErrNeedsRebuild.
 //
 // Capture times are stored as the camera's wall-clock time encoded as Unix
 // seconds "as if UTC" in taken_at, with the real zone offset (seconds east of
@@ -22,7 +23,7 @@ import (
 )
 
 // SchemaVersion is the schema version this package reads and writes.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 const dsnParams = "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(1)&_txlock=immediate"
 
@@ -33,30 +34,48 @@ type DB struct {
 	logger *slog.Logger
 }
 
-// ErrNeedsMigration is returned (wrapped) by OpenExisting when the catalog
-// has an older schema than SchemaVersion.
-var ErrNeedsMigration = errors.New("catalog needs migration: run 'picmover migrate <library>' first")
+// ErrNeedsRebuild is returned (wrapped) by Open and OpenExisting when the
+// catalog has a schema other than SchemaVersion. There is no migration: the
+// catalog is derived from the files and is rebuilt instead.
+var ErrNeedsRebuild = errors.New("catalog format changed; run 'picmover rebuild <library>'")
 
-// Open opens or creates the catalog at path and migrates it to SchemaVersion.
-// logger may be nil.
+// Open opens the catalog at path, creating it with schema SchemaVersion when
+// the file is missing, empty, or has user_version 0 and no media table. Any
+// other schema version is refused with an error wrapping ErrNeedsRebuild,
+// without modifying the file. logger may be nil.
 func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
+	if err := checkPath(path); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(path); err == nil {
+		// Check an existing file without enabling WAL, so a database of
+		// another format is left untouched.
+		v, hasMedia, err := probe(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkSchema(path, v, hasMedia, true); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("catalog: %w", err)
+	}
 	d, err := openDB(ctx, path, logger)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.migrate(ctx); err != nil {
+	if err := d.ensureSchema(ctx); err != nil {
 		d.Close()
 		return nil, err
 	}
 	return d, nil
 }
 
-// OpenExisting opens the catalog at path like Open but never creates or
-// migrates it. It returns an error if the file does not exist, an error
-// wrapping ErrNeedsMigration if its schema is older than SchemaVersion
-// (including a legacy v1 database), and an error if it is newer. The schema
-// version is probed without enabling WAL, so an old database is not written.
-// logger may be nil.
+// OpenExisting opens the catalog at path like Open but never creates it. It
+// returns an error if the file does not exist or has no schema, and an error
+// wrapping ErrNeedsRebuild if its schema version is not SchemaVersion. The
+// schema is probed without enabling WAL, so a database of another format is
+// not written. logger may be nil.
 func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 	if err := checkPath(path); err != nil {
 		return nil, err
@@ -68,11 +87,11 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("catalog: %s is not a regular file", path)
 	}
-	v, err := probeVersion(ctx, path)
+	v, hasMedia, err := probe(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkVersion(path, v); err != nil {
+	if err := checkSchema(path, v, hasMedia, false); err != nil {
 		return nil, err
 	}
 	d, err := openDB(ctx, path, logger)
@@ -80,9 +99,9 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 		return nil, err
 	}
 	// Re-check on the real connection in case the file changed meanwhile.
-	v, err = d.userVersion(ctx)
+	v, hasMedia, err = schemaState(ctx, d.DB)
 	if err == nil {
-		err = checkVersion(path, v)
+		err = checkSchema(path, v, hasMedia, false)
 	}
 	if err != nil {
 		d.Close()
@@ -91,29 +110,55 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	return d, nil
 }
 
-func checkVersion(path string, v int) error {
+// checkSchema accepts version SchemaVersion, and also an empty database
+// (user_version 0, no media table) when allowFresh is set.
+func checkSchema(path string, v int, hasMedia, allowFresh bool) error {
 	switch {
-	case v < SchemaVersion:
-		return fmt.Errorf("catalog: %s has schema version %d, older than %d: %w", path, v, SchemaVersion, ErrNeedsMigration)
+	case v == SchemaVersion:
+		return nil
+	case v == 0 && !hasMedia:
+		if allowFresh {
+			return nil
+		}
+		return fmt.Errorf("catalog: %s is not a picmover catalog (no schema)", path)
 	case v > SchemaVersion:
-		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d; upgrade picmover", path, v, SchemaVersion)
+		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d (upgrade picmover): %w",
+			path, v, SchemaVersion, ErrNeedsRebuild)
 	}
-	return nil
+	return fmt.Errorf("catalog: %s has schema version %d, want %d: %w", path, v, SchemaVersion, ErrNeedsRebuild)
 }
 
-// probeVersion reads user_version through a connection that sets no
-// journal_mode, so probing a rollback-journal (v1) file does not convert it.
-func probeVersion(ctx context.Context, path string) (int, error) {
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// schemaState returns user_version and whether a media table exists. Both
+// are read by one statement, so they come from the same snapshot: read
+// separately, a concurrent schema creation committing in between would make
+// a new catalog look like a v1 catalog (user_version 0 with a media table).
+func schemaState(ctx context.Context, q queryRower) (version int, hasMedia bool, err error) {
+	var n int
+	err = q.QueryRowContext(ctx, `SELECT (SELECT user_version FROM pragma_user_version),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media')`).Scan(&version, &n)
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: inspect schema: %w", err)
+	}
+	return version, n > 0, nil
+}
+
+// probe reads the schema state through a connection that sets no
+// journal_mode, so probing a rollback-journal file does not convert it.
+func probe(ctx context.Context, path string) (version int, hasMedia bool, err error) {
 	sqldb, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
 	if err != nil {
-		return 0, fmt.Errorf("catalog: open %s: %w", path, err)
+		return 0, false, fmt.Errorf("catalog: open %s: %w", path, err)
 	}
 	defer sqldb.Close()
-	var v int
-	if err := sqldb.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
-		return 0, fmt.Errorf("catalog: open %s: read user_version: %w", path, err)
+	version, hasMedia, err = schemaState(ctx, sqldb)
+	if err != nil {
+		return 0, false, fmt.Errorf("catalog: open %s: %w", path, err)
 	}
-	return v, nil
+	return version, hasMedia, nil
 }
 
 func checkPath(path string) error {
@@ -128,7 +173,8 @@ func checkPath(path string) error {
 	return nil
 }
 
-// openDB opens the database with the connection pragmas, without migrating.
+// openDB opens the database with the connection pragmas, without touching
+// the schema.
 func openDB(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 	if err := checkPath(path); err != nil {
 		return nil, err
@@ -183,84 +229,25 @@ func isBusy(err error) bool {
 	return errors.As(err, &ce) && ce.Code()&0xff == 5 // SQLITE_BUSY
 }
 
-func (d *DB) userVersion(ctx context.Context) (int, error) {
-	var v int
-	if err := d.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
-		return 0, fmt.Errorf("catalog: read user_version: %w", err)
-	}
-	return v, nil
-}
-
-// migrate brings the database to SchemaVersion, one step at a time.
-func (d *DB) migrate(ctx context.Context) error {
-	for {
-		v, err := d.userVersion(ctx)
-		if err != nil {
-			return err
-		}
-		if v > SchemaVersion {
-			return checkVersion(d.path, v)
-		}
-		if v == SchemaVersion {
-			return nil
-		}
-		if err := d.migrateStep(ctx, v); err != nil {
-			return err
-		}
-		nv, err := d.userVersion(ctx)
-		if err != nil {
-			return err
-		}
-		if nv <= v {
-			return fmt.Errorf("catalog: migration from version %d did not advance the schema", v)
-		}
-	}
-}
-
-// migrateStep performs the migration away from version from. Future steps
-// (2 -> 3, ...) are added as further cases.
-func (d *DB) migrateStep(ctx context.Context, from int) error {
-	switch from {
-	case 0:
-		legacy, hasMedia, err := d.isLegacy(ctx)
-		if err != nil {
-			return err
-		}
-		if legacy {
-			return d.migrateLegacy(ctx)
-		}
-		if hasMedia {
-			return fmt.Errorf("catalog: %s has a media table of unknown schema (user_version 0)", d.path)
-		}
-		return d.createFresh(ctx)
-	default:
-		return fmt.Errorf("catalog: no migration from schema version %d", from)
-	}
-}
-
-func (d *DB) isLegacy(ctx context.Context) (legacy, hasMedia bool, err error) {
-	var n int
-	err = d.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media'").Scan(&n)
-	if err != nil {
-		return false, false, fmt.Errorf("catalog: inspect schema: %w", err)
-	}
-	if n == 0 {
-		return false, false, nil
-	}
-	err = d.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('media') WHERE name = 'new_path'").Scan(&n)
-	if err != nil {
-		return false, true, fmt.Errorf("catalog: inspect media table: %w", err)
-	}
-	return n > 0, true, nil
-}
-
-func (d *DB) createFresh(ctx context.Context) error {
+// ensureSchema creates the schema if the database is empty, inside an
+// IMMEDIATE transaction so concurrent openers create it once.
+func (d *DB) ensureSchema(ctx context.Context) error {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("catalog: begin: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
+	v, hasMedia, err := schemaState(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := checkSchema(d.path, v, hasMedia, true); err != nil {
+		return err
+	}
+	if v == SchemaVersion {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, schemaV3); err != nil {
 		return fmt.Errorf("catalog: create schema: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {

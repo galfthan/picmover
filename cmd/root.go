@@ -23,14 +23,19 @@ catalog (media.db) at the library root with a content hash and the capture
 metadata of every file.
 
 Paths in the catalog are relative to the library root, so the same library
-can be used from Linux, Windows and macOS.`,
+can be used from Linux, Windows and macOS. Thumbnails and previews are cached
+in <library>/.picmover.
+
+When a new version changes the catalog format, run 'picmover rebuild
+<library>' to recreate the catalog from the files.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 	root.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
 		return usageError(c, err)
 	})
-	root.AddCommand(newImportCmd(), newDBCmd(), newUpdateMetadataCmd(), newVerifyCmd(), newMigrateCmd())
+	root.AddCommand(newImportCmd(), newDBCmd(), newUpdateMetadataCmd(), newVerifyCmd(), newThumbsCmd(),
+		newRebuildCmd())
 	return root
 }
 

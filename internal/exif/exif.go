@@ -1,6 +1,8 @@
 // Package exif is a small, bounded EXIF reader. It extracts only the fields
 // picmover uses (dates, offsets, camera, orientation, dimensions, GPS) from
-// JPEG, TIFF-based raw formats, Canon CR3 and Fujifilm RAF files.
+// JPEG, TIFF-based raw formats, Canon CR3, Fujifilm RAF, HEIF/AVIF, WebP and
+// PNG files, and locates the JPEG previews embedded in raw and HEIF files
+// (Previews).
 //
 // It is written for hostile input: every read goes through io.ReaderAt with
 // an offset and length checked against the file size, nothing is allocated
@@ -58,11 +60,15 @@ var (
 
 // Read parses r, which holds a whole file of size bytes. It detects JPEG,
 // TIFF-based files (classic TIFF, CR2, NEF, ARW, DNG, PEF, SRW, plus Olympus
-// ORF "IIRO"/"MMOR" and Panasonic RW2 "IIU\x00" headers), Canon CR3 (ISO BMFF)
-// and Fujifilm RAF by magic bytes. It never reads more than it needs, never
-// allocates based on untrusted sizes, and never loops: it returns an error
-// only when no EXIF structure can be located; malformed parts produce
-// warnings and the rest is still returned.
+// ORF "IIRO"/"MMOR" and Panasonic RW2 "IIU\x00" headers), Canon CR3 (ISO BMFF),
+// Fujifilm RAF and HEIF/AVIF (ISO BMFF with a heic/heix/hevc/mif1/msf1/
+// avif/avis brand; the Exif item of the primary image, with irot/imir as
+// the orientation, overriding any EXIF Orientation tag), WebP (the RIFF
+// EXIF chunk) and PNG (the eXIf chunk before IDAT) by magic bytes. It never
+// reads more than it needs, never allocates based on untrusted sizes, and
+// never loops: it returns an error only when no EXIF structure can be
+// located (for HEIF: no readable Exif item and no irot/imir); malformed
+// parts produce warnings and the rest is still returned.
 func Read(r io.ReaderAt, size int64) (*Fields, error) {
 	if size < 8 {
 		return nil, fmt.Errorf("%w: file too small", ErrNoExif)
@@ -79,10 +85,16 @@ func Read(r io.ReaderAt, size int64) (*Fields, error) {
 		err = s.tiff(io.NewSectionReader(r, 6, size-6), size-6, tiffMain, false)
 	case isTIFF(head):
 		err = s.tiff(r, size, tiffMain, true)
+	case string(head[4:8]) == "ftyp" && isHEIF(r, size):
+		err = s.heif(r, size)
 	case string(head[4:8]) == "ftyp":
 		err = s.cr3(r, size)
 	case bytes.HasPrefix(head, rafMagic):
 		err = s.raf(r, size)
+	case isWebP(head):
+		err = s.webp(r, size)
+	case bytes.HasPrefix(head, pngMagic):
+		err = s.png(r, size)
 	default:
 		err = ErrNoExif
 	}
@@ -243,27 +255,9 @@ type entry struct {
 // whether IFDs after IFD0 in the next-IFD chain are image candidates
 // (true for TIFF-based files, false for JPEG where IFD1 is the thumbnail).
 func (s *state) tiff(r io.ReaderAt, size int64, kind tiffKind, chain bool) error {
-	h, err := readAt(r, size, 0, min(size, 8))
-	if err != nil || len(h) < 8 {
-		return fmt.Errorf("%w: TIFF header truncated", ErrNoExif)
-	}
-	t := &tiffReader{s: s, r: r, size: size, visited: map[int64]bool{}, follow: kind == tiffMain}
-	switch string(h[:2]) {
-	case "II":
-		t.bo = binary.LittleEndian
-	case "MM":
-		t.bo = binary.BigEndian
-	default:
-		return fmt.Errorf("%w: bad TIFF byte order", ErrNoExif)
-	}
-	switch t.bo.Uint16(h[2:4]) {
-	case 42, 0x4F52, 0x5352, 0x55: // TIFF, ORF "RO"/"SR", RW2 "U"
-	default:
-		return fmt.Errorf("%w: bad TIFF magic", ErrNoExif)
-	}
-	ifd0 := int64(t.bo.Uint32(h[4:8]))
-	if ifd0 < 8 || ifd0 >= size {
-		return fmt.Errorf("%w: IFD0 offset %d outside data", ErrNoExif, ifd0)
+	t, ifd0, err := s.newTIFFReader(r, size, kind)
+	if err != nil {
+		return err
 	}
 	switch kind {
 	case tiffMain, tiffCMT1:
@@ -274,6 +268,34 @@ func (s *state) tiff(r io.ReaderAt, size int64, kind tiffKind, chain bool) error
 		t.walkGPS(ifd0, 1)
 	}
 	return nil
+}
+
+// newTIFFReader checks the TIFF header at offset 0 of r and returns a reader
+// for it and the offset of IFD0.
+func (s *state) newTIFFReader(r io.ReaderAt, size int64, kind tiffKind) (*tiffReader, int64, error) {
+	h, err := readAt(r, size, 0, min(size, 8))
+	if err != nil || len(h) < 8 {
+		return nil, 0, fmt.Errorf("%w: TIFF header truncated", ErrNoExif)
+	}
+	t := &tiffReader{s: s, r: r, size: size, visited: map[int64]bool{}, follow: kind == tiffMain}
+	switch string(h[:2]) {
+	case "II":
+		t.bo = binary.LittleEndian
+	case "MM":
+		t.bo = binary.BigEndian
+	default:
+		return nil, 0, fmt.Errorf("%w: bad TIFF byte order", ErrNoExif)
+	}
+	switch t.bo.Uint16(h[2:4]) {
+	case 42, 0x4F52, 0x5352, 0x55: // TIFF, ORF "RO"/"SR", RW2 "U"
+	default:
+		return nil, 0, fmt.Errorf("%w: bad TIFF magic", ErrNoExif)
+	}
+	ifd0 := int64(t.bo.Uint32(h[4:8]))
+	if ifd0 < 8 || ifd0 >= size {
+		return nil, 0, fmt.Errorf("%w: IFD0 offset %d outside data", ErrNoExif, ifd0)
+	}
+	return t, ifd0, nil
 }
 
 // readIFD reads the entry table at off. It enforces the visited set and the

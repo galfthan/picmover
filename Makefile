@@ -3,7 +3,10 @@
 GO        ?= go
 BINARY    := picmover
 DIST      := dist
-BUILD_FLAGS := -trimpath -ldflags '-s -w'
+# nodynamic: the gen2brain image decoders (HEIC, AVIF, WebP encoder) use
+# their embedded WebAssembly builds only, never a system shared library.
+TAGS        := -tags nodynamic
+BUILD_FLAGS := $(TAGS) -trimpath -ldflags '-s -w'
 
 .PHONY: build test vet build-all build-linux build-windows build-darwin clean install
 
@@ -11,10 +14,10 @@ build:
 	CGO_ENABLED=0 $(GO) build $(BUILD_FLAGS) -o $(BINARY) .
 
 test:
-	$(GO) test ./...
+	$(GO) test $(TAGS) ./...
 
 vet:
-	$(GO) vet ./...
+	$(GO) vet $(TAGS) ./...
 
 build-all: build-linux build-windows build-darwin
 

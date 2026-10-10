@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"picmover/internal/catalog"
@@ -48,7 +49,7 @@ func formatDate(t time.Time) string {
 	return t.Format("2006-01-02")
 }
 
-// stderrLogger logs catalog notices (creation, v1 migration) to stderr.
+// stderrLogger logs catalog notices (creation) to stderr.
 func stderrLogger() *slog.Logger { return slog.New(stderrHandler()) }
 
 // stderrHandler is a text handler on stderr without timestamps.
@@ -64,10 +65,10 @@ func stderrHandler() slog.Handler {
 }
 
 // openExisting attaches to the library at dir and opens its catalog without
-// creating directories or migrating: db, verify and update-metadata never
-// write to a library they were not asked to change, and a mistyped path does
-// not leave an empty media.db behind. An old catalog is refused with an error
-// wrapping catalog.ErrNeedsMigration.
+// creating directories or a catalog: db, verify, update-metadata and thumbs
+// never create a library, and a mistyped path does not leave an empty
+// media.db behind. A catalog of another format is refused, unmodified, with
+// an error wrapping catalog.ErrNeedsRebuild that names the rebuild command.
 func openExisting(ctx context.Context, dir string) (*library.Library, *catalog.DB, error) {
 	lib, err := library.Attach(dir)
 	if err != nil {
@@ -81,7 +82,37 @@ func openExisting(ctx context.Context, dir string) (*library.Library, *catalog.D
 	}
 	db, err := catalog.OpenExisting(ctx, lib.DBPath(), stderrLogger())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, catalogError(lib.Root(), err)
 	}
 	return lib, db, nil
+}
+
+// rebuildError explains how to recover from a catalog of another format.
+type rebuildError struct {
+	root string
+	err  error
+}
+
+func (e *rebuildError) Error() string {
+	return fmt.Sprintf("%v\nRecreate the catalog from the files with:\n  picmover rebuild %s\n"+
+		"(the old catalog is kept as %s.bak-<timestamp>; thumbnails are reused)", e.err, quoteArg(e.root), library.DBName)
+}
+
+func (e *rebuildError) Unwrap() error { return e.err }
+
+// catalogError turns catalog.ErrNeedsRebuild into a message naming
+// "picmover rebuild <library>"; other errors are returned unchanged.
+func catalogError(root string, err error) error {
+	if errors.Is(err, catalog.ErrNeedsRebuild) {
+		return &rebuildError{root: root, err: err}
+	}
+	return err
+}
+
+// quoteArg quotes a path for a shell command line when it needs it.
+func quoteArg(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t'\"$&|;<>()*?[]#~`") {
+		return s
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
 }
