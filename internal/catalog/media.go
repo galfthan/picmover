@@ -12,7 +12,7 @@ import (
 type Media struct {
 	ID                                        int64
 	Hash                                      uint64
-	Size                                      int64 // 0 = unknown
+	Size                                      int64 // bytes; required (> 0)
 	RelPath                                   string
 	FileType                                  string
 	Ext                                       string
@@ -33,7 +33,22 @@ type Media struct {
 	ImportSessionID                           int64 // 0 = none
 	Rating                                    int
 	DeletedAt                                 time.Time // zero = not deleted
+	PHash                                     uint64    // perceptual hash; 0 = none
+	ThumbState                                string    // pending | ok | unsupported | error | stale
+	ThumbError                                string
+	ThumbAt                                   time.Time // zero = never attempted
 }
+
+// Thumbnail states stored in thumb_state.
+const (
+	ThumbStatePending     = "pending"
+	ThumbStateOK          = "ok"
+	ThumbStateUnsupported = "unsupported"
+	ThumbStateError       = "error"
+	// ThumbStateStale marks cached renditions that no longer match the
+	// row (its orientation changed); they are regenerated with force.
+	ThumbStateStale = "stale"
+)
 
 // Summary holds aggregate statistics over the catalog.
 type Summary struct {
@@ -80,7 +95,8 @@ func orderBy(s string) (string, error) {
 const mediaColumns = `id, hash, size, rel_path, file_type, ext, taken_at, taken_at_offset,
 	taken_at_source, width, height, orientation, duration_ms, lat, lon, altitude,
 	camera_make, camera_model, camera_type, lens, original_path, original_mtime,
-	imported_at, import_session_id, rating, deleted_at`
+	imported_at, import_session_id, rating, deleted_at,
+	phash, thumb_state, thumb_error, thumb_at`
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -134,6 +150,13 @@ func nonZeroInt(v int64) any {
 	return v
 }
 
+func thumbState(s string) string {
+	if s == "" {
+		return ThumbStatePending
+	}
+	return s
+}
+
 func takenAtSource(s string) string {
 	if s == "" {
 		return "none"
@@ -143,9 +166,13 @@ func takenAtSource(s string) string {
 
 // InsertMedia inserts m inside tx with ON CONFLICT(hash) DO NOTHING.
 // Returns inserted=false when the hash already existed. Sets m.ID on success.
-// Empty TakenAtSource is stored as "none". A zero ImportedAt is stored as the
-// current time. tx may be nil to run outside a transaction.
+// Size must be > 0. Empty TakenAtSource is stored as "none", empty ThumbState
+// as "pending", and a zero ImportedAt as the current time. tx may be nil to
+// run outside a transaction.
 func (d *DB) InsertMedia(ctx context.Context, tx *sql.Tx, m *Media) (inserted bool, err error) {
+	if m.Size <= 0 {
+		return false, fmt.Errorf("catalog: insert %s: size %d, must be > 0", m.RelPath, m.Size)
+	}
 	var ex execer = d.DB
 	if tx != nil {
 		ex = tx
@@ -166,14 +193,16 @@ func (d *DB) InsertMedia(ctx context.Context, tx *sql.Tx, m *Media) (inserted bo
 		hash, size, rel_path, file_type, ext, taken_at, taken_at_offset, taken_at_source,
 		width, height, orientation, duration_ms, lat, lon, altitude,
 		camera_make, camera_model, camera_type, lens, original_path, original_mtime,
-		imported_at, import_session_id, rating, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		imported_at, import_session_id, rating, deleted_at,
+		phash, thumb_state, thumb_error, thumb_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(hash) DO NOTHING`,
-		int64(m.Hash), nonZeroInt(m.Size), m.RelPath, m.FileType, m.Ext, wall, off, takenAtSource(m.TakenAtSource),
+		int64(m.Hash), m.Size, m.RelPath, m.FileType, m.Ext, wall, off, takenAtSource(m.TakenAtSource),
 		nonZeroInt(int64(m.Width)), nonZeroInt(int64(m.Height)), nonZeroInt(int64(m.Orientation)), nonZeroInt(m.DurationMS),
 		lat, lon, alt,
 		m.CameraMake, m.CameraModel, m.CameraType, m.Lens, m.OriginalPath, unixOrNil(m.OriginalMTime),
-		importedAt.Unix(), nonZeroInt(m.ImportSessionID), m.Rating, unixOrNil(m.DeletedAt))
+		importedAt.Unix(), nonZeroInt(m.ImportSessionID), m.Rating, unixOrNil(m.DeletedAt),
+		nonZeroInt(int64(m.PHash)), thumbState(m.ThumbState), m.ThumbError, unixOrNil(m.ThumbAt))
 	if err != nil {
 		return false, fmt.Errorf("catalog: insert %s: %w", m.RelPath, err)
 	}
@@ -224,20 +253,22 @@ type rowScanner interface {
 func scanMedia(r rowScanner) (Media, error) {
 	var (
 		m                                       Media
-		hash                                    int64
-		size, wall, off, w, h, orient, dur      sql.NullInt64
+		hash, size                              int64
+		wall, off, w, h, orient, dur            sql.NullInt64
+		phash, thumbAt                          sql.NullInt64
 		lat, lon, alt                           sql.NullFloat64
 		mtime, importedAt, sessionID, deletedAt sql.NullInt64
 	)
 	err := r.Scan(&m.ID, &hash, &size, &m.RelPath, &m.FileType, &m.Ext, &wall, &off,
 		&m.TakenAtSource, &w, &h, &orient, &dur, &lat, &lon, &alt,
 		&m.CameraMake, &m.CameraModel, &m.CameraType, &m.Lens, &m.OriginalPath, &mtime,
-		&importedAt, &sessionID, &m.Rating, &deletedAt)
+		&importedAt, &sessionID, &m.Rating, &deletedAt,
+		&phash, &m.ThumbState, &m.ThumbError, &thumbAt)
 	if err != nil {
 		return Media{}, err
 	}
 	m.Hash = uint64(hash)
-	m.Size = size.Int64
+	m.Size = size
 	m.TakenAt, m.OffsetKnown = decodeTakenAt(wall, off)
 	m.Width, m.Height, m.Orientation = int(w.Int64), int(h.Int64), int(orient.Int64)
 	m.DurationMS = dur.Int64
@@ -251,6 +282,8 @@ func scanMedia(r rowScanner) (Media, error) {
 	m.ImportedAt = fromUnix(importedAt)
 	m.ImportSessionID = sessionID.Int64
 	m.DeletedAt = fromUnix(deletedAt)
+	m.PHash = uint64(phash.Int64)
+	m.ThumbAt = fromUnix(thumbAt)
 	return m, nil
 }
 
@@ -297,23 +330,142 @@ func (d *DB) List(ctx context.Context, opts ListOptions) ([]Media, error) {
 		q += " LIMIT ? OFFSET ?"
 		args = append(args, limit, max(opts.Offset, 0))
 	}
-	rows, err := d.QueryContext(ctx, q, args...)
+	out, err := d.queryMedia(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: list: %w", err)
+	}
+	return out, nil
+}
+
+func (d *DB) queryMedia(ctx context.Context, q string, args ...any) ([]Media, error) {
+	rows, err := d.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	var out []Media
 	for rows.Next() {
 		m, err := scanMedia(rows)
 		if err != nil {
-			return nil, fmt.Errorf("catalog: list: %w", err)
+			return nil, err
 		}
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("catalog: list: %w", err)
+		return nil, err
 	}
 	return out, nil
+}
+
+// ListThumbPending returns up to limit rows (all when limit <= 0) with
+// thumb_state 'pending' that are not soft-deleted, ordered by id. When
+// sessionID > 0 only rows of that import session are returned.
+func (d *DB) ListThumbPending(ctx context.Context, limit int, sessionID int64) ([]Media, error) {
+	q := "SELECT " + mediaColumns + " FROM media WHERE thumb_state = 'pending' AND deleted_at IS NULL"
+	var args []any
+	if sessionID > 0 {
+		q += " AND import_session_id = ?"
+		args = append(args, sessionID)
+	}
+	q += " ORDER BY id"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	out, err := d.queryMedia(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list thumb pending: %w", err)
+	}
+	return out, nil
+}
+
+// ListForThumbs returns up to limit rows (all when limit <= 0) with
+// id > afterID that are not soft-deleted, ordered by id, for paging through
+// the rows a thumbnail pass works on: rows with thumb_state 'pending',
+// 'stale' or 'error' (failed rows are retried), or every row when all is
+// set. When sessionID > 0 only rows of that import
+// session are returned. Paging by id (pass the last id seen as afterID)
+// stays correct while the pass changes the thumb state of earlier rows.
+func (d *DB) ListForThumbs(ctx context.Context, afterID int64, limit int, sessionID int64, all bool) ([]Media, error) {
+	q := "SELECT " + mediaColumns + " FROM media WHERE id > ? AND deleted_at IS NULL"
+	args := []any{afterID}
+	if !all {
+		q += " AND thumb_state IN ('pending', 'stale', 'error')"
+	}
+	if sessionID > 0 {
+		q += " AND import_session_id = ?"
+		args = append(args, sessionID)
+	}
+	q += " ORDER BY id"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	out, err := d.queryMedia(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list for thumbs: %w", err)
+	}
+	return out, nil
+}
+
+// SetThumb records the outcome of a thumbnail attempt for row id: thumb_state
+// = state (one of the ThumbState* constants), thumb_error = msg, thumb_at = now and
+// phash (NULL when 0). width and height are set from w and h only when both
+// are > 0 and the row's value is NULL or 0. tx may be nil to run outside a
+// transaction. Returns sql.ErrNoRows when no row has this id.
+func (d *DB) SetThumb(ctx context.Context, tx *sql.Tx, id int64, state, msg string, phash uint64, w, h int) error {
+	var ex execer = d.DB
+	if tx != nil {
+		ex = tx
+	}
+	var nw, nh any
+	if w > 0 && h > 0 {
+		nw, nh = int64(w), int64(h)
+	}
+	res, err := ex.ExecContext(ctx, `UPDATE media SET
+		thumb_state = ?, thumb_error = ?, thumb_at = ?, phash = ?,
+		width = CASE WHEN COALESCE(width, 0) = 0 THEN COALESCE(?, width) ELSE width END,
+		height = CASE WHEN COALESCE(height, 0) = 0 THEN COALESCE(?, height) ELSE height END
+		WHERE id = ?`,
+		state, msg, time.Now().Unix(), nonZeroInt(int64(phash)), nw, nh, id)
+	if err != nil {
+		return fmt.Errorf("catalog: set thumb %d: %w", id, err)
+	}
+	return checkOneRow(res, id)
+}
+
+// MarkThumbStale sets thumb_state = 'stale' for row id, so the next
+// thumbnail pass regenerates its cached renditions (for example after its
+// orientation changed). Every state becomes 'stale': even a 'pending' row
+// may have renditions in the cache under its hash (after a rebuild), which
+// a non-forced pass would reuse. tx may be nil to run outside a
+// transaction. Returns sql.ErrNoRows when no row has this id.
+func (d *DB) MarkThumbStale(ctx context.Context, tx *sql.Tx, id int64) error {
+	var ex execer = d.DB
+	if tx != nil {
+		ex = tx
+	}
+	res, err := ex.ExecContext(ctx, "UPDATE media SET thumb_state = 'stale' WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("catalog: mark thumb stale %d: %w", id, err)
+	}
+	return checkOneRow(res, id)
+}
+
+// ThumbStats counts non-deleted rows per thumb_state; pending counts
+// 'pending' and 'stale' (both wait for a thumbnail pass), failed counts
+// 'error'.
+func (d *DB) ThumbStats(ctx context.Context) (pending, ok, unsupported, failed int64, err error) {
+	err = d.QueryRowContext(ctx, `SELECT
+		COALESCE(SUM(thumb_state IN ('pending', 'stale')), 0),
+		COALESCE(SUM(thumb_state = 'ok'), 0),
+		COALESCE(SUM(thumb_state = 'unsupported'), 0),
+		COALESCE(SUM(thumb_state = 'error'), 0)
+		FROM media WHERE deleted_at IS NULL`).Scan(&pending, &ok, &unsupported, &failed)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("catalog: thumb stats: %w", err)
+	}
+	return pending, ok, unsupported, failed, nil
 }
 
 // UpdateMetadata rewrites the metadata columns of row id from m: taken_at,
@@ -348,12 +500,16 @@ func (d *DB) UpdateMetadata(ctx context.Context, tx *sql.Tx, id int64, m *Media)
 	return checkOneRow(res, id)
 }
 
-// UpdateSize sets size for row id. tx may be nil to run outside a
-// transaction. Returns sql.ErrNoRows when no row has this id.
+// UpdateSize sets size for row id (for example after a file was rewritten).
+// size must be > 0. tx may be nil to run outside a transaction. Returns
+// sql.ErrNoRows when no row has this id.
 func (d *DB) UpdateSize(ctx context.Context, tx *sql.Tx, id, size int64) error {
 	var ex execer = d.DB
 	if tx != nil {
 		ex = tx
+	}
+	if size <= 0 {
+		return fmt.Errorf("catalog: update size %d: size %d, must be > 0", id, size)
 	}
 	res, err := ex.ExecContext(ctx, "UPDATE media SET size = ? WHERE id = ?", size, id)
 	if err != nil {

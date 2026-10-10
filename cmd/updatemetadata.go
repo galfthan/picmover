@@ -37,8 +37,11 @@ to only show what would change.
 Good metadata is never degraded: a date read from the file's metadata is not
 replaced by a file-time fallback (such rows are counted as skipped), and an
 empty value never replaces a known one. Without --timezone, times derived
-from instants (video UTC, file time, legacy UTC) keep their stored offset;
+from instants (video UTC, file time) keep their stored offset;
 with --timezone they are converted to that zone. Videos need ffprobe.
+When the orientation of a file changes, its thumbnail state becomes
+'stale' and the next 'picmover thumbs' regenerates its thumbnail and
+preview.
 Exits with status 2 when any row could not be updated.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -69,7 +72,7 @@ Exits with status 2 when any row could not be updated.`,
 			out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 			var (
 				updated, unchanged, degraded, errCount, warnCount int
-				pending                                           []catalog.Media
+				pending                                           []metaUpdate
 			)
 			for _, old := range rows {
 				if err := ctx.Err(); err != nil {
@@ -115,7 +118,7 @@ Exits with status 2 when any row could not be updated.`,
 					fmt.Fprintf(out, "Would update %s:\n", old.RelPath)
 				} else {
 					fmt.Fprintf(out, "Updated %s:\n", old.RelPath)
-					pending = append(pending, nw)
+					pending = append(pending, metaUpdate{m: nw, orientationChanged: nw.Orientation != old.Orientation})
 				}
 				for _, ch := range changes {
 					fmt.Fprintf(out, "  %s\n", ch)
@@ -154,22 +157,34 @@ Exits with status 2 when any row could not be updated.`,
 	f := c.Flags()
 	f.StringVarP(&fileType, "type", "t", "all", "type of media to update: all, image, image_raw or video")
 	f.BoolVarP(&dryRun, "dry-run", "d", false, "show changes without writing them")
-	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime, legacy UTC), applied to all rows; default: keep each row's stored offset, else the system zone")
+	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime), applied to all rows; default: keep each row's stored offset, else the system zone")
 	f.BoolVarP(&verbose, "verbose", "v", false, "print extractor warnings to stderr and rows skipped because extraction degraded")
 	return c
 }
 
-// applyUpdates writes rows in one transaction. Rows that no longer exist are
-// reported and counted in missing; any other error rolls back the batch.
-func applyUpdates(ctx context.Context, db *catalog.DB, rows []catalog.Media, out io.Writer) (missing int, err error) {
+// metaUpdate is one row to rewrite.
+type metaUpdate struct {
+	m                  catalog.Media
+	orientationChanged bool // the cached thumbnail and preview are now wrong
+}
+
+// applyUpdates writes rows in one transaction. A row whose orientation
+// changed is also marked thumb_state 'stale', so the next 'picmover thumbs'
+// regenerates its renditions. Rows that no longer exist are reported and
+// counted in missing; any other error rolls back the batch.
+func applyUpdates(ctx context.Context, db *catalog.DB, rows []metaUpdate, out io.Writer) (missing int, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 	for i := range rows {
-		m := &rows[i]
-		if err := db.UpdateMetadata(ctx, tx, m.ID, m); err != nil {
+		m := &rows[i].m
+		err := db.UpdateMetadata(ctx, tx, m.ID, m)
+		if err == nil && rows[i].orientationChanged {
+			err = db.MarkThumbStale(ctx, tx, m.ID)
+		}
+		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				fmt.Fprintf(out, "Error updating record for %s: row %d no longer exists\n", m.RelPath, m.ID)
 				missing++
@@ -199,7 +214,7 @@ func hasVideo(rows []catalog.Media) bool {
 
 // rowZone returns the zone used to turn instants into wall-clock times when
 // re-extracting m. An explicit --timezone applies to every row. Otherwise a
-// row whose time was derived from an instant (mtime, video_utc, legacy_utc)
+// row whose time was derived from an instant (mtime, video_utc)
 // with a known offset keeps that offset, so running on a machine in another
 // zone does not shift it; every other row uses the system zone (def).
 func rowZone(m catalog.Media, def *time.Location, explicit bool) *time.Location {
@@ -207,7 +222,7 @@ func rowZone(m catalog.Media, def *time.Location, explicit bool) *time.Location 
 		return def
 	}
 	switch m.TakenAtSource {
-	case "mtime", "video_utc", "legacy_utc":
+	case "mtime", "video_utc":
 		_, off := m.TakenAt.Zone()
 		return time.FixedZone("", off)
 	}
@@ -215,7 +230,7 @@ func rowZone(m catalog.Media, def *time.Location, explicit bool) *time.Location 
 }
 
 // trustedSources are date sources read from the file's own metadata.
-var trustedSources = map[string]bool{"exif": true, "video": true, "video_utc": true, "legacy": true, "legacy_utc": true}
+var trustedSources = map[string]bool{"exif": true, "video": true, "video_utc": true}
 
 // mergeInfo returns m updated with info without degrading it. When the new
 // date only comes from a fallback (mtime or none) and the old one came from

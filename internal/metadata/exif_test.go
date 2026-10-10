@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -52,8 +53,30 @@ func TestExtractJPEGExif(t *testing.T) {
 	if !info.HasAltitude || math.Abs(info.Altitude-12.5) > 1e-9 {
 		t.Errorf("Altitude = %v %v", info.HasAltitude, info.Altitude)
 	}
-	if info.Width != 24 || info.Height != 16 {
-		t.Errorf("size = %dx%d", info.Width, info.Height)
+	// Orientation 6: the catalog gets the display (upright) size.
+	if info.Width != 16 || info.Height != 24 {
+		t.Errorf("size = %dx%d, want display size 16x24", info.Width, info.Height)
+	}
+}
+
+// TestExtractDisplayDimensions checks that orientations 5..8 swap the
+// stored size and 1..4 keep it.
+func TestExtractDisplayDimensions(t *testing.T) {
+	for o := 1; o <= 8; o++ {
+		data := testimg.JPEG(testimg.Options{Width: 24, Height: 18, Orientation: o})
+		p, _ := writeFile(t, fmt.Sprintf("o%d.jpg", o), data)
+		info, _, err := Default{DefaultZone: time.UTC}.Extract(context.Background(), p, KindImage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantW, wantH := 24, 18
+		if o >= 5 {
+			wantW, wantH = 18, 24
+		}
+		if info.Orientation != o || info.Width != wantW || info.Height != wantH {
+			t.Errorf("orientation %d: got orientation %d size %dx%d, want %dx%d",
+				o, info.Orientation, info.Width, info.Height, wantW, wantH)
+		}
 	}
 }
 

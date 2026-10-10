@@ -2,16 +2,13 @@ package metadata
 
 import (
 	"fmt"
-	"image"
-	_ "image/jpeg" // register JPEG for image.DecodeConfig
-	_ "image/png"  // register PNG for image.DecodeConfig
-	"io"
 	"os"
 	"strings"
 	"time"
 
 	"picmover/internal/exif"
 	"picmover/internal/geo"
+	"picmover/internal/imaging"
 )
 
 var exifDateLayouts = []struct {
@@ -85,10 +82,18 @@ func extractImage(path string, kind Kind) (info Info, warnings []string, err err
 		return Info{}, nil, fmt.Errorf("metadata: stat %s: %w", path, err)
 	}
 
+	// uprightSize is true when info's size is already the display size.
+	uprightSize := false
 	if kind == KindImage {
-		// DecodeConfig reads only the header (bounded for JPEG and PNG).
-		if cfg, _, err := image.DecodeConfig(io.NewSectionReader(f, 0, st.Size())); err == nil && cfg.Width > 0 && cfg.Height > 0 {
-			info.Width, info.Height = cfg.Width, cfg.Height
+		// imaging.Config sniffs the format and reads only the header; it
+		// covers every image format picmover decodes (JPEG, PNG, GIF, WebP,
+		// BMP, TIFF, HEIF, AVIF). The size is that of the stored pixels,
+		// before any orientation is applied, except for HEIF: libheif
+		// applies irot/imir and reports the transformed size. (AVIF's
+		// DecodeConfig reports the stored ispe size.) EXIF is the fallback.
+		if w, h, f, err := imaging.Config(f, st.Size()); err == nil {
+			info.Width, info.Height = w, h
+			uprightSize = f == imaging.FormatHEIF
 		}
 	}
 
@@ -99,9 +104,13 @@ func extractImage(path string, kind Kind) (info Info, warnings []string, err err
 		warnings = append(warnings, x.Warnings...)
 		warnings = append(warnings, applyExif(x, kind, &info)...)
 	}
+	// The catalog stores display (upright) dimensions.
+	if !uprightSize && info.Orientation >= 5 && info.Orientation <= 8 {
+		info.Width, info.Height = info.Height, info.Width
+	}
 	if kind == KindImage && (info.Width == 0 || info.Height == 0) {
-		// JPEG/PNG always carry their size and TIFF its ImageWidth, so a
-		// missing size means the file is damaged.
+		// Every supported image format carries its size in the header, so
+		// a missing size means the file is damaged or not an image.
 		warnings = append(warnings, "could not determine image dimensions")
 	}
 	return info, warnings, nil

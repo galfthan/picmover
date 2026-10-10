@@ -23,6 +23,8 @@ const (
 
 var kindByExt = map[string]Kind{
 	".jpg": KindImage, ".jpeg": KindImage, ".png": KindImage, ".tiff": KindImage, ".tif": KindImage,
+	".heic": KindImage, ".heif": KindImage, ".avif": KindImage, ".webp": KindImage, ".gif": KindImage,
+	".bmp": KindImage,
 
 	".cr2": KindRaw, ".crw": KindRaw, ".cr3": KindRaw, ".dng": KindRaw, ".nef": KindRaw,
 	".arw": KindRaw, ".x3f": KindRaw, ".orf": KindRaw, ".rw2": KindRaw, ".raf": KindRaw,
@@ -40,6 +42,13 @@ func Classify(name string) (Kind, bool) {
 }
 
 // Info is the metadata extracted from a media file.
+//
+// Width and Height are the display (upright) dimensions: for images and
+// RAW files whose Orientation is 5..8 (a 90-degree rotation) the stored
+// pixel size is swapped, except for HEIF sizes from the container, which
+// libheif already reports after applying irot/imir. AVIF sizes come from
+// the stored ispe and are swapped like JPEG. Video dimensions follow the
+// stream's display rotation.
 type Info struct {
 	TakenAt     time.Time // wall-clock; zone = real offset when OffsetKnown, else UTC placeholder
 	OffsetKnown bool

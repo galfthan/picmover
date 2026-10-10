@@ -53,7 +53,7 @@ func TestOpenFreshAndReopen(t *testing.T) {
 	if err := d.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
 		t.Fatalf("journal_mode = %q, %v", mode, err)
 	}
-	if _, err := d.InsertMedia(ctx, nil, &Media{Hash: 1, RelPath: "image/2020/01/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
+	if _, err := d.InsertMedia(ctx, nil, &Media{Hash: 1, Size: 10, RelPath: "image/2020/01/a.jpg", FileType: "image", Ext: "jpg"}); err != nil {
 		t.Fatal(err)
 	}
 	d.Close()
@@ -65,10 +65,6 @@ func TestOpenFreshAndReopen(t *testing.T) {
 	if _, found, err := d.LookupHash(ctx, 1); err != nil || !found {
 		t.Fatalf("row lost on reopen: %v %v", found, err)
 	}
-	matches, _ := filepath.Glob(p + ".v1-*")
-	if len(matches) != 0 {
-		t.Fatalf("unexpected backup on fresh db: %v", matches)
-	}
 }
 
 func TestOpenNewerVersionFails(t *testing.T) {
@@ -78,9 +74,104 @@ func TestOpenNewerVersionFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Close()
-	_, err := Open(context.Background(), p, nil)
-	if err == nil || !strings.Contains(err.Error(), "newer") {
-		t.Fatalf("expected newer-version error, got %v", err)
+	for _, open := range []func(context.Context, string, *slog.Logger) (*DB, error){Open, OpenExisting} {
+		_, err := open(context.Background(), p, nil)
+		if err == nil || !strings.Contains(err.Error(), "newer") || !errors.Is(err, ErrNeedsRebuild) {
+			t.Fatalf("expected newer-version ErrNeedsRebuild, got %v", err)
+		}
+	}
+}
+
+// writeOld creates a database at p with the given user_version and a media
+// table, using raw SQL (as an older picmover would have left it).
+func writeOld(t *testing.T, p string, version int) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	stmts := []string{
+		`CREATE TABLE media (id INTEGER PRIMARY KEY AUTOINCREMENT, hash INTEGER UNIQUE,
+			original_path TEXT, new_path TEXT, date_taken DATETIME, file_type TEXT)`,
+		`INSERT INTO media (hash, new_path, file_type) VALUES (1, '/x/image/2020/01/a.jpg', 'image')`,
+	}
+	if version == 2 {
+		stmts = []string{
+			`CREATE TABLE media (id INTEGER PRIMARY KEY, hash INTEGER NOT NULL UNIQUE, size INTEGER,
+				rel_path TEXT NOT NULL, file_type TEXT NOT NULL, ext TEXT NOT NULL,
+				taken_at_source TEXT NOT NULL DEFAULT 'none', imported_at INTEGER NOT NULL)`,
+			`INSERT INTO media (hash, rel_path, file_type, ext, taken_at_source, imported_at)
+				VALUES (1, 'a.jpg', 'image', 'jpg', 'legacy', 1)`,
+		}
+	}
+	for _, q := range stmts {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Older catalogs (v1 with user_version 0 or 1, v2) are refused with
+// ErrNeedsRebuild by both Open and OpenExisting and left byte-for-byte intact.
+func TestOpenOldVersionNeedsRebuild(t *testing.T) {
+	ctx := context.Background()
+	for _, version := range []int{0, 1, 2} {
+		p := filepath.Join(t.TempDir(), "media.db")
+		writeOld(t, p, version)
+		before, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, open := range map[string]func(context.Context, string, *slog.Logger) (*DB, error){
+			"Open": Open, "OpenExisting": OpenExisting} {
+			d, err := open(ctx, p, nil)
+			if version == 0 {
+				// user_version 0 with a media table is a v1 catalog.
+				if err == nil || !errors.Is(err, ErrNeedsRebuild) {
+					if d != nil {
+						d.Close()
+					}
+					t.Fatalf("%s(v1, user_version 0) = %v, want ErrNeedsRebuild", name, err)
+				}
+				continue
+			}
+			if !errors.Is(err, ErrNeedsRebuild) {
+				if d != nil {
+					d.Close()
+				}
+				t.Fatalf("%s(user_version %d) = %v, want ErrNeedsRebuild", name, version, err)
+			}
+			if !strings.Contains(err.Error(), "picmover rebuild") {
+				t.Errorf("%s error does not mention rebuild: %v", name, err)
+			}
+		}
+		after, _ := os.ReadFile(p)
+		if !bytes.Equal(before, after) {
+			t.Errorf("user_version %d: database modified", version)
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if _, err := os.Stat(p + suffix); err == nil {
+				t.Errorf("user_version %d: %s created", version, suffix)
+			}
+		}
+	}
+}
+
+// A normal filesystem supports WAL: Open logs no warning.
+func TestOpenNoWALWarning(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	d, err := Open(context.Background(), filepath.Join(t.TempDir(), "media.db"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	if strings.Contains(buf.String(), "WAL") {
+		t.Errorf("unexpected WAL warning: %s", buf.String())
 	}
 }
 
@@ -91,7 +182,7 @@ func TestOpenPathWithSpaces(t *testing.T) {
 	}
 	p := filepath.Join(dir, "media.db")
 	d := openTest(t, p)
-	if _, err := d.InsertMedia(context.Background(), nil, &Media{Hash: 5, RelPath: "x.jpg", FileType: "image", Ext: "jpg"}); err != nil {
+	if _, err := d.InsertMedia(context.Background(), nil, &Media{Hash: 5, Size: 1, RelPath: "x.jpg", FileType: "image", Ext: "jpg"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(p); err != nil {
@@ -149,6 +240,10 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 		ImportSessionID: 7,
 		Rating:          4,
 		DeletedAt:       time.Unix(1700000500, 0).UTC(),
+		PHash:           0x8000000000000001,
+		ThumbState:      "ok",
+		ThumbError:      "",
+		ThumbAt:         time.Unix(1700000600, 0).UTC(),
 	}
 	m := full
 	if !insert(t, d, &m) {
@@ -170,7 +265,7 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 	}
 
 	// Wall-clock only: zone discarded, wall-clock preserved, UTC placeholder.
-	wall := Media{Hash: 2, RelPath: "image/2021/01/b.jpg", FileType: "image", Ext: "jpg",
+	wall := Media{Hash: 2, Size: 1, RelPath: "image/2021/01/b.jpg", FileType: "image", Ext: "jpg",
 		TakenAt: time.Date(2021, 1, 2, 10, 0, 0, 999, time.FixedZone("", -5*3600))}
 	insert(t, d, &wall)
 	got, err = d.GetMedia(ctx, wall.ID)
@@ -186,7 +281,7 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 	}
 
 	// Zero times, no GPS.
-	zero := Media{Hash: 3, RelPath: "video/x.mp4", FileType: "video", Ext: "mp4", OffsetKnown: true,
+	zero := Media{Hash: 3, Size: 1, RelPath: "video/x.mp4", FileType: "video", Ext: "mp4", OffsetKnown: true,
 		ImportedAt: time.Unix(1700000000, 0).UTC()}
 	insert(t, d, &zero)
 	got, err = d.GetMedia(ctx, zero.ID)
@@ -196,12 +291,13 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 	want := zero
 	want.TakenAtSource = "none"
 	want.OffsetKnown = false
+	want.ThumbState = "pending"
 	if got != want {
 		t.Errorf("zero round trip:\n got %+v\nwant %+v", got, want)
 	}
 
 	// Conflict.
-	dup := Media{Hash: full.Hash, RelPath: "other.jpg", FileType: "image", Ext: "jpg"}
+	dup := Media{Hash: full.Hash, Size: 1, RelPath: "other.jpg", FileType: "image", Ext: "jpg"}
 	if insert(t, d, &dup) {
 		t.Error("duplicate hash inserted")
 	}
@@ -224,7 +320,7 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 func TestUpdateMetadataAndSize(t *testing.T) {
 	ctx := context.Background()
 	d := newDB(t)
-	m := Media{Hash: 1, RelPath: "a.jpg", FileType: "image", Ext: "jpg", CameraModel: "old", Lat: 1, Lon: 2, HasGPS: true}
+	m := Media{Hash: 1, Size: 1, RelPath: "a.jpg", FileType: "image", Ext: "jpg", CameraModel: "old", Lat: 1, Lon: 2, HasGPS: true}
 	insert(t, d, &m)
 	upd := Media{TakenAt: time.Date(2019, 5, 6, 7, 8, 9, 0, time.UTC), TakenAtSource: "exif",
 		Width: 10, Height: 20, CameraModel: "new", Lens: "L"}
@@ -242,12 +338,15 @@ func TestUpdateMetadataAndSize(t *testing.T) {
 	if err := d.UpdateSize(ctx, nil, 999, 1); !errors.Is(err, sql.ErrNoRows) {
 		t.Errorf("UpdateSize(missing) = %v", err)
 	}
+	if err := d.UpdateSize(ctx, nil, m.ID, 0); err == nil {
+		t.Error("UpdateSize(0) succeeded")
+	}
 }
 
 func TestRelPathTakenCaseInsensitive(t *testing.T) {
 	ctx := context.Background()
 	d := newDB(t)
-	insert(t, d, &Media{Hash: 1, RelPath: "image/2020/01/IMG_001.JPG", FileType: "image", Ext: "jpg"})
+	insert(t, d, &Media{Hash: 1, Size: 1, RelPath: "image/2020/01/IMG_001.JPG", FileType: "image", Ext: "jpg"})
 	for _, p := range []string{"image/2020/01/IMG_001.JPG", "image/2020/01/img_001.jpg", "IMAGE/2020/01/Img_001.Jpg"} {
 		if ok, err := d.RelPathTaken(ctx, p); err != nil || !ok {
 			t.Errorf("RelPathTaken(%q) = %v %v", p, ok, err)
@@ -381,193 +480,6 @@ func TestSessions(t *testing.T) {
 	}
 }
 
-const v1DDL = `CREATE TABLE media (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, hash INTEGER UNIQUE, original_path TEXT,
-    new_path TEXT, date_taken DATETIME, file_type TEXT, location TEXT,
-    camera_model TEXT, camera_make TEXT, camera_type TEXT, resolution TEXT)`
-
-func TestLegacyMigration(t *testing.T) {
-	ctx := context.Background()
-	root := filepath.Join(t.TempDir(), "Photo Lib")
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p := filepath.Join(root, "media.db")
-
-	raw, err := sql.Open("sqlite", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(v1DDL); err != nil {
-		t.Fatal(err)
-	}
-	// Path under the actual root, with different case (case-insensitive strip).
-	underRoot := strings.ToUpper(filepath.Join(root, "video", "2021", "05", "c.mp4")[:1]) +
-		filepath.Join(root, "video", "2021", "05", "c.mp4")[1:]
-	type v1 struct {
-		hash                     int64
-		orig, newPath            string
-		date                     any
-		ftype                    string
-		loc                      any
-		model, make, ctype, reso string
-	}
-	rows := []v1{
-		{-42, `C:\src\a.jpg`, `D:\images\image\2020\01\a.jpg`, "2020-01-02 03:04:05+00:00", "image", "60.1699,24.9384", "iPhone", "Apple", "phone", "4032x3024"},
-		{2, "/home/u/b.jpg", "/mnt/d/images/image/2019/07/b.JPG", "2019-07-08 09:10:11.5+00:00", "image", "-33.5,151.25", "", "", "unknown", "unknown"},
-		{3, "/src/c.mp4", underRoot, "2021-05-06 18:30:00+03:00", "video", "+60.1699+024.9384+010.000/", "Pixel", "Google", "phone", "1920x1080"},
-		{4, "/src/d.cr2", `D:\images\image_raw\2018\02\d.cr2`, "0001-01-01 00:00:00+00:00", "image_raw", nil, "EOS", "Canon", "camera", "6000x4000"},
-		{5, "/src/e.jpg", "/elsewhere/e.jpg", time.Date(2017, 3, 4, 5, 6, 7, 0, time.UTC), "image", "", "", "", "", "garbage"},
-		{6, "/src/f.mp4", `D:\images\video\2016\01\f.mp4`, "not a date", "video", "+48.85-002.29/", "", "", "", "640x480"},
-	}
-	for _, r := range rows {
-		if _, err := raw.Exec(`INSERT INTO media (hash, original_path, new_path, date_taken, file_type, location,
-			camera_model, camera_make, camera_type, resolution) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.hash, r.orig, r.newPath, r.date, r.ftype, r.loc, r.model, r.make, r.ctype, r.reso); err != nil {
-			t.Fatal(err)
-		}
-	}
-	raw.Close()
-
-	d := openTest(t, p)
-	if v := userVersion(t, d); v != SchemaVersion {
-		t.Fatalf("user_version = %d", v)
-	}
-	var n int
-	if err := d.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_v1'").Scan(&n); err != nil || n != 0 {
-		t.Fatalf("media_v1 still present: %d %v", n, err)
-	}
-	backups, _ := filepath.Glob(filepath.Join(root, "media.db.v1-*.bak"))
-	if len(backups) != 1 {
-		t.Fatalf("backups = %v", backups)
-	}
-	bk, err := sql.Open("sqlite", backups[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := bk.QueryRow("SELECT COUNT(*) FROM media WHERE new_path IS NOT NULL").Scan(&n); err != nil || n != len(rows) {
-		t.Errorf("backup rows = %d %v", n, err)
-	}
-	bk.Close()
-
-	all, err := d.List(ctx, ListOptions{OrderBy: "id"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != len(rows) {
-		t.Fatalf("migrated %d rows, want %d", len(all), len(rows))
-	}
-	byHash := map[int64]Media{}
-	for _, m := range all {
-		byHash[int64(m.Hash)] = m
-	}
-	type want struct {
-		rel, ext, taken, source string
-		lat, lon                float64
-		gps                     bool
-		alt                     float64
-		hasAlt                  bool
-		w, h                    int
-	}
-	wants := map[int64]want{
-		-42: {"image/2020/01/a.jpg", "jpg", "2020-01-02 03:04:05", "legacy", 60.1699, 24.9384, true, 0, false, 4032, 3024},
-		2:   {"image/2019/07/b.JPG", "jpg", "2019-07-08 09:10:11", "legacy", -33.5, 151.25, true, 0, false, 0, 0},
-		3:   {"video/2021/05/c.mp4", "mp4", "2021-05-06 18:30:00", "legacy", 60.1699, 24.9384, true, 10, true, 1920, 1080},
-		4:   {"image_raw/2018/02/d.cr2", "cr2", "", "none", 0, 0, false, 0, false, 6000, 4000},
-		5:   {"/elsewhere/e.jpg", "jpg", "2017-03-04 05:06:07", "legacy", 0, 0, false, 0, false, 0, 0},
-		6:   {"video/2016/01/f.mp4", "mp4", "", "none", 48.85, -2.29, true, 0, false, 640, 480},
-	}
-	for h, w := range wants {
-		m, ok := byHash[h]
-		if !ok {
-			t.Errorf("hash %d missing", h)
-			continue
-		}
-		taken := ""
-		if !m.TakenAt.IsZero() {
-			taken = m.TakenAt.Format("2006-01-02 15:04:05")
-		}
-		if m.RelPath != w.rel || m.Ext != w.ext || taken != w.taken || m.TakenAtSource != w.source ||
-			m.OffsetKnown != (h == 3) || m.HasGPS != w.gps || m.Lat != w.lat || m.Lon != w.lon ||
-			m.HasAltitude != w.hasAlt || m.Altitude != w.alt || m.Width != w.w || m.Height != w.h {
-			t.Errorf("hash %d: got %+v\nwant %+v", h, m, w)
-		}
-		if _, off := m.TakenAt.Zone(); h == 3 && off != 3*3600 {
-			t.Errorf("hash 3: offset = %d, want %d", off, 3*3600)
-		}
-		if m.ImportedAt.IsZero() || m.Size != 0 {
-			t.Errorf("hash %d: imported_at=%v size=%d", h, m.ImportedAt, m.Size)
-		}
-	}
-	a := byHash[-42]
-	if a.OriginalPath != `C:\src\a.jpg` || a.FileType != "image" || a.CameraMake != "Apple" ||
-		a.CameraModel != "iPhone" || a.CameraType != "phone" || uint64(a.Hash) != uint64(0xFFFFFFFFFFFFFFD6) {
-		t.Errorf("row -42 fields: %+v", a)
-	}
-	if rel, found, _ := d.LookupHash(ctx, uint64(0xFFFFFFFFFFFFFFD6)); !found || rel != "image/2020/01/a.jpg" {
-		t.Errorf("LookupHash after migration = %q %v", rel, found)
-	}
-
-	// Inserting after migration works and reopening is a no-op.
-	insert(t, d, &Media{Hash: 100, RelPath: "image/new.jpg", FileType: "image", Ext: "jpg"})
-	d.Close()
-	d = openTest(t, p)
-	if err := d.QueryRow("SELECT COUNT(*) FROM media").Scan(&n); err != nil || n != len(rows)+1 {
-		t.Errorf("rows after reopen = %d %v", n, err)
-	}
-	backups, _ = filepath.Glob(filepath.Join(root, "media.db.v1-*.bak"))
-	if len(backups) != 1 {
-		t.Errorf("reopen created another backup: %v", backups)
-	}
-}
-
-func TestLegacyRelPath(t *testing.T) {
-	root := "/data/Lib"
-	cases := []struct {
-		in, want string
-		ok       bool
-	}{
-		{"/data/lib/image/2020/01/a.jpg", "image/2020/01/a.jpg", true},
-		{"/data/Lib/odd/a.jpg", "odd/a.jpg", true},
-		{"/data/Library/image/2020/01/a.jpg", "image/2020/01/a.jpg", true},
-		{`E:\x\video\2020\01\v.mp4`, "video/2020/01/v.mp4", true},
-		{`E:\x\other\2020\01\v.mp4`, "E:/x/other/2020/01/v.mp4", false},
-		{"a.jpg", "a.jpg", false},
-	}
-	for _, c := range cases {
-		got, ok := legacyRelPath(c.in, root)
-		if got != c.want || ok != c.ok {
-			t.Errorf("legacyRelPath(%q) = %q %v, want %q %v", c.in, got, ok, c.want, c.ok)
-		}
-	}
-}
-
-// writeV1 creates a v1 database at p with n image rows.
-func writeV1(t *testing.T, p string, n int) {
-	t.Helper()
-	raw, err := sql.Open("sqlite", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	if _, err := raw.Exec(v1DDL); err != nil {
-		t.Fatal(err)
-	}
-	tx, err := raw.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < n; i++ {
-		if _, err := tx.Exec(`INSERT INTO media (hash,new_path,original_path,date_taken,file_type) VALUES (?,?,?,?,?)`,
-			i+1, fmt.Sprintf("/x/image/2020/01/a%d.jpg", i), "/src/a.jpg", "2020-01-02 03:04:05+03:00", "image"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // A '?' in the path would make the driver open a different file.
 func TestOpenRejectsQuestionMark(t *testing.T) {
 	parent := t.TempDir()
@@ -591,29 +503,288 @@ func TestOpenRejectsQuestionMark(t *testing.T) {
 	}
 }
 
-// Two openers of the same v1 database: both succeed, the migration runs
-// once and exactly one backup remains.
-func TestConcurrentLegacyMigration(t *testing.T) {
-	const n = 500
+func TestInsertRejectsZeroSize(t *testing.T) {
+	ctx := context.Background()
+	d := newDB(t)
+	for _, size := range []int64{0, -1} {
+		m := Media{Hash: 1, Size: size, RelPath: "a.jpg", FileType: "image", Ext: "jpg"}
+		if ok, err := d.InsertMedia(ctx, nil, &m); err == nil || ok {
+			t.Errorf("InsertMedia(size %d) = %v %v, want error", size, ok, err)
+		}
+	}
+	if _, err := d.Exec(`INSERT INTO media (hash, rel_path, file_type, ext, taken_at_source, imported_at)
+		VALUES (1, 'a.jpg', 'image', 'jpg', 'none', 1)`); err == nil {
+		t.Error("NULL size accepted by the schema")
+	}
+}
+
+func isConstraint(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "constraint failed")
+}
+
+func TestRelPathUniqueNoCase(t *testing.T) {
+	ctx := context.Background()
+	d := newDB(t)
+	insert(t, d, &Media{Hash: 1, Size: 1, RelPath: "image/2020/01/IMG_001.JPG", FileType: "image", Ext: "jpg"})
+	m := Media{Hash: 2, Size: 1, RelPath: "image/2020/01/img_001.jpg", FileType: "image", Ext: "jpg"}
+	ok, err := d.InsertMedia(ctx, nil, &m)
+	if ok || !isConstraint(err) || !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("case-variant insert = %v %v, want UNIQUE constraint error", ok, err)
+	}
+	if ok, err := d.RelPathTaken(ctx, "IMAGE/2020/01/img_001.jpg"); err != nil || !ok {
+		t.Errorf("RelPathTaken = %v %v", ok, err)
+	}
+	var n int
+	if err := d.QueryRow("SELECT COUNT(*) FROM media").Scan(&n); err != nil || n != 1 {
+		t.Errorf("rows = %d %v", n, err)
+	}
+}
+
+func TestTakenAtSourceCheck(t *testing.T) {
+	ctx := context.Background()
+	d := newDB(t)
+	for i, src := range []string{"exif", "video", "video_utc", "mtime", "none", ""} {
+		m := Media{Hash: uint64(i + 1), Size: 1, RelPath: fmt.Sprintf("%d.jpg", i), FileType: "image", Ext: "jpg", TakenAtSource: src}
+		if _, err := d.InsertMedia(ctx, nil, &m); err != nil {
+			t.Errorf("source %q: %v", src, err)
+		}
+	}
+	for _, src := range []string{"legacy", "legacy_utc", "EXIF"} {
+		m := Media{Hash: 100, Size: 1, RelPath: "bad.jpg", FileType: "image", Ext: "jpg", TakenAtSource: src}
+		if _, err := d.InsertMedia(ctx, nil, &m); !isConstraint(err) {
+			t.Errorf("source %q: err = %v, want CHECK constraint error", src, err)
+		}
+	}
+	m := Media{Hash: 101, Size: 1, RelPath: "bad.jpg", FileType: "image", Ext: "jpg", ThumbState: "bogus"}
+	if _, err := d.InsertMedia(ctx, nil, &m); !isConstraint(err) {
+		t.Errorf("thumb_state bogus: err = %v, want CHECK constraint error", err)
+	}
+}
+
+func TestThumbs(t *testing.T) {
+	ctx := context.Background()
+	d := newDB(t)
+	s1, err := d.BeginSession(ctx, "/a", "copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := d.BeginSession(ctx, "/b", "copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []Media{
+		{Hash: 1, Size: 1, RelPath: "1.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1},
+		{Hash: 2, Size: 1, RelPath: "2.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s2, Width: 10, Height: 20},
+		{Hash: 3, Size: 1, RelPath: "3.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1},
+		{Hash: 4, Size: 1, RelPath: "4.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1, DeletedAt: time.Unix(1, 0)},
+		{Hash: 5, Size: 1, RelPath: "5.jpg", FileType: "image", Ext: "jpg", ThumbState: ThumbStateOK},
+		{Hash: 6, Size: 1, RelPath: "6.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s2},
+	}
+	for i := range rows {
+		insert(t, d, &rows[i])
+	}
+	check := func(limit int, session int64, want string) {
+		t.Helper()
+		got, err := d.ListThumbPending(ctx, limit, session)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := fmt.Sprint(hashes(got)); s != want {
+			t.Errorf("ListThumbPending(%d, %d) = %s, want %s", limit, session, s, want)
+		}
+	}
+	check(0, 0, "[1 2 3 6]")
+	check(2, 0, "[1 2]")
+	check(0, s1, "[1 3]")
+	check(1, s2, "[2]")
+	if p, ok, u, f, err := d.ThumbStats(ctx); err != nil || p != 4 || ok != 1 || u != 0 || f != 0 {
+		t.Errorf("ThumbStats = %d %d %d %d %v", p, ok, u, f, err)
+	}
+
+	before := time.Now().Add(-time.Second)
+	// Row 1 has no dimensions: filled. High-bit phash round-trips.
+	if err := d.SetThumb(ctx, nil, rows[0].ID, ThumbStateOK, "", 0xF000000000000001, 640, 480); err != nil {
+		t.Fatal(err)
+	}
+	// Row 2 has dimensions: kept.
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetThumb(ctx, tx, rows[1].ID, ThumbStateOK, "", 42, 640, 480); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Row 3 fails: phash NULL, w/h 0 leave dimensions unset.
+	if err := d.SetThumb(ctx, nil, rows[2].ID, ThumbStateError, "decode: bad", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Row 6 unsupported; only one of w/h given: dimensions unset.
+	if err := d.SetThumb(ctx, nil, rows[5].ID, ThumbStateUnsupported, "", 0, 100, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	type want struct {
+		state, msg string
+		phash      uint64
+		w, h       int
+		phashNull  bool
+	}
+	for i, w := range map[int]want{
+		0: {ThumbStateOK, "", 0xF000000000000001, 640, 480, false},
+		1: {ThumbStateOK, "", 42, 10, 20, false},
+		2: {ThumbStateError, "decode: bad", 0, 0, 0, true},
+		5: {ThumbStateUnsupported, "", 0, 0, 0, true},
+	} {
+		got, err := d.GetMedia(ctx, rows[i].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ThumbState != w.state || got.ThumbError != w.msg || got.PHash != w.phash ||
+			got.Width != w.w || got.Height != w.h || got.ThumbAt.Before(before) {
+			t.Errorf("row %d after SetThumb: state=%q err=%q phash=%x %dx%d at=%v",
+				i, got.ThumbState, got.ThumbError, got.PHash, got.Width, got.Height, got.ThumbAt)
+		}
+		var ph, wd sql.NullInt64
+		if err := d.QueryRow("SELECT phash, width FROM media WHERE id = ?", rows[i].ID).Scan(&ph, &wd); err != nil {
+			t.Fatal(err)
+		}
+		if ph.Valid == w.phashNull {
+			t.Errorf("row %d: phash NULL = %v, want %v", i, !ph.Valid, w.phashNull)
+		}
+		if wd.Valid != (w.w != 0) {
+			t.Errorf("row %d: width NULL = %v", i, !wd.Valid)
+		}
+	}
+	// Setting phash back to 0 stores NULL.
+	if err := d.SetThumb(ctx, nil, rows[0].ID, ThumbStatePending, "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	var ph sql.NullInt64
+	if err := d.QueryRow("SELECT phash FROM media WHERE id = ?", rows[0].ID).Scan(&ph); err != nil || ph.Valid {
+		t.Errorf("phash after reset = %v %v, want NULL", ph, err)
+	}
+	if got, _ := d.GetMedia(ctx, rows[0].ID); got.Width != 640 || got.PHash != 0 {
+		t.Errorf("after reset: %dx%d phash=%x", got.Width, got.Height, got.PHash)
+	}
+
+	check(0, 0, "[1]")
+	if p, ok, u, f, err := d.ThumbStats(ctx); err != nil || p != 1 || ok != 2 || u != 1 || f != 1 {
+		t.Errorf("ThumbStats = %d %d %d %d %v", p, ok, u, f, err)
+	}
+	if err := d.SetThumb(ctx, nil, 999, ThumbStateOK, "", 0, 0, 0); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("SetThumb(missing) = %v", err)
+	}
+	if err := d.SetThumb(ctx, nil, rows[0].ID, "bogus", "", 0, 0, 0); !isConstraint(err) {
+		t.Errorf("SetThumb(bogus state) = %v", err)
+	}
+	empty := newDB(t)
+	if p, ok, u, f, err := empty.ThumbStats(ctx); err != nil || p+ok+u+f != 0 {
+		t.Errorf("empty ThumbStats = %d %d %d %d %v", p, ok, u, f, err)
+	}
+}
+
+func TestListForThumbs(t *testing.T) {
+	ctx := context.Background()
+	d := newDB(t)
+	s1, err := d.BeginSession(ctx, "/a", "copy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []Media{
+		{Hash: 1, Size: 1, RelPath: "1.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1},
+		{Hash: 2, Size: 1, RelPath: "2.jpg", FileType: "image", Ext: "jpg", ThumbState: ThumbStateOK},
+		{Hash: 3, Size: 1, RelPath: "3.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1, ThumbState: ThumbStateError},
+		{Hash: 4, Size: 1, RelPath: "4.jpg", FileType: "image", Ext: "jpg", DeletedAt: time.Unix(1, 0)},
+		{Hash: 5, Size: 1, RelPath: "5.jpg", FileType: "image", Ext: "jpg", ImportSessionID: s1},
+		{Hash: 6, Size: 1, RelPath: "6.jpg", FileType: "image", Ext: "jpg", ThumbState: ThumbStateUnsupported},
+	}
+	for i := range rows {
+		insert(t, d, &rows[i])
+	}
+	check := func(after int64, limit int, session int64, all bool, want string) {
+		t.Helper()
+		got, err := d.ListForThumbs(ctx, after, limit, session, all)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := fmt.Sprint(hashes(got)); s != want {
+			t.Errorf("ListForThumbs(%d, %d, %d, %v) = %s, want %s", after, limit, session, all, s, want)
+		}
+	}
+	check(0, 0, 0, false, "[1 3 5]")
+	check(0, 0, 0, true, "[1 2 3 5 6]")
+	check(0, 2, 0, true, "[1 2]")
+	check(rows[1].ID, 2, 0, true, "[3 5]")
+	check(rows[4].ID, 0, 0, true, "[6]")
+	check(0, 0, s1, true, "[1 3 5]")
+	check(rows[0].ID, 0, s1, false, "[3 5]")
+	// Paging stays correct while earlier rows change state.
+	if err := d.SetThumb(ctx, nil, rows[0].ID, ThumbStateOK, "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	check(rows[0].ID, 1, 0, false, "[3]")
+	check(rows[2].ID, 1, 0, false, "[5]")
+	// A stale row is selected again; ThumbStats counts it as pending.
+	if err := d.MarkThumbStale(ctx, nil, rows[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := d.GetMedia(ctx, rows[1].ID); err != nil || m.ThumbState != ThumbStateStale {
+		t.Fatalf("after MarkThumbStale: %q %v", m.ThumbState, err)
+	}
+	check(0, 0, 0, false, "[2 3 5]")
+	if pending, ok, _, failed, err := d.ThumbStats(ctx); err != nil || pending != 2 || ok != 1 || failed != 1 {
+		t.Errorf("ThumbStats = pending %d ok %d failed %d, %v", pending, ok, failed, err)
+	}
+	if err := d.MarkThumbStale(ctx, nil, 9999); err != sql.ErrNoRows {
+		t.Errorf("MarkThumbStale(missing) = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// Many concurrent openers of a new database: the schema is created once,
+// every opener succeeds and every insert lands.
+func TestConcurrentOpenAndInsert(t *testing.T) {
+	const openers, perOpener = 8, 50
 	p := filepath.Join(t.TempDir(), "media.db")
-	writeV1(t, p, n)
 	var wg sync.WaitGroup
-	errs := make([]error, 2)
-	for i := range errs {
+	errs := make([]error, openers)
+	for i := range openers {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			d, err := Open(context.Background(), p, nil)
-			errs[i] = err
-			if err == nil {
-				d.Close()
+			ctx := context.Background()
+			d, err := Open(ctx, p, nil)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer d.Close()
+			for j := range perOpener {
+				tx, err := d.BeginTx(ctx, nil)
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				m := Media{Hash: uint64(i*perOpener + j + 1), Size: 1, FileType: "image", Ext: "jpg",
+					RelPath: fmt.Sprintf("image/%d/%d.jpg", i, j)}
+				if _, err := d.InsertMedia(ctx, tx, &m); err != nil {
+					tx.Rollback()
+					errs[i] = err
+					return
+				}
+				if err := tx.Commit(); err != nil {
+					errs[i] = err
+					return
+				}
 			}
 		}(i)
 	}
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			t.Errorf("concurrent Open failed: %v", err)
+			t.Errorf("concurrent opener failed: %v", err)
 		}
 	}
 	d := openTest(t, p)
@@ -621,120 +792,11 @@ func TestConcurrentLegacyMigration(t *testing.T) {
 		t.Errorf("user_version = %d", v)
 	}
 	var c int
-	if err := d.QueryRow("SELECT COUNT(*) FROM media").Scan(&c); err != nil || c != n {
-		t.Errorf("rows = %d %v, want %d", c, err, n)
-	}
-	backups, _ := filepath.Glob(p + ".v1-*.bak")
-	if len(backups) != 1 {
-		t.Errorf("backups = %v, want exactly one", backups)
-	}
-	if tmps, _ := filepath.Glob(p + ".v1-*.tmp"); len(tmps) != 0 {
-		t.Errorf("temp files left: %v", tmps)
+	if err := d.QueryRow("SELECT COUNT(*) FROM media").Scan(&c); err != nil || c != openers*perOpener {
+		t.Errorf("rows = %d %v, want %d", c, err, openers*perOpener)
 	}
 }
 
-// A failed backup leaves no file named like a backup (nor a temp file).
-func TestFailedBackupLeavesNoFile(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "media.db")
-	writeV1(t, p, 10)
-	sqldb, err := sql.Open("sqlite", p+dsnParams)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-	d := &DB{DB: sqldb, path: p, logger: slog.New(slog.DiscardHandler)}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := d.migrateLegacy(ctx); err == nil {
-		t.Fatal("migrateLegacy with a cancelled context succeeded")
-	}
-	m, _ := filepath.Glob(p + ".v1-*")
-	if len(m) != 0 {
-		t.Errorf("failed backup left files: %v", m)
-	}
-}
-
-func TestLegacyMigrationOffsets(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	p := filepath.Join(root, "media.db")
-	raw, err := sql.Open("sqlite", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(v1DDL); err != nil {
-		t.Fatal(err)
-	}
-	rows := []struct {
-		hash         int64
-		date, ftype  string
-		loc          string
-		wantKnown    bool
-		wantOffset   int
-		wantSource   string
-		wantWallText string
-	}{
-		{1, "2021-05-06 18:30:00+00:00", "video", "0.000000,0.000000", true, 0, "legacy_utc", "2021-05-06 18:30:00"},
-		{2, "2021-05-06 18:30:00+03:00", "video", "", true, 10800, "legacy", "2021-05-06 18:30:00"},
-		{3, "2020-01-02 03:04:05+00:00", "image", "", false, 0, "legacy", "2020-01-02 03:04:05"},
-		{4, "2020-01-02 03:04:05+03:00", "image", "", true, 10800, "legacy", "2020-01-02 03:04:05"},
-		{5, "2020-01-02 03:04:05+00:00", "image_raw", "", false, 0, "legacy", "2020-01-02 03:04:05"},
-	}
-	for _, r := range rows {
-		if _, err := raw.Exec(`INSERT INTO media (hash, new_path, date_taken, file_type, location) VALUES (?, ?, ?, ?, ?)`,
-			r.hash, fmt.Sprintf("/x/%s/2020/01/f%d", r.ftype, r.hash), r.date, r.ftype, r.loc); err != nil {
-			t.Fatal(err)
-		}
-	}
-	raw.Close()
-
-	d := openTest(t, p)
-	for _, r := range rows {
-		var id int64
-		if err := d.QueryRow("SELECT id FROM media WHERE hash = ?", r.hash).Scan(&id); err != nil {
-			t.Fatalf("hash %d: %v", r.hash, err)
-		}
-		m, err := d.GetMedia(ctx, id)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, off := m.TakenAt.Zone()
-		if m.OffsetKnown != r.wantKnown || (r.wantKnown && off != r.wantOffset) ||
-			m.TakenAtSource != r.wantSource || m.TakenAt.Format("2006-01-02 15:04:05") != r.wantWallText {
-			t.Errorf("hash %d: known=%v offset=%d source=%q wall=%s, want %v %d %q %s", r.hash,
-				m.OffsetKnown, off, m.TakenAtSource, m.TakenAt.Format("2006-01-02 15:04:05"),
-				r.wantKnown, r.wantOffset, r.wantSource, r.wantWallText)
-		}
-		if r.hash == 1 && m.HasGPS {
-			t.Errorf("hash 1: 0,0 location gave HasGPS (%v,%v)", m.Lat, m.Lon)
-		}
-	}
-}
-
-func TestLegacyTimeZoneless(t *testing.T) {
-	for _, v := range []any{"2020-01-02 03:04:05", []byte("2020-01-02T03:04:05")} {
-		if _, off, source := legacyTakenAt(v, "video"); off != nil || source != "legacy" {
-			t.Errorf("legacyTakenAt(%q) offset=%v source=%q, want unknown/legacy", v, off, source)
-		}
-	}
-	if w, off, source := legacyTakenAt("0001-01-01 00:00:00+00:00", "video"); w != nil || off != nil || source != "none" {
-		t.Errorf("zero time: %v %v %q", w, off, source)
-	}
-}
-
-func TestLegacyLocationNullIsland(t *testing.T) {
-	for _, s := range []string{"0.000000,0.000000", "+00.0000+000.0000/"} {
-		if _, _, _, _, ok := legacyLocation(s); ok {
-			t.Errorf("legacyLocation(%q) ok, want no location", s)
-		}
-	}
-	if la, lo, _, _, ok := legacyLocation("0.000000,24.5"); !ok || la != 0 || lo != 24.5 {
-		t.Errorf("legacyLocation on equator rejected: %v %v %v", la, lo, ok)
-	}
-}
-
-// OpenExisting never creates or migrates: a missing file and a v1 database
-// are errors, and the v1 file is left untouched.
 func TestOpenExisting(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -746,19 +808,16 @@ func TestOpenExisting(t *testing.T) {
 	if _, err := os.Stat(p); err == nil {
 		t.Fatal("OpenExisting created the database")
 	}
-	writeV1(t, p, 2)
-	before, _ := os.ReadFile(p)
-	if d, err := OpenExisting(ctx, p, nil); !errors.Is(err, ErrNeedsMigration) {
-		if d != nil {
-			d.Close()
-		}
-		t.Fatalf("OpenExisting(v1) = %v, want ErrNeedsMigration", err)
+	// An empty file is not a catalog and is not initialised.
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if after, _ := os.ReadFile(p); !bytes.Equal(before, after) {
-		t.Error("OpenExisting modified the v1 database")
+	if d, err := OpenExisting(ctx, p, nil); err == nil {
+		d.Close()
+		t.Fatal("OpenExisting of an empty file succeeded")
 	}
-	if m, _ := filepath.Glob(p + ".v1-*"); len(m) != 0 {
-		t.Errorf("OpenExisting wrote a backup: %v", m)
+	if fi, _ := os.Stat(p); fi.Size() != 0 {
+		t.Fatal("OpenExisting wrote to an empty file")
 	}
 	d, err := Open(ctx, p, nil)
 	if err != nil {
@@ -767,7 +826,10 @@ func TestOpenExisting(t *testing.T) {
 	d.Close()
 	d, err = OpenExisting(ctx, p, nil)
 	if err != nil {
-		t.Fatalf("OpenExisting after migration: %v", err)
+		t.Fatalf("OpenExisting after create: %v", err)
+	}
+	if v := userVersion(t, d); v != SchemaVersion {
+		t.Errorf("user_version = %d", v)
 	}
 	d.Close()
 }

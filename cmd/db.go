@@ -1,14 +1,21 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	"picmover/internal/catalog"
+	"picmover/internal/library"
+	"picmover/internal/thumbs"
 )
 
 func newDBCmd() *cobra.Command {
@@ -32,7 +39,7 @@ or with --list a table of catalog rows (newest first).`,
 				return fmt.Errorf("--limit must be >= 0")
 			}
 			ctx := cmd.Context()
-			_, db, err := openExisting(ctx, args[0])
+			lib, db, err := openExisting(ctx, args[0])
 			if err != nil {
 				return err
 			}
@@ -52,6 +59,9 @@ or with --list a table of catalog rows (newest first).`,
 				return err
 			}
 			printSummary(out, s)
+			if err := printThumbStats(ctx, out, lib, db); err != nil {
+				return err
+			}
 			fmt.Fprintf(out, "\nMost recent files:\n")
 			for _, m := range rows {
 				fmt.Fprintf(out, "%s - %s (%s)\n", formatTakenAt(m.TakenAt, m.OffsetKnown), m.RelPath, m.FileType)
@@ -90,14 +100,46 @@ func printSummary(w io.Writer, s catalog.Summary) {
 	fmt.Fprintf(w, "Unique camera models: %d\n", s.UniqueModels)
 }
 
+// printThumbStats prints the thumbnail states and the cache size. The
+// cache is opened read-only (thumbs.OpenStoreReadOnly), so db never creates
+// or writes it; a missing, locked or incompatible cache is reported as
+// unavailable instead of failing the command.
+func printThumbStats(ctx context.Context, w io.Writer, lib *library.Library, db *catalog.DB) error {
+	pending, ok, unsupported, failed, err := db.ThumbStats(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "Thumbnails:           %d ok, %d pending, %d unsupported, %d failed\n", ok, pending, unsupported, failed)
+	if _, err := os.Stat(filepath.Join(lib.Root(), library.MetaDir, thumbs.DBName)); errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(w, "Thumbnail cache:      0 entries, %s\n", humanSize(0))
+		return nil
+	}
+	count, size, err := cacheStats(ctx, lib)
+	if err != nil {
+		fmt.Fprintf(w, "Thumbnail cache:      unavailable (%v)\n", err)
+		return nil
+	}
+	fmt.Fprintf(w, "Thumbnail cache:      %d entries, %s\n", count, humanSize(size))
+	return nil
+}
+
+func cacheStats(ctx context.Context, lib *library.Library) (count, size int64, err error) {
+	store, err := thumbs.OpenStoreReadOnly(lib)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer store.Close()
+	return store.Stats(ctx)
+}
+
 func printMediaTable(w io.Writer, rows []catalog.Media) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tHASH\tPATH\tTAKEN AT\tTYPE\tWxH\tLAT,LON\tCAMERA")
+	fmt.Fprintln(tw, "ID\tHASH\tPATH\tTAKEN AT\tTYPE\tWxH\tLAT,LON\tCAMERA\tTHUMB")
 	for _, m := range rows {
-		fmt.Fprintf(tw, "%d\t%016x\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%d\t%016x\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			m.ID, m.Hash, m.RelPath, formatTakenAt(m.TakenAt, m.OffsetKnown), m.FileType,
 			orDash(formatResolution(m.Width, m.Height)), orDash(formatLatLon(m.Lat, m.Lon, m.HasGPS)),
-			orDash(strings.TrimSpace(m.CameraMake+" "+m.CameraModel)))
+			orDash(strings.TrimSpace(m.CameraMake+" "+m.CameraModel)), orDash(m.ThumbState))
 	}
 	tw.Flush()
 	fmt.Fprintf(w, "\nTotal files displayed: %d\n", len(rows))

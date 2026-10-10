@@ -82,6 +82,12 @@ func HashFile(p string) (hash uint64, size int64, err error)       // xxhash64
 
 ## internal/catalog
 
+> **Superseded in part by `thumbnails.md`:** the catalog is now schema v3
+> and there is no migration (any other `user_version` is refused with
+> `ErrNeedsRebuild`; `migrate_legacy.go` and `ErrNeedsMigration` are gone).
+> See "Policy change" and "internal/catalog: schema v3" there; the rest of
+> this section describes the v2 contract that v3 extends.
+
 File: `internal/catalog/catalog.go` (open/migrate), `schema.go`, `media.go`
 (types and queries), `migrate_legacy.go`, tests in `catalog_test.go`.
 
@@ -275,64 +281,6 @@ func (d *DB) FinishSession(ctx context.Context, id int64, s SessionStats) error
 `Summary` must not fail on an empty database (NULL aggregates). `WithGPS`
 counts rows with `lat IS NOT NULL`. Counts exclude soft-deleted rows except
 `Deleted`.
-
-### Migration from v1
-
-The v1 schema (from the old `cmd/import.go`):
-
-```sql
-CREATE TABLE media (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, hash INTEGER UNIQUE, original_path TEXT,
-    new_path TEXT, date_taken DATETIME, file_type TEXT, location TEXT,
-    camera_model TEXT, camera_make TEXT, camera_type TEXT, resolution TEXT)
-```
-
-`date_taken` was written by mattn/go-sqlite3 as text
-`"2006-01-02 15:04:05.999999999-07:00"`; images were parsed as UTC so they
-carry `+00:00`; a zero time appears as `0001-01-01 ...`. The modernc driver
-may hand a DATETIME column back as `time.Time` or as `string`/`[]byte`, so
-scan into `any` and handle both. `location` is `"lat,lon"` for images and an
-ISO6709 string (possibly with a trailing `/`) for videos; use
-`internal/geo`. `resolution` is `"WxH"` or `"unknown"`. `new_path` is an
-absolute path in whatever OS wrote it (`D:\images\image\2020\01\a.jpg` or
-`/mnt/d/images/image/2020/01/a.jpg`).
-
-Procedure in `Open` when a legacy DB is detected:
-
-1. `VACUUM INTO` (bound parameter) a unique temp file next to the DB, then
-   move it to `'<dbdir>/media.db.v1-<YYYYMMDD-HHMMSS>.bak'` without
-   overwriting an existing backup. Fail if the backup cannot be written; on
-   failure the temp file is removed, so no partial `.bak` is left.
-2. In one (IMMEDIATE) transaction: first re-check that the DB is still legacy
-   (`user_version` 0 and `media.new_path` exists); if another process
-   migrated it meanwhile, roll back, delete this process's backup and carry
-   on. Then `ALTER TABLE media RENAME TO media_v1`; create the v2
-   schema; read **all** v1 rows into memory first (close the cursor), then
-   insert transformed rows; `DROP TABLE media_v1`; `PRAGMA user_version = 2`.
-3. Transform per row:
-   - `hash`: copy the int64 as-is.
-   - `rel_path`: convert `new_path` with backslashes normalised to `/`. If it
-     starts with the library root (the directory containing the DB, compared
-     case-insensitively) strip it. Otherwise take the last four path
-     segments when the fourth-from-last is one of `image`, `image_raw`,
-     `video` (the v1 layout was always `<root>/<type>/YYYY/MM/<name>`).
-     Otherwise keep the full normalised path and log a warning.
-   - `taken_at`: parse `date_taken`; take its wall-clock fields. The offset
-     depends on what v1 stored: a `video` at `+00:00` was a true UTC instant
-     from ffprobe -> offset 0, source `legacy_utc`; any type at a non-zero
-     offset was the file mtime in local time -> keep that offset, source
-     `legacy`; an `image`/`image_raw` at `+00:00` (EXIF without zone, the
-     `+00:00` is a placeholder) or a value without any zone -> offset NULL,
-     source `legacy`. Zero/unparseable -> NULL and source `none`.
-   - A `location` of exactly `0,0` (Null Island) counts as no location.
-   - `lat/lon/altitude` from `location`; `width/height` from `resolution`.
-   - `ext` from the file name; `file_type` as-is; `original_path` as-is;
-     `imported_at = now`; `size`, `orientation`, `duration_ms`, `lens` NULL/empty.
-4. Log the number of rows migrated and the number with unresolved paths.
-
-A later `migrations` table/map keyed by from-version handles 2 -> 3 etc.
-Opening a DB whose `user_version` is greater than `SchemaVersion` must fail
-with a clear error.
 
 ### Tests (catalog_test.go)
 

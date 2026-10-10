@@ -71,6 +71,12 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 			return true
 		}
 		if isZip(name) {
+			if im.opts.RecordInPlace {
+				// Extracting would copy the entries into the library.
+				im.scanned.Add(1)
+				im.report(Result{Status: StatusNonMedia, Source: p, Message: "zip archive; not extracted when recording in place"})
+				return true
+			}
 			return send(job{path: p, zip: true})
 		}
 		im.scanned.Add(1)

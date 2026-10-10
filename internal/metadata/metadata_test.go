@@ -33,8 +33,13 @@ func TestClassify(t *testing.T) {
 		{"noext", "", false},
 		{"", "", false},
 		{".jpg.txt", "", false},
-		{"f.heic", "", false},
-		{"f.webp", "", false},
+		{"f.heic", KindImage, true},
+		{"f.HEIF", KindImage, true},
+		{"f.avif", KindImage, true},
+		{"f.webp", KindImage, true},
+		{"f.GIF", KindImage, true},
+		{"f.bmp", KindImage, true},
+		{"f.jxl", "", false},
 		{"trailingdot.", "", false},
 	}
 	for _, tt := range tests {

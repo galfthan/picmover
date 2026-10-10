@@ -71,6 +71,16 @@ func TestIsInternal(t *testing.T) {
 		"import_x.txt":                              false,
 		"media.v1-20240101.bak":                     false,
 		"media.db.v1-20240101.bak":                  true,
+		"media.db.bak-20261010-120000":              true,
+		"media.db.bak-20261010-120000-wal":          true,
+		"media.db.bak-20261010-120000-shm":          true,
+		"media.db.bak-20261010-120000-journal":      true,
+		"media.db.bak-20261010-120000-foo":          false,
+		"media.db.bak-holiday.jpg":                  false,
+		"media.db.bak-20261010120000":               false,
+		"media.db.bak-2026101a-120000":              false,
+		"media.db.bak-20261010-120000.jpg":          false,
+		"image/media.db.bak-20261010-120000":        false,
 		"import_2024-01-01.log":                     true,
 		".picmover":                                 true,
 		".picmover/tmp/x.part":                      true,
@@ -262,8 +272,8 @@ func TestAttach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.Root() != filepath.Clean(dir) {
-		t.Errorf("Root = %q", l.Root())
+	if want, _ := filepath.EvalSymlinks(dir); l.Root() != want {
+		t.Errorf("Root = %q, want %q", l.Root(), want)
 	}
 	if _, err := os.Stat(l.TempDir()); !os.IsNotExist(err) {
 		t.Errorf("Attach created %s (err %v)", l.TempDir(), err)
@@ -281,5 +291,61 @@ func TestAttach(t *testing.T) {
 	}
 	if _, err := Attach(file); err == nil {
 		t.Error("Attach of a regular file succeeded")
+	}
+}
+
+// A library opened through a symlinked path resolves its root, and paths
+// spelled through either the link or the target are recognised.
+func TestSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks not available: %v", err)
+	}
+	realLib, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realLib = filepath.Join(realLib, "lib")
+	linkLib := filepath.Join(link, "lib")
+	for name, openFn := range map[string]func(string) (*Library, error){"Open": Open, "Attach": Attach} {
+		l, err := openFn(linkLib)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if l.Root() != realLib {
+			t.Errorf("%s: Root = %q, want %q", name, l.Root(), realLib)
+		}
+		for _, root := range []string{realLib, linkLib} {
+			p := filepath.Join(root, "image", "2020", "01", "a.jpg")
+			if rel, err := l.Rel(p); err != nil || rel != "image/2020/01/a.jpg" {
+				t.Errorf("%s: Rel(%q) = %q, %v", name, p, rel, err)
+			}
+			if !l.Contains(p) {
+				t.Errorf("%s: Contains(%q) = false", name, p)
+			}
+			if l.IsInternal(p) {
+				t.Errorf("%s: IsInternal(%q) = true", name, p)
+			}
+			for _, in := range []string{
+				filepath.Join(root, MetaDir, "previews", "ab", "ab01.jpg"),
+				filepath.Join(root, DBName),
+				filepath.Join(root, DBName+".bak-20261010-120000"),
+			} {
+				if !l.IsInternal(in) {
+					t.Errorf("%s: IsInternal(%q) = false", name, in)
+				}
+			}
+			if l.Contains(root) {
+				t.Errorf("%s: Contains(root %q) = true", name, root)
+			}
+			if out := filepath.Join(filepath.Dir(root), "other", "a.jpg"); l.Contains(out) || l.IsInternal(out) {
+				t.Errorf("%s: %q reported inside", name, out)
+			}
+		}
 	}
 }

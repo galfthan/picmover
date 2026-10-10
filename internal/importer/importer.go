@@ -11,6 +11,12 @@
 // committed are move sources deleted; if an insert loses a hash race or the
 // commit fails, the file operations of the affected items are undone.
 // Nothing is ever overwritten.
+//
+// After the copy stage, unless Options.NoThumbs, Run runs the thumbnail
+// stage (RunThumbs) over the rows of this session: N workers generate the
+// thumbnail, preview and perceptual hash of each library file into the
+// cache (internal/thumbs), and a single writer records the outcome in the
+// catalog in batches.
 package importer
 
 import (
@@ -59,6 +65,9 @@ type Result struct {
 type Stats struct {
 	Scanned, Imported, Existing, Duplicates, SkippedSmall, NonMedia, Errors int64
 	BytesCopied                                                             int64
+	// Thumbnail stage: rows that got renditions (ok), that cannot have
+	// any (unsupported), and that failed (error).
+	ThumbsDone, ThumbsUnsupported, ThumbsFailed int64
 }
 
 // Options configure an import.
@@ -73,6 +82,21 @@ type Options struct {
 	OnProgress       func(Stats)        // optional, called every ProgressInterval and once at the end
 	ProgressInterval time.Duration      // <=0: 200ms
 	ForceCopy        bool               // testing: never rename when moving; always copy+verify+delete
+
+	// RecordInPlace records the library's own files where they are (for
+	// "picmover rebuild"). Source must be the library root. Every regular,
+	// non-internal media file under it is recorded at its current path,
+	// whatever its folder: nothing is copied, moved or deleted. A file whose
+	// hash is already recorded is reported as a duplicate and left alone; a
+	// file whose path is already recorded under another case is an error
+	// result. Zip archives are not extracted and symbolic links are not
+	// recorded. Move is ignored.
+	RecordInPlace bool
+
+	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
+	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64
+	ThumbLimit   int    // RunThumbs processes at most this many rows; <=0: no limit
+	FFmpeg       string // ffmpeg path for video thumbnails; "" = look it up
 }
 
 const (
@@ -98,6 +122,7 @@ type Importer struct {
 	dirNames map[string]map[string]struct{} // catalog dir -> lower-cased names on disk or claimed in this import
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
+	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
 }
 
 // pending is a file that is fully on disk in the library and waits for the
@@ -135,9 +160,12 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		dirNames: map[string]map[string]struct{}{}}
 }
 
-// Run executes the import. It always returns the final stats, plus
-// ctx.Err() when cancelled or a fatal error (the source cannot be stat'ed,
-// the catalog cannot be written). Per-file problems are results, not errors.
+// Run executes the import and then, unless Options.NoThumbs, the thumbnail
+// stage for the rows of this session (RunThumbs). The thumbnail stage only
+// runs when the copy stage finished without cancellation or a fatal error.
+// Run always returns the final stats, plus ctx.Err() when cancelled or a
+// fatal error (the source cannot be stat'ed, the catalog or the thumbnail
+// cache cannot be written). Per-file problems are results, not errors.
 func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if err := im.lib.CleanTemp(); err != nil {
 		return im.Stats(), fmt.Errorf("importer: clean temp dir: %w", err)
@@ -155,7 +183,15 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 		return im.Stats(), fmt.Errorf("importer: source: %w", err)
 	}
 	mode := "copy"
-	if im.opts.Move {
+	switch {
+	case im.opts.RecordInPlace:
+		rootInfo, err := os.Stat(im.lib.Root())
+		if err != nil || !os.SameFile(srcInfo, rootInfo) {
+			return im.Stats(), fmt.Errorf("importer: record in place: source %s is not the library root %s", src, im.lib.Root())
+		}
+		src = im.lib.Root() // the spelling Rel and IsInternal know
+		mode = "record"
+	case im.opts.Move:
 		mode = "move"
 	}
 	im.sessionID, err = im.db.BeginSession(ctx, src, mode)
@@ -172,25 +208,7 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	jobs := make(chan job, im.opts.Workers*4)
 	pend := make(chan *pending, batchSize)
 
-	stopProgress := make(chan struct{})
-	progressDone := make(chan struct{})
-	go func() {
-		defer close(progressDone)
-		if im.opts.OnProgress == nil {
-			<-stopProgress
-			return
-		}
-		t := time.NewTicker(im.opts.ProgressInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				im.opts.OnProgress(im.Stats())
-			case <-stopProgress:
-				return
-			}
-		}
-	}()
+	stopProgress := im.startProgress()
 
 	writerErr := make(chan error, 1)
 	go func() { writerErr <- im.writer(pend) }()
@@ -205,8 +223,7 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	wg.Wait()
 	close(pend)
 	fatal := <-writerErr
-	close(stopProgress)
-	<-progressDone
+	stopProgress()
 
 	stats := im.Stats()
 	if err := im.db.FinishSession(context.Background(), im.sessionID, catalog.SessionStats{
@@ -217,9 +234,6 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 		if fatal == nil {
 			fatal = fmt.Errorf("importer: %w", err)
 		}
-	}
-	if im.opts.OnProgress != nil {
-		im.opts.OnProgress(stats)
 	}
 	im.log.Info("import finished", "source", src, "library", im.lib.Root(), "mode", mode,
 		"workers", im.opts.Workers, "scanned", stats.Scanned, "imported", stats.Imported,
@@ -232,7 +246,56 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
-	return stats, nil
+	if im.opts.NoThumbs {
+		return stats, nil
+	}
+	// The thumbnail stage reads the library copies, after every file of
+	// this session is recorded; a failure here leaves rows pending and
+	// never affects the imported files.
+	stats, err = im.RunThumbs(ctx, im.sessionID, false)
+	if err != nil && ctx.Err() == nil {
+		return stats, &ThumbStageError{Err: err}
+	}
+	return stats, err
+}
+
+// ThumbStageError is returned by Run when the copy stage succeeded but the
+// thumbnail stage failed fatally (for example the cache has an
+// incompatible format). Every file of the import is recorded; the rows not
+// processed stay pending for "picmover thumbs".
+type ThumbStageError struct {
+	Err error
+}
+
+func (e *ThumbStageError) Error() string { return "thumbnail stage: " + e.Err.Error() }
+func (e *ThumbStageError) Unwrap() error { return e.Err }
+
+// startProgress calls OnProgress every ProgressInterval until the returned
+// function is called; that function also makes one final call.
+func (im *Importer) startProgress() (stop func()) {
+	if im.opts.OnProgress == nil {
+		return func() {}
+	}
+	stopc := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(im.opts.ProgressInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				im.opts.OnProgress(im.Stats())
+			case <-stopc:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stopc)
+		<-done
+		im.opts.OnProgress(im.Stats())
+	}
 }
 
 // Stats returns a snapshot of the counters.
@@ -246,6 +309,10 @@ func (im *Importer) Stats() Stats {
 		NonMedia:     im.nonMedia.Load(),
 		Errors:       im.errs.Load(),
 		BytesCopied:  im.bytesCopied.Load(),
+
+		ThumbsDone:        im.thumbsDone.Load(),
+		ThumbsUnsupported: im.thumbsUnsupported.Load(),
+		ThumbsFailed:      im.thumbsFailed.Load(),
 	}
 }
 
@@ -300,12 +367,23 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		return fail("stat", err)
 	}
 	isLink := lfi.Mode()&fs.ModeSymlink != 0
+	if isLink && im.opts.RecordInPlace {
+		return nil, &Result{Status: StatusError, Source: origin,
+			Message: "symbolic link; not recorded in place", Err: fmt.Errorf("%s: symbolic link", srcPath)}
+	}
 	fi, err := os.Stat(srcPath)
 	if err != nil {
 		return fail("stat", err)
 	}
 	if !fi.Mode().IsRegular() {
 		return fail("not a regular file", fmt.Errorf("%s: not a regular file", srcPath))
+	}
+	// In record-in-place mode the file's own path is its catalog path.
+	ownRel := ""
+	if im.opts.RecordInPlace {
+		if ownRel, err = im.lib.Rel(srcPath); err != nil {
+			return fail("record in place", err)
+		}
 	}
 	hash, size, err := library.HashFile(srcPath)
 	if err != nil {
@@ -353,6 +431,27 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		takenAt, offsetKnown, source = fi.ModTime(), true, "mtime"
 	}
 	rel := library.LayoutPath(string(kind), takenAt, filepath.Base(srcPath))
+
+	if im.opts.RecordInPlace {
+		rel = ownRel
+		if r := im.claimOwnPath(ctx, rel); r != nil {
+			if ctx.Err() != nil {
+				return nil, nil
+			}
+			r.Source = origin
+			return nil, r
+		}
+		claim = strings.ToLower(rel)
+		keep = true
+		return &pending{
+			media:  im.newMedia(hash, size, rel, kind, takenAt, offsetKnown, source, info, origin, fi.ModTime()),
+			status: StatusExisting,
+			src:    srcPath,
+			origin: origin,
+			hash:   hash,
+			claim:  claim,
+		}, nil
+	}
 
 	// In place only when the path is not already recorded for another file
 	// (its hash missed the catalog above), so two rows never share a path.
@@ -415,7 +514,34 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	if inPlace || identical {
 		status = StatusExisting
 	}
-	m := catalog.Media{
+	// original_mtime is the mtime of the file as it lies in the library:
+	// the thumbnail stage checks it to detect a file changed since import.
+	// It equals the source's for moves and copies (CopyVerified preserves
+	// it), but an identical file found at the destination, or a copy whose
+	// mtime could not be set, has its own.
+	mtime := fi.ModTime()
+	if dfi, err := os.Stat(dst); err == nil {
+		mtime = dfi.ModTime()
+	}
+	keep = true
+	return &pending{
+		media:     im.newMedia(hash, size, rel, kind, takenAt, offsetKnown, source, info, origin, mtime),
+		status:    status,
+		src:       srcPath,
+		origin:    origin,
+		hash:      hash,
+		claim:     claim,
+		moved:     moved,
+		copied:    copied,
+		bytes:     nbytes,
+		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
+	}, nil
+}
+
+// newMedia builds the catalog row of a file recorded at rel.
+func (im *Importer) newMedia(hash uint64, size int64, rel string, kind metadata.Kind, takenAt time.Time,
+	offsetKnown bool, source string, info metadata.Info, origin string, mtime time.Time) catalog.Media {
+	return catalog.Media{
 		Hash:            hash,
 		Size:            size,
 		RelPath:         rel,
@@ -438,23 +564,36 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		CameraType:      info.CameraType,
 		Lens:            info.Lens,
 		OriginalPath:    origin,
-		OriginalMTime:   fi.ModTime(),
+		OriginalMTime:   mtime,
 		ImportedAt:      time.Now(),
 		ImportSessionID: im.sessionID,
 	}
-	keep = true
-	return &pending{
-		media:     m,
-		status:    status,
-		src:       srcPath,
-		origin:    origin,
-		hash:      hash,
-		claim:     claim,
-		moved:     moved,
-		copied:    copied,
-		bytes:     nbytes,
-		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
-	}, nil
+}
+
+// claimOwnPath claims rel, the current path of a file recorded in place.
+// It returns an error result when rel (compared case-insensitively) is
+// already recorded in the catalog or claimed by another file of this
+// import: two rows never share a path, and the file is left where it is.
+func (im *Importer) claimOwnPath(ctx context.Context, rel string) *Result {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	key := strings.ToLower(rel)
+	taken := false
+	if _, ok := im.claimed[key]; ok {
+		taken = true
+	} else {
+		t, err := im.db.RelPathTaken(ctx, rel)
+		if err != nil {
+			return &Result{Status: StatusError, Dest: rel, Message: "catalog lookup", Err: err}
+		}
+		taken = t
+	}
+	if taken {
+		return &Result{Status: StatusError, Dest: rel, Message: "duplicate path: another file is recorded at this path (case-insensitively); not recorded",
+			Err: fmt.Errorf("duplicate path %s", rel)}
+	}
+	im.claimed[key] = struct{}{}
+	return nil
 }
 
 // inLayoutDir reports whether srcPath already lies inside the library in the

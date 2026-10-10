@@ -102,12 +102,12 @@ func TestCommandsEndToEnd(t *testing.T) {
 	if err := os.WriteFile(lib.Abs(rel), jpg, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, _, err := library.HashFile(lib.Abs(rel))
+	h, size, err := library.HashFile(lib.Abs(rel))
 	if err != nil {
 		t.Fatal(err)
 	}
 	tx, _ := db.BeginTx(ctx, nil)
-	if _, err := db.InsertMedia(ctx, tx, &catalog.Media{Hash: h, RelPath: rel, FileType: "image", Ext: ".jpg"}); err != nil {
+	if _, err := db.InsertMedia(ctx, tx, &catalog.Media{Hash: h, Size: size, RelPath: rel, FileType: "image", Ext: ".jpg"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -130,12 +130,13 @@ func TestCommandsEndToEnd(t *testing.T) {
 
 	out, err = run(t, "db", "--list", dir)
 	if err != nil || !strings.Contains(out, "2022-05-06 07:08:09") || !strings.Contains(out, "32x16") ||
-		!strings.Contains(out, "60.100000,24.900000") || !strings.Contains(out, "Canon EOS 5D") {
+		!strings.Contains(out, "60.100000,24.900000") || !strings.Contains(out, "Canon EOS 5D") ||
+		!strings.Contains(out, "THUMB") || !strings.Contains(out, "pending") {
 		t.Fatalf("db --list: %v\n%s", err, out)
 	}
 
 	out, err = run(t, "verify", "--rehash", "--fill-size", dir)
-	if err != nil || !strings.Contains(out, "Sizes filled: 1") {
+	if err != nil || !strings.Contains(out, "Sizes filled: 0") {
 		t.Fatalf("verify clean: %v\n%s", err, out)
 	}
 
@@ -218,7 +219,7 @@ func exitCode(err error) int {
 	return 0
 }
 
-// newLibrary creates an empty v2 library in a temp dir and inserts rows.
+// newLibrary creates an empty library in a temp dir and inserts rows.
 // Each row's file must be written by the caller.
 func newLibrary(t *testing.T, rows ...catalog.Media) (string, *library.Library) {
 	t.Helper()
@@ -309,7 +310,8 @@ func TestEmptyArgumentsRejected(t *testing.T) {
 		{"db", "  "},
 		{"verify", ""},
 		{"update-metadata", "\t"},
-		{"migrate", ""},
+		{"thumbs", ""},
+		{"rebuild", " "},
 	} {
 		_, err := run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "empty") || !strings.Contains(err.Error(), "--help") {
@@ -358,12 +360,8 @@ func TestImportSourceCheckedFirstAndNewLibrary(t *testing.T) {
 	}
 }
 
-const v1DDL = `CREATE TABLE media (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, hash INTEGER UNIQUE, original_path TEXT,
-    new_path TEXT, date_taken DATETIME, file_type TEXT, location TEXT,
-    camera_model TEXT, camera_make TEXT, camera_type TEXT, resolution TEXT)`
-
-func writeV1Library(t *testing.T) string {
+// writeV2Library writes a catalog with step 1's schema version (2).
+func writeV2Library(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	raw, err := sql.Open("sqlite", filepath.Join(dir, library.DBName))
@@ -371,53 +369,63 @@ func writeV1Library(t *testing.T) string {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if _, err := raw.Exec(v1DDL); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := raw.Exec(`INSERT INTO media (hash,new_path,original_path,date_taken,file_type) VALUES (?,?,?,?,?)`,
-		1, filepath.ToSlash(filepath.Join(dir, "image/2020/01/a.jpg")), "/src/a.jpg", "2020-01-02 03:04:05+03:00", "image"); err != nil {
-		t.Fatal(err)
+	for _, q := range []string{
+		`CREATE TABLE media (id INTEGER PRIMARY KEY, hash INTEGER NOT NULL UNIQUE, size INTEGER,
+			rel_path TEXT NOT NULL UNIQUE, file_type TEXT NOT NULL, ext TEXT NOT NULL)`,
+		`INSERT INTO media (hash, size, rel_path, file_type, ext) VALUES (1, 10, 'image/2020/01/a.jpg', 'image', 'jpg')`,
+		`PRAGMA user_version = 2`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return dir
 }
 
-// Findings 4 and 5: read-only commands refuse a v1 catalog without writing
-// anything; migrate upgrades it.
-func TestReadOnlyCommandsRefuseOldCatalogAndMigrate(t *testing.T) {
-	dir := writeV1Library(t)
+// Every command refuses a catalog of another format without writing to it
+// and names the rebuild command.
+func TestOldCatalogNeedsRebuild(t *testing.T) {
+	dir := writeV2Library(t)
 	dbPath := filepath.Join(dir, library.DBName)
 	before, err := os.ReadFile(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []string{"db", "verify", "update-metadata"} {
+	if _, err := openExistingForTest(dir); !errors.Is(err, catalog.ErrNeedsRebuild) ||
+		!strings.Contains(err.Error(), "picmover rebuild "+dir) {
+		t.Errorf("openExisting on a v2 catalog: err = %v", err)
+	}
+	for _, c := range []string{"db", "verify", "update-metadata", "thumbs"} {
 		_, err := run(t, c, dir)
-		if !errors.Is(err, catalog.ErrNeedsMigration) || !strings.Contains(err.Error(), "picmover migrate") {
-			t.Errorf("%s on a v1 catalog: err = %v", c, err)
+		if !errors.Is(err, catalog.ErrNeedsRebuild) || !strings.Contains(err.Error(), "picmover rebuild "+dir) {
+			t.Errorf("%s on a v2 catalog: err = %v", c, err)
 		}
 	}
 	if after, _ := os.ReadFile(dbPath); !bytes.Equal(before, after) {
-		t.Fatal("a read-only command modified the v1 catalog")
+		t.Fatal("a command modified the v2 catalog")
 	}
 	ents, _ := os.ReadDir(dir)
 	if len(ents) != 1 {
-		t.Fatalf("read-only commands wrote to the library: %v", ents)
+		t.Fatalf("commands wrote to the library: %v", ents)
 	}
+	// import refuses too, with the same hint.
+	src := t.TempDir()
+	writeJPEG(t, filepath.Join(src, "a.jpg"), 1)
+	if _, err := run(t, "import", "--quiet", src, dir); !errors.Is(err, catalog.ErrNeedsRebuild) ||
+		!strings.Contains(err.Error(), "picmover rebuild "+dir) {
+		t.Errorf("import into a v2 catalog: err = %v", err)
+	}
+	if after, _ := os.ReadFile(dbPath); !bytes.Equal(before, after) {
+		t.Fatal("import modified the v2 catalog")
+	}
+}
 
-	out, err := run(t, "migrate", dir)
-	if err != nil || !strings.Contains(out, "Catalog migrated to schema version 2: 1 rows.") ||
-		!strings.Contains(out, "Backup of the old catalog: "+filepath.Join(dir, "media.db.v1-")) {
-		t.Fatalf("migrate: %v\n%s", err, out)
+func openExistingForTest(dir string) (*catalog.DB, error) {
+	_, db, err := openExisting(context.Background(), dir)
+	if db != nil {
+		db.Close()
 	}
-	if out, err := run(t, "db", dir); err != nil || !strings.Contains(out, "Total files:          1") {
-		t.Fatalf("db after migrate: %v\n%s", err, out)
-	}
-	if out, err := run(t, "migrate", dir); err != nil || !strings.Contains(out, "Catalog is already up to date.") {
-		t.Fatalf("second migrate: %v\n%s", err, out)
-	}
-	if _, err := run(t, "migrate", t.TempDir()); err == nil {
-		t.Fatal("migrate of a directory without media.db succeeded")
-	}
+	return db, err
 }
 
 // Finding 6: update-metadata refuses to run over videos without ffprobe.
@@ -427,10 +435,10 @@ func TestUpdateMetadataRequiresFFprobe(t *testing.T) {
 	findTool = func(name string) (string, error) { return "", errors.New("not found") }
 
 	dir, lib := newLibrary(t,
-		catalog.Media{Hash: 1, RelPath: "video/2019/05/clip.mp4", FileType: "video", Ext: ".mp4",
+		catalog.Media{Hash: 1, Size: 1, RelPath: "video/2019/05/clip.mp4", FileType: "video", Ext: ".mp4",
 			TakenAt: time.Date(2019, 5, 4, 20, 0, 0, 0, time.FixedZone("", 7200)), OffsetKnown: true,
 			TakenAtSource: "video", Width: 1920, Height: 1080, DurationMS: 12000, CameraMake: "Apple", CameraModel: "iPhone 12"},
-		catalog.Media{Hash: 2, RelPath: "image/2021/03/a.jpg", FileType: "image", Ext: ".jpg"})
+		catalog.Media{Hash: 2, Size: 1, RelPath: "image/2021/03/a.jpg", FileType: "image", Ext: ".jpg"})
 	writeBytes(t, lib.Abs("video/2019/05/clip.mp4"), []byte("not really a video"))
 	writeJPEG(t, lib.Abs("image/2021/03/a.jpg"), 1)
 
@@ -451,7 +459,7 @@ func TestUpdateMetadataRequiresFFprobe(t *testing.T) {
 func TestUpdateMetadataDegradedExtractionSkipped(t *testing.T) {
 	taken := time.Date(2018, 6, 7, 8, 9, 10, 0, time.FixedZone("", 3*3600))
 	rel := "image/2018/06/a.jpg"
-	dir, lib := newLibrary(t, catalog.Media{Hash: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
+	dir, lib := newLibrary(t, catalog.Media{Hash: 1, Size: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
 		TakenAt: taken, OffsetKnown: true, TakenAtSource: "exif", Width: 16, Height: 16,
 		CameraMake: "Canon", CameraModel: "EOS", CameraType: "dslr"})
 	writeBytes(t, lib.Abs(rel), testimg.BareJPEG()) // no EXIF: extraction falls back to mtime
@@ -474,8 +482,8 @@ func TestUpdateMetadataDegradedExtractionSkipped(t *testing.T) {
 // Finding 7: empty new values never replace known old ones.
 func TestUpdateMetadataMergeKeepsKnownFields(t *testing.T) {
 	rel := "image/2021/03/a.jpg"
-	dir, lib := newLibrary(t, catalog.Media{Hash: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
-		TakenAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), TakenAtSource: "legacy",
+	dir, lib := newLibrary(t, catalog.Media{Hash: 1, Size: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
+		TakenAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), TakenAtSource: "mtime",
 		Lat: 60.1, Lon: 24.9, HasGPS: true, Altitude: 12, HasAltitude: true, Orientation: 6,
 		CameraMake: "Nikon", CameraModel: "D90", CameraType: "dslr", Lens: "50mm"})
 	// EXIF date and dimensions, but no GPS, camera, lens or orientation.
@@ -503,7 +511,7 @@ func TestUpdateMetadataKeepsStoredOffset(t *testing.T) {
 	instant := time.Date(2020, 2, 3, 4, 5, 6, 0, time.UTC)
 	zone := time.FixedZone("", 5*3600+1800) // unlikely to be the test machine's zone
 	rel := "image/2020/02/a.jpg"
-	dir, lib := newLibrary(t, catalog.Media{Hash: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
+	dir, lib := newLibrary(t, catalog.Media{Hash: 1, Size: 1, RelPath: rel, FileType: "image", Ext: ".jpg",
 		TakenAt: instant.In(zone), OffsetKnown: true, TakenAtSource: "mtime", Width: 16, Height: 16})
 	writeBytes(t, lib.Abs(rel), testimg.BareJPEG())
 	if err := os.Chtimes(lib.Abs(rel), instant, instant); err != nil {
@@ -540,18 +548,17 @@ func TestVerifyReportsCaseConflict(t *testing.T) {
 	}
 }
 
-// Finding 10: --fill-size does not record the size of a row whose hash
-// does not match.
-func TestVerifyFillSizeSkipsHashMismatch(t *testing.T) {
+// Finding 10: a hash mismatch is reported (sizes are always recorded now,
+// so --fill-size has nothing to fill).
+func TestVerifyReportsHashMismatch(t *testing.T) {
+	jpg := testimg.JPEG(testimg.Options{Width: 32, Height: 16, Seed: 1})
 	dir, lib := newLibrary(t,
-		catalog.Media{Hash: 1, RelPath: "image/2021/03/bad.jpg", FileType: "image", Ext: ".jpg"})
-	writeJPEG(t, lib.Abs("image/2021/03/bad.jpg"), 1)
+		catalog.Media{Hash: 1, Size: int64(len(jpg)), RelPath: "image/2021/03/bad.jpg", FileType: "image", Ext: ".jpg"})
+	writeBytes(t, lib.Abs("image/2021/03/bad.jpg"), jpg)
 	out, err := run(t, "verify", "--rehash", "--fill-size", dir)
-	if exitCode(err) != 1 || !strings.Contains(out, "Hash mismatches: 1") || !strings.Contains(out, "Sizes filled: 0") {
+	if exitCode(err) != 1 || !strings.Contains(out, "Hash mismatches: 1") || !strings.Contains(out, "Sizes filled: 0") ||
+		!strings.Contains(out, "Size mismatches: 0") {
 		t.Fatalf("verify: %v\n%s", err, out)
-	}
-	if m := getRow(t, dir, "image/2021/03/bad.jpg"); m.Size != 0 {
-		t.Fatalf("size filled for a hash mismatch: %d", m.Size)
 	}
 }
 
@@ -573,5 +580,226 @@ func TestRedrawLine(t *testing.T) {
 	}
 	if newStatusLine(&bytes.Buffer{}) != nil {
 		t.Error("status line on a non-terminal")
+	}
+}
+
+// --- Thumbnails and rebuild ---
+
+// mediaSet returns rel_path -> hash for every catalog row.
+func mediaSet(t *testing.T, dir string) map[string]uint64 {
+	t.Helper()
+	db, err := catalog.OpenExisting(context.Background(), filepath.Join(dir, library.DBName), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.List(context.Background(), catalog.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]uint64{}
+	for _, m := range rows {
+		out[m.RelPath] = m.Hash
+	}
+	return out
+}
+
+// thumbRows counts the rows of thumbs.db.
+func thumbRows(t *testing.T, dir string) int {
+	t.Helper()
+	raw, err := sql.Open("sqlite", filepath.Join(dir, library.MetaDir, "thumbs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var n int
+	if err := raw.QueryRow("SELECT COUNT(*) FROM thumbs").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// previewMTimes maps each preview file to its modification time.
+func previewMTimes(t *testing.T, dir string) map[string]time.Time {
+	t.Helper()
+	out := map[string]time.Time{}
+	root := filepath.Join(dir, library.MetaDir, "previews")
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			out[p] = fi.ModTime()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestImportThumbsAndDB(t *testing.T) {
+	src, dir := t.TempDir(), filepath.Join(t.TempDir(), "lib")
+	writeJPEG(t, filepath.Join(src, "a.jpg"), 1)
+	writeBytes(t, filepath.Join(src, "b.png"), testimg.PNG(24, 20, 2))
+	out, err := run(t, "import", "--quiet", src, dir)
+	if err != nil || !strings.Contains(out, "Thumbnails:\nDone:              2\nUnsupported:       0\nFailed:            0\n") {
+		t.Fatalf("import: %v\n%s", err, out)
+	}
+	out, err = run(t, "db", dir)
+	if err != nil || !strings.Contains(out, "Thumbnails:           2 ok, 0 pending, 0 unsupported, 0 failed") ||
+		!strings.Contains(out, "Thumbnail cache:      2 entries, ") {
+		t.Fatalf("db: %v\n%s", err, out)
+	}
+	if out, err = run(t, "db", "--list", dir); err != nil || strings.Count(out, "  ok\n") != 2 {
+		t.Fatalf("db --list: %v\n%s", err, out)
+	}
+}
+
+func TestThumbsAfterNoThumbsImport(t *testing.T) {
+	src, dir := t.TempDir(), filepath.Join(t.TempDir(), "lib")
+	writeJPEG(t, filepath.Join(src, "a.jpg"), 1)
+	writeJPEG(t, filepath.Join(src, "b.jpg"), 2)
+	out, err := run(t, "import", "--quiet", "--no-thumbs", src, dir)
+	if err != nil || strings.Contains(out, "Thumbnails:") {
+		t.Fatalf("import --no-thumbs: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, library.MetaDir, "thumbs.db")); err == nil {
+		t.Error("import --no-thumbs created thumbs.db")
+	}
+	out, err = run(t, "db", dir)
+	if err != nil || !strings.Contains(out, "Thumbnails:           0 ok, 2 pending, 0 unsupported, 0 failed") ||
+		!strings.Contains(out, "Thumbnail cache:      0 entries, 0 B") {
+		t.Fatalf("db: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, library.MetaDir, "thumbs.db")); err == nil {
+		t.Error("db created thumbs.db")
+	}
+	out, err = run(t, "thumbs", "--quiet", "--limit", "1", dir)
+	if err != nil || !strings.Contains(out, "Done:              1\n") || !strings.Contains(out, "Still pending:     1\n") {
+		t.Fatalf("thumbs --limit 1: %v\n%s", err, out)
+	}
+	out, err = run(t, "thumbs", "--quiet", dir)
+	if err != nil || !strings.Contains(out, "Done:              1\n") || !strings.Contains(out, "Still pending:     0\n") {
+		t.Fatalf("thumbs: %v\n%s", err, out)
+	}
+	out, err = run(t, "db", dir)
+	if err != nil || !strings.Contains(out, "Thumbnails:           2 ok, 0 pending") {
+		t.Fatalf("db after thumbs: %v\n%s", err, out)
+	}
+	out, err = run(t, "thumbs", "--quiet", "--rebuild", "--workers", "1", dir)
+	if err != nil || !strings.Contains(out, "Done:              2\n") {
+		t.Fatalf("thumbs --rebuild: %v\n%s", err, out)
+	}
+
+	// A file that cannot be decoded: exit status 2.
+	writeBytes(t, filepath.Join(src, "bad.jpg"), []byte("not a jpeg"))
+	if out, err := run(t, "import", "--quiet", "--no-thumbs", src, dir); err != nil {
+		t.Fatalf("import bad: %v\n%s", err, out)
+	}
+	out, err = run(t, "thumbs", "--quiet", dir)
+	if exitCode(err) != 2 || !strings.Contains(out, "Failed:            1\n") {
+		t.Fatalf("thumbs with a broken file: code %d (%v)\n%s", exitCode(err), err, out)
+	}
+}
+
+func TestRebuild(t *testing.T) {
+	if _, err := run(t, "rebuild", t.TempDir()); err == nil || !strings.Contains(err.Error(), "nothing to rebuild") ||
+		!strings.Contains(err.Error(), "picmover import") {
+		t.Fatalf("rebuild without media.db: %v", err)
+	}
+
+	src, dir := t.TempDir(), filepath.Join(t.TempDir(), "lib")
+	writeJPEG(t, filepath.Join(src, "a.jpg"), 1)
+	writeJPEG(t, filepath.Join(src, "sub", "a.jpg"), 2) // same name: a_1.jpg
+	writeBytes(t, filepath.Join(src, "c.png"), testimg.PNG(24, 20, 3))
+	if out, err := run(t, "import", "--quiet", src, dir); err != nil {
+		t.Fatalf("import: %v\n%s", err, out)
+	}
+	before := mediaSet(t, dir)
+	thumbsBefore := thumbRows(t, dir)
+	previews := previewMTimes(t, dir)
+	if len(before) != 3 || thumbsBefore != 3 || len(previews) != 3 {
+		t.Fatalf("setup: rows %v thumbs %d previews %d", before, thumbsBefore, len(previews))
+	}
+	// A WAL next to the catalog moves with it.
+	writeBytes(t, filepath.Join(dir, "media.db-wal"), nil)
+
+	out, err := run(t, "rebuild", "--quiet", dir)
+	if err != nil || !strings.Contains(out, "Old catalog saved as "+filepath.Join(dir, "media.db.bak-")) ||
+		!strings.Contains(out, "Already in place:  3\n") || !strings.Contains(out, "Imported:          0\n") ||
+		!strings.Contains(out, "Thumbnails:\nDone:              3\n") {
+		t.Fatalf("rebuild: %v\n%s", err, out)
+	}
+	baks, _ := filepath.Glob(filepath.Join(dir, "media.db.bak-*"))
+	var main, wal int
+	for _, b := range baks {
+		switch {
+		case strings.HasSuffix(b, "-wal"):
+			wal++
+		case !strings.HasSuffix(b, "-shm"):
+			main++
+		}
+	}
+	if main != 1 || wal != 1 {
+		t.Errorf("backups = %v", baks)
+	}
+	after := mediaSet(t, dir)
+	if len(after) != len(before) {
+		t.Errorf("rows after rebuild = %v, before %v", after, before)
+	}
+	for rel, h := range before {
+		if after[rel] != h {
+			t.Errorf("%s: hash %x after rebuild, want %x", rel, after[rel], h)
+		}
+	}
+	if n := thumbRows(t, dir); n != thumbsBefore {
+		t.Errorf("thumbs.db rows = %d, want %d", n, thumbsBefore)
+	}
+	for p, mt := range previewMTimes(t, dir) {
+		if !previews[p].Equal(mt) {
+			t.Errorf("preview %s rewritten", p)
+		}
+	}
+	if out, err := run(t, "db", dir); err != nil || !strings.Contains(out, "Thumbnails:           3 ok, 0 pending") {
+		t.Fatalf("db after rebuild: %v\n%s", err, out)
+	}
+	if out, err := run(t, "verify", dir); err != nil {
+		t.Fatalf("verify after rebuild: %v\n%s", err, out)
+	}
+}
+
+func TestBackupCatalog(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "media.db")
+	writeBytes(t, db, []byte("db"))
+	writeBytes(t, db+"-shm", []byte("shm"))
+	now := time.Date(2026, 10, 10, 9, 8, 7, 0, time.UTC)
+	got, err := backupCatalog(db, now)
+	if err != nil || got != db+".bak-20261010-090807" {
+		t.Fatalf("backupCatalog = %q, %v", got, err)
+	}
+	for _, p := range []string{got, got + "-shm"} {
+		if _, err := os.Stat(p); err != nil {
+			t.Error(err)
+		}
+	}
+	for _, p := range []string{db, db + "-shm", got + "-wal"} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s exists", p)
+		}
+	}
+	// Never overwrites an existing backup.
+	writeBytes(t, db, []byte("db2"))
+	if _, err := backupCatalog(db, now); err == nil {
+		t.Fatal("backup over an existing backup succeeded")
+	}
+	if b, _ := os.ReadFile(db); string(b) != "db2" {
+		t.Error("catalog moved although the backup failed")
 	}
 }

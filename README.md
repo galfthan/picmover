@@ -9,7 +9,8 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 - **Intelligent File Organization**: Automatically organizes files into `<type>/YYYY/MM/` based on their capture date and file type.
 - **Duplicate Detection**: Uses hash-based comparison to prevent duplicate imports.
 - **Metadata Extraction**: Extracts and stores EXIF data for images, including camera information and GPS coordinates.
-- **Support for Various File Types**: Handles different image formats (JPEG, PNG, TIFF) and RAW files (CR2, DNG, etc.), as well as common video formats.
+- **Support for Various File Types**: Images (JPEG, PNG, TIFF, HEIC/HEIF, AVIF, WebP, GIF, BMP), RAW files (CR2, CR3, NEF, ARW, DNG, ORF, RW2, RAF, PEF, SRW, ...) and common video formats. See [Supported Formats](#supported-formats).
+- **Thumbnails and Previews**: Every imported file gets a 256 px thumbnail, a 1600 px preview and a perceptual hash (for finding near-duplicates later), cached by content hash in `.picmover/`.
 - **Database Management**: Uses SQLite to maintain a catalog (`media.db`) of all imported files for quick access and management. SQLite is built in (pure Go, no cgo).
 - **Portable Libraries**: Paths in the catalog are relative to the library root, so one library works from Linux, Windows and macOS.
 - **Verified Copies**: Each copy goes through a temp file, is hash-checked, fsynced and renamed into place before it is recorded in the catalog.
@@ -23,7 +24,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 ### Prerequisites
 
 - Go 1.27 or newer. The `toolchain` line in `go.mod` fetches the required toolchain automatically.
-- For video metadata only: `ffprobe` (part of FFmpeg) on the PATH, or placed next to the `picmover` binary. `ffmpeg` itself is not needed.
+- For videos only: `ffprobe` (metadata) and `ffmpeg` (video thumbnails), both part of FFmpeg, on the PATH or placed next to the `picmover` binary. Without `ffprobe` videos are imported with their file time; without `ffmpeg` their thumbnails are marked unsupported. Everything else is pure Go: no cgo and no system libraries.
 
 ### Steps
 
@@ -41,6 +42,8 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
    ```
    make build
    ```
+
+   The Makefile passes `-tags nodynamic` to every `go build`, `go test` and `go vet`, so the HEIC/AVIF/WebP codecs use their embedded WebAssembly builds and never load a system library. Pass the tag yourself when you run the Go tools directly, for example `go test -tags nodynamic ./...`.
 
    To cross-compile all targets, run `make build-all`. It writes:
    - `dist/picmover-linux-amd64`
@@ -62,7 +65,9 @@ The source may be a folder, a single file or a `.zip` archive. Files whose conte
 
 Press Ctrl+C to stop cleanly: files already copied are recorded, the partial summary is printed and the command exits with status 130. Press Ctrl+C a second time to terminate at once.
 
-Exit status: 0 on success; 2 when some files could not be imported (they are counted under `Errors` and listed in the log; with `--move` they are left in the source); 130 when cancelled; 1 for any other error. So `picmover import --move a lib && rm -rf a` only deletes `a` when everything was imported.
+After the files are copied, the thumbnail stage generates a thumbnail and a preview for every file imported in this run (one worker per CPU, at most 16). The status line shows `Thumbs N` during that stage, and the summary lists the thumbnails done, unsupported (for example a video without `ffmpeg`, a RAW file without an embedded preview, or an image above 100 megapixels) and failed. Ctrl+C during the thumbnail stage keeps every imported file; the remaining thumbnails stay pending and `picmover thumbs` generates them later.
+
+Exit status: 0 on success; 2 when some files could not be imported or thumbnails failed (they are counted under `Errors` and listed in the log; with `--move` they are left in the source), or when the thumbnail stage could not run at all (for example an incompatible thumbnail cache: the files are imported, the cache error is printed as a warning and the thumbnails stay pending); 130 when cancelled; 1 for any other error, never after the files were imported successfully. So `picmover import --move a lib && rm -rf a` only deletes `a` when everything was imported.
 
 Flags:
 
@@ -71,8 +76,40 @@ Flags:
 - `--workers N`: number of parallel workers (0 = auto).
 - `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time). Defaults to the system zone.
 - `--quiet`: do not show the live status line.
+- `--no-thumbs`: skip the thumbnail stage; the files are marked pending for `picmover thumbs`.
 
-Importing a library onto itself (the same path as source and library) rebuilds the catalog from the files; it works with or without `--move`.
+Importing a library onto itself (the same path as source and library) records files that are in the library but not in the catalog; files outside the `<type>/YYYY/MM` layout are copied (or with `--move` moved) into it. To recreate the whole catalog without touching any file use `rebuild`.
+
+### Thumbnails
+
+To generate the thumbnails and previews that are still pending (after `import --no-thumbs` or a cancelled import), retry the files whose thumbnails failed before, and regenerate stale ones:
+
+```
+./picmover thumbs /path/to/library
+```
+
+Flags:
+
+- `--workers N`: number of parallel workers (0 = one per CPU, at most 16).
+- `--rebuild`: regenerate the thumbnails of every file, not only the pending, failed and stale ones.
+- `--limit N`: process at most N files (0 = no limit).
+- `--quiet`: do not show the live status line.
+
+Every run retries the files whose thumbnails failed, so a file that can never be decoded is reported as failed (exit status 2) each time. A file becomes `stale` when `update-metadata` changes its orientation; `thumbs` then regenerates its thumbnail and preview even though they are cached.
+
+It exits with status 2 when thumbnails failed for some files (they are listed in the log in `.picmover/logs/`), and 130 when cancelled.
+
+### Rebuild
+
+To recreate the catalog from the files in the library:
+
+```
+./picmover rebuild /path/to/library
+```
+
+The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet` as for `import`.
+
+To undo a rebuild, delete the new `media.db` (and its `-wal`/`-shm`) and rename the newest `media.db.bak-<timestamp>` files back to `media.db`. If `media.db` is missing but backups exist, `rebuild` says so and explains this. To move stray files into the layout instead, use `picmover import <library> <library>`.
 
 ### Database Query
 
@@ -88,6 +125,8 @@ Flags:
 - `--limit N`, `-n N`: maximum number of files to show (default 10, 0 = no limit).
 - `--type TYPE`, `-t TYPE`: only show files of this type: `image`, `image_raw` or `video`.
 
+The summary includes the thumbnail states (ok, pending, unsupported, failed; stale files are counted as pending) and the size of the thumbnail cache; `--list` shows each file's thumbnail state. `db` only reads the thumbnail cache: if it is locked, damaged or of another format, it prints `Thumbnail cache: unavailable (<reason>)` and carries on.
+
 ### Update Metadata
 
 To re-read capture metadata (time, GPS, dimensions, camera) from the files in the catalog:
@@ -100,10 +139,10 @@ Flags:
 
 - `--type TYPE`, `-t TYPE`: type of media to update: `all`, `image`, `image_raw` or `video` (default `all`).
 - `--dry-run`, `-d`: show changes without writing them.
-- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time, legacy UTC), applied to every row. Without it, such rows keep the UTC offset already stored in the catalog, so running on a machine in another time zone does not change them; other rows use the system zone.
+- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time), applied to every row. Without it, such rows keep the UTC offset already stored in the catalog, so running on a machine in another time zone does not change them; other rows use the system zone.
 - `--verbose`, `-v`: print extractor warnings to stderr, and the rows skipped because extraction degraded.
 
-`update-metadata` never makes the catalog worse: if a file's date can now only be taken from its modification time, but the catalog has a date read from the file's metadata, the row is left alone and counted as `Skipped (extraction degraded)`; and an empty new value (no GPS, no camera, unknown size) never replaces a known one. If the catalog has videos, `ffprobe` must be available (or use `--type` to skip videos). It exits with status 2 when any row could not be updated.
+`update-metadata` never makes the catalog worse: if a file's date can now only be taken from its modification time, but the catalog has a date read from the file's metadata, the row is left alone and counted as `Skipped (extraction degraded)`; and an empty new value (no GPS, no camera, unknown size) never replaces a known one. If the catalog has videos, `ffprobe` must be available (or use `--type` to skip videos). When a file's orientation changes, its thumbnail state becomes `stale` and the next `picmover thumbs` regenerates its thumbnail and preview. It exits with status 2 when any row could not be updated.
 
 ### Verify
 
@@ -117,18 +156,8 @@ Every catalog row must point to an existing file with the recorded size. The com
 
 Flags:
 
-- `--fill-size`: record the file size for rows whose size is unknown (not for rows whose hash does not match with `--rehash`).
+- `--fill-size`: record the file size for rows whose size is unknown (not for rows whose hash does not match with `--rehash`). Catalogs created by this version always record sizes.
 - `--rehash`: re-hash every file and compare with the catalog (slow).
-
-### Migrate
-
-To upgrade the catalog of an existing library to the current format:
-
-```
-./picmover migrate /path/to/library
-```
-
-See [Upgrading from the Previous Version](#upgrading-from-the-previous-version).
 
 Usage errors (a missing argument, an unknown flag) end with a hint such as `see 'picmover import --help'`. Empty arguments (for example an unset shell variable) are rejected.
 
@@ -140,19 +169,35 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
   image_raw/YYYY/MM/<name>
   video/YYYY/MM/<name>
   media.db              catalog
-  .picmover/logs/       import logs
+  .picmover/thumbs.db   thumbnail cache (256 px JPEGs, keyed by content hash)
+  .picmover/previews/   preview cache (1600 px JPEGs, <hh>/<hash>.jpg)
+  .picmover/logs/       import, thumbs and rebuild logs
   .picmover/tmp/        in-progress copies
 ```
 
+The thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them.
+
 Times are stored as the camera's wall-clock time, plus the UTC offset when it is known. `--timezone` only affects videos and files without an embedded timestamp.
 
-## Upgrading from the Previous Version
+## Upgrading
 
-- Run `picmover migrate <library>` to upgrade an existing `media.db`; the first `import` into the library also migrates it. `db`, `verify` and `update-metadata` do not write to an old catalog: they refuse with a message to run `picmover migrate` first. Before migrating, a backup is written next to the catalog as `media.db.v1-<timestamp>.bak`.
-- The absolute paths stored by the old version become relative to the library root.
-- Run `picmover verify <library> --fill-size` once afterwards to record file sizes.
-- Optionally run `picmover update-metadata <library>` to refresh metadata fields that the old version did not store.
-- The old version stored video times in UTC; after migrating they are marked `legacy_utc` and shown in UTC. Run `picmover update-metadata --timezone <zone> <library>` (for example `--timezone Europe/Helsinki`) to convert them to local time in that zone. Without `--timezone` they keep their stored offset.
+The catalog is derived entirely from the files, so there is no migration: when a new version changes the catalog format, every command refuses the old catalog (without changing it) with a message to run
+
+```
+picmover rebuild /path/to/library
+```
+
+which keeps the old catalog as `media.db.bak-<timestamp>` and recreates it from the files. Libraries from the first version of picmover (absolute paths in `media.db`) are upgraded the same way. Afterwards the backup can be deleted.
+
+Width and height in the catalog are the display (upright) dimensions: a portrait photo stored sideways with an EXIF rotation is recorded as portrait.
+
+## Supported Formats
+
+- Images: JPEG, PNG, TIFF, HEIC/HEIF, AVIF, WebP, GIF, BMP. Dimensions, dates, GPS and camera come from the file header and EXIF (also inside HEIC/AVIF).
+- RAW: CR2, CR3, CRW, NEF, ARW, DNG, ORF, RW2, RAF, PEF, SRW, X3F, RAW. Thumbnails come from the JPEG preview embedded in the RAW file; a RAW file without one is marked unsupported.
+- Video: MP4, MOV, M4V, AVI, MKV, WebM, MTS/M2TS/TS, MPG, 3GP, WMV, FLV, ASF. Metadata needs `ffprobe`, thumbnails need `ffmpeg`.
+
+All image decoding is pure Go (HEIC and AVIF through WebAssembly builds of libheif and libavif); images above 100 megapixels are not decoded and get no thumbnail.
 
 ## Notes
 
@@ -162,8 +207,7 @@ Times are stored as the camera's wall-clock time, plus the UTC offset when it is
 
 ## Limitations
 
-- Video metadata extraction requires `ffprobe` (part of FFmpeg) to be installed on the system.
-- HEIC, WebP and AVIF files are not imported yet.
+- Video metadata extraction requires `ffprobe`, and video thumbnails require `ffmpeg` (both part of FFmpeg).
 - The application does not modify or edit the original files; it only copies them to the new location (or moves them with `--move`).
 
 ## Contributing
