@@ -75,20 +75,42 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   const albums: { id: number; name: string; hashes: string[]; cover: string | null }[] = [{ id: 2, name: 'Summer', hashes: [hashOf(1), hashOf(2)], cover: null }];
   let nextTag = 10;
   let nextAlbum = 10;
-  let ignored = 0;
+  /** Near-duplicate groups as hash lists, before trash and ignore; tests may replace them. */
+  const similar: { groups: string[][] } = { groups: [[hashOf(7), hashOf(8)]] };
+  /** Ignored pairs "a|b" (a < b), as user.db similar_ignored. */
+  const ignoredPairs = new Set<string>();
+  const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+  /** Ids whose open answers 409 state "error" with this message although the listing says closed (user.db too new, ...). */
+  const openErrors = new Map<string, string>();
+  /** user.db counts that differ from the catalog's (null: the same). */
+  const userdb: { trashed: number | null } = { trashed: null };
 
   const libs: Lib[] =
     mode === 'single'
       ? [{ id: 'peter', name: 'peter', path: '/media/peter', state: 'open', summary: summary(8) }]
       : [
           { id: 'peter', name: 'peter', path: '/media/peter', state: 'closed', summary: summary(8), cover: hashOf(1) },
-          { id: 'penny', name: 'penny', path: '/media/penny', state: 'busy', summary: summary(3), holder: { pid: 812, cmd: 'import', since: '2026-10-10T09:00:00Z' } },
+          { id: 'penny', name: 'penny', path: '/media/penny', state: 'busy', summary: summary(3), holder: { pid: 812, cmd: 'import', since: '2026-10-10T09:00:00' } },
           { id: 'broken', name: 'broken', path: '/media/broken', state: 'error', error: 'media.db needs a rebuild' },
         ];
-  const folders = mode === 'single' ? [] : [{ name: 'scans', path: '/media/scans' }];
+  const folders = mode === 'single' ? [] : [{ id: 'scans', name: 'scans', path: '/media/scans', state: 'folder' }];
   let jobId = 0;
 
   const live = () => items.filter((x) => !x.deletedAt);
+
+  /** The current groups: live members only, at least two, not wholly ignored (as the server's union-find, simplified). */
+  function similarGroups(): Item[][] {
+    const out: Item[][] = [];
+    for (const g of similar.groups) {
+      const members = g.map((h) => items.find((x) => x.hash === h && !x.deletedAt)).filter((x): x is Item => !!x);
+      if (members.length < 2) continue;
+      let open = false;
+      for (let i = 0; i < members.length && !open; i++)
+        for (let j = i + 1; j < members.length && !open; j++) if (!ignoredPairs.has(pairKey(members[i]!.hash, members[j]!.hash))) open = true;
+      if (open) out.push(members);
+    }
+    return out;
+  }
   const wire = (x: Item): MediaItem => {
     const { tagIds: _t, ...rest } = x;
     return rest;
@@ -114,11 +136,11 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       return json({
         root: '/media/peter',
         version: 'test',
-        summary: summary(live().length),
+        summary: { ...summary(live().length), deleted: items.length - live().length },
         thumbs: { pending: 0, ok: 9, unsupported: 0, error: 0 },
         cameras: [],
         ffmpeg: true,
-        userdb: { ratings: items.filter((x) => x.rating).length, tags: tags.length, albums: albums.length, trashed: items.length - live().length, ignoredPairs: ignored },
+        userdb: { ratings: items.filter((x) => x.rating).length, tags: tags.length, albums: albums.length, trashed: userdb.trashed ?? items.length - live().length, ignoredPairs: ignoredPairs.size },
         similar: { at: 1760090000, distance: 6, items: 8, pairs: 1 },
       });
     }
@@ -171,9 +193,14 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       return json({ albums: albums.map((a) => ({ id: a.id, name: a.name, count: a.hashes.length, cover: a.cover ?? a.hashes[0] ?? null, createdAt: '', updatedAt: '' })) });
     }
     if (method === 'GET' && path === 'similar') {
-      const g = live().filter((x) => x.id === 7 || x.id === 8);
-      const groups = g.length === 2 && ignored === 0 ? [{ maxDistance: 3, items: g.map((x, i) => ({ ...wire(x), size: 1000 + i, width: x.w, height: x.h, relPath: `image/2024/06/${x.id}.jpg` })) }] : [];
-      return json({ groups, total: groups.length, at: 1760090000, distance: 6 });
+      const all = similarGroups();
+      const offset = Number(q.get('offset') ?? 0);
+      const limit = Number(q.get('limit') ?? 50);
+      const groups = all.slice(offset, offset + limit).map((g) => ({
+        maxDistance: 3,
+        items: g.map((x, i) => ({ ...wire(x), size: 1000 + i, width: x.w, height: x.h, relPath: `image/2024/06/${x.id}.jpg` })),
+      }));
+      return json({ groups, total: all.length, at: 1760090000, distance: 6 });
     }
     if (method === 'GET' && path === 'jobs') return json({ jobs: [] });
     if (method !== 'POST') return json({ error: 'not found' }, 404);
@@ -213,18 +240,31 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         }
         return json({ trashed: hs.length - failed.length, failed });
       }
-      case 'trash/restore':
-        for (const x of items) if (hs.includes(x.hash)) x.deletedAt = null;
-        return json({ restored: hs.length, failed: [] });
+      case 'trash/restore': {
+        const failed: { hash: string; error: string }[] = [];
+        for (const h of hs) {
+          const x = items.find((i) => i.hash === h);
+          if (!x) failed.push({ hash: h, error: 'not in the catalog' });
+          else if (!x.deletedAt) failed.push({ hash: h, error: 'not in the trash' });
+          else x.deletedAt = null;
+        }
+        return json({ restored: hs.length - failed.length, failed });
+      }
       case 'trash/delete': {
         if (!body.confirm) return json({ error: 'confirm required' }, 400);
         const gone = body.all ? items.filter((x) => x.deletedAt) : items.filter((x) => hs.includes(x.hash) && x.deletedAt);
         for (const g of gone) items.splice(items.indexOf(g), 1);
         return json({ deleted: gone.length, failed: [] });
       }
-      case 'similar/ignore':
-        ignored++;
-        return json({ ignored: 1 });
+      case 'similar/ignore': {
+        // The group form: every pair of the current group containing the hash.
+        if (typeof body.group !== 'string') return json({ error: 'group: expected a hash' }, 400);
+        const g = similarGroups().find((m) => m.some((x) => x.hash === body.group));
+        if (!g) return json({ error: 'no such group' }, 404);
+        const before = ignoredPairs.size;
+        for (let i = 0; i < g.length; i++) for (let j = i + 1; j < g.length; j++) ignoredPairs.add(pairKey(g[i]!.hash, g[j]!.hash));
+        return json({ ignored: ignoredPairs.size - before });
+      }
       case 'jobs':
         return json({ id: ++jobId, kind: body.kind, state: 'running', library: 'peter', startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
     }
@@ -258,7 +298,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     if (p === '/api/libraries' && method === 'GET') {
       res = json({ root: mode === 'single' ? '/media/peter' : '/media', mode, libraries: libs, folders });
     } else if (p === '/api/libraries' && method === 'POST') {
-      const l: Lib = { id: String(body.name), name: String(body.name), path: `/media/${String(body.name)}`, state: 'closed', summary: summary(0) };
+      const l: Lib = { id: String(body.name), name: String(body.name), path: `/media/${String(body.name)}`, state: 'open', summary: summary(0) };
       libs.push(l);
       res = json(l, 201);
     } else if (/^\/api\/libraries\/[^/]+\/cover$/.test(p) && method === 'GET') {
@@ -267,8 +307,13 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     } else if (/^\/api\/libraries\/[^/]+\/open$/.test(p)) {
       const id = decodeURIComponent(p.split('/')[3] ?? '');
       const l = libs.find((x) => x.id === id);
-      if (!l) res = json({ error: 'not found' }, 404);
-      else if (l.state === 'busy') res = json({ error: 'locked', holder: l.holder }, 409);
+      const msg = openErrors.get(id);
+      if (!l && folders.some((f) => f.id === id)) res = json({ error: 'not a library (no media.db)', state: 'folder' }, 409);
+      else if (!l) res = json({ error: 'no such library' }, 404);
+      else if (l.state === 'busy') res = json({ error: 'library is in use by another picmover process', state: 'busy', holder: l.holder }, 409);
+      else if (l.state === 'error') res = json({ error: l.error ?? 'the catalog cannot be read', state: 'error' }, 409);
+      else if (msg !== undefined) res = json({ error: msg, state: 'error' }, 409);
+      else if (l.state === 'rebuilding') res = json({ error: 'the library is being rebuilt', state: 'rebuilding' }, 503);
       else {
         l.state = 'open';
         res = json(l);
@@ -300,7 +345,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, libs, install, posts };
+  return { calls, items, tags, albums, libs, folders, similar, openErrors, userdb, install, posts };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

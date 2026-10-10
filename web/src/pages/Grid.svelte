@@ -226,7 +226,11 @@
         break;
       case 'deleted':
         if (mode === 'trash' && c.hashes.length) removeHashes(c.hashes);
-        else if (mode === 'trash') void loadTimeline(false);
+        else if (mode === 'trash') {
+          // Empty trash (no hashes): everything listed here is gone, the selection too.
+          selection.clear();
+          void loadTimeline(false);
+        }
         break;
       case 'album':
         if (mode !== 'album' || c.albumId !== albumId) break;

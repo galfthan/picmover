@@ -67,6 +67,10 @@ describe('thumbnail and preview URLs', () => {
     expect(libraryCoverUrl('peter')).toBe('/api/libraries/peter/cover');
     expect(libraryCoverUrl('my photos')).toBe('/api/libraries/my%20photos/cover');
   });
+  it('version library covers by the cover hash (the server caches them for an hour)', () => {
+    expect(libraryCoverUrl('peter', '00000000000000ab')).toBe('/api/libraries/peter/cover?v=00000000000000ab');
+    expect(libraryCoverUrl('peter', null)).toBe('/api/libraries/peter/cover');
+  });
 });
 
 describe('filters in queries', () => {
@@ -163,6 +167,16 @@ describe('chunking', () => {
       { hashes: hashes(3), confirm: true },
       { all: true, confirm: true },
     ]);
+  });
+});
+
+describe('similar', () => {
+  it('ignores a whole group by one of its hashes (any group size)', async () => {
+    reply = () => json({ ignored: 45 });
+    expect(await libApi('peter').ignoreSimilarGroup('00000000000000ab')).toEqual({ ignored: 45 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.path).toBe('/api/l/peter/similar/ignore');
+    expect(calls[0]?.body).toEqual({ group: '00000000000000ab' });
   });
 });
 

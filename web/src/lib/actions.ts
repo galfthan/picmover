@@ -2,10 +2,11 @@
 // page: call the API (chunked there), announce the change so pages update
 // in place, and refresh the library's counts and lists.
 
-import type { AlbumRef, ChunkProgress, Failure, LibApi, Tag, TagChange } from './api';
+import { errorMessage, type AlbumRef, type ChunkProgress, type Failure, type LibApi, type Tag, type TagChange } from './api';
 import { emitChange } from './changes';
 import { formatCount } from './format';
 import { library } from './library.svelte';
+import { toasts } from './toast.svelte';
 
 /** The hashes that are not in `failed`. */
 export function succeeded(hashes: readonly string[], failed: readonly Failure[]): string[] {
@@ -47,6 +48,20 @@ export async function restoreItems(api: LibApi, hashes: readonly string[], progr
   if (done.length) emitChange({ kind: 'restored', hashes: done });
   void library.load();
   return { done, failed: r.failed };
+}
+
+/**
+ * The Undo of a trash toast: restores `hashes` and reports what could not
+ * be restored (the server answers 200 with `failed`, e.g. "the file is
+ * missing") or a failed request as an error toast. Never throws.
+ */
+export async function undoTrash(api: LibApi, hashes: readonly string[]): Promise<void> {
+  try {
+    const r = await restoreItems(api, hashes);
+    if (r.failed.length) toasts.error(failureText(r.failed, 'restored'));
+  } catch (e) {
+    toasts.error(errorMessage(e));
+  }
 }
 
 export async function deleteItems(api: LibApi, hashes: readonly string[], progress?: ChunkProgress): Promise<Outcome> {

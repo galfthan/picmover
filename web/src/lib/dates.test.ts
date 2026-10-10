@@ -6,14 +6,12 @@ import {
   exclusiveEnd,
   formatRecur,
   fromYear,
-  inRecur,
   inclusiveEnd,
   isDay,
   parseRecur,
   recurPresets,
   toYear,
-  wraps,
-  yearRange,
+  withYear,
 } from './dates';
 
 describe('recur', () => {
@@ -40,17 +38,10 @@ describe('recur', () => {
     expect(formatRecur(parseRecur('07-14..07-14')!)).toBe('07-14');
   });
 
-  it('wraps over the year end', () => {
+  it('keeps a range over the year end', () => {
     const r = parseRecur('12-30..01-02')!;
-    expect(wraps(r)).toBe(true);
-    expect(inRecur(r, { month: 12, day: 31 })).toBe(true);
-    expect(inRecur(r, { month: 1, day: 2 })).toBe(true);
-    expect(inRecur(r, { month: 1, day: 3 })).toBe(false);
-    expect(inRecur(r, { month: 6, day: 1 })).toBe(false);
-    const summer = parseRecur('06-01..08-31')!;
-    expect(wraps(summer)).toBe(false);
-    expect(inRecur(summer, { month: 8, day: 31 })).toBe(true);
-    expect(inRecur(summer, { month: 9, day: 1 })).toBe(false);
+    expect(r).toEqual({ from: { month: 12, day: 30 }, to: { month: 1, day: 2 } });
+    expect(formatRecur(r)).toBe('12-30..01-02');
   });
 
   it('describes ranges', () => {
@@ -96,8 +87,20 @@ describe('day ranges', () => {
     expect(addDays('0099-12-31', 1)).toBe('0100-01-01');
   });
   it('maps whole years', () => {
-    expect(yearRange(2010, 2012)).toEqual({ from: '2010-01-01', to: '2013-01-01' });
-    expect(yearRange(null, 2012)).toEqual({ from: undefined, to: '2013-01-01' });
+    expect(withYear(undefined, undefined, 'from', 2010)).toEqual({ from: '2010-01-01', to: undefined });
+    expect(withYear('2010-01-01', undefined, 'to', 2012)).toEqual({ from: '2010-01-01', to: '2013-01-01' });
+    expect(withYear('2010-01-01', '2013-01-01', 'from', null)).toEqual({ from: undefined, to: '2013-01-01' });
+  });
+  it('changes one year limit without dropping a day bound on the other side', () => {
+    expect(withYear(undefined, '2024-07-16', 'from', 2020)).toEqual({ from: '2020-01-01', to: '2024-07-16' });
+    expect(withYear('2020-03-05', undefined, 'to', 2024)).toEqual({ from: '2020-03-05', to: '2025-01-01' });
+  });
+  it('never lets the year limits cross', () => {
+    // From after To: To moves to the end of the same year, and the other way round.
+    expect(withYear('2010-01-01', '2013-01-01', 'from', 2015)).toEqual({ from: '2015-01-01', to: '2016-01-01' });
+    expect(withYear('2015-01-01', '2016-01-01', 'to', 2010)).toEqual({ from: '2010-01-01', to: '2011-01-01' });
+    expect(withYear('2015-01-01', '2016-01-01', 'to', 2015)).toEqual({ from: '2015-01-01', to: '2016-01-01' });
+    expect(withYear(undefined, '2020-03-01', 'from', 2020)).toEqual({ from: '2020-01-01', to: '2020-03-01' });
     expect(fromYear('2010-01-01')).toBe(2010);
     expect(fromYear('2010-03-01')).toBeNull();
     expect(toYear('2013-01-01')).toBe(2012);
@@ -111,5 +114,8 @@ describe('day ranges', () => {
     expect(describeDates(undefined, undefined, '12-24..12-26', 'en-GB')).toBe('24 Dec – 26 Dec every year');
     expect(describeDates('2010-01-01', undefined, '06-01..08-31', 'en-GB')).toBe('1 Jun – 31 Aug every year, 2010 –');
     expect(describeDates(undefined, undefined, undefined)).toBe('');
+    // A day on one side shows days on both, not "2020 – 2020-02-29".
+    expect(describeDates('2020-01-01', '2020-03-01', undefined)).toBe('2020-01-01 – 2020-02-29');
+    expect(describeDates('2020-03-05', '2021-01-01', undefined)).toBe('2020-03-05 – 2020-12-31');
   });
 });

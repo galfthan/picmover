@@ -7,7 +7,7 @@
   import { isBoolean, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
-  import { addToAlbum, deleteItems, failureText, rateItems, removeFromAlbum, restoreItems, tagItems, trashItems } from '../lib/actions';
+  import { addToAlbum, deleteItems, failureText, rateItems, removeFromAlbum, restoreItems, tagItems, trashItems, undoTrash } from '../lib/actions';
   import CopyButton from './CopyButton.svelte';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
@@ -197,13 +197,7 @@
         ms: 8000,
         action: {
           label: 'Undo',
-          run: async () => {
-            try {
-              await restoreItems(api, [cur.hash]);
-            } catch (e) {
-              toasts.error(errorMessage(e));
-            }
-          },
+          run: () => undoTrash(api, [cur.hash]),
         },
       });
       nb = target;

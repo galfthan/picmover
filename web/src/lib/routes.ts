@@ -63,19 +63,6 @@ export function libHref(lib: string, sub = '', query?: Parameters<typeof href>[1
   return href(libPath(lib, sub), query);
 }
 
-/** Path (no query) of the page an AppRoute names, for building links back to it. */
-export function pagePath(lib: string, page: LibPage, albumId: number | null): string {
-  switch (page) {
-    case 'grid':
-    case 'view':
-      return libPath(lib, '');
-    case 'album':
-      return libPath(lib, `albums/${albumId ?? ''}`);
-    default:
-      return libPath(lib, page);
-  }
-}
-
 export interface WorkspaceMode {
   /** null until the listing has loaded. */
   mode: 'workspace' | 'single' | null;

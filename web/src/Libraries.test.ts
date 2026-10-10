@@ -55,9 +55,9 @@ describe('Libraries page', () => {
     expect(peter.querySelector('a.main')?.getAttribute('href')).toBe('#/l/peter/');
     expect(peter.textContent).toContain('/media/peter');
     expect(peter.textContent).toContain('8 photos · 0 videos · 2024');
-    // Every card asks the workspace cover endpoint, closed libraries included;
-    // a failed load (404: no cover) falls back to the initial.
-    expect(peter.querySelector('img')?.getAttribute('src')).toBe('/api/libraries/peter/cover');
+    // Every card asks the workspace cover endpoint, closed libraries included,
+    // versioned by the cover hash; a failed load (404: no cover) falls back to the initial.
+    expect(peter.querySelector('img')?.getAttribute('src')).toBe('/api/libraries/peter/cover?v=0000000000000001');
     const brokenImg = card('broken').querySelector('img')!;
     expect(brokenImg.getAttribute('src')).toBe('/api/libraries/broken/cover');
     brokenImg.dispatchEvent(new Event('error'));
@@ -69,6 +69,7 @@ describe('Libraries page', () => {
     const penny = card('penny');
     expect(penny.querySelector('.badge')?.textContent).toBe('In use');
     expect(penny.textContent).toMatch(/in use by picmover import \(pid 812\) since/);
+    expect(penny.textContent).not.toContain('T09:00:00'); // the wall-clock string is formatted
     button(penny, 'Retry')!.click();
     await settle();
     expect(server.posts('libraries/penny/open')).toHaveLength(1);
@@ -179,5 +180,64 @@ describe('Libraries page', () => {
 
     await go('#/l/nothing/');
     expect(document.body.textContent).toContain('No library “nothing”');
+  });
+
+  it('shows the reason when opening fails with state "error", with Rebuild', async () => {
+    server.openErrors.set('peter', 'user.db has schema version 2; upgrade picmover');
+    await start('#/l/peter/');
+    expect(server.posts('libraries/peter/open')).toHaveLength(1);
+    expect(document.body.textContent).toContain('The catalog cannot be used: user.db has schema version 2; upgrade picmover');
+    expect(document.body.textContent).not.toContain('in use by');
+    expect(button(document, 'Rebuild')).toBeDefined();
+    expect(button(document, 'Retry')).toBeUndefined();
+    await settle();
+    expect(server.posts('libraries/peter/open')).toHaveLength(1); // no retry loop
+  });
+
+  it('keeps a gate current when a rebuild starts elsewhere', async () => {
+    await start('#/l/broken/');
+    expect(document.body.textContent).toContain('The catalog cannot be used');
+    // Another tab starts a rebuild: the listing says so, and the gate follows on its next look.
+    server.libs.find((l) => l.id === 'broken')!.state = 'rebuilding';
+    await vi.advanceTimersByTimeAsync(10_000);
+    await settle();
+    expect(document.body.textContent).toContain('Rebuilding the catalog');
+  });
+
+  it('keeps focus in a dialog whose focused button is disabled, with the page behind inert', async () => {
+    await start();
+    const opener = button(document, 'New library')!;
+    opener.focus();
+    opener.click();
+    await settle();
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+    const backdrop = dialog.parentElement!;
+    // The dialog sits at the end of <body>; everything else is inert while it is open.
+    expect(backdrop.parentElement).toBe(document.body);
+    const others = [...document.body.children].filter((el) => el !== backdrop) as HTMLElement[];
+    expect(others.length).toBeGreaterThan(0);
+    expect(others.every((el) => el.inert)).toBe(true);
+
+    const input = dialog.querySelector<HTMLInputElement>('input')!;
+    input.value = 'x';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    const create = button(dialog, 'Create')!;
+    create.focus();
+    // The name becomes invalid: Create is disabled under the focus, which moves to the dialog.
+    input.value = 'CON';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(create.disabled).toBe(true);
+    expect(document.activeElement).toBe(dialog);
+    // Tab goes on inside the dialog.
+    dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    // Escape works even when the key reaches the window from <body> (focus lost there in a browser).
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await settle();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(others.some((el) => el.inert)).toBe(false);
+    expect(document.activeElement).toBe(opener);
   });
 });

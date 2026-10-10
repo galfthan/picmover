@@ -8,7 +8,7 @@
 
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { ApiError, createLibrary, errorMessage, getWorkspace, isRecord, openLibrary, type FolderEntry, type Holder, type Job, type Lib } from './api';
-import { formatInstant } from './format';
+import { formatInstant, parseLocalWallClock } from './format';
 import { jobs } from './jobs.svelte';
 
 export type Gate =
@@ -50,7 +50,9 @@ export function holderText(h: Holder | null | undefined): string {
   if (!h) return 'in use by another picmover process';
   const cmd = h.cmd ? `picmover ${h.cmd}` : 'another picmover process';
   const pid = h.pid ? ` (pid ${h.pid})` : '';
-  const since = h.since ? ` since ${formatInstant(h.since)}` : '';
+  // `since` is a wall-clock string in the server's zone (same machine as the browser).
+  const at = parseLocalWallClock(h.since);
+  const since = h.since ? ` since ${at ? formatInstant(at.toISOString()) : h.since}` : '';
   return `in use by ${cmd}${pid}${since}`;
 }
 
@@ -181,7 +183,13 @@ export class LibrariesStore {
       this.#put({ ...lib, state: lib.state || 'open' });
       this.#reopened.set(id, Date.now());
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
+      const state = e instanceof ApiError && typeof e.body?.state === 'string' ? e.body.state : null;
+      if (e instanceof ApiError && e.status === 409 && state === 'error') {
+        // Unreadable or needs a rebuild (the listing's peek may not have noticed): the gate offers Rebuild.
+        this.#patch(id, { state: 'error', error: e.message });
+      } else if (e instanceof ApiError && e.status === 409 && state === 'folder') {
+        await this.load();
+      } else if (e instanceof ApiError && e.status === 409) {
         this.#patch(id, { state: 'busy', holder: holderFrom(e.body?.holder) });
       } else if (e instanceof ApiError && e.status === 503) {
         this.#patch(id, { state: 'rebuilding' });
@@ -195,7 +203,7 @@ export class LibrariesStore {
     }
   }
 
-  /** Creates <root>/<name> with an empty catalog; returns the new library (not yet open). */
+  /** Creates <root>/<name> with an empty catalog; returns the new library (the server opens it). */
   async create(name: string): Promise<Lib> {
     const lib = await createLibrary(name.trim());
     this.#put(lib);

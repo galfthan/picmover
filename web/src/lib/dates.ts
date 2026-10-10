@@ -66,19 +66,6 @@ export function formatRecur(r: Recur): string {
   return sameMonthDay(r.from, r.to) ? formatMonthDay(r.from) : `${formatMonthDay(r.from)}..${formatMonthDay(r.to)}`;
 }
 
-const ord = (md: MonthDay) => md.month * 100 + md.day;
-
-/** True when the range runs over the year end (from after to). */
-export function wraps(r: Recur): boolean {
-  return ord(r.from) > ord(r.to);
-}
-
-/** Whether a month-day falls in the range (inclusive, wrapping as the server does). */
-export function inRecur(r: Recur, md: MonthDay): boolean {
-  const x = ord(md);
-  return wraps(r) ? x >= ord(r.from) || x <= ord(r.to) : x >= ord(r.from) && x <= ord(r.to);
-}
-
 function mdLabel(md: MonthDay, locale?: string): string {
   return `${md.day} ${monthName(md.month, 'short', locale)}`;
 }
@@ -144,12 +131,23 @@ export function exclusiveEnd(lastDay: string): string | undefined {
   return isDay(lastDay) ? addDays(lastDay, 1) : undefined;
 }
 
-/** Whole calendar years: from = Jan 1 of `a`, to = Jan 1 after `b`. */
-export function yearRange(a: number | null, b: number | null): { from?: string; to?: string } {
-  return {
-    from: a !== null ? `${String(a).padStart(4, '0')}-01-01` : undefined,
-    to: b !== null ? `${String(b + 1).padStart(4, '0')}-01-01` : undefined,
-  };
+const yearDay = (y: number) => `${String(y).padStart(4, '0')}-01-01`;
+
+/**
+ * Sets one whole-year limit (null: open) and keeps the other bound as it
+ * is, whatever it is (a day or a year). When the two would cross, the other
+ * bound moves to the same year, so the range never matches nothing.
+ */
+export function withYear(from: string | undefined, to: string | undefined, which: 'from' | 'to', year: number | null): { from?: string; to?: string } {
+  if (which === 'from') {
+    const f = year !== null ? yearDay(year) : undefined;
+    // Days "YYYY-MM-DD" with four-digit years compare as strings.
+    const t = f && to && to <= f && year !== null ? yearDay(year + 1) : to;
+    return { from: f, to: t };
+  }
+  const t = year !== null ? yearDay(year + 1) : undefined;
+  const f = t && from && from >= t && year !== null ? yearDay(year) : from;
+  return { from: f, to: t };
 }
 
 /** The year of `from` when it is a Jan 1 (null otherwise or absent). */
@@ -162,7 +160,11 @@ export function toYear(to: string | undefined): number | null {
   return to && /^\d{4}-01-01$/.test(to) ? Number(to.slice(0, 4)) - 1 : null;
 }
 
-/** Short text for the filter button: "2020 – 2024", "24 Dec – 26 Dec every year, 2010 –", "". */
+/**
+ * Short text for the filter button: "2020 – 2024", "24 Dec – 26 Dec every
+ * year, 2010 –", "". Years only when every given bound is a whole year,
+ * else days on both sides ("2020-01-01 – 2020-02-29").
+ */
 export function describeDates(from: string | undefined, to: string | undefined, recur: string | undefined, locale?: string): string {
   const parts: string[] = [];
   const r = parseRecur(recur);
@@ -170,8 +172,9 @@ export function describeDates(from: string | undefined, to: string | undefined, 
   if (from || to) {
     const fy = fromYear(from);
     const ty = toYear(to);
-    const a = from ? (fy !== null ? String(fy) : from) : '';
-    const b = to ? (ty !== null ? String(ty) : inclusiveEnd(to)) : '';
+    const years = (!from || fy !== null) && (!to || ty !== null);
+    const a = from ? (years ? String(fy) : from) : '';
+    const b = to ? (years ? String(ty) : inclusiveEnd(to)) : '';
     if (a && b && a === b) parts.push(a);
     else parts.push(`${a}${a || b ? ' – ' : ''}${b}`.trim());
   }

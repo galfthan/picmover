@@ -27,6 +27,8 @@ const click = (el: Element, init: MouseEventInit = {}) => el.dispatchEvent(new M
 const key = (k: string, target: EventTarget = window) => target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
 const button = (root: ParentNode, label: string) => [...root.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent?.trim() === label);
 const toastText = () => [...document.querySelectorAll('.toast .text')].map((t) => t.textContent);
+const navTrash = () => [...document.querySelectorAll('nav a')].find((a) => a.textContent?.startsWith('Trash'))?.textContent;
+const check = (id: number) => document.querySelector<HTMLInputElement>(`a.tile[href="#/l/peter/view/${id}"] + input.check`)!;
 const toast = (text: string) => [...document.querySelectorAll<HTMLElement>('.toast')].find((t) => t.querySelector('.text')?.textContent === text)!;
 
 describe('management flows', () => {
@@ -112,6 +114,64 @@ describe('management flows', () => {
     expect(tiles()).toHaveLength(5);
   });
 
+  it('shows a Shift-clicked checkbox of a selected tile as checked', async () => {
+    await start();
+    click(tile(2), { ctrlKey: true });
+    click(tile(4), { ctrlKey: true });
+    await settle();
+    // Shift on tile 2's box selects 2..4; tile 2 stays selected although the browser flipped its box.
+    click(check(2), { shiftKey: true });
+    await settle();
+    expect(document.querySelector('.selbar')?.textContent).toContain('3 selected');
+    expect(tile(2).parentElement?.classList.contains('selected')).toBe(true);
+    expect(check(2).checked).toBe(true);
+  });
+
+  it('forgets the selection bar message with the selection', async () => {
+    await start();
+    click(tile(1), { ctrlKey: true });
+    await settle();
+    server.items[0]!.deletedAt = '2026-10-10T11:00:00'; // trashed in another tab
+    button(document.querySelector('.selbar')!, 'Trash')!.click();
+    await settle();
+    expect(document.querySelector('.selbar .err')?.textContent).toContain('could not be moved to the trash: already in the trash');
+    button(document.querySelector('.selbar')!, 'Clear')!.click();
+    await settle();
+    click(tile(2), { ctrlKey: true });
+    await settle();
+    expect(document.querySelector('.selbar')?.textContent).toContain('1 selected');
+    expect(document.querySelector('.selbar .err')).toBeNull();
+  });
+
+  it('reloads the library counts after a write made while a load was in flight', async () => {
+    await start();
+    expect(navTrash()).toBe('Trash1');
+    const { library } = await import('./lib/library.svelte');
+    server.items[0]!.deletedAt = '2026-10-10T11:00:00';
+    const first = library.load(); // answered with two items in the trash
+    server.items[1]!.deletedAt = '2026-10-10T11:00:00';
+    const second = library.load(); // shares the first, which then loads again
+    await settle();
+    await Promise.all([first, second]);
+    expect(navTrash()).toBe('Trash3');
+  });
+
+  it('says so when Undo cannot restore', async () => {
+    await start();
+    tile(1).click();
+    await settle();
+    key('Delete');
+    await settle();
+    expect(toastText()).toContain('Moved to the trash');
+    // The file left the trash meanwhile: the server answers 200 with a failure.
+    server.items.splice(0, 1);
+    button(toast('Moved to the trash'), 'Undo')!.click();
+    await settle();
+    expect(server.posts('l/peter/trash/restore')).toHaveLength(1);
+    expect(toastText()).toContain('1 item could not be restored: not in the catalog');
+    expect(document.querySelector('.toast.error')).not.toBeNull();
+  });
+
   it('rates, tags and trashes in the lightbox', async () => {
     await start();
     tile(1).click();
@@ -158,8 +218,13 @@ describe('management flows', () => {
   });
 
   it('shows the trash with restore keys and Empty trash', async () => {
+    // user.db knows no trash row for the item (put in .picmover/trash by hand and
+    // recorded by a rebuild): the counts follow the catalog, which the page lists.
+    server.userdb.trashed = 0;
     await start('#/l/peter/trash');
     expect(document.querySelector('.thead')?.textContent).toContain('1 item');
+    expect(navTrash()).toBe('Trash1');
+    expect(button(document, 'Empty trash')?.disabled).toBe(false);
     expect(tiles()).toHaveLength(1);
     expect(tile(9).textContent).toContain('deleted yesterday');
     tile(9).click();
@@ -183,6 +248,9 @@ describe('management flows', () => {
     server.items[1]!.deletedAt = '2026-10-10T11:00:00';
     await go('#/l/peter/');
     await go('#/l/peter/trash');
+    click(tile(1), { ctrlKey: true });
+    await settle();
+    expect(document.querySelector('.selbar')?.textContent).toContain('1 selected');
     button(document, 'Empty trash')!.click();
     await settle();
     const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
@@ -203,6 +271,8 @@ describe('management flows', () => {
     expect(server.posts('l/peter/trash/delete')[0]?.body).toEqual({ all: true, confirm: true });
     expect(tiles()).toHaveLength(0);
     expect(toastText()).toContain('Deleted 2 files permanently');
+    // The selected item is gone with the rest: no bar offering Restore of nothing.
+    expect(document.querySelector('.selbar')).toBeNull();
   });
 
   it('lists albums and removes items from one', async () => {
@@ -261,6 +331,11 @@ describe('management flows', () => {
     for (let i = 0; i < 20 && location.hash.includes('/view/'); i++) await vi.advanceTimersByTimeAsync(10);
     await settle();
     expect(location.hash).toBe('#/l/peter/similar');
+    // Enter on a thumbnail link is the link's (it bubbles to the row): it must not trash.
+    key('Enter', document.querySelector('.group a.thumb')!);
+    await settle();
+    expect(server.posts('l/peter/trash')).toHaveLength(0);
+    expect(document.querySelectorAll('.group').length).toBe(1);
     key('Enter', document.querySelector('.group .items')!);
     await settle();
     expect(server.posts('l/peter/trash')[0]?.body).toEqual({ hashes: [hashOf(8)] });
@@ -274,6 +349,76 @@ describe('management flows', () => {
     button(document, 'Run')!.click();
     await settle();
     expect(server.posts('l/peter/jobs')[0]?.body).toEqual({ kind: 'similar', distance: 4 });
+  });
+
+  it('pages through duplicates with the server: handled groups make room, ignore by group', async () => {
+    // 120 groups of two (ids 100..339), after the fixture's own group.
+    const groups: string[][] = [];
+    for (let i = 0; i < 120; i++) {
+      const a = 100 + 2 * i;
+      for (const id of [a, a + 1]) server.items.push({ id, hash: hashOf(id), type: 'image', takenAt: '2020-01-01T10:00:00', w: 100, h: 100, thumb: 'ok', tagIds: [] });
+      groups.push([hashOf(a), hashOf(a + 1)]);
+    }
+    server.similar.groups = groups;
+    await start('#/l/peter/similar');
+    const pager = () => document.querySelector('.pager')?.textContent?.replace(/\s+/g, ' ').trim();
+    const firstIds = () => [...document.querySelectorAll('.group')].map((g) => g.querySelector('a.thumb')?.getAttribute('href'));
+    expect(document.querySelectorAll('.group').length).toBe(50);
+    expect(pager()).toContain('Groups 1–50 of 120');
+
+    // Trash the others of group 1: the page is fetched again and group 51 moves up.
+    key('Enter', document.querySelector('.group .items')!);
+    await settle();
+    expect(server.posts('l/peter/trash')[0]?.body).toEqual({ hashes: [hashOf(100)] }); // the larger file (101) is kept
+    expect(document.querySelectorAll('.group').length).toBe(50);
+    expect(firstIds()[0]).toBe('#/l/peter/view/102');
+    expect(firstIds()[49]).toBe(`#/l/peter/view/${100 + 2 * 50}`);
+    expect(pager()).toContain('Groups 1–50 of 119');
+
+    // Ignore sends one hash of the group; the server ignores the whole group.
+    button(document.querySelector('.group')!, 'Ignore group')!.click();
+    await settle();
+    expect(server.posts('l/peter/similar/ignore')).toHaveLength(1);
+    expect(server.posts('l/peter/similar/ignore')[0]?.body).toEqual({ group: hashOf(102) });
+    expect(firstIds()[0]).toBe('#/l/peter/view/104');
+    expect(document.querySelectorAll('.group').length).toBe(50);
+    expect(pager()).toContain('Groups 1–50 of 118');
+
+    // The last page empties (its items trashed elsewhere): no "nothing left" while groups
+    // remain; the page moves back to the last one that has groups.
+    button(document.querySelector('.pager')!, 'Next')!.click();
+    await settle();
+    button(document.querySelector('.pager')!, 'Next')!.click();
+    await settle();
+    expect(pager()).toContain('Groups 101–118 of 118');
+    const hashes = [...document.querySelectorAll('.group a.thumb')].map((a) => hashOf(Number(a.getAttribute('href')!.split('/').pop())));
+    for (const x of server.items) if (hashes.includes(x.hash)) x.deletedAt = '2026-10-10T11:00:00';
+    const { emitChange } = await import('./lib/changes');
+    emitChange({ kind: 'trashed', hashes });
+    await settle();
+    expect(document.body.textContent).not.toContain('No near-duplicates left');
+    expect(pager()).toContain('Groups 51–100 of 100');
+    expect(document.querySelectorAll('.group').length).toBe(50);
+  });
+
+  it('keeps an existing day bound when a year limit changes, and summarises in days', async () => {
+    await start('#/l/peter/?to=2024-07-16');
+    const dates = [...document.querySelectorAll<HTMLButtonElement>('.datefilter > button')][0]!;
+    expect(dates.textContent).toContain('– 2024-07-15');
+    dates.click();
+    await settle();
+    button(document.querySelector('.datefilter .panel')!, 'Every year')!.click();
+    await settle();
+    const toYear = document.querySelector<HTMLSelectElement>('select[aria-label="To year"]')!;
+    // The day bound is shown as such, not as "Any".
+    expect(toYear.value).toBe('day');
+    expect(toYear.selectedOptions[0]?.textContent).toBe('2024-07-15');
+    const fromYear = document.querySelector<HTMLSelectElement>('select[aria-label="From year"]')!;
+    fromYear.value = '2024';
+    fromYear.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?from=2024-01-01&to=2024-07-16');
+    expect(dates.textContent).toContain('2024-01-01 – 2024-07-15');
   });
 
   it('puts the new filters in the URL and the requests', async () => {

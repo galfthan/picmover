@@ -8,6 +8,7 @@ import {
   cancelJob,
   errorMessage,
   getJob,
+  isRecord,
   libApi,
   listJobs,
   startWorkspaceJob,
@@ -51,7 +52,12 @@ export function emptyStats(): JobStats {
 }
 
 function normalize(j: Job): Job {
-  return { ...j, stats: { ...emptyStats(), ...(j.stats ?? {}) } };
+  const out: Job = { ...j, stats: { ...emptyStats(), ...(j.stats ?? {}) } };
+  // A similar job carries its phase as `progress` in the job object (listings,
+  // state events): the pill and the progress panel read `phase`.
+  const p = j.progress;
+  if (out.phase === undefined && isRecord(p) && typeof p.phase === 'string') out.phase = { ...p };
+  return out;
 }
 
 /**

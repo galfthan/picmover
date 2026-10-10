@@ -10,7 +10,7 @@
   import { library } from '../lib/library.svelte';
   import { onChange } from '../lib/changes';
   import { toasts } from '../lib/toast.svelte';
-  import { failureText, restoreItems, trashItems } from '../lib/actions';
+  import { failureText, trashItems, undoTrash } from '../lib/actions';
   import { formatAgo, formatBytes, formatCount, formatInstant, formatWallDate, parseWhen } from '../lib/format';
   import { openViewer, setSequenceProvider, viewerHref } from '../lib/viewer';
   import { bestOf } from '../lib/similar';
@@ -81,10 +81,15 @@
   });
   $effect(() => jobs.watch());
 
-  // Items trashed elsewhere (the lightbox) leave their groups.
+  // Trashed items (here or in the lightbox) leave their groups at once; the
+  // page is then fetched again, because the server's list has shifted: the
+  // groups after this page move up into it (and the total is the server's).
   $effect(() =>
     onChange((c) => {
-      if (c.kind === 'trashed' || c.kind === 'deleted') dropHashes(c.hashes);
+      if (c.kind === 'trashed' || c.kind === 'deleted') {
+        dropHashes(c.hashes);
+        untrack(() => void load());
+      }
       if (c.kind === 'restored') untrack(() => void load());
       if (c.kind === 'rating') {
         const set = new Set(c.hashes);
@@ -134,13 +139,7 @@
           ms: 8000,
           action: {
             label: 'Undo',
-            run: async () => {
-              try {
-                await restoreItems(api, moved);
-              } catch (e) {
-                toasts.error(errorMessage(e));
-              }
-            },
+            run: () => undoTrash(api, moved),
           },
         });
       }
@@ -156,8 +155,11 @@
     if (busyGroup) return;
     busyGroup = key;
     try {
-      await api.ignoreSimilar(g.items.map((x) => x.hash));
+      // Any hash names the group; the server ignores the whole current group (any size).
+      const first = g.items[0];
+      if (first) await api.ignoreSimilarGroup(first.hash);
       removeGroup(g);
+      void load();
       void library.load();
     } catch (e) {
       groupError = { ...groupError, [key]: errorMessage(e) };
@@ -169,7 +171,9 @@
   function onGroupKey(e: KeyboardEvent, g: SimilarGroup) {
     const key = gkey(g);
     if (e.key === 'Enter') {
-      if (e.target instanceof HTMLButtonElement) return;
+      // Only the row itself or a Keep radio: Enter on a thumbnail link opens the viewer.
+      const onRadio = e.target instanceof HTMLInputElement && e.target.type === 'radio';
+      if (e.target !== e.currentTarget && !onRadio) return;
       e.preventDefault();
       void trashOthers(g);
       return;
@@ -273,7 +277,7 @@
       <div class="error-box">{error} <button class="small" onclick={() => load()}>Retry</button></div>
     {/if}
 
-    {#if data && groups.length === 0 && !loading}
+    {#if data && total === 0 && !loading}
       <div class="empty">
         {#if lastRun}
           <h2>No near-duplicates left</h2>

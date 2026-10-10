@@ -1,7 +1,15 @@
+<script lang="ts" module>
+  /** Open dialogs, innermost last: only the top one handles keys that reach the window. */
+  const stack: symbol[] = [];
+</script>
+
 <script lang="ts">
-  // Modal dialog: traps Tab inside, closes on Escape or a backdrop click,
-  // focuses the first field (else the first button) on open and gives focus
-  // back to the element that opened it.
+  // Modal dialog: rendered at the end of <body> with everything else inert
+  // while it is open, traps Tab inside, closes on Escape or a backdrop
+  // click, focuses the first field (else the first button) on open and
+  // gives focus back to the element that opened it. When the focused
+  // control becomes disabled (a submit button while working), focus moves
+  // to the dialog itself so Escape and Tab keep working.
   import { tick, type Snippet } from 'svelte';
 
   interface Props {
@@ -14,6 +22,7 @@
   let { title, onclose, children, wide = false }: Props = $props();
 
   const titleId = `dlg-${Math.random().toString(36).slice(2, 9)}`;
+  const me = Symbol(titleId);
   let box: HTMLDivElement | undefined = $state();
   const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
@@ -21,6 +30,34 @@
 
   function focusables(): HTMLElement[] {
     return box ? [...box.querySelectorAll<HTMLElement>(FOCUSABLE)] : [];
+  }
+
+  /** Moves the backdrop to <body> and makes its siblings inert until the dialog closes. */
+  function modal(node: HTMLElement) {
+    document.body.appendChild(node);
+    const made: HTMLElement[] = [];
+    for (const el of document.body.children) {
+      if (el === node || !(el instanceof HTMLElement) || el.inert) continue;
+      el.inert = true;
+      made.push(el);
+    }
+    stack.push(me);
+    return {
+      destroy() {
+        for (const el of made) el.inert = false;
+        const i = stack.lastIndexOf(me);
+        if (i >= 0) stack.splice(i, 1);
+        node.remove();
+      },
+    };
+  }
+
+  /** Keeps focus inside: when the focused element is disabled or gone, focus the dialog. */
+  function rescue() {
+    if (!box || stack[stack.length - 1] !== me) return;
+    const a = document.activeElement;
+    const lost = !a || a === document.body || !box.contains(a) || (a instanceof HTMLElement && a.matches(':disabled'));
+    if (lost) box.focus();
   }
 
   $effect(() => {
@@ -31,6 +68,13 @@
     return () => {
       if (opener?.isConnected) opener.focus();
     };
+  });
+
+  $effect(() => {
+    if (!box) return;
+    const mo = new MutationObserver(rescue);
+    mo.observe(box, { subtree: true, childList: true, attributes: true, attributeFilter: ['disabled'] });
+    return () => mo.disconnect();
   });
 
   function onKeydown(e: KeyboardEvent) {
@@ -57,10 +101,21 @@
       first.focus();
     }
   }
+
+  /** Keys from outside the dialog (focus fell to <body>): handled by the top dialog before the page sees them. */
+  function onWindowKeydown(e: KeyboardEvent) {
+    if (stack[stack.length - 1] !== me || !box) return;
+    if (e.target instanceof Node && box.contains(e.target)) return;
+    if (e.key !== 'Escape' && e.key !== 'Tab') return;
+    onKeydown(e);
+    e.stopPropagation();
+  }
 </script>
 
+<svelte:window onkeydowncapture={onWindowKeydown} />
+
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-<div class="backdrop" onclick={(e) => e.target === e.currentTarget && onclose()} onkeydown={onKeydown}>
+<div class="backdrop" use:modal onclick={(e) => e.target === e.currentTarget && onclose()} onkeydown={onKeydown}>
   <div class="dialog" class:wide role="dialog" aria-modal="true" aria-labelledby={titleId} tabindex="-1" bind:this={box}>
     <h2 id={titleId}>{title}</h2>
     {@render children()}

@@ -19,6 +19,8 @@ class LibraryStore {
   /** Bumped by every load(); answers for an older library or generation are dropped. */
   #gen = 0;
   #inflight: Promise<void> | null = null;
+  /** A load() arrived while one was in flight: that one may have read the old state, so load again after it. */
+  #dirty = false;
 
   get api(): LibApi | null {
     return this.id === null ? null : libApi(this.id);
@@ -28,11 +30,14 @@ class LibraryStore {
     return this.displayName || (this.info ? baseName(this.info.root) : (this.id ?? ''));
   }
 
-  /** Items in the trash (user.db count, else the catalog's). */
+  /**
+   * Items in the trash: the catalog's count (`summary.deleted`), which is
+   * what the trash page lists and what Empty trash deletes. user.db's
+   * `trash` rows can differ (a file put in .picmover/trash by hand and
+   * recorded by a rebuild has no row there).
+   */
   get trashed(): number {
-    const i = this.info;
-    if (!i) return 0;
-    return i.userdb?.trashed ?? i.summary.deleted ?? 0;
+    return this.info?.summary.deleted ?? 0;
   }
 
   /** Switches to library `id` (or none) and loads it. */
@@ -48,15 +53,24 @@ class LibraryStore {
     this.tags = [];
     this.albums = [];
     this.#inflight = null;
+    this.#dirty = false;
     this.#gen++;
     if (id !== null) void this.load();
   }
 
-  /** Fetches the summary, tags and albums; concurrent calls share one request. */
+  /**
+   * Fetches the summary, tags and albums. A call while a load is in flight
+   * shares it, and that load is followed by one more (the first request may
+   * have been answered before the caller's write), so the promise resolves
+   * once the state is at least as new as the call.
+   */
   load(): Promise<void> {
     const id = this.id;
     if (id === null) return Promise.resolve();
-    if (this.#inflight) return this.#inflight;
+    if (this.#inflight) {
+      this.#dirty = true;
+      return this.#inflight;
+    }
     const g = ++this.#gen;
     const api = libApi(id);
     this.loading = true;
@@ -72,10 +86,14 @@ class LibraryStore {
         },
       ),
       this.#loadLists(g, api),
-    ]).then(() => {
+    ]).then((): Promise<void> | undefined => {
       if (g !== this.#gen) return;
       this.loading = false;
       this.#inflight = null;
+      if (this.#dirty) {
+        this.#dirty = false;
+        return this.load();
+      }
     });
     this.#inflight = p;
     return p;

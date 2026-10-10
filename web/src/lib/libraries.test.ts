@@ -71,6 +71,11 @@ describe('names and holders', () => {
   it('describes a lock holder', () => {
     expect(holderText(null)).toBe('in use by another picmover process');
     expect(holderText({ pid: 0, cmd: 'serve', since: '' })).toBe('in use by picmover serve');
+    // `since` is a wall-clock string in the server's zone, shown as a local date and time.
+    const t = holderText({ pid: 812, cmd: 'import', since: '2026-10-10T09:00:00' });
+    expect(t).toMatch(/^in use by picmover import \(pid 812\) since /);
+    expect(t).not.toContain('T09:00:00');
+    expect(t).toContain('2026');
   });
 });
 
@@ -135,7 +140,8 @@ describe('libraries store', () => {
 
   it('turns 409 into busy with the holder, 503 into rebuilding, others into a failure', async () => {
     await store.load();
-    routes['POST /api/libraries/busy/open'] = () => json({ error: 'locked', holder: { pid: 9, cmd: 'import', since: '2026-10-10T10:00:00Z' } }, 409);
+    routes['POST /api/libraries/busy/open'] = () =>
+      json({ error: 'library is in use', state: 'busy', holder: { pid: 9, cmd: 'import', since: '2026-10-10T10:00:00' } }, 409);
     await store.open('busy');
     const g = store.gate('busy');
     expect(g.kind).toBe('busy');
@@ -155,13 +161,34 @@ describe('libraries store', () => {
     expect(store.gate('peter').kind).toBe('open');
   });
 
+  it('shows the reason of a 409 in state "error" with Rebuild, not busy with Retry', async () => {
+    await store.load();
+    // The listing peeks media.db only; opening finds user.db too new.
+    routes['POST /api/libraries/peter/open'] = () =>
+      json({ error: 'user.db has schema version 2; upgrade picmover', state: 'error' }, 409);
+    await store.open('peter');
+    expect(store.gate('peter')).toMatchObject({ kind: 'error', message: 'user.db has schema version 2; upgrade picmover' });
+    expect(store.find('peter')?.holder ?? null).toBeNull();
+  });
+
+  it('reloads the listing when the id turned out to be a folder (409 state "folder")', async () => {
+    await store.load();
+    routes['POST /api/libraries/peter/open'] = () => json({ error: 'not a library', state: 'folder' }, 409);
+    routes['GET /api/libraries'] = () => json({ root: '/media', mode: 'workspace', libraries: [], folders: [{ id: 'peter', name: 'peter', path: '/media/peter', state: 'folder' }] });
+    const before = requests.filter((r) => r === 'GET /api/libraries').length;
+    await store.open('peter');
+    expect(requests.filter((r) => r === 'GET /api/libraries').length).toBe(before + 1);
+    expect(store.gate('peter').kind).toBe('folder');
+  });
+
   it('creates a library and replaces a folder entry of the same name', async () => {
     await store.load();
-    routes['POST /api/libraries'] = () => json(L('old', 'closed'), 201);
+    // The server answers the new library already open.
+    routes['POST /api/libraries'] = () => json(L('old', 'open'), 201);
     const lib = await store.create(' old ');
     expect(lib.id).toBe('old');
     expect(store.folders).toEqual([]);
-    expect(store.gate('old').kind).toBe('closed');
+    expect(store.gate('old').kind).toBe('open');
   });
 
   it('records a folder in place through the workspace jobs route', async () => {

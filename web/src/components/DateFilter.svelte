@@ -22,7 +22,7 @@
     parseRecur,
     recurPresets,
     toYear,
-    yearRange,
+    withYear,
     type MonthDay,
     type Recur,
   } from '../lib/dates';
@@ -90,8 +90,10 @@
     setRecur({ ...cur, [which]: md });
   }
 
-  function setYears(a: string, b: string) {
-    const r = yearRange(a ? Number(a) : null, b ? Number(b) : null);
+  /** One year limit changed; the other bound stays (a day bound too). "day" is the shown day bound itself. */
+  function setYear(which: 'from' | 'to', v: string) {
+    if (v === 'day') return;
+    const r = withYear(from, to, which, v ? Number(v) : null);
     onchange({ from: r.from, to: r.to, recur });
   }
 
@@ -152,13 +154,15 @@
           {/each}
           <div class="md">
             <span>Years</span>
-            <select aria-label="From year" value={yFrom !== null ? String(yFrom) : ''} onchange={(e) => setYears(e.currentTarget.value, yTo !== null ? String(yTo) : '')}>
+            <select aria-label="From year" value={yFrom !== null ? String(yFrom) : from ? 'day' : ''} onchange={(e) => setYear('from', e.currentTarget.value)}>
               <option value="">Any</option>
+              {#if from && yFrom === null}<option value="day">{from}</option>{/if}
               {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
             </select>
             <span class="muted">–</span>
-            <select aria-label="To year" value={yTo !== null ? String(yTo) : ''} onchange={(e) => setYears(yFrom !== null ? String(yFrom) : '', e.currentTarget.value)}>
+            <select aria-label="To year" value={yTo !== null ? String(yTo) : to ? 'day' : ''} onchange={(e) => setYear('to', e.currentTarget.value)}>
               <option value="">Any</option>
+              {#if to && yTo === null}<option value="day">{inclusiveEnd(to) || to}</option>{/if}
               {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
             </select>
           </div>

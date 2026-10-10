@@ -169,8 +169,9 @@ export type LibState = 'closed' | 'open' | 'busy' | 'rebuilding' | 'error' | 'fo
 /** The process holding a library's lock. */
 export interface Holder {
   pid: number;
+  /** The holder's command ("import", "serve"); "" when unknown. */
   cmd: string;
-  /** RFC 3339 instant. */
+  /** Wall-clock string in the server's zone ("2026-10-10T09:00:00"); "" when unknown. */
   since: string;
 }
 
@@ -191,6 +192,9 @@ export interface Lib {
 export interface FolderEntry {
   name: string;
   path: string;
+  /** Sent by the server (= name, state "folder"); the client keys folders by `name`. */
+  id?: string;
+  state?: string;
 }
 
 export interface Workspace {
@@ -278,7 +282,9 @@ export interface Job {
   error: string | null;
   exitCode?: number | null;
   distance?: number;
-  /** Client-side: the last phase-style progress event. */
+  /** Server-side phase progress of a running similar job (also in listings). */
+  progress?: JobPhase | null;
+  /** Client-side: the last phase-style progress event (or `progress`). */
   phase?: JobPhase | null;
 }
 
@@ -538,14 +544,10 @@ export interface LibApi {
   fileUrl(id: number, download?: boolean): string;
   getGeoClusters(f: Filters, bbox: BBox, zoom: number, signal?: AbortSignal): Promise<GeoCluster[]>;
   getGeoItems(f: Filters, bbox: BBox, limit: number, signal?: AbortSignal): Promise<{ items: MediaItem[]; total: number }>;
-  listJobs(signal?: AbortSignal): Promise<Job[]>;
   startJob(req: JobRequest): Promise<Job>;
 
   setRating(hashes: readonly string[], rating: number, progress?: ChunkProgress): Promise<{ updated: number }>;
   getTags(signal?: AbortSignal): Promise<Tag[]>;
-  createTag(name: string): Promise<Tag>;
-  renameTag(id: number, name: string): Promise<Tag>;
-  deleteTag(id: number): Promise<{ removed: number }>;
   tagMedia(hashes: readonly string[], change: TagChange, progress?: ChunkProgress): Promise<{ tags: Tag[] }>;
 
   getAlbums(signal?: AbortSignal): Promise<Album[]>;
@@ -560,7 +562,8 @@ export interface LibApi {
   emptyTrash(): Promise<DeleteResult>;
 
   getSimilar(offset: number, limit: number, signal?: AbortSignal): Promise<SimilarPage>;
-  ignoreSimilar(hashes: readonly string[]): Promise<{ ignored: number }>;
+  /** Ignores the whole current group that contains `hash` (any size; the server finds the group). */
+  ignoreSimilarGroup(hash: string): Promise<{ ignored: number }>;
 }
 
 function versioned(base: string, kind: 'thumb' | 'preview', ref: ThumbRef): string {
@@ -622,10 +625,6 @@ function makeLibApi(id: string): LibApi {
       const items = r.items ?? [];
       return { items, total: typeof r.total === 'number' ? r.total : items.length };
     },
-    async listJobs(signal) {
-      const r = await get<{ jobs: Job[] | null }>('/jobs', signal);
-      return r.jobs ?? [];
-    },
     async startJob(req) {
       return unwrapJob(await post<unknown>('/jobs', req));
     },
@@ -637,12 +636,6 @@ function makeLibApi(id: string): LibApi {
     async getTags(signal) {
       const r = await get<{ tags: Tag[] | null }>('/tags', signal);
       return r.tags ?? [];
-    },
-    createTag: (name) => post<Tag>('/tags', { name }),
-    renameTag: (tid, name) => post<Tag>(`/tags/${enc(String(tid))}`, { name }),
-    async deleteTag(tid) {
-      const r = await post<{ removed?: number }>(`/tags/${enc(String(tid))}/delete`, {});
-      return { removed: num(r.removed) };
     },
     async tagMedia(hashes, change, progress) {
       // Tags named in `create` are created by the first chunk; later chunks
@@ -729,10 +722,10 @@ function makeLibApi(id: string): LibApi {
       const groups = (r.groups ?? []).map((g) => ({ ...g, items: g.items ?? [] }));
       return { groups, total: num(r.total), at: r.at ?? null, distance: typeof r.distance === 'number' ? r.distance : null };
     },
-    async ignoreSimilar(hashes) {
-      // Not chunked: the server ignores the pairs *among* the hashes of one
-      // call, and a group is far smaller than the cap.
-      const r = await post<{ ignored?: number }>('/similar/ignore', { hashes });
+    async ignoreSimilarGroup(hash) {
+      // The group form: the server ignores every pair of the current group
+      // containing `hash`, so groups larger than the hash-list cap work too.
+      const r = await post<{ ignored?: number }>('/similar/ignore', { group: hash });
       return { ignored: num(r.ignored) };
     },
   };
@@ -768,13 +761,19 @@ export function createLibrary(name: string): Promise<Lib> {
 
 /**
  * Cover thumbnail of a library in any readable state (closed included):
- * a 256 px JPEG, 404 when there is none. Cached by the server's ETag.
+ * a 256 px JPEG, 404 when there is none. The server caches it for an hour,
+ * so the URL carries the cover hash (`?v=`): a new cover item is a new URL.
  */
-export function libraryCoverUrl(id: string): string {
-  return `/api/libraries/${enc(id)}/cover`;
+export function libraryCoverUrl(id: string, cover?: string | null): string {
+  const u = `/api/libraries/${enc(id)}/cover`;
+  return cover ? `${u}?v=${enc(cover)}` : u;
 }
 
-/** Opens a library: 200 lib; ApiError 409 (body.holder) when locked, 503 while rebuilding. */
+/**
+ * Opens a library: 200 lib. ApiError 409 with `body.state` "busy" (and
+ * `body.holder`), "error" (unreadable catalog; the message says why) or
+ * "folder"; 503 while rebuilding.
+ */
 export function openLibrary(id: string): Promise<Lib> {
   return postJSON<Lib>(`/api/libraries/${enc(id)}/open`, {});
 }

@@ -35,7 +35,7 @@
   });
 
   let errors = $state<Record<string, string>>({});
-  /** Libraries whose cover failed to load (404: none yet); they show their initial. */
+  /** Cover URLs that failed to load (404: none yet); those cards show the initial. Keyed by URL, so a new cover is tried again. */
   let noCover = $state<Record<string, boolean>>({});
   let starting = $state<string | null>(null);
 
@@ -160,16 +160,17 @@
       <ul class="cards" aria-label="Libraries">
         {#each libraries.libraries as l (l.id)}
           {@const job = jobFor(l.id)}
+          {@const coverUrl = libraryCoverUrl(l.id, l.cover)}
           <li class="card libcard state-{l.state}">
             <a class="main" href={libHref(l.id, '')} aria-label="Open {l.name}, {l.path}">
               <span class="cover">
-                {#if !noCover[l.id]}
+                {#if !noCover[coverUrl]}
                   <img
-                    src={libraryCoverUrl(l.id)}
+                    src={coverUrl}
                     alt=""
                     loading="lazy"
                     decoding="async"
-                    onerror={() => (noCover = { ...noCover, [l.id]: true })}
+                    onerror={() => (noCover = { ...noCover, [coverUrl]: true })}
                   />
                 {:else}
                   <span class="ph" aria-hidden="true">{l.name.slice(0, 1).toUpperCase()}</span>

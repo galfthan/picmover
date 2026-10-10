@@ -4,7 +4,7 @@
   // Rebuild, folder → Record files in place, rebuilding → progress).
   import { errorMessage } from '../lib/api';
   import { libraries, type Gate } from '../lib/libraries.svelte';
-  import { jobs } from '../lib/jobs.svelte';
+  import { jobs, POLL_MS } from '../lib/jobs.svelte';
   import JobProgress from './JobProgress.svelte';
 
   interface Props {
@@ -20,6 +20,23 @@
   const path = $derived('lib' in gate && gate.lib ? gate.lib.path : 'folder' in gate && gate.folder ? gate.folder.path : '');
   const job = $derived(jobs.active && jobs.active.library === id ? jobs.active : null);
   const workspace = $derived(libraries.mode === 'workspace');
+
+  // These states change without this tab doing anything (a rebuild started or
+  // finished in another tab or by the CLI): look at the listing and the jobs
+  // now and then, as the Libraries page does.
+  const stale = $derived(gate.kind === 'error' || gate.kind === 'rebuilding' || gate.kind === 'folder' || gate.kind === 'failed');
+  $effect(() => {
+    if (!stale) return;
+    const stop = jobs.watch();
+    const t = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      void libraries.load();
+    }, POLL_MS);
+    return () => {
+      clearInterval(t);
+      stop();
+    };
+  });
 
   async function rebuild() {
     actionError = '';

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseHash } from './router';
-import { libHref, libPath, pagePath, parseAppRoute, redirectFor, type AppRoute } from './routes';
+import { libHref, libPath, parseAppRoute, redirectFor, type AppRoute } from './routes';
 
 const app = (h: string) => parseAppRoute(parseHash(h));
 const lib = (lib: string, page: string, extra: Partial<Extract<AppRoute, { kind: 'lib' }>> = {}) => ({
@@ -49,8 +49,6 @@ describe('app routes', () => {
     expect(libHref('peter', '', { session: 17 })).toBe('#/l/peter/?session=17');
     expect(app(libHref('a/b?c', 'trash'))).toEqual(lib('a/b?c', 'trash')); // the encoding round-trips
     expect(app(libHref('a?c#d', 'trash'))).toEqual(lib('a?c#d', 'trash'));
-    expect(pagePath('peter', 'album', 4)).toBe('/l/peter/albums/4');
-    expect(pagePath('peter', 'view', null)).toBe('/l/peter/');
   });
 });
 

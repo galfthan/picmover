@@ -19,6 +19,7 @@
     restoreItems,
     tagItems,
     trashItems,
+    undoTrash,
   } from '../lib/actions';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
@@ -47,6 +48,10 @@
   let error = $state('');
 
   const n = $derived(selection.size);
+  // The message belongs to the selection it was about; a new selection starts clean.
+  $effect(() => {
+    if (n === 0) error = '';
+  });
   const items = (k: number) => `${formatCount(k)} ${k === 1 ? 'item' : 'items'}`;
 
   async function run(label: string, fn: (hashes: string[]) => Promise<void>) {
@@ -107,13 +112,7 @@
           ms: 8000,
           action: {
             label: 'Undo',
-            run: async () => {
-              try {
-                await restoreItems(api, moved);
-              } catch (e) {
-                toasts.error(errorMessage(e));
-              }
-            },
+            run: () => undoTrash(api, moved),
           },
         });
       }

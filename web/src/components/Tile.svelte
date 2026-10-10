@@ -116,7 +116,12 @@
       type="checkbox"
       checked={selected}
       aria-label="Select {label}"
-      onclick={(e) => onselect(item, e.shiftKey)}
+      onclick={(e) => {
+        const box = e.currentTarget;
+        onselect(item, e.shiftKey);
+        // The browser flipped the box; a Shift range can leave this tile selected, so show the real state.
+        box.checked = selected;
+      }}
     />
   {/if}
 </div>

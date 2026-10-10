@@ -217,4 +217,17 @@ describe('job store', () => {
     expect(FakeEventSource.instances).toHaveLength(1);
     expect(jobs.doneCount).toBe(0);
   });
+
+  it('reads the phase of a similar job from its progress field (listings and state events)', async () => {
+    const similar = (state: string, progress: unknown): Job =>
+      ({ ...job(5, state), kind: 'similar', library: 'peter', distance: 6, progress }) as Job;
+    // After a reload during the search the listing carries the phase.
+    routes['GET /api/jobs'] = () => json({ jobs: [similar('running', { phase: 'compare', items: 136000, bands: 3, pairs: 0 })] });
+    await jobs.init();
+    expect(jobs.current?.phase).toEqual({ phase: 'compare', items: 136000, bands: 3, pairs: 0 });
+    // The final job object brings the done phase even when no progress event was seen.
+    lastES().emit('done', similar('done', { phase: 'done', items: 136000, bands: 8, pairs: 42 }));
+    await flush();
+    expect(jobs.current?.phase).toEqual({ phase: 'done', items: 136000, bands: 8, pairs: 42 });
+  });
 });
