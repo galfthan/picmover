@@ -11,9 +11,11 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/image/draw"
 
@@ -466,14 +468,16 @@ func (g *Generator) video(ctx context.Context, src Source) (image.Image, error) 
 }
 
 // grabFrame runs ffmpeg and returns the JPEG it writes to stdout (at most
-// maxFrameBytes).
+// maxFrameBytes). ffmpeg logs at warning level because FFmpeg reports
+// unsupported features (avpriv_request_sample) as warnings; stderr is only
+// consulted when ffmpeg fails.
 func grabFrame(parent context.Context, ffmpeg, path string, t float64) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, ffmpegTimeout)
 	defer cancel()
 	// "file:" stops ffmpeg from reading a protocol prefix or option out
 	// of the path.
 	cmd := exec.CommandContext(ctx, ffmpeg,
-		"-hide_banner", "-loglevel", "error",
+		"-hide_banner", "-loglevel", "warning",
 		"-ss", fmt.Sprintf("%.3f", t),
 		"-i", "file:"+path,
 		"-frames:v", "1",
@@ -509,8 +513,8 @@ func grabFrame(parent context.Context, ffmpeg, path string, t float64) ([]byte, 
 		return nil, fmt.Errorf("ffmpeg: timed out after %v", ffmpegTimeout)
 	}
 	if werr != nil {
-		if line := stderr.lastLine(); line != "" {
-			return nil, fmt.Errorf("ffmpeg: %s", line)
+		if msg := ffmpegMessage(stderr.b, stderr.truncated); msg != "" {
+			return nil, fmt.Errorf("ffmpeg: %s", msg)
 		}
 		return nil, fmt.Errorf("ffmpeg: %w", werr)
 	}
@@ -520,26 +524,99 @@ func grabFrame(parent context.Context, ffmpeg, path string, t float64) ([]byte, 
 	return out, nil
 }
 
-// tailBuffer keeps the last max bytes written to it.
+// tailBuffer keeps the last max bytes written to it and records whether
+// it dropped any.
 type tailBuffer struct {
-	max int
-	b   []byte
+	max       int
+	b         []byte
+	truncated bool
 }
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
 	n := len(p)
 	if len(p) > t.max {
 		p = p[len(p)-t.max:]
+		t.truncated = true
 	}
 	t.b = append(t.b, p...)
 	if over := len(t.b) - t.max; over > 0 {
 		t.b = append(t.b[:0], t.b[over:]...)
+		t.truncated = true
 	}
 	return n, nil
 }
 
-// lastLine returns the last non-empty line written.
-func (t *tailBuffer) lastLine() string {
-	lines := strings.Split(strings.TrimSpace(string(t.b)), "\n")
-	return strings.TrimSpace(lines[len(lines)-1])
+// ffmpegContext matches FFmpeg's log context prefix, e.g.
+// "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x58991ef07680] " or "[in#0 @ 0x...] ".
+// Windows builds print the pointer without 0x, e.g.
+// "[h264 @ 0000020a0b7d7200] ".
+var ffmpegContext = regexp.MustCompile(`^\[[^\]]* @ (?:0x)?[0-9a-fA-F]+\] `)
+
+// ffmpegBoilerplate lists stderr text that says nothing about the
+// failure. A rule with cut keeps what precedes cut; a rule with prefix
+// (and suffix, when set) drops the whole line.
+var ffmpegBoilerplate = []struct{ cut, prefix, suffix string }{
+	{cut: " Update your FFmpeg version to the newest one from Git"},
+	{prefix: "If you want to help, upload a sample"},
+	// picmover's own log already names the file.
+	{prefix: "Error opening input file ", suffix: "."},
+}
+
+// ffmpegMaxPart caps each part of an ffmpeg failure message, in bytes.
+const ffmpegMaxPart = 200
+
+// ffmpegMessage condenses ffmpeg's stderr tail into a one-line failure
+// message: the first and last distinct lines, joined with "; ", after
+// stripping context prefixes and boilerplate. truncated means the tail's
+// first line is partial. It returns "" when nothing useful remains.
+func ffmpegMessage(tail []byte, truncated bool) string {
+	lines := strings.Split(string(tail), "\n")
+	if truncated && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	var kept []string
+	seen := map[string]bool{}
+next:
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		l = strings.TrimSpace(ffmpegContext.ReplaceAllString(l, ""))
+		if l == "" {
+			continue
+		}
+		for _, r := range ffmpegBoilerplate {
+			switch {
+			case r.cut != "":
+				if i := strings.Index(l, r.cut); i >= 0 {
+					l = l[:i]
+				}
+			case strings.HasPrefix(l, r.prefix) && strings.HasSuffix(l, r.suffix):
+				continue next
+			}
+		}
+		l = strings.TrimSpace(strings.TrimSuffix(l, "."))
+		if l == "" || seen[l] {
+			continue
+		}
+		seen[l] = true
+		kept = append(kept, l)
+	}
+	switch len(kept) {
+	case 0:
+		return ""
+	case 1:
+		return capPart(kept[0])
+	}
+	return capPart(kept[0]) + "; " + capPart(kept[len(kept)-1])
+}
+
+// capPart cuts s to ffmpegMaxPart bytes on a rune boundary, marking the cut.
+func capPart(s string) string {
+	if len(s) <= ffmpegMaxPart {
+		return s
+	}
+	i := ffmpegMaxPart
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i] + "…"
 }

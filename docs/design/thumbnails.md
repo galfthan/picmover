@@ -340,9 +340,15 @@ catalog. The perceptual hash is the 64-bit DCT pHash computed from the
 preview reduced to 32x32 grayscale (implement it directly, about 60 lines;
 no new dependency needed), plus nothing else for now.
 
-ffmpeg frame grab: `ffmpeg -hide_banner -loglevel error -ss <t> -i <path>
+ffmpeg frame grab: `ffmpeg -hide_banner -loglevel warning -ss <t> -i <path>
 -frames:v 1 -vf scale='min(1600,iw)':-2 -f image2pipe -vcodec mjpeg -q:v 3 -`
-with a 60 s timeout; the JPEG comes from stdout.
+with a 60 s timeout; the JPEG comes from stdout. The log level is warning
+because FFmpeg reports unsupported features (its request-sample
+diagnostics, which name the cause) as warnings; stderr is read only when
+ffmpeg exits non-zero. The failure message is the first and last distinct
+stderr lines, joined with `; `, after removing `[ctx @ 0x...]` context
+prefixes (without `0x` on Windows) and boilerplate (the "update your FFmpeg"/"upload a sample"
+text and the line naming the input file), each capped at 200 bytes.
 
 ## internal/catalog: schema v3
 
