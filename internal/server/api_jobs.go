@@ -102,6 +102,12 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if isBackupKind(p.Kind) {
+		if code, msg := s.checkBackupJob(r.Context(), e, &p); code != 0 {
+			writeError(w, code, msg)
+			return
+		}
+	}
 	if lib != nil && e.checkFolder() != nil {
 		writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})
 		return
@@ -184,10 +190,10 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 			p.Distance = similar.DefaultDistance
 		}
 		return nil, nil
-	case kindRebuild:
-		return nil, nil
+	case kindRebuild, kindBackup, kindScrub, kindPrune, kindRestore:
+		return nil, nil // the backup kinds are checked by checkBackupJob
 	}
-	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar or rebuild", p.Kind)
+	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar, rebuild, backup, scrub, prune or restore", p.Kind)
 }
 
 // overlapsLibraries reports whether an import source (as given and

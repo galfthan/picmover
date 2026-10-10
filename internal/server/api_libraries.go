@@ -11,6 +11,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/library"
+	"picmover/internal/userdata"
 )
 
 // libJSON is the lib object of /api/libraries.
@@ -23,6 +24,20 @@ type libJSON struct {
 	Cover   *string      `json:"cover,omitempty"`
 	Holder  *holderJSON  `json:"holder,omitempty"`
 	Error   string       `json:"error,omitempty"`
+	// Backup is the library's backup status; omitted when it has no
+	// backup targets.
+	Backup *libBackupJSON `json:"backup,omitempty"`
+}
+
+// libBackupJSON is the backup one-liner of a library: targets and the
+// newest backup (Unix seconds or null) from user.db, read-only for a
+// closed library; behind (files) only for an open library whose plan
+// for the most recently used target is cached.
+type libBackupJSON struct {
+	Targets      int    `json:"targets"`
+	LastBackupAt *int64 `json:"lastBackupAt"`
+	Label        string `json:"label,omitempty"`
+	Behind       *int64 `json:"behind,omitempty"`
 }
 
 // holderJSON describes the process holding a library's lock; fields are
@@ -94,6 +109,43 @@ func (s *Server) describe(ctx context.Context, l listed, e *libEntry) libJSON {
 		if pk.HasCover {
 			c := hexHash(pk.Cover)
 			out.Cover = &c
+		}
+	}
+	if out.State != libError {
+		out.Backup = s.libBackup(ctx, l, e)
+	}
+	return out
+}
+
+// libBackup reads the backup status of a listed library: from the open
+// user.db, else from a read-only peek of it.
+func (s *Server) libBackup(ctx context.Context, l listed, e *libEntry) *libBackupJSON {
+	var (
+		sum userdata.BackupSummary
+		ok  bool
+	)
+	if e != nil {
+		if state, h := e.snapshot(); state == libOpen && h.user != nil {
+			var err error
+			sum, err = h.user.BackupSummary(ctx)
+			ok = err == nil
+		}
+	}
+	if !ok {
+		var err error
+		sum, ok, err = userdata.PeekBackupSummary(ctx, filepath.Join(l.path, userdata.FileName))
+		if err != nil || !ok {
+			return nil
+		}
+	}
+	if sum.Targets == 0 {
+		return nil
+	}
+	out := &libBackupJSON{Targets: sum.Targets, LastBackupAt: unixOrNull(sum.LastBackupAt), Label: sum.LastLabel}
+	if e != nil && sum.LastID != "" {
+		if plan, ok := e.cachedPlanOf(sum.LastID, planTTL); ok {
+			n := plan.New.Count + plan.Changed.Count + plan.Moved.Count
+			out.Behind = &n
 		}
 	}
 	return out

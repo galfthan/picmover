@@ -313,6 +313,319 @@ Job progress events: `{phase: "plan"|"copy"|"snapshot"|"scrub"|"prune"|"restore"
 Cloud/object targets behind the same `Target` interface; scheduled runs
 from inside `serve`; cross-library dedup on a shared target.
 
+## As implemented (backend)
+
+Everything outside `web/`. Notes that matter to the client are marked
+**(frontend)**; the shapes the frontend asked for during the build are
+matched exactly. Where this section is silent, the contract holds.
+
+### API shapes, exactly
+
+- **(frontend)** Times (`lastBackupAt`, `lastScrubAt`, a run's
+  `startedAt`/`finishedAt`) are **Unix seconds** as numbers, `null` when
+  unknown or not finished.
+- **(frontend)** `GET /api/l/{lib}/backups[?plan=1]` → `{targets: [target]}`
+  in the order the targets were added. `target` = `{id, label, path,
+  reachable, lastBackupAt, lastScrubAt, set, error?}`; `path` is the folder
+  the target was last seen at on this machine. `set` is `null` when the
+  target is unreachable, else `{name, files, bytes, behind: {new, changed,
+  moved, bytes} | null, extras, damaged, unverified}`: `files`/`bytes`/
+  `unverified` (rows never scrubbed or found damaged) from `backup.db`
+  (zeros before the first backup); `behind` from the plan (`bytes` = new +
+  changed bytes, what a run copies), `extras` = the plan's `extra.count`;
+  `damaged` = damaged and not repaired in the last scrub. The plan behind
+  `behind`/`extras` is cached per library and target for 60 s;
+  `?plan=1` computes it again; any job on the library, a target add,
+  update or forget drops the cache. `error` (reachable targets only) is set
+  when the set cannot be shown, e.g. the set name holds another library's
+  backup; `behind` is then `null`. Addition: `set.name` (the set folder).
+- **(frontend)** `POST /api/l/{lib}/backups/targets {path, label?, set?}` →
+  201 target. `path` rules below; an existing target (marker present) is
+  attached as it is, an empty folder gets a new marker. `label` defaults to
+  the folder's name; 1-64 runes, no control characters (400 `label: ...`).
+  `set` (addition) chooses the set folder name; without it the set is the
+  one on the target that already belongs to this library (found by
+  `library_id`), else the library's folder name. 409 `{error: "the target
+  already holds a backup of another library under this name; choose
+  another set name"}` when that set belongs to another library; nothing is
+  written then. Adding an attached target again updates its label, path
+  and host. 400 texts: `path: path must be absolute`, `path: path contains
+  a NUL byte`, `path: device paths are not supported`, `path: a backup
+  target must be outside every library and outside the workspace folder`,
+  `the folder is not empty and is not a picmover backup target; ...`,
+  `the target path is not a folder`, `the folder does not exist`,
+  `permission denied`, marker errors.
+- **(frontend)** `POST /api/l/{lib}/backups/targets/{id} {label?, path?}` →
+  200 target; a new `path` must hold a marker with the same id (409 `the
+  folder is another backup target (its marker has another id)`).
+- **(frontend)** `POST .../targets/{id}/forget` → `{}`; the target is not
+  touched.
+- **(frontend)** `GET .../targets/{id}/plan[?keepDays=N]` → `{new, changed,
+  moved, current, extra, setName, symlinks, missing, keepDays}`; each class
+  is `{count, bytes, paths}` with at most 500 set-relative paths (strings;
+  for `moved` `{from, to}` objects). `extra` is exactly what a prune with
+  that keep window removes: the set's files whose path and content the
+  library no longer has, plus earlier versions under
+  `.picmover/previous/` older than the keep window (default 30 days), so
+  `extra.count` is the `expected` of a prune. `symlinks` and `missing`
+  (catalog rows whose file is missing in the library) are counts. The plan
+  is computed on every call. 409 when the target is unreachable or the set
+  is another library's.
+- **(frontend)** `GET .../targets/{id}/runs` → `{runs: [{id, kind,
+  startedAt, finishedAt, stats}]}`, newest first, at most 50; `[]` before
+  the first run; 409 when unreachable.
+- Ids: a malformed `{id}` (not 16 lower-case hex digits) is **400**
+  `invalid target id: ...`, an unknown one 404 `no such target`, on every
+  route. Every POST is under the step 3 rules (JSON content type,
+  `X-Picmover: 1`, origin checks).
+- **(frontend)** Jobs, `POST /api/l/{lib}/jobs`:
+  - `{kind: "backup", target, partial?, workers?}` (`workers` 0-16, 0 = 2);
+  - `{kind: "scrub", target, budget?: seconds, repair?: bool}` (no or 0
+    `budget`: the whole set; `repair` defaults to true);
+  - `{kind: "prune", target, keepDays?, confirm: true, expected: n}`:
+    400 without `confirm` or `expected`; the plan is computed when the job
+    is requested and a different `extra.count` is 409 `{error: "the files
+    to remove changed: the plan now lists N, not M; review them again"}`
+    without starting; the job checks the count again before removing;
+  - `{kind: "restore", target, mode?: "missing"}`.
+  Before starting: 400 malformed target or field, 404 unknown target, 409
+  unreachable target / another library's set / no backup of this library
+  on the target yet (scrub, prune, restore), and the usual 409 while any
+  job runs (one job at a time, imports included).
+- **(frontend)** Job object: backup kinds carry `target` (the marker id)
+  next to `library`, in `GET /api/jobs`, `GET /api/l/{lib}/jobs`, replays
+  and SSE `state`/`done`; restore jobs carry `mode`; `progress` is the
+  backup progress object (below); `result` is the run's stats once the job
+  has finished (absent before). `stats` (the importer counters) stays
+  present and zero.
+- **(frontend)** Progress events (`event: progress`, coalesced, every
+  500 ms): top level `{phase, files, bytes, totalFiles, totalBytes,
+  current, failed, rate, eta}`: `phase` `plan|copy|snapshot|scrub|prune|
+  restore`, `failed` a count, `current` a set-relative path; `rate`
+  (bytes/s since the phase began) and `eta` (seconds, -1 unknown) are
+  additions. Files that fail are also sent as `result` events
+  `{status: "error", source: <relative path>, dest: "", message}`
+  (scrub: unrepaired damaged files with message `damaged`).
+- **(frontend)** Exit codes and states: 0 `done`; 1 `failed` with a message
+  (backup: files failed, `--partial` left files or a snapshot failed;
+  scrub: damage or missing files found, repaired ones included; prune and
+  restore: files failed); 2 `failed` (target or library unusable: not
+  reachable, another library's set, not enough space without `partial`,
+  count changed); 130 `cancelled`. Messages carry no absolute paths.
+- **(frontend)** Run stats (`result`, and `stats` in `runs`); every list
+  is capped at 500 with `truncated: true` on the stats when one was:
+  - backup: `{copied, moved, changed, bytes, failed: [{path, error}]}` plus
+    `current, new, extra, adopted, refreshed, failedCount, partial,
+    leftFiles, leftBytes, symlinkCount, symlinks, missingCount, missing,
+    invalidCount, userSnapshot, mediaSnapshot, snapshotError?, cancelled,
+    seconds`. `moved` = files renamed on the target, `changed`/`new` the
+    plan's counts, `copied` new and changed files copied.
+  - scrub: `{checked, bytes, damaged: [{path, repaired, error?}], unknown:
+    [paths], missing: [paths]}` plus `ok, damagedCount, repaired,
+    missingCount, unknownCount, passComplete, remaining, cancelled,
+    seconds`.
+  - prune: `{removed, bytes}` plus `failed: [{path, error}], seconds`.
+  - restore: `{restored, bytes, failed: [{path, error}]}` plus `present,
+    elsewhere, failedCount, userDB, needsRebuild, cancelled, seconds`.
+- **(frontend)** `GET /api/libraries`: a library object carries `backup:
+  {targets, lastBackupAt, label?, behind?}` when it has targets
+  (omitted otherwise, and for libraries in state `error`): `targets` and
+  `lastBackupAt` (the newest backup over all targets) from user.db, read
+  through a read-only, immutable open for libraries that are not open;
+  `label` (addition) is that target's label; `behind` (files: new +
+  changed + moved) only when an open library has a cached plan for that
+  target.
+
+### Target path rules (POST only)
+
+`server.ValidTargetPath`: not empty, absolute, no NUL, not a device path
+(`\\?\`, `\\.\`, `//?/`, `//./`, `\??\`). UNC paths (`\\nas\share\x`) are
+accepted here, unlike `/api/fs` and import sources. Then lexically and
+with links resolved (`EvalSymlinks` of the path and of each root) the
+folder must not be, lie inside or contain the workspace root (workspace
+mode: also any listed folder), or the library root (single mode); then
+`backup.CheckSeparate` against the library. GET routes take ids only.
+
+### Package `internal/backup`
+
+- `marker.go`: `ValidID`, `NewID`, `ReadMarker` (≤ 4 KiB JSON, regular
+  file, `format` 1; a higher format is `ErrNewerMarker`), `OpenTarget`,
+  `InitTarget` (marker written to a temp file, fsynced, renamed without
+  replacing; only in an empty folder, where "empty" ignores file system
+  bookkeeping: `System Volume Information`, `$RECYCLE.BIN`, `lost+found`,
+  `.Trashes`, `.Trash-*`, `.Spotlight-V100`, `.fseventsd`, `.DS_Store`,
+  `desktop.ini`, `Thumbs.db`, `._*`), `CheckSeparate`.
+- `set.go`: `backup.db` exactly as in the contract (journal_mode DELETE,
+  synchronous FULL, busy_timeout 10 s); `meta` keys `name`, `library_id`,
+  `scrub_cursor`. `OpenSet`, `Sets`, `SetExists`, `FindSet` (by
+  library_id), `SetOwner`, `ResolveSetName`, `Claim` (a set without owner
+  takes the library's id; another id is `ErrOtherLibrary`), `Files`,
+  `Summary`, `Runs`, `LastRun`. Rows whose path is not a set path (empty,
+  `.`/`..` components, `\`, `:`, NUL, under `.picmover` other than
+  `.picmover/trash/`, a database name at the root) are ignored. Every
+  write and removal on the target first checks that the parent folder,
+  with links resolved, is inside the set (`inSet`), so a link planted on
+  the target is never followed.
+- `scan.go`/`plan.go`: `ScanLibrary` (catalog rows newest first, `taken_at
+  DESC, id DESC`, undated last, matched against a walk of the tree; other
+  regular files newest first by mtime; trashed rows at
+  `.picmover/trash/<rel>`; skipped: `.picmover` except the trash, every
+  `IsInternal` file at the root, links (listed), other non-regular files;
+  catalog rows with a non-library path are counted as invalid),
+  `MakePlan` (pure; NOCASE keys as SQLite folds them), `PlanFor`. A
+  non-media file whose size or mtime changed is `changed`; the run hashes
+  it and, when the content is the same, only refreshes the row
+  (`refreshed`).
+- `run.go`: `Run`. Order: claim the set, plan, clean picmover's own temp
+  names in `<set>/.picmover/tmp` (`copy-*`, `stage-*`, `snap-*`; left by a
+  killed run), free space, runs row, renames, copies, snapshots, end of
+  run. Copies use `library.CopyReadBack` (below) into the set's tmp folder.
+  A changed file's new content is staged and verified first; only then
+  does the old file move to `previous/<rel>.<unix>` and the new one take
+  its place. A destination that exists without a row (a killed run) is
+  hashed: the right content is adopted (`adopted`), anything else is moved
+  to `previous/` first. Rows are written 64 per transaction (and at least
+  every 5 s); a cancelled run writes the rows of the files done and its
+  runs row. The partial budget is taken in copy order by the feeder, so
+  the newest files get the space whatever the workers' timing.
+- `scrub.go`, `prune.go`, `restore.go`: below.
+- Free space: `statfs` (Linux, macOS, FreeBSD), `GetDiskFreeSpaceEx`
+  (Windows), unknown elsewhere (no check).
+
+`internal/library`: `CopyReadBack(ctx, src, dst, tmpDir, want *uint64)`
+(write, fsync, close, **read the temp file back and hash it**, compare with
+the hash of the bytes read and with `want`, refuse a source whose size or
+mtime changed during the copy, set the source mtime, `RenameNoReplace`,
+sync the folder), `HashFileContext`, `SyncDir`, `IsUserDBBackup`
+(`user.db.bak-<stamp>[-wal|-shm|-journal]` is now a database name:
+internal, skipped by imports and backups). The importer's `CopyVerified`
+is unchanged.
+
+`internal/catalog`: `PathRows` (hash, size, rel_path, trashed; newest
+first) and `Snapshot` (`VACUUM INTO`).
+
+`internal/userdata`: schema 2 = schema 1 + `backup_targets` (the
+contract's columns plus `set_name TEXT NOT NULL DEFAULT ''`) + `meta(key,
+value)` with `library_id` (16 random hex digits) and `created_at`. A fresh
+file is created at version 2 directly. Version 1 is migrated on `Open`:
+`VACUUM INTO user.db.bak-<YYYYMMDD-HHMMSS>` (never replacing a file), then
+one transaction (tables, identity, `user_version = 2`); a failed backup
+leaves version 1 untouched. `CheckFile` accepts 1 and 2; 3+ is refused with
+the existing `VersionError` ("user.db has schema version 3; this picmover
+supports 2: upgrade picmover"). Typed API: `LibraryID`, `CreatedAt`,
+`BackupTargets`, `BackupTarget`, `AddBackupTarget` (re-adding updates
+label, path and host), `UpdateBackupTarget(TargetUpdate{Label, LastPath,
+LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
+`BackupSummary`, `PeekBackupSummary` (read-only), `Snapshot`, `Migrated`,
+`CleanLabel`.
+
+### Deviations and additions
+
+- **Set names.** The contract's "unless the user chooses another set name"
+  needed somewhere to keep the choice: `backup_targets.set_name` (user.db),
+  `set` in `POST .../targets`, `--set` on `targets add`. The set is also
+  found by `library_id`, so renaming the library folder keeps its set.
+- **user.db snapshot history.** The previous `user.db` snapshot is moved to
+  `previous/user.db.<unix>` (pruned with the keep window) instead of being
+  replaced: user data is the one thing a rebuild cannot recreate. The
+  `media.db` snapshot is replaced (it is derived).
+- **Exit codes.** Usage errors of the backup commands exit 2 (not 1), so a
+  scheduled job never reads them as "some files failed". `--partial`
+  leaving files is exit 1 (the backup is incomplete).
+- **Restore in the server** supports `mode: "missing"` only: `user-data`
+  replaces the `user.db` the server holds open, so the API answers 400 and
+  names the CLI (`picmover restore --mode user-data` while the library is
+  not served). Missing mode also restores `user.db` when the library has
+  none (never in the server, which always has one open). A restore into an
+  open library leaves its catalog alone (it has a `media.db`); restored
+  files the catalog does not list show up in `verify` as orphans.
+- **Restore "present elsewhere"** is decided by content, not the catalog:
+  library files of the same size are hashed (lazily, each once), so it
+  also works for a library without `media.db`.
+- **Missing target files.** A backup run trusts its rows (it does not stat
+  136k files on the target); a file deleted from the target is found by the
+  next scrub (listed as missing, and copied again with repair).
+- **Scrub passes.** The cursor (`meta.scrub_cursor` = `{pass, v, p}`) keeps
+  a pass's position in `(coalesce(verified_at, -1), rel_path)` order;
+  rows verified at or after the pass start are left for the next pass. A
+  new pass starts one second after "now" (verified_at has second
+  resolution), so a pass started right after another reads everything
+  again. A scrub reads at least one file whatever the budget. Missing and
+  unknown files are found by walking the set on every scrub.
+- **Prune** removes folders its removals left empty (not the set,
+  `.picmover`, `previous` or the trash folder itself). Unknown files (no
+  row) are never pruned. A row whose file is already gone is dropped and
+  counted as removed.
+- **The library lock** is held by `backup`, `prune`, `restore` and `scrub
+  --library` (unless `--no-repair`); `targets`, `backup --dry-run`, `restore
+  --dry-run` and plain `scrub` take none. In the server the job runs under
+  the server's lock; trash operations are not blocked during a backup (a
+  file moved meanwhile fails or is picked up as moved by the next run).
+- **CLI additions:** `--quiet` (no status line) on backup, scrub and
+  restore; `--dry-run` and `--thumbs` (generate thumbnails in the rebuild
+  after a restore) on `restore`; `prune <library> <target>` takes a folder
+  or an id; `scrub` without `--budget` reads the whole set (`--all` says so
+  explicitly); `--keep` takes `30d` or a Go duration. When a folder given
+  to `backup` holds a marker the library does not know yet, it is attached
+  (label = folder name) and the run goes on.
+- **Logs:** `<library>/.picmover/logs/{backup,scrub,prune,restore}_<time>.log`
+  (the job's `logPath`) and the same names in `<set>/.picmover/logs/`.
+
+### Tests
+
+`internal/backup` (`backup_test.go`): marker create/read/validate incl.
+system entries, non-empty folder, bad/newer markers, `ValidID`;
+`CheckSeparate` incl. a link into the library; `MakePlan` classes (current,
+moved, changed, new, extra, non-media by size and mtime, NOCASE, a hash
+used by one move only, extras excluded when the catalog or a non-media
+file has the hash, copy order); a full run with a trashed file, a symlink
+(skipped and listed), internal files and a catalog backup (not copied),
+snapshots, mtimes, runs row; an incremental run (nothing copied, previous
+user.db snapshot kept); move, change and delete in the library (rename on
+the target, previous version kept, nothing removed); touch without change
+(refreshed); another library's set refused, `FindSet`, `SetOwner`; a
+verification failure (catalog hash mismatch: listed with a path-free
+text, no row, nothing at the destination, no temp files) and a file
+missing from the library; **a kill mid-run** (`crashAfter`: exactly the
+first 64-row batch survives, every row's file is intact on the target, the
+run row is unfinished, the next run adopts the unrecorded files by hash
+and copies the rest); free-space refusal and `--partial` (newest file
+first); scrub budget and cursor over five runs, damage, missing and
+unknown, repair with the damaged copy kept, clean afterwards; prune rules
+(extras, trashed content kept, previous/ by age, wrong count refused,
+snapshots kept, empty folders removed, a planted link not followed);
+restore into an empty library (dry run, files, user.db with its ratings,
+rebuild needed), missing mode never overwriting and skipping content
+present elsewhere, user-data mode with and without force; set name and
+set path rules. `bench_test.go`: `MakePlan` for 136k rows: 40 ms (Ryzen 7
+7800X3D); the library walk comes on top and is bounded by the file system.
+`internal/library/copyfile_test.go` (`CopyReadBack`: success with mtime,
+no replace, wrong hash, a read-back mismatch, no temp files left, a
+folder refused). `internal/userdata/targets_test.go` (v1 → v2 migration
+with the backup copy, id kept on reopen and no second backup, a refused
+migration leaves version 1, fresh v2 identity, target CRUD incl. labels,
+set names, marks, summary, read-only peek, snapshot); version 3 refusal
+in the existing tests (moved from 2). `internal/server/backup_test.go`
+(endpoints and shapes, the backup, scrub and restore jobs with results and
+Unix-second times, the libraries one-liner, rename and forget; prune
+confirm/expected 400/409 and the job; path rules incl. relative, NUL,
+device paths, inside/containing the library and the workspace, a link into
+the library, non-empty and missing folders, no path in answers, nothing
+written on refusal; another library's set 409 and `set`; re-pointing with
+the same and another id; unreachable target in the listing and for jobs;
+id validation on every route and job; mutation headers; `ValidTargetPath`
+with UNC accepted only there; a backup job refused while an import runs;
+the progress event and job object shape). `cmd/backup_test.go` (targets
+list/add/forget, exit codes 0/1/2 incl. usage errors, dry-run output,
+target resolution messages for a missing marker, a moved drive and a
+re-pointed one, scrub damage/repair/budget, prune with and without
+`--yes`, restore with rebuild, user-data with and without `--force`, the
+library lock refusal, another library's set and `--set`).
+
+Not measured: the 136k-row plan end to end on real disks (only the
+classification), throughput on a USB drive, `GET /backups` warm (it is a
+cache read plus one `backup.db` summary per target).
+
 ## As implemented (frontend)
 
 Built against this contract while the Go side was written in parallel, so
