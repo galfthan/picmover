@@ -28,6 +28,9 @@ const (
 	DBName = "media.db"
 	// MetaDir holds picmover's own files (temp files, logs).
 	MetaDir = ".picmover"
+	// UserDBName is the user data database (ratings, tags, albums) at
+	// the library root; see internal/userdata.
+	UserDBName = "user.db"
 )
 
 // ErrHashMismatch is returned by CopyVerified when the bytes written do not
@@ -185,7 +188,8 @@ func (l *Library) Contains(abs string) bool {
 }
 
 // IsInternal reports whether abs is a file picmover manages itself: the
-// catalog (media.db, media.db-wal, -shm, -journal), its backups
+// catalog (media.db, media.db-wal, -shm, -journal), the user data
+// database (user.db and its -wal, -shm, -journal), the catalog's backups
 // (media.db.bak-YYYYMMDD-HHMMSS[-wal|-shm|-journal], and the v1 media.db.v1-*.bak and their .tmp files), import_*.log at the root, and
 // everything under the .picmover directory. Importers skip these when the source
 // overlaps the library.
@@ -202,7 +206,8 @@ func (l *Library) IsInternal(abs string) bool {
 	}
 	base := path.Base(rel)
 	switch base {
-	case DBName, DBName + "-wal", DBName + "-shm", DBName + "-journal":
+	case DBName, DBName + "-wal", DBName + "-shm", DBName + "-journal",
+		UserDBName, UserDBName + "-wal", UserDBName + "-shm", UserDBName + "-journal":
 		return true
 	}
 	if isBackupName(base) {
