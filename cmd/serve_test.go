@@ -105,14 +105,14 @@ func (r *serveRun) stop(t *testing.T) {
 
 func getLibrary(t *testing.T, url string) map[string]any {
 	t.Helper()
-	resp, err := http.Get(url + "api/library")
+	resp, err := http.Get(url + "api/l/lib/library")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /api/library: %d %s", resp.StatusCode, b)
+		t.Fatalf("GET /api/l/lib/library: %d %s", resp.StatusCode, b)
 	}
 	var v map[string]any
 	if err := json.Unmarshal(b, &v); err != nil {
@@ -129,7 +129,7 @@ func TestServeFlagValidation(t *testing.T) {
 	}{
 		{[]string{"serve"}, "accepts 1 arg"},
 		{[]string{"serve", lib, "extra"}, "accepts 1 arg"},
-		{[]string{"serve", " "}, "empty <library> argument"},
+		{[]string{"serve", " "}, "empty <library-or-workspace> argument"},
 		{[]string{"serve", "--addr", "nonsense", lib}, "invalid --addr"},
 		{[]string{"serve", "--cors-origin", "ftp://x", lib}, "invalid --cors-origin"},
 		{[]string{"serve", "--cors-origin", "http://localhost:5173/app", lib}, "invalid --cors-origin"},
@@ -316,7 +316,7 @@ func TestServeOpensBrowser(t *testing.T) {
 	r = startServe(t, "--addr", "127.0.0.1:0", "--verbose", "--cors-origin", "http://localhost:5173", lib)
 	getLibrary(t, r.url)
 	// The CORS origin is honoured.
-	req, _ := http.NewRequest(http.MethodGet, r.url+"api/library", nil)
+	req, _ := http.NewRequest(http.MethodGet, r.url+"api/l/lib/library", nil)
 	req.Header.Set("Origin", "http://localhost:5173")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -333,7 +333,7 @@ func TestServeOpensBrowser(t *testing.T) {
 		t.Fatalf("opened %v, want %s", opened, r.url)
 	}
 	// --verbose logs requests to stderr.
-	if !strings.Contains(r.errOut.String(), "path=/api/library") {
+	if !strings.Contains(r.errOut.String(), "path=/api/l/lib/library") {
 		t.Fatalf("no request log: %s", r.errOut)
 	}
 }

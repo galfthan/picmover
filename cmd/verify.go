@@ -46,6 +46,7 @@ func newVerifyCmd() *cobra.Command {
 		Long: `Check every catalog row against the library: the file must exist and have
 the recorded size (and, with --rehash, the recorded hash). Then list files
 under image/, image_raw/ and video/ that are not in the catalog (orphans),
+(trashed rows are checked at their path in .picmover/trash),
 files whose name matches a catalog row only when case is ignored (case
 conflicts) and catalog rows whose paths differ only in case. Exits with
 status 1 when any problem is found.`,
@@ -62,7 +63,7 @@ status 1 when any problem is found.`,
 			}
 			defer unlock()
 			defer db.Close()
-			rows, err := db.List(ctx, catalog.ListOptions{OrderBy: "rel_path"})
+			rows, err := db.List(ctx, catalog.ListOptions{OrderBy: "rel_path", IncludeDeleted: true})
 			if err != nil {
 				return err
 			}
@@ -109,6 +110,9 @@ func checkRows(ctx context.Context, lib *library.Library, db *catalog.DB, rows [
 			return err
 		}
 		abs := lib.Abs(m.RelPath)
+		if !m.DeletedAt.IsZero() {
+			abs = lib.TrashPath(m.RelPath) // a trashed row's file is in the trash
+		}
 		fi, err := os.Stat(abs)
 		if errors.Is(err, fs.ErrNotExist) {
 			r.missing = append(r.missing, m.RelPath)
@@ -176,11 +180,15 @@ func fillBatch(ctx context.Context, db *catalog.DB, batch []sizeFill) error {
 // is not in the catalog. A file that matches a catalog row only when case is
 // ignored is a case conflict: an uncatalogued file on a case-sensitive file
 // system, and a collision once the library is copied to Windows or macOS.
-// Soft-deleted rows are not in rows, so their files count as orphans too.
+// Trashed rows have their files in the trash, so a file at their path in
+// the library counts as an orphan.
 func findOrphans(ctx context.Context, lib *library.Library, rows []catalog.Media, r *verifyReport) error {
 	known := make(map[string]bool, len(rows))
 	folded := make(map[string]string, len(rows))
 	for _, m := range rows {
+		if !m.DeletedAt.IsZero() {
+			continue
+		}
 		known[m.RelPath] = true
 		folded[strings.ToLower(m.RelPath)] = m.RelPath
 	}

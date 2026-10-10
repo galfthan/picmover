@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"picmover/internal/library"
+	"picmover/internal/userdata"
 )
 
 func newRebuildCmd() *cobra.Command {
@@ -33,6 +35,9 @@ copied, moved, renamed or deleted. A file whose content is already recorded
 (an identical copy elsewhere in the library) is reported as a duplicate and
 left in place. Zip archives are not extracted. To move files into the
 <type>/YYYY/MM layout use 'picmover import <library> <library>' instead.
+Files in the trash (<library>/.picmover/trash) are recorded as trashed, with
+the time they were trashed from user.db (else their modification time);
+user.db itself (ratings, tags, albums) is never changed by a rebuild.
 Finally the thumbnail stage runs (skip it with --no-thumbs and run
 'picmover thumbs' later); thumbnails and previews are cached by content
 hash in <library>/.picmover and are reused.
@@ -101,6 +106,9 @@ Exit status as for import.`,
 			}
 			p.source, p.libRoot, p.zone = root, root, zone
 			p.recordInPlace = true
+			if p.trashTimes, err = trashTimes(ctx, root); err != nil {
+				return err
+			}
 			p.locked = true
 			p.logPrefix, p.what = "rebuild", "Rebuild"
 			return runImport(cmd, ctx, p)
@@ -112,6 +120,21 @@ Exit status as for import.`,
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.noThumbs, "no-thumbs", false, "do not generate thumbnails and previews (run 'picmover thumbs' later)")
 	return c
+}
+
+// trashTimes reads the trash timestamps from the library's user.db, or
+// returns nil when there is none (it is not created).
+func trashTimes(ctx context.Context, root string) (map[uint64]time.Time, error) {
+	p := filepath.Join(root, userdata.FileName)
+	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	u, err := userdata.Open(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close()
+	return u.TrashedAt(ctx, nil)
 }
 
 // missingCatalogNote describes a rebuild of a library that has no media.db

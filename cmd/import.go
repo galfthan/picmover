@@ -91,10 +91,11 @@ type importParams struct {
 	quiet           bool
 	noThumbs        bool
 	isNew           bool
-	recordInPlace   bool   // importer.Options.RecordInPlace (rebuild)
-	locked          bool   // the caller holds the library lock (rebuild)
-	logPrefix       string // log file name prefix; "" = "import"
-	what            string // operation name in messages; "" = "Import"
+	recordInPlace   bool                 // importer.Options.RecordInPlace (rebuild)
+	trashTimes      map[uint64]time.Time // importer.Options.TrashTimes (rebuild)
+	locked          bool                 // the caller holds the library lock (rebuild)
+	logPrefix       string               // log file name prefix; "" = "import"
+	what            string               // operation name in messages; "" = "Import"
 }
 
 // interruptContext returns a context cancelled by the first SIGINT or
@@ -168,6 +169,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 			Logger:        logger,
 			NoThumbs:      p.noThumbs,
 			RecordInPlace: p.recordInPlace,
+			TrashTimes:    p.trashTimes,
 		}
 		var status *statusLine // nil: no live status line
 		if !p.quiet {
