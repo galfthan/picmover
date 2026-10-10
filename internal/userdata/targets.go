@@ -107,7 +107,7 @@ func scanTarget(r interface{ Scan(...any) error }) (BackupTarget, error) {
 // BackupTargets returns the library's targets, in the order they were
 // added.
 func (d *DB) BackupTargets(ctx context.Context) ([]BackupTarget, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT `+targetColumns+` FROM backup_targets ORDER BY added_at, id`)
+	rows, err := d.db.QueryContext(ctx, `SELECT `+targetColumns+` FROM backup_targets ORDER BY added_at, rowid`)
 	if err != nil {
 		return nil, fmt.Errorf("userdata: backup targets: %w", err)
 	}
