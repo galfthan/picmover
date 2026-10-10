@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"picmover/internal/library"
@@ -99,6 +102,10 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if lib != nil && e.checkFolder() != nil {
+		writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})
+		return
+	}
 	j, err := s.jobs.start(e, p, zone)
 	switch {
 	case errors.Is(err, errBusy):
@@ -129,7 +136,15 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 		p.Source = filepath.Clean(p.Source)
 		st, err := os.Stat(p.Source)
 		if err != nil {
-			return nil, fmt.Errorf("source: %w", err)
+			// No raw OS error text in the answer.
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				return nil, errors.New("source: the path does not exist")
+			case errors.Is(err, fs.ErrPermission):
+				return nil, errors.New("source: permission denied")
+			}
+			s.log.Info("import source refused", "source", p.Source, "err", err)
+			return nil, errors.New("source: the path cannot be read")
 		}
 		if !st.IsDir() && !st.Mode().IsRegular() {
 			return nil, fmt.Errorf("source %s is not a directory or a file", p.Source)
@@ -142,6 +157,10 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 			if lib.IsInternal(c) {
 				return nil, fmt.Errorf("source %s is inside picmover's own files", p.Source)
 			}
+		}
+		if s.overlapsLibraries(p.Source, resolved) {
+			return nil, fmt.Errorf("source %s is a library, lies inside one or contains one; "+
+				"import from a folder outside the libraries", p.Source)
 		}
 		if p.Timezone == "" {
 			// Like the CLI's --timezone default: the system zone.
@@ -169,6 +188,70 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 		return nil, nil
 	}
 	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar or rebuild", p.Kind)
+}
+
+// overlapsLibraries reports whether an import source (as given and
+// resolved) is a library the server serves, lies inside one, or contains
+// one: in workspace mode every listed folder with a media.db or a
+// .picmover, and the workspace root itself; in single mode the library.
+// Importing from there would read another library's previews and, with
+// move, empty a library whose catalog still lists the files.
+func (s *Server) overlapsLibraries(source, resolved string) bool {
+	spellings := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && filepath.Clean(r) != filepath.Clean(p) {
+			out = append(out, filepath.Clean(r))
+		}
+		return out
+	}
+	sources := []string{filepath.Clean(source), filepath.Clean(resolved)}
+	if !s.ws.single {
+		// The workspace root itself, or a folder that contains it (a
+		// plain folder of the workspace is a fine source).
+		for _, r := range spellings(s.ws.root) {
+			for _, c := range sources {
+				if pathEqual(r, c) || within(c, r) {
+					return true
+				}
+			}
+		}
+	}
+	var roots []string
+	add := func(p string) { roots = append(roots, spellings(p)...) }
+	if s.ws.single {
+		add(s.ws.root)
+	} else {
+		all, err := s.ws.discover()
+		if err != nil {
+			return true // cannot tell: refuse
+		}
+		for _, l := range all {
+			if l.library || isLibraryDir(l.path) {
+				add(l.path)
+			}
+		}
+	}
+	for _, c := range sources {
+		for _, r := range roots {
+			if sameOrWithin(r, c) || within(c, r) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sameOrWithin reports whether p is dir or lies inside it (lexically,
+// case-insensitively on Windows and macOS file systems).
+func sameOrWithin(dir, p string) bool {
+	if pathEqual(dir, p) {
+		return true
+	}
+	return within(dir, p) || (caseInsensitiveFS && within(strings.ToLower(dir), strings.ToLower(p)))
+}
+
+func pathEqual(a, b string) bool {
+	return a == b || (caseInsensitiveFS && strings.EqualFold(a, b))
 }
 
 // jobFromPath returns the job named by the {id} path value or answers
@@ -282,3 +365,7 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// caseInsensitiveFS: the default file systems of Windows and macOS ignore
+// case, so path comparisons for refusals do too there.
+var caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"

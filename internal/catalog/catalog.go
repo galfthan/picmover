@@ -39,6 +39,14 @@ type DB struct {
 // catalog is derived from the files and is rebuilt instead.
 var ErrNeedsRebuild = errors.New("catalog format changed; run 'picmover rebuild <library>'")
 
+// ErrNewerSchema is wrapped, next to ErrNeedsRebuild, when the catalog was
+// written by a newer picmover.
+var ErrNewerSchema = errors.New("catalog written by a newer picmover")
+
+// ErrNotCatalog is returned (wrapped) when the file is not a picmover
+// catalog at all.
+var ErrNotCatalog = errors.New("not a picmover catalog")
+
 // Open opens the catalog at path, creating it with schema SchemaVersion when
 // the file is missing, empty, or has user_version 0 and no media table. Any
 // other schema version is refused with an error wrapping ErrNeedsRebuild,
@@ -144,10 +152,10 @@ func checkSchema(path string, v int, hasMedia, allowFresh bool) error {
 		if allowFresh {
 			return nil
 		}
-		return fmt.Errorf("catalog: %s is not a picmover catalog (no schema)", path)
+		return fmt.Errorf("catalog: %s is not a picmover catalog (no schema): %w", path, ErrNotCatalog)
 	case v > SchemaVersion:
-		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d (upgrade picmover): %w",
-			path, v, SchemaVersion, ErrNeedsRebuild)
+		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d (upgrade picmover): %w (%w)",
+			path, v, SchemaVersion, ErrNeedsRebuild, ErrNewerSchema)
 	}
 	return fmt.Errorf("catalog: %s has schema version %d, want %d: %w", path, v, SchemaVersion, ErrNeedsRebuild)
 }

@@ -36,6 +36,13 @@ const (
 	// collapse into the same band values, and comparing thousands of
 	// them pairwise is slow and pointless; such a bucket is skipped.
 	MaxBucket = 5000
+	// MaxPairsPerItem caps the pairs kept per item: each item keeps its
+	// MaxPairsPerItem nearest partners (by distance, then hash), and a
+	// pair is stored when either item keeps it. A burst or time-lapse of
+	// n near-identical frames then stores at most n*MaxPairsPerItem
+	// pairs instead of n(n-1)/2, and stays one group: every item keeps
+	// an edge to its nearest partner.
+	MaxPairsPerItem = 32
 )
 
 // SkippedBucket describes a bucket skipped for exceeding MaxBucket.
@@ -100,6 +107,7 @@ func Find(items []catalog.PHashItem, d int, onBand func(done int)) ([]catalog.Si
 	for b := range Bands {
 		pairs = append(pairs, results[b]...)
 	}
+	pairs = capPairs(pairs, MaxPairsPerItem)
 	slices.SortFunc(pairs, func(x, y catalog.SimilarPair) int {
 		return cmp.Or(cmp.Compare(int64(x.A), int64(y.A)), cmp.Compare(int64(x.B), int64(y.B)))
 	})
@@ -108,6 +116,55 @@ func Find(items []catalog.PHashItem, d int, onBand func(done int)) ([]catalog.Si
 		skips = append(skips, skipped[b]...)
 	}
 	return pairs, skips, nil
+}
+
+// capPairs keeps, for every item with more than k pairs, only its k
+// nearest partners (smallest distance, then smallest partner hash as
+// int64); a pair survives when either of its items keeps it. Items with at
+// most k pairs keep them all, so groups that are not dense lose nothing.
+func capPairs(pairs []catalog.SimilarPair, k int) []catalog.SimilarPair {
+	adj := map[uint64][]int32{}
+	for i, p := range pairs {
+		adj[p.A] = append(adj[p.A], int32(i))
+		adj[p.B] = append(adj[p.B], int32(i))
+	}
+	dense := false
+	for _, l := range adj {
+		if len(l) > k {
+			dense = true
+			break
+		}
+	}
+	if !dense {
+		return pairs
+	}
+	keep := make([]bool, len(pairs))
+	other := func(x uint64, p catalog.SimilarPair) uint64 {
+		if p.A == x {
+			return p.B
+		}
+		return p.A
+	}
+	for x, l := range adj {
+		if len(l) > k {
+			slices.SortFunc(l, func(i, j int32) int {
+				pi, pj := pairs[i], pairs[j]
+				return cmp.Or(cmp.Compare(pi.Distance, pj.Distance),
+					cmp.Compare(int64(other(x, pi)), int64(other(x, pj))))
+			})
+			l = l[:k]
+		}
+		for _, i := range l {
+			keep[i] = true
+		}
+	}
+	out := pairs[:0:0]
+	for i, p := range pairs {
+		if keep[i] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // band returns band b (0 = lowest byte) of p.

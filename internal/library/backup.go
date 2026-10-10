@@ -47,3 +47,28 @@ func BackupCatalog(dbPath string, now time.Time) (string, error) {
 	}
 	return backup, nil
 }
+
+// RestoreCatalogBackup undoes BackupCatalog after a rebuild that failed or
+// was cancelled before its new catalog was complete: it removes the new
+// catalog at dbPath with its -wal/-shm/-journal files and renames the
+// backup's files back (never replacing anything). With backup "" (the
+// folder had no catalog) it only removes the new catalog. The new catalog
+// must be closed first.
+func RestoreCatalogBackup(dbPath, backup string) error {
+	for _, s := range CatalogFileSuffixes {
+		if err := os.Remove(dbPath + s); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove the incomplete catalog: %w", err)
+		}
+	}
+	if backup == "" {
+		return nil
+	}
+	for _, s := range CatalogFileSuffixes {
+		err := RenameNoReplace(backup+s, dbPath+s)
+		if err == nil || (s != "" && errors.Is(err, fs.ErrNotExist)) {
+			continue
+		}
+		return fmt.Errorf("restore the catalog backup: %w; rename %s back to %s by hand", err, backup+s, dbPath+s)
+	}
+	return nil
+}

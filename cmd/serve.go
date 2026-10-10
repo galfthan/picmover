@@ -371,13 +371,21 @@ func runServe(cmd *cobra.Command, dir string, p serveParams) error {
 	}
 	stop() // a second Ctrl+C now terminates at once
 	fmt.Fprintln(out, "Stopping...")
-	if err := srv.Shutdown(context.Background()); err != nil {
-		fmt.Fprintf(errOut, "Warning: %v\n", err)
+	// Shutdown in three phases: stop the job (its event streams end),
+	// drain the HTTP requests still in flight (a trash batch finishes
+	// against open catalogs and under the lock), then close the
+	// libraries and release their locks.
+	jobErr := srv.StopJobs(context.Background())
+	if jobErr != nil {
+		fmt.Fprintf(errOut, "Warning: %v\n", jobErr)
 	}
 	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	if err := httpSrv.Shutdown(sctx); err != nil {
 		httpSrv.Close()
+	}
+	if jobErr == nil {
+		srv.Close()
 	}
 	if runErr != nil && !errors.Is(runErr, http.ErrServerClosed) {
 		return fmt.Errorf("serve: %w", runErr)

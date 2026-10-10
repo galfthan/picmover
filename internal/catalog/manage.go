@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -148,6 +149,31 @@ func cover(ctx context.Context, q queryRower) (uint64, time.Time, bool, error) {
 	return uint64(h), fromUnix(at), true, nil
 }
 
+// LiveHashes returns the hashes among hashes that have a live row.
+func (d *DB) LiveHashes(ctx context.Context, hashes []uint64) (map[uint64]bool, error) {
+	out := map[uint64]bool{}
+	if len(hashes) == 0 {
+		return out, nil
+	}
+	rows, err := d.QueryContext(ctx, `SELECT hash FROM media WHERE deleted_at IS NULL
+		AND hash IN (SELECT value FROM json_each(?))`, hashArray(hashes))
+	if err != nil {
+		return nil, fmt.Errorf("catalog: live hashes: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("catalog: live hashes: %w", err)
+		}
+		out[uint64(h)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: live hashes: %w", err)
+	}
+	return out, nil
+}
+
 // NewestOf returns the newest live row among hashes (taken_at DESC, id
 // DESC, undated last); ok is false when none of them is a live row.
 func (d *DB) NewestOf(ctx context.Context, hashes []uint64) (hash uint64, ok bool, err error) {
@@ -238,13 +264,30 @@ func (d *DB) ReplaceSimilarPairs(ctx context.Context, pairs []SimilarPair, meta 
 	return nil
 }
 
-// SimilarPairs returns the stored pairs whose rows both exist and are
-// live (not trashed), ordered by A, B.
+// SimilarPairs returns the stored pairs whose rows are both live (not
+// trashed), ordered by A, B. Trashed rows are left out in Go, from the
+// (small) set of trashed hashes, rather than by joining every pair with
+// media twice (measured 43 of 53 ms for 20k pairs). A pair's rows always
+// exist: Remove drops a hash's pairs, and a rebuild starts a new catalog.
 func (d *DB) SimilarPairs(ctx context.Context) ([]SimilarPair, error) {
-	rows, err := d.QueryContext(ctx, `SELECT p.hash_a, p.hash_b, p.distance FROM similar_pairs p
-		JOIN media a ON a.hash = p.hash_a AND a.deleted_at IS NULL
-		JOIN media b ON b.hash = p.hash_b AND b.deleted_at IS NULL
-		ORDER BY p.hash_a, p.hash_b`)
+	trashed := map[int64]bool{}
+	trows, err := d.QueryContext(ctx, `SELECT hash FROM media WHERE deleted_at IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: similar pairs: %w", err)
+	}
+	for trows.Next() {
+		var h int64
+		if err := trows.Scan(&h); err != nil {
+			trows.Close()
+			return nil, fmt.Errorf("catalog: similar pairs: %w", err)
+		}
+		trashed[h] = true
+	}
+	trows.Close()
+	if err := trows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: similar pairs: %w", err)
+	}
+	rows, err := d.QueryContext(ctx, `SELECT hash_a, hash_b, distance FROM similar_pairs ORDER BY hash_a, hash_b`)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: similar pairs: %w", err)
 	}
@@ -255,6 +298,9 @@ func (d *DB) SimilarPairs(ctx context.Context) ([]SimilarPair, error) {
 		var p SimilarPair
 		if err := rows.Scan(&a, &b, &p.Distance); err != nil {
 			return nil, fmt.Errorf("catalog: similar pairs: %w", err)
+		}
+		if trashed[a] || trashed[b] {
+			continue
 		}
 		p.A, p.B = uint64(a), uint64(b)
 		out = append(out, p)
@@ -331,12 +377,50 @@ type Peek struct {
 // query_only: no lock is taken, nothing is created or converted), checks
 // its schema version (an error wrapping ErrNeedsRebuild for another one)
 // and returns its summary and cover. It is for listing libraries that are
-// not opened.
+// not opened. In a folder picmover cannot write, the read-only open of a
+// WAL catalog fails because SQLite cannot create the -shm file; when no
+// -wal file holds data, the peek is retried with immutable=1 (no locks,
+// no side files), which is safe then.
 func PeekFile(ctx context.Context, path string) (Peek, error) {
 	if err := checkPath(path); err != nil {
 		return Peek{}, err
 	}
-	sqldb, err := sql.Open("sqlite", readOnlyDSN(path))
+	p, err := peekFile(ctx, path, false)
+	if err != nil && ctx.Err() == nil && cannotOpenReadOnly(err) && !walHasData(path) {
+		if p2, err2 := peekFile(ctx, path, true); err2 == nil {
+			return p2, nil
+		}
+	}
+	return p, err
+}
+
+// cannotOpenReadOnly reports SQLite's SQLITE_READONLY and SQLITE_CANTOPEN
+// (primary codes), what a read-only open of a WAL database in an
+// unwritable folder returns.
+func cannotOpenReadOnly(err error) bool {
+	var ce interface{ Code() int }
+	if !errors.As(err, &ce) {
+		return false
+	}
+	switch ce.Code() & 0xff {
+	case 8, 14: // SQLITE_READONLY, SQLITE_CANTOPEN
+		return true
+	}
+	return false
+}
+
+// walHasData reports whether path's -wal file exists and is not empty.
+func walHasData(path string) bool {
+	fi, err := os.Lstat(path + "-wal")
+	return err == nil && fi.Size() > 0
+}
+
+func peekFile(ctx context.Context, path string, immutable bool) (Peek, error) {
+	dsn := readOnlyDSN(path)
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return Peek{}, fmt.Errorf("catalog: open %s: %w", path, err)
 	}

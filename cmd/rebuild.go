@@ -94,21 +94,24 @@ Exit status as for import.`,
 			ctx, stop := interruptContext(cmd.Context())
 			defer stop()
 			out := cmd.OutOrStdout()
+			// user.db is read before the backup: an unreadable one must
+			// never leave the library without its catalog.
+			if p.trashTimes, err = trashTimes(ctx, root); err != nil {
+				return err
+			}
 			if hasCatalog {
 				backup, err := backupCatalog(dbPath, time.Now())
 				if err != nil {
 					return err
 				}
 				fmt.Fprintf(out, "Old catalog saved as %s\n", backup)
+				p.backup = backup
 			} else {
 				fmt.Fprintln(out, missingCatalogNote(root))
 				p.isNew = true
 			}
 			p.source, p.libRoot, p.zone = root, root, zone
 			p.recordInPlace = true
-			if p.trashTimes, err = trashTimes(ctx, root); err != nil {
-				return err
-			}
 			p.locked = true
 			p.logPrefix, p.what = "rebuild", "Rebuild"
 			return runImport(cmd, ctx, p)

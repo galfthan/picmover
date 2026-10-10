@@ -94,7 +94,7 @@ func New(opts Options) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	ws := &workspace{log: log, libs: map[string]*libEntry{}, peeks: map[string]peekEntry{}, now: time.Now}
+	ws := &workspace{log: log, libs: map[string]*libEntry{}, peeks: map[string]peekEntry{}}
 	switch {
 	case opts.Workspace != "":
 		if opts.Library != nil || opts.Catalog != nil || opts.Store != nil {
@@ -126,8 +126,11 @@ func New(opts Options) (*Server, error) {
 		// would reopen, re-running the connection pragmas, on every request).
 		opts.Catalog.SetMaxIdleConns(maxIdleConns)
 		id := singleID(ws.root)
+		// The lock belongs to the caller (cmd/serve): the entry records it
+		// as held, so nothing here takes it again or releases it.
+		lockInfo, _ := os.Stat(opts.Library.LockPath())
 		ws.libs[id] = &libEntry{id: id, path: ws.root, state: libOpen, lib: opts.Library, db: opts.Catalog,
-			store: opts.Store, user: user}
+			store: opts.Store, user: user, unlock: func() {}, external: true, lockInfo: lockInfo}
 	}
 	s := &Server{
 		ws:      ws,
@@ -166,16 +169,32 @@ func (s *Server) Mode() string {
 	return modeWorkspace
 }
 
-// Shutdown cancels the running job and waits for it to finish, bounded by
-// ctx and by 30 s, and ends every event stream. New jobs are refused
-// afterwards. Then every library is closed and its lock released (in
-// single mode too: the catalog, store and user.db of Options).
-func (s *Server) Shutdown(ctx context.Context) error {
+// StopJobs is the first phase of a shutdown: it refuses new jobs,
+// cancels the running one and waits for it (bounded by ctx and
+// jobShutdownTimeout); when it does not stop, its event streams are
+// closed so their connections end. The libraries stay open, so requests
+// still in flight (a trash batch) finish against open handles while the
+// HTTP server drains them. Close is the last phase.
+func (s *Server) StopJobs(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, jobShutdownTimeout)
 	defer cancel()
-	err := s.jobs.shutdown(ctx)
+	return s.jobs.shutdown(ctx)
+}
+
+// Close is the last phase of a shutdown, after the HTTP server has
+// drained: it closes every library (catalog, store, user.db) and releases
+// the locks it took. Library routes answer 503 afterwards.
+func (s *Server) Close() {
+	s.ws.closeAll()
+}
+
+// Shutdown is StopJobs followed by Close, for callers that have no HTTP
+// server to drain in between. When the job does not stop, the libraries
+// are left open (the job still uses them) and the error says so.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.StopJobs(ctx)
 	if err == nil {
-		s.ws.closeAll()
+		s.Close()
 	}
 	return err
 }

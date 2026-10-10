@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -200,6 +201,13 @@ func (d *DB) TagMedia(ctx context.Context, hashes []uint64, add, remove []int64,
 				added = append(added, t)
 			}
 		}
+		// A tag both added and removed in one call is removed: remove
+		// wins, and the tag is not reported as added.
+		removed := map[int64]bool{}
+		for _, id := range remove {
+			removed[id] = true
+		}
+		added = slices.DeleteFunc(added, func(t Tag) bool { return removed[t.ID] })
 		arr := hashArray(hashes)
 		for _, t := range added {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO media_tags (hash, tag_id, added_at)

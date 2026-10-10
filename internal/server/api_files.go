@@ -246,7 +246,8 @@ func within(dir, p string) bool {
 // validRelPath reports whether rel has the shape of a path in the
 // library: slash-separated components, none empty, "." or "..", none
 // containing \, : (drive letters, NTFS streams) or NUL, and a first
-// component that is not .picmover and does not start with media.db, nor
+// component that is not .picmover and does not start with media.db or
+// user.db, nor
 // (for a file at the root) an import_*.log, compared case-insensitively
 // after trimming trailing dots and spaces (NTFS and APFS ignore case,
 // Win32 drops trailing dots and spaces). The importer only writes
@@ -259,7 +260,8 @@ func validRelPath(rel string) bool {
 		}
 	}
 	first := strings.ToLower(strings.TrimRight(parts[0], ". "))
-	if first == "" || first == library.MetaDir || strings.HasPrefix(first, library.DBName) {
+	if first == "" || first == library.MetaDir || strings.HasPrefix(first, library.DBName) ||
+		strings.HasPrefix(first, library.UserDBName) {
 		return false
 	}
 	if len(parts) == 1 && strings.HasPrefix(first, "import_") && strings.HasSuffix(first, ".log") {

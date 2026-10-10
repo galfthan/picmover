@@ -104,6 +104,15 @@ type Options struct {
 	// entry gets its mtime.
 	TrashTimes map[uint64]time.Time
 
+	// TrashLock, when set, is held while a trashed row is restored
+	// because its content was imported again (the server's per-library
+	// trash lock, so a restore never races a trash, restore or delete
+	// request).
+	TrashLock sync.Locker
+	// OnRestored is called after such a restore (the server and the CLI
+	// remove the user.db trash row); an error is only logged.
+	OnRestored func(ctx context.Context, hash uint64) error
+
 	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
 	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64
 	ThumbLimit   int    // RunThumbs processes at most this many rows; <=0: no limit
@@ -132,6 +141,8 @@ type Importer struct {
 	mu       sync.Mutex
 	claimed  map[string]struct{}            // lower-cased rel paths reserved by in-flight files
 	dirNames map[string]map[string]struct{} // catalog dir -> lower-cased names on disk or claimed in this import
+
+	recorded atomic.Bool // the copy (or record) stage finished; see RecordStageDone
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
@@ -251,6 +262,9 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if fatal != nil {
 		return stats, fatal
 	}
+	if runCtx.Err() == nil {
+		im.recorded.Store(true)
+	}
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -323,6 +337,12 @@ func (im *Importer) startProgress() (stop func()) {
 		im.opts.OnProgress(im.Stats())
 	}
 }
+
+// RecordStageDone reports whether Run finished its copy (or record) stage:
+// every file was handled and the session recorded, without cancellation
+// or a fatal error. An error from Run after that comes from the thumbnail
+// stage (or a cancellation during it) and never affects the catalog rows.
+func (im *Importer) RecordStageDone() bool { return im.recorded.Load() }
 
 // SessionID returns the catalog import session of a running or finished
 // Run, or 0 before Run has begun the session. It is safe to call from any
@@ -432,6 +452,17 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	if rel, found, err := im.db.LookupHash(ctx, hash); err != nil {
 		return fail("catalog lookup", err)
 	} else if found {
+		if !im.opts.RecordInPlace {
+			m, err := im.db.GetByHash(ctx, hash)
+			if err != nil {
+				return fail("catalog lookup", err)
+			}
+			if !m.DeletedAt.IsZero() {
+				// The content is in the trash: restore it rather than
+				// report a duplicate that "Empty trash" would delete.
+				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip)
+			}
+		}
 		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog"}
 	}
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
@@ -766,10 +797,10 @@ func moveFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if _, err := os.Lstat(dst); err == nil {
-		return fmt.Errorf("destination already exists: %s", dst)
-	}
-	if err := os.Rename(src, dst); err != nil {
+	if err := library.RenameNoReplace(src, dst); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("destination already exists: %s", dst)
+		}
 		return err
 	}
 	syncDir(filepath.Dir(dst))
@@ -910,7 +941,7 @@ func (im *Importer) undo(p *pending) {
 		}
 		err := os.MkdirAll(filepath.Dir(p.src), 0o755)
 		if err == nil {
-			err = os.Rename(dst, p.src)
+			err = library.RenameNoReplace(dst, p.src)
 		}
 		if err != nil {
 			im.log.Error("undo move", "source", p.src, "dest", dst, "err", err)

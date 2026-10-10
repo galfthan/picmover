@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"picmover/internal/library"
 	"picmover/internal/metadata"
 )
 
@@ -27,6 +28,15 @@ var junkNames = map[string]bool{
 // that is never imported nor counted.
 func isJunk(name string) bool {
 	return junkNames[strings.ToLower(name)] || strings.HasPrefix(name, "._")
+}
+
+// isPicmoverFile reports a name that belongs to some picmover library,
+// wherever it lies in the source: a catalog or user database (media.db,
+// user.db, their -wal/-shm/-journal files and the catalog backups) or a
+// .picmover directory, case-insensitively. They are never imported, also
+// when the source contains another library.
+func isPicmoverFile(name string) bool {
+	return strings.EqualFold(name, library.MetaDir) || library.IsDatabaseName(name)
 }
 
 func isZip(name string) bool {
@@ -70,7 +80,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 
 	// visit handles one non-directory entry; false stops the scan.
 	visit := func(p string, name string) bool {
-		if (!trash && im.lib.IsInternal(p)) || isJunk(name) {
+		if (!trash && im.lib.IsInternal(p)) || isJunk(name) || isPicmoverFile(name) {
 			return true
 		}
 		if isZip(name) {
@@ -109,7 +119,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 			return nil
 		}
 		if d.IsDir() {
-			if p != src && !trash && im.lib.IsInternal(p) {
+			if p != src && ((!trash && im.lib.IsInternal(p)) || isPicmoverFile(d.Name())) {
 				return filepath.SkipDir
 			}
 			return nil

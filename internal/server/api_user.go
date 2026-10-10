@@ -265,29 +265,52 @@ type albumJSON struct {
 	UpdatedAt string  `json:"updatedAt"`
 }
 
-// newAlbum returns the album object. Without an explicit cover still in
-// the album, the cover is the newest live item (by capture time) in the
-// catalog, else the item added last.
+// newAlbum returns the album object. Count and cover consider only live
+// members (a row in the catalog, not trashed): the explicit cover while it
+// is a live member, else the newest live member by capture time; null
+// when no member is live.
 func (s *Server) newAlbum(r *http.Request, l *libHandles, a userdata.Album) (albumJSON, error) {
-	out := albumJSON{ID: a.ID, Name: a.Name, Count: a.Count,
+	out := albumJSON{ID: a.ID, Name: a.Name,
 		CreatedAt: a.CreatedAt.Local().Format(time.RFC3339), UpdatedAt: a.UpdatedAt.Local().Format(time.RFC3339)}
-	cover, ok := a.Cover, a.Count > 0
-	if !a.CoverSet && a.Count > 0 {
-		hashes, err := l.user.AlbumHashes(r.Context(), a.ID)
+	if a.Count == 0 {
+		return out, nil
+	}
+	hashes, err := l.user.AlbumHashes(r.Context(), a.ID)
+	if err != nil {
+		return out, err
+	}
+	live, err := l.db.LiveHashes(r.Context(), hashes)
+	if err != nil {
+		return out, err
+	}
+	out.Count = int64(len(live))
+	if len(live) == 0 {
+		return out, nil
+	}
+	cover := a.Cover
+	if !a.CoverSet || !live[cover] {
+		h, found, err := l.db.NewestOf(r.Context(), hashes)
 		if err != nil {
 			return out, err
 		}
-		if h, found, err := l.db.NewestOf(r.Context(), hashes); err != nil {
-			return out, err
-		} else if found {
-			cover = h
+		if !found {
+			return out, nil
 		}
+		cover = h
 	}
-	if ok {
-		c := hexHash(cover)
-		out.Cover = &c
-	}
+	c := hexHash(cover)
+	out.Cover = &c
 	return out, nil
+}
+
+// liveAlbumCount is the number of live members of album id.
+func liveAlbumCount(r *http.Request, l *libHandles, id int64) (int64, error) {
+	hashes, err := l.user.AlbumHashes(r.Context(), id)
+	if err != nil {
+		return 0, err
+	}
+	live, err := l.db.LiveHashes(r.Context(), hashes)
+	return int64(len(live)), err
 }
 
 type albumsJSON struct {
@@ -427,9 +450,13 @@ func (s *Server) handleAlbumItems(w http.ResponseWriter, r *http.Request, l *lib
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	n, err := l.user.AlbumEdit(r.Context(), id, add, remove)
-	if err != nil {
+	if _, err := l.user.AlbumEdit(r.Context(), id, add, remove); err != nil {
 		s.userError(w, r, err)
+		return
+	}
+	n, err := liveAlbumCount(r, l, id)
+	if err != nil {
+		s.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, countJSON{Count: n})

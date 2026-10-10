@@ -639,16 +639,17 @@ func TestOutcome(t *testing.T) {
 		msg   string
 	}{
 		{kindImport, importer.Stats{}, nil, stateDone, 0, ""},
-		{kindImport, importer.Stats{Errors: 2}, nil, stateDone, 2, "2 files could not be imported; see L"},
-		{kindImport, importer.Stats{ThumbsFailed: 3}, nil, stateDone, 2, "thumbnails failed for 3 files; see L"},
+		{kindImport, importer.Stats{Errors: 2}, nil, stateDone, 2, "2 files could not be imported; see the job log"},
+		{kindImport, importer.Stats{ThumbsFailed: 3}, nil, stateDone, 2, "thumbnails failed for 3 files; see the job log"},
 		{kindImport, importer.Stats{}, fmt.Errorf("x: %w", context.Canceled), stateCancelled, 130, ""},
-		{kindImport, importer.Stats{}, &importer.ThumbStageError{Err: fmt.Errorf("bad cache")}, stateDone, 2, "thumbnail stage failed (bad cache)"},
-		{kindImport, importer.Stats{}, fmt.Errorf("disk full"), stateFailed, 1, "disk full"},
+		{kindImport, importer.Stats{}, &importer.ThumbStageError{Err: fmt.Errorf("bad cache")}, stateDone, 2, "thumbnail stage failed (see the job log)"},
+		{kindImport, importer.Stats{}, fmt.Errorf("/abs/path: disk full"), stateFailed, 1, "import failed; see the job log"},
 		{kindThumbs, importer.Stats{ThumbsFailed: 1}, nil, stateDone, 2, "thumbnails failed for 1 files"},
 		{kindThumbs, importer.Stats{}, context.Canceled, stateCancelled, 130, ""},
 	} {
 		state, code, msg := outcome(c.kind, c.s, c.err, "L", "/lib")
-		if state != c.state || code != c.code || !strings.Contains(msg, c.msg) || (c.msg == "" && msg != "") {
+		if state != c.state || code != c.code || !strings.Contains(msg, c.msg) || (c.msg == "" && msg != "") ||
+			strings.Contains(msg, "bad cache") || strings.Contains(msg, "/abs") || strings.Contains(msg, " L") {
 			t.Errorf("%+v %v: %s %d %q", c.s, c.err, state, code, msg)
 		}
 	}

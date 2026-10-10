@@ -220,6 +220,11 @@ non-nil set matches nothing (the caller may short-circuit).
   larger than 5000 items is skipped with a warning (near-black or flat
   images collapse into the same bands; comparing them pairwise is
   pointless).
+- Pairs are capped per item: each item keeps its 32 nearest partners (by
+  distance, then partner hash), and a pair is stored when either item
+  keeps it. A burst or time-lapse of n near-identical frames stores at
+  most 32·n pairs instead of n(n−1)/2 (2000 identical frames: 63k instead
+  of 2M) and stays one group, since every item keeps its nearest edge.
 - Job kind `similar` (`{kind:"similar", distance?: 1..7}`): loads items,
   computes, replaces `similar_pairs` in one transaction, writes `meta`.
   Progress events: `{phase:"load", items}`, `{phase:"compare", bands}`,
@@ -229,9 +234,11 @@ non-nil set matches nothing (the caller may short-circuit).
   sorted by size desc, then by max distance asc, then by smallest hash.
   Computed per request (20k pairs → a few ms), paginated with
   `offset`/`limit` (default 50, max 200).
-- "Ignore": all pairs among the given hashes are inserted into
-  `similar_ignored`. "Keep": the client trashes the other hashes with the
-  trash endpoint; no special server support.
+- "Ignore": `{group: hash}` inserts the stored pairs of the current
+  group containing that hash into `similar_ignored`; `{hashes}` inserts
+  the stored pairs among the given hashes (not every combination).
+  "Keep": the client trashes the other hashes with the trash endpoint; no
+  special server support.
 
 ### Date filters
 
@@ -290,8 +297,9 @@ directory listing (exact byte match) or the answer is 404.
 Discovery rescans `<root>` on every `GET /api/libraries` (one `ReadDir`);
 a subfolder is a library when it has a regular `media.db`; everything else
 that is a directory (not `.picmover`, not hidden) is a `folder`. Peeks open
-`media.db` read-only without the lock, and are cached per path by the
-file's size+mtime for 10 s. In single mode the listing has exactly one
+`media.db` read-only without the lock. A successful peek is cached by
+the size and mtime of `media.db`, `media.db-wal` and `user.db` until one
+of them changes; errors are not cached. In single mode the listing has exactly one
 library, `state: "open"` from startup, id = base name of the root folder
 (`"library"` when that is empty, e.g. a drive root).
 
@@ -361,7 +369,7 @@ deletes every trashed row. Contents are listed with `trashed=1`.
 | Method | Path | Result |
 |---|---|---|
 | GET | `/api/l/{lib}/similar?offset=&limit=` | `{groups: [{items: [item + {size, width, height, relPath}], maxDistance}], total, at, distance}`; `at` null before the first run |
-| POST | `/api/l/{lib}/similar/ignore` | `{hashes: [...]}` → `{ignored: pairs}` |
+| POST | `/api/l/{lib}/similar/ignore` | `{group: hash}` or `{hashes: [...]}` → `{ignored: pairs}`; 404 when the group hash is in no group |
 
 ### Jobs
 
@@ -399,9 +407,17 @@ graceful shutdown) is unchanged.
 
 - Library ids and new library names validated as above; every path is
   built from the validated id joined to the workspace root and re-checked
-  with `Contains`; symlinked subfolders are allowed only when they resolve
-  inside the root (`EvalSymlinks` + `Contains`), otherwise skipped from
-  the listing and 404 on access.
+  with `Contains`; a symlinked subfolder is allowed only when it resolves
+  to a plain folder directly under the root (no leading dot, no
+  `media.db` or `.picmover`), otherwise it is skipped from the listing and
+  404 on access; no library is ever created through a link.
+- Trash, restore and permanent deletion resolve links like the file
+  endpoint and only move or delete regular files inside the library or
+  its trash; renames never replace a file.
+- An import source may not be, contain or lie inside a library of the
+  workspace, or be the workspace root (400).
+- Error texts sent to clients name no absolute paths and carry no raw OS
+  errors; the detail goes to the server log.
 - Trash moves and restores operate only on catalog rows, never on request
   paths; permanent deletion only on rows with `deleted_at` set, only with
   `confirm: true`. Nothing in this step deletes a live file.
@@ -659,9 +675,11 @@ Everything outside `web/`. Notes that matter to the client are marked
   400. Groups use only pairs whose rows both exist and are live, minus
   ignored pairs; an offset past the end gives `groups: []` with the
   `total`.
-- **(frontend)** `POST similar/ignore {hashes}` takes **2–200 hashes**
-  (every pair among them is stored, n(n-1)/2 rows; 2000 would be two
-  million) and returns `{ignored}` = new pairs.
+- **(frontend)** `POST similar/ignore` takes `{group: hash}` (the whole
+  current group, any member's hash; 404 when it is in no group) or
+  `{hashes}` with **2–200 hashes**, exactly one of them (400 otherwise);
+  only the stored pairs are ignored (see "Review fixes"), and it returns
+  `{ignored}` = new pairs.
 - **(frontend)** Jobs: the job object always has `library` (the id),
   also in `GET /api/jobs` and SSE replays. `similar` jobs add `distance`
   (the effective one, default 6) and `progress: {phase, items, bands,
@@ -786,6 +804,140 @@ search (no 136k-row benchmarks were added for the rating/tag/album
 filters, `recur` timelines or the groups page). The pre-existing
 `TestThumbsCancellationLeavesPending` in `internal/importer` is timing
 dependent and fails now and then on the base commit too.
+
+### Review fixes (security and file safety)
+
+From the step 4 security and data-integrity reviews. These override the
+notes above where they differ.
+
+- **Locks.** An entry tracks the lock it holds and reuses it: an open or
+  rebuild never takes a lock this process already holds (in single mode
+  the lock is `cmd/serve`'s, recorded as held). A rebuild that ends
+  without a catalog releases the lock and `user.db` (workspace mode), so
+  a retried rebuild or open works.
+- **Replaced folders.** Opening records the lock file's identity. Before
+  trash, restore, delete and job start, the lock file at the library's
+  path must still be that file (`os.SameFile`); otherwise the answer is
+  409 `{error: "the library folder was replaced or moved while it was
+  open; open it again", state: "error"}`. The handles close once no
+  request uses them, and the next open locks the new folder. Creating a
+  library whose old folder was deleted while open gets a new entry (409
+  while that name is being rebuilt).
+- **Trash, restore, delete** resolve the path like `/file`: the parent is
+  resolved with `EvalSymlinks`, and the result must stay inside the
+  library and not be internal (live rows) or inside the trash (trashed
+  rows), for the source and for the target directory. The last component
+  must be a regular file. Otherwise the hash fails with `the file's
+  catalog path is not a library path` or `the path is a folder or a link,
+  not a file`. A link in the trash is no longer deleted (step 4 removed
+  the link itself). Renames never replace: `library.RenameNoReplace`
+  (`renameat2` `RENAME_NOREPLACE`, `renamex_np` `RENAME_EXCL`, link and
+  unlink on other Unix systems, `MoveFileEx` without
+  `REPLACE_EXISTING`). Only a file system with neither the flag nor hard
+  links falls back to check-then-rename. Restore retries the next free
+  name when one is taken in between. The importer's moves and copies use
+  the same rename.
+- **Rebuild vs trash.** A rebuild holds the library's trash lock from
+  start to end. It waits for a running trash, restore or delete batch,
+  and none starts while it runs. The 10 s drain still applies to reads.
+- **Import sources.** An import job's source is refused (400) when it is
+  a library of the workspace (a listed folder with `media.db` or
+  `.picmover`), lies inside one, or contains one. This includes the target
+  library, the workspace root and any folder containing the root. In
+  single mode the library is refused the same way. The importer skips
+  every `.picmover` directory and every catalog or `user.db` file
+  (`media.db`, `user.db`, their `-wal/-shm/-journal`, catalog backups)
+  anywhere in a source, case-insensitively.
+- **Symlinked workspace entries** are listed only when they resolve to a
+  folder directly under the root whose name has no leading dot and that
+  has no `media.db` or `.picmover`, so a link is never a second name for
+  a library or a way into one. A rebuild through a link is refused: a
+  library is never created through a link.
+- **No paths or OS text to clients.** Trash failures use fixed texts
+  (`permission denied`, `the library is on a read-only file system`, `no
+  space left on the device`, `the file is in use by another program`,
+  else `the file could not be moved to the trash` / `restored` /
+  `deleted`). Library `error` texts (listing, open, jobs) are short
+  reasons: `the catalog needs a rebuild: ...`, `the catalog was written by
+  a newer picmover: upgrade picmover`, `media.db is not a picmover
+  catalog`, `media.db is not a regular file`, `user.db has schema version
+  N; this picmover supports 1: upgrade picmover`, `the folder is
+  read-only (...)`, else `the catalog could not be read (see the server
+  log)`. Job error messages say `see the job log` instead of naming the
+  log path (the job object's `logPath` is unchanged), and an import
+  source that cannot be stat'ed is `source: the path does not exist` /
+  `permission denied` / `cannot be read`. Details go to the server log.
+  Per-file `result` events are unchanged.
+- **Peek cache.** A successful peek is cached by the size and mtime of
+  `media.db`, `media.db-wal` and `user.db`, with no expiry. Every listing
+  re-stats the files and peeks again only when one of them changed. An
+  error is never cached. The peeks a listing needs run concurrently, at
+  most 4 at a time (warm listing of 10 libraries: about 3 ms). The peek
+  also checks `user.db` read-only when it exists (`userdata.CheckFile`),
+  so a library whose `user.db` has another schema version is listed as
+  `error` with the open's message. In a read-only folder, where SQLite
+  cannot create `-shm`, the peek is retried with `immutable=1` when no
+  `-wal` holds data. Opening such a library is 409 `error` `the folder is
+  read-only ...`.
+- **Rebuild never leaves a partial or missing catalog** (job and CLI).
+  The trash times are read from `user.db` before the backup, so an
+  unreadable `user.db` leaves `media.db` in place. When the record stage
+  does not finish (a fatal error, or a cancellation before the trash
+  pass ends), the new catalog and its `-wal/-shm` are removed and the
+  backup is renamed back. A folder that had no catalog is left without
+  one (state `folder`). The job ends `failed` or `cancelled` with "...;
+  the previous catalog was restored" (or "the incomplete catalog was
+  removed"). The CLI prints the same. A cancellation during the
+  thumbnail stage keeps the complete new catalog
+  (`importer.RecordStageDone`).
+- **Re-imported trashed content** is restored, not reported as a
+  duplicate. When an import (job or CLI, not record-in-place) meets a
+  file whose hash is a trashed row:
+  - The trashed copy is hashed. On a mismatch the result is an error and
+    the source is kept.
+  - The row is restored through `importer.RestoreFromTrash`, the restore
+    endpoint's code path, under the library's trash lock, with a unique
+    name on collision.
+  - The `user.db` trash row is removed.
+  - The file is reported `imported` with the message `restored from
+    trash`. With `move`, the source is deleted only after the restored
+    copy hashes to the row's hash.
+- **Empty trash** (`trash/delete` with `all: true`) also removes regular
+  files under the trash directory that no trashed row names. A rebuild
+  records no row for a trash file whose content or path is live. These
+  files are counted in `deleted`. `verify` lists them as `orphan file in
+  trash: <path>` and counts them as problems.
+- **Shutdown** runs in three phases: `Server.StopJobs` (cancel the job;
+  its streams end), then `http.Server.Shutdown` (in-flight requests,
+  trash batches included, finish against open catalogs and under the
+  lock), then `Server.Close` (close catalogs, stores, `user.db`, release
+  locks). `Server.Shutdown` remains as StopJobs followed by Close.
+- **Similar.** At most 32 pairs per item (see "Similarity"). The groups
+  endpoint drops trashed rows in Go instead of joining every pair with
+  `media` twice. `similar/ignore` takes `{group: hash}`; the `hashes`
+  form now stores only the pairs that exist among the hashes.
+  `Buckets` scans `NOT INDEXED` for hash sets over 10k.
+- **Albums.** `count` and the default `cover` consider live members only.
+  An explicit cover that is trashed (or not a member) falls back to the
+  newest live member, and no live member gives `cover: null`. The
+  `albums/{aid}/items` count is the live count too.
+- **Smaller ones.** `validRelPath` also refuses a first component starting
+  with `user.db`. `IsInternal` compares case-insensitively.
+  `TagMedia` with a tag in both `add` and `remove` removes it and does
+  not report it as added. `catalog.ErrNewerSchema`, `catalog.ErrNotCatalog`,
+  `userdata.VersionError`/`ErrUnsupportedVersion`, `userdata.ErrNotUserDB`
+  are new sentinels. `catalog.LiveHashes` is new.
+- **Tests:** `internal/library/trash_test.go` (no-replace rename, restore
+  and trash races, symlinked folders on both sides, directories and
+  links refused); `internal/importer/restore_test.go`;
+  `internal/catalog/peek_readonly_test.go`;
+  `internal/userdata/checkfile_test.go`, `tagremovewins_test.go`;
+  `internal/similar/cap_test.go`;
+  `internal/server/review_fixes_test.go` and `management_fixes_test.go`
+  (one test per finding); `cmd/rebuild_safety_test.go`. The thumbnail
+  writer's commit interval is a package variable, so
+  `TestThumbsCancellationLeavesPending` can cancel between commits (20 of
+  20 runs pass). `TestFilterHashes`' time guard is 10 s (race builds).
 
 ## As implemented (frontend)
 

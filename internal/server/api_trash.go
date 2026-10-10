@@ -6,11 +6,12 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
-	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/importer"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
 )
@@ -46,19 +47,46 @@ type deleteResultJSON struct {
 	Failed  []failedJSON `json:"failed"`
 }
 
-// fileOpError is the user-facing text of a failed rename or removal; the
-// detail (paths, OS text) goes to the log.
+// fileOpError is the user-facing text of a failed rename or removal: a
+// fixed text per kind of failure, never a path or a raw OS error; the
+// detail goes to the log.
 func (s *Server) fileOpError(what string, h uint64, rel string, err error) string {
 	s.log.Info(what+" failed", "hash", hexHash(h), "rel_path", rel, "err", err)
 	switch {
 	case errors.Is(err, library.ErrTrashTargetExists):
 		return "the trash already holds a different file at this path"
+	case errors.Is(err, library.ErrNotLibraryPath):
+		return "the file's catalog path is not a library path"
+	case errors.Is(err, library.ErrNotRegularFile):
+		return "the path is a folder or a link, not a file"
+	case errors.Is(err, importer.ErrRecordRestore):
+		return "the catalog could not be updated"
 	case errors.Is(err, fs.ErrNotExist):
 		return "the file is missing"
 	case library.IsCrossDevice(err):
 		return "the file is on another volume (a mounted folder); picmover moves files only within one volume and never copies and deletes"
+	case errors.Is(err, syscall.EROFS):
+		return "the library is on a read-only file system"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.ENOSPC):
+		return "no space left on the device"
+	case isBusyErr(err):
+		return "the file is in use by another program"
 	}
-	return what + " failed: " + err.Error()
+	switch what {
+	case "move to trash":
+		return "the file could not be moved to the trash"
+	case "restore":
+		return "the file could not be restored"
+	}
+	return "the file could not be deleted"
+}
+
+// folderReplaced answers a mutation on a library whose folder was
+// replaced while open: 409 {error, state: "error"}.
+func folderReplaced(w http.ResponseWriter) {
+	writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})
 }
 
 // trashRows returns the catalog rows of hashes and reports the hashes
@@ -91,6 +119,10 @@ func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request, l *libHandl
 	}
 	l.entry.trashMu.Lock()
 	defer l.entry.trashMu.Unlock()
+	if l.entry.checkFolder() != nil {
+		folderReplaced(w)
+		return
+	}
 	ctx := context.WithoutCancel(r.Context()) // a file moved must be recorded
 	out := trashResultJSON{Failed: []failedJSON{}}
 	rows, err := trashRows(ctx, l, hashes, &out.Failed)
@@ -110,10 +142,12 @@ func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request, l *libHandl
 		case !m.DeletedAt.IsZero():
 			fail("already in the trash")
 			continue
-		case !validRelPath(m.RelPath) || l.lib.IsInternal(l.lib.Abs(m.RelPath)):
+		case !validRelPath(m.RelPath):
 			fail("the file's catalog path is not a library path")
 			continue
 		}
+		// MoveToTrash checks the rest like the file server: links
+		// resolved, inside the library, not internal, a regular file.
 		if err := l.lib.MoveToTrash(m.RelPath); err != nil {
 			fail(s.fileOpError("move to trash", h, m.RelPath, err))
 			continue
@@ -153,6 +187,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, l *libHan
 	}
 	l.entry.trashMu.Lock()
 	defer l.entry.trashMu.Unlock()
+	if l.entry.checkFolder() != nil {
+		folderReplaced(w)
+		return
+	}
 	ctx := context.WithoutCancel(r.Context())
 	out := restoreResultJSON{Failed: []failedJSON{}}
 	rows, err := trashRows(ctx, l, hashes, &out.Failed)
@@ -171,29 +209,14 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, l *libHan
 		case m.DeletedAt.IsZero():
 			fail("not in the trash")
 			continue
-		case !validRelPath(m.RelPath) || !within(l.lib.TrashDir(), l.lib.TrashPath(m.RelPath)):
+		case !validRelPath(m.RelPath):
 			fail("the file's catalog path is not a library path")
 			continue
 		}
-		// The row's own path is not "taken": rel_path is unique
-		// case-insensitively, so only this row can hold it.
-		taken := func(c string) (bool, error) {
-			if strings.EqualFold(c, m.RelPath) {
-				return false, nil
-			}
-			return l.db.RelPathTaken(ctx, c)
-		}
-		rel, err := l.lib.Restore(m.RelPath, taken)
-		if err != nil {
+		// The one restore path, shared with an import that meets
+		// trashed content.
+		if _, err := importer.RestoreFromTrash(ctx, l.lib, l.db, m, nil); err != nil {
 			fail(s.fileOpError("restore", h, m.RelPath, err))
-			continue
-		}
-		if err := l.db.ClearDeleted(ctx, h, rel); err != nil {
-			s.log.Error("record restore", "hash", hexHash(h), "err", err)
-			if uerr := l.lib.MoveToTrashAs(rel, m.RelPath); uerr != nil {
-				s.log.Error("undo restore", "hash", hexHash(h), "err", uerr)
-			}
-			fail("the catalog could not be updated")
 			continue
 		}
 		done = append(done, h)
@@ -237,6 +260,10 @@ func (s *Server) handleTrashDelete(w http.ResponseWriter, r *http.Request, l *li
 	}
 	l.entry.trashMu.Lock()
 	defer l.entry.trashMu.Unlock()
+	if l.entry.checkFolder() != nil {
+		folderReplaced(w)
+		return
+	}
 	ctx := context.WithoutCancel(r.Context())
 	out := deleteResultJSON{Failed: []failedJSON{}}
 	var rows map[uint64]catalog.Media
@@ -300,36 +327,58 @@ func (s *Server) handleTrashDelete(w http.ResponseWriter, r *http.Request, l *li
 		}
 	}
 	out.Deleted = len(done)
+	if body.All {
+		out.Deleted += s.removeTrashOrphans(ctx, l)
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-// errNotRemovable refuses a trash path that is not a file.
-var errNotRemovable = errors.New("the trash entry is not a file")
+// removeTrashOrphans deletes, for "Empty trash", the files under the trash
+// directory that no trashed row names: a rebuild records no row for a
+// trash file whose content or path is live, so nothing else could ever
+// show or delete them. Files of trashed rows that remain (their deletion
+// failed) are kept. It returns the number removed.
+func (s *Server) removeTrashOrphans(ctx context.Context, l *libHandles) int {
+	files, err := l.lib.TrashFiles()
+	if err != nil {
+		s.log.Error("list the trash", "err", err)
+	}
+	if len(files) == 0 {
+		return 0
+	}
+	rows, err := l.db.ListTrashed(ctx)
+	if err != nil {
+		s.log.Error("list trashed rows", "err", err)
+		return 0
+	}
+	kept := make(map[string]bool, len(rows))
+	for _, m := range rows {
+		kept[strings.ToLower(m.RelPath)] = true
+	}
+	n := 0
+	for _, rel := range files {
+		if kept[strings.ToLower(rel)] {
+			continue
+		}
+		if err := l.lib.RemoveTrashFile(rel); err != nil {
+			s.log.Info("remove orphan trash file", "rel_path", rel, "err", err)
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		s.log.Info("removed trash files without a catalog row", "count", n)
+	}
+	return n
+}
 
-// removeTrashFile removes the trash file of the catalog path rel. The
-// path must have a library path's shape and lie inside the trash
-// directory; it must not be a directory. A missing file counts as
-// removed. A symbolic link is removed itself, never its target.
+// removeTrashFile removes the trash file of the catalog path rel: the
+// path must have a library path's shape; library.RemoveTrashFile checks
+// the rest (inside the trash with links resolved, a regular file). A
+// missing file counts as removed.
 func removeTrashFile(lib *library.Library, rel string) error {
 	if !validRelPath(rel) {
-		return errNotRemovable
+		return library.ErrNotLibraryPath
 	}
-	p := lib.TrashPath(rel)
-	if !within(lib.TrashDir(), p) {
-		return errNotRemovable
-	}
-	fi, err := os.Lstat(p)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if fi.IsDir() {
-		return errNotRemovable
-	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
+	return lib.RemoveTrashFile(rel)
 }

@@ -20,6 +20,7 @@ import (
 	"picmover/internal/importer"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
+	"picmover/internal/userdata"
 )
 
 func newImportCmd() *cobra.Command {
@@ -94,8 +95,13 @@ type importParams struct {
 	recordInPlace   bool                 // importer.Options.RecordInPlace (rebuild)
 	trashTimes      map[uint64]time.Time // importer.Options.TrashTimes (rebuild)
 	locked          bool                 // the caller holds the library lock (rebuild)
-	logPrefix       string               // log file name prefix; "" = "import"
-	what            string               // operation name in messages; "" = "Import"
+	// backup is the catalog backup of a rebuild ("" when the folder had
+	// no catalog). When the record stage does not finish (an error, a
+	// cancellation, a catalog that cannot be created), the incomplete new
+	// catalog is removed and the backup renamed back.
+	backup    string
+	logPrefix string // log file name prefix; "" = "import"
+	what      string // operation name in messages; "" = "Import"
 }
 
 // interruptContext returns a context cancelled by the first SIGINT or
@@ -150,16 +156,24 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 	sum := importSummary{libRoot: lib.Root(), isNew: p.isNew, logPath: logPath, thumbs: !p.noThumbs}
 
 	var (
-		stats  importer.Stats
-		runErr error
-		opened bool
+		stats    importer.Stats
+		runErr   error
+		opened   bool
+		recorded bool
 	)
 	db, err := catalog.Open(ctx, lib.DBPath(), slog.New(slog.NewMultiHandler(fileHandler, stderrHandler())))
 	if err != nil {
 		runErr = catalogError(lib.Root(), err)
 	} else {
 		opened = true
-		defer db.Close()
+		dbOpen := true
+		closeDB := func() {
+			if dbOpen {
+				dbOpen = false
+				db.Close()
+			}
+		}
+		defer closeDB()
 		opts := importer.Options{
 			Source:        p.source,
 			Move:          p.move,
@@ -178,9 +192,34 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if status != nil {
 			opts.OnProgress = func(s importer.Stats) { status.show(formatStatus(s)) }
 		}
-		stats, runErr = importer.New(lib, db, opts).Run(ctx)
+		if !p.recordInPlace {
+			// Content found in the trash is restored; its user.db trash
+			// row is removed when there is a user.db.
+			opts.OnRestored = func(ctx context.Context, hash uint64) error {
+				return untrashUserDB(ctx, lib.Root(), hash)
+			}
+		}
+		im := importer.New(lib, db, opts)
+		stats, runErr = im.Run(ctx)
+		recorded = im.RecordStageDone()
 		if status != nil {
 			status.done()
+		}
+		if p.recordInPlace && !recorded {
+			closeDB()
+		}
+	}
+	if p.recordInPlace && !recorded {
+		// Never leave a partial catalog live, or none at all.
+		if err := library.RestoreCatalogBackup(lib.DBPath(), p.backup); err != nil {
+			logger.Error("restore the previous catalog", "err", err)
+			fmt.Fprintf(cmd.ErrOrStderr(), "Error: the rebuild did not finish and the previous catalog could not be restored: %v\n", err)
+		} else if p.backup != "" {
+			logger.Info("rebuild rolled back", "backup", p.backup)
+			fmt.Fprintf(out, "The rebuild did not finish; the previous catalog was restored from %s.\n", filepath.Base(p.backup))
+		} else {
+			logger.Info("rebuild rolled back: incomplete catalog removed")
+			fmt.Fprintln(out, "The rebuild did not finish; the incomplete catalog was removed.")
 		}
 	}
 
@@ -323,4 +362,19 @@ func (is importSummary) print(w io.Writer, s importer.Stats) {
 		fmt.Fprintf(w, "Library: %s\n", is.libRoot)
 	}
 	fmt.Fprintf(w, "Log: %s\n", is.logPath)
+}
+
+// untrashUserDB removes hash's trash row from the library's user.db, when
+// the library has one (it is never created here).
+func untrashUserDB(ctx context.Context, root string, hash uint64) error {
+	p := filepath.Join(root, userdata.FileName)
+	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	u, err := userdata.Open(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer u.Close()
+	return u.Untrash(ctx, []uint64{hash})
 }

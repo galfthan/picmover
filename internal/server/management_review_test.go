@@ -29,10 +29,15 @@ func TestTrashFileServingChecks(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 	wantError(t, f.get(lp+"file/"+itoa64(m.ID)), http.StatusNotFound, "not available")
-	// Permanent deletion removes the link, never its target.
-	f.post(lp+"trash/delete", `{"hashes":["`+a+`"],"confirm":true}`)
-	if _, err := os.Lstat(tp); !os.IsNotExist(err) {
-		t.Fatalf("link not removed: %v", err)
+	// Permanent deletion refuses a link (it is never followed, and only
+	// regular files are deleted): a per-hash failure, the row stays.
+	w0 := f.post(lp+"trash/delete", `{"hashes":["`+a+`"],"confirm":true}`)
+	if d := decode[deleteResultJSON](t, w0); d.Deleted != 0 || len(d.Failed) != 1 ||
+		d.Failed[0].Error != "the path is a folder or a link, not a file" {
+		t.Fatalf("link delete %s", w0.Body)
+	}
+	if _, err := os.Lstat(tp); err != nil {
+		t.Fatalf("link removed: %v", err)
 	}
 	if b, err := os.ReadFile(filepath.Join(f.base, "outside.jpg")); err != nil || string(b) != "secret" {
 		t.Fatal("link target touched")
