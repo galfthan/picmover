@@ -561,3 +561,160 @@ libraries state machine), no `any`, wall-clock date handling via
   is needed for it; it is a server feature plus UI.
 - Manual album ordering (`position` is already there), tag hierarchies,
   smart albums (saved filters), moving items between libraries.
+
+## As implemented (frontend)
+
+The Svelte app under `web/` was built against this contract while the Go
+side was written in parallel, so it was tested against a fake of the API
+(`web/src/testing/fakes.ts`), not against the server. Everything in
+"Frontend" is implemented except the optional `#/jobs` page.
+
+### Files
+
+`lib/api.ts` (`libApi(id)`, workspace calls, chunking), `lib/routes.ts`
+(app routes on the hash router, redirects), `lib/libraries.svelte.ts`
+(workspace store, `gateOf`, `holderText`, `libraryNameProblem`),
+`lib/library.svelte.ts` (the open library's summary, tags and albums),
+`lib/selection.svelte.ts`, `lib/dates.ts`, `lib/actions.ts` (rate, tag,
+album, trash, restore, delete: API call + change event + count refresh),
+`lib/changes.ts` (change events so pages patch in place),
+`lib/toast.svelte.ts`, `lib/similar.ts`; components `LibrarySwitcher`,
+`LibraryGate` (what `#/l/<id>/…` shows while the library is not open),
+`SelectionBar`, `RatingStars`, `TagInput` (combobox, also used for albums
+and the tag filter), `AlbumPicker`, `DateFilter`, `Dialog` (focus trap,
+Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
+`Trash`, `Similar`.
+
+### Shapes relied on
+
+- `GET /api/libraries` → `{root, mode, libraries, folders}`; a folder's id
+  is its `name`. `POST /api/libraries/{id}/open`: 200 → the lib object
+  (state taken as `open` when empty); 409 → `body.holder` `{pid, cmd,
+  since}` with `since` an RFC 3339 instant; 503 → rebuilding; 404 → the
+  listing is reloaded. `POST /api/libraries` → 201 lib (state `closed`),
+  which the client then opens.
+- A library-scoped answer counts as "not open" only when it is 409 **and**
+  carries a string `state` (409 without `state`, e.g. "another job is
+  running" or a tag rename conflict, is an ordinary error); 503 counts as
+  rebuilding. The shell then marks the library closed and reopens it. A
+  409 within 5 s of a successful open is shown as an open failure with
+  Retry instead (no reopen loop).
+- Jobs: library jobs go to `POST /api/l/{id}/jobs`; a rebuild of a
+  `folder` or an `error` library goes to `POST /api/libraries/{id}/jobs`
+  with `{kind: "rebuild"}`. The job's `library` is read for the pill and
+  for filtering the Import and Library pages; a started job without it gets
+  the id filled in client-side. Rebuild stats are read like an import's
+  (`scanned`, `imported` + `existing` as "recorded", `errors`).
+- `similar` progress: an SSE `progress` event whose data has `phase`
+  (`load`/`compare`/`done` with `items`/`bands`/`pairs`) at the top level
+  or under `progress`; a `stats` object, if present, is applied as before.
+  The phase is kept on the job as `job.phase` (client-side field).
+- Times: `similar.at` / `GET …/similar` `at` may be Unix seconds, an RFC
+  3339 instant or a wall-clock string (`format.ts` `parseWhen`); the
+  contract does not fix it. `deletedAt` is a wall-clock string in the
+  server's zone and is read as a local time of the browser (same machine)
+  for "deleted 3 days ago" (`parseLocalWallClock`, `formatAgo`).
+- Items: `rating` omitted when 0; detail `rating` 0 or absent, `tags` and
+  `albums` arrays or null, `deletedAt` null when live. Similar items: the
+  extra `width`, `height`, `size`, `relPath` (falling back to `w`/`h`).
+- `POST …/media/tags`: the answer's `tags` (added, including created) are
+  sent by id in later chunks, so a tag named in `create` is only created by
+  the first chunk. `POST …/albums` with more than 1000 hashes: the first
+  1000 in the create body, the rest through `…/albums/{aid}/items`.
+  `…/albums/{aid}/items` chunks `add` and `remove` separately; the last
+  `count` wins. Trash, restore and delete sum their counts and concatenate
+  `failed`. `similar/ignore` is not chunked (the server ignores pairs
+  *within* one call; a group is far below the cap). Empty trash sends
+  `{all: true, confirm: true}`; per-item deletes always send `confirm:
+  true`.
+- `/api/l/{id}/library`: the trash count in the nav is `userdb.trashed`,
+  falling back to `summary.deleted`; the Library page shows the `userdb`
+  counts and `similar.pairs`.
+- Album `cover` is a hash or null and is shown through the scoped
+  `thumb` endpoint.
+
+### Deviations and additions
+
+- **Covers on the Libraries page** are shown only for libraries that are
+  `open`: the scoped `thumb` endpoint answers 409 for a closed library, so
+  a closed one shows its initial instead. Serving covers of closed
+  libraries (a read-only thumbs peek) would need a server change.
+- Step 3 hashes (`#/map`, `#/view/3`, `#/?session=4`) are redirected: in
+  single mode to the same page of the one library, in workspace mode to
+  `#/`. Unknown routes go home the same way. No `#/jobs` page (optional in
+  the contract); the pill and the Library page's job table (now filtered
+  to the library) cover it.
+- The selection's scope key is library + page + album + filters; changing
+  any of them clears it. A plain click on a tile still opens the lightbox
+  while selecting; the checkbox, Ctrl/Cmd-click and Shift-click select.
+  The bar shows "(N in months not loaded were skipped)" after a range over
+  unloaded months.
+- Undo toasts (8 s) also follow Trash in the selection bar and "Trash the
+  others" on the duplicates page, not only the lightbox's Delete.
+- Lightbox additions: Trash/Restore buttons in its top bar, × on album
+  chips (remove from album), tag and album chips link to the filtered
+  grid and the album. `t`/`b` open the info panel when it is hidden.
+- Date filter: the Range tab edits the inclusive last day (the URL keeps
+  the exclusive `to`); editing it clears `recur`. The Every-year tab's
+  month/day selects start at today until changed; its year limits are
+  whole years (`from=YYYY-01-01`, `to=` the next Jan 1). The step 3 year
+  selects moved into this panel.
+- `hasFilters` ignores what the page implies (the album page's `album`,
+  the trash page's `trashed`), so their empty states and Clear button
+  behave like the grid's.
+- New library names are checked in the browser with the server's rules
+  (path separators, `:`, NUL and control characters, leading dot, 255
+  bytes, Windows device names) before the request.
+- "Set cover from selection" needs exactly one selected item.
+- Duplicates: the default Keep is the item with the most pixels, then the
+  larger file. Page size 50. Items trashed elsewhere (the lightbox) leave
+  their group; a group under two items disappears.
+- The Library page gained a "Your data" card: the `user.db` path and the
+  user data counts with links (rated, albums, trash, duplicates).
+
+### Tests
+
+`make web-check`: svelte-check (0 errors, 0 warnings), 122 vitest tests in
+16 files, plus `npm run build`.
+
+- `lib/routes.test.ts`: every route under `#/l/<id>/`, id decoding and
+  encoding round trip, not-found shapes, step 3 paths, single-mode
+  redirect of `#/` with the query, workspace redirects, no redirect before
+  the listing.
+- `lib/selection.test.ts`: ranges in display order either way, unloaded
+  months skipped and counted, toggle without anchor, scope clearing,
+  removal of hashes and the anchor.
+- `lib/dates.test.ts`: `recur` parsing incl. `02-29` and wrapping ranges,
+  malformed values, canonical serialization, `inRecur`, presets (incl.
+  This month in February = `02-01..02-29`), real-day checks, inclusive /
+  exclusive conversions, year ranges, summaries.
+- `lib/filters.test.ts`: the new query parameters, repeated `tag`,
+  malformed values dropped, round trip, `filtersKey` and `hasFilters`.
+- `lib/libraries.test.ts`: `gateOf` for every state; the store's load,
+  open (opening → open; 409 → busy with holder; 503 → rebuilding; other →
+  openFailed, Retry), create replacing a folder entry, record in place
+  through the workspace route, the reopen guard, single mode; name
+  validation and holder text.
+- `lib/api.test.ts`: scoped URLs incl. encoded ids, filter parameters,
+  chunking (ratings with progress, trash failures across chunks, tag
+  create only in the first chunk, album create + items, album add/remove,
+  delete with confirm, empty list sends nothing), the unavailable handler.
+- `lib/format.test.ts` (relative times, `parseWhen`), `lib/similar.test.ts`
+  (`bestOf`), `lib/jobs.test.ts` (start in a library).
+- Component tests (jsdom, whole app or component mounted):
+  `Libraries.test.ts` (cards in every state, Retry, Record files in place
+  with progress and opening afterwards, New library dialog: focus, Tab
+  wrap, Escape with focus return, validation, create and open; opening a
+  closed library, the switcher menu, gates for busy, error with Rebuild
+  and missing), `SelectionBar.test.ts` (hidden when empty; rate and clear,
+  tag autocomplete and create, album pick and create, trash with partial
+  failure and Undo, 2500 hashes in three chunks, album and trash modes),
+  `Management.test.ts` (Ctrl and Shift selection, checkbox, in-place
+  rating without a timeline reload, trash with the nav count and Undo,
+  Escape and filter change clear; lightbox `4`, `t` + create, `b`,
+  Delete with Undo; trash page tiles, `r`, Empty trash typed count; albums
+  list, rename, album page, cover, Remove from album; duplicates Keep
+  default and arrows, lightbox over the page, Enter, Run with distance;
+  date presets, range, rating, tag and album filters in the URL and the
+  requests), and the step 3 `App.test.ts` / `Grid.test.ts` moved under
+  `#/l/<id>/`.
