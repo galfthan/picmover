@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,7 @@ func TestIsInternal(t *testing.T) {
 		"import_2024-01-01.log":                     true,
 		".picmover":                                 true,
 		".picmover/tmp/x.part":                      true,
+		".picmover/lock":                            true,
 		"image/2020/01/a.jpg":                       false,
 		"image/import_x.log":                        false,
 	}
@@ -312,8 +314,14 @@ func TestSymlinkedRoot(t *testing.T) {
 	}
 	realLib = filepath.Join(realLib, "lib")
 	linkLib := filepath.Join(link, "lib")
-	for name, openFn := range map[string]func(string) (*Library, error){"Open": Open, "Attach": Attach} {
-		l, err := openFn(linkLib)
+	// Open first: it creates the directory Attach needs (a map would
+	// iterate in random order).
+	for _, c := range []struct {
+		name   string
+		openFn func(string) (*Library, error)
+	}{{"Open", Open}, {"Attach", Attach}} {
+		name := c.name
+		l, err := c.openFn(linkLib)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -347,5 +355,39 @@ func TestSymlinkedRoot(t *testing.T) {
 				t.Errorf("%s: %q reported inside", name, out)
 			}
 		}
+	}
+}
+
+func TestOpenLog(t *testing.T) {
+	l := open(t)
+	before := time.Now().Truncate(time.Second)
+	f, p, err := l.OpenLog("import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if filepath.Dir(p) != l.LogDir() {
+		t.Fatalf("log %s not in %s", p, l.LogDir())
+	}
+	base := filepath.Base(p)
+	stamp, ok := strings.CutPrefix(base, "import_")
+	if !ok || !strings.HasSuffix(stamp, ".log") {
+		t.Fatalf("log name %q", base)
+	}
+	ts, err := time.ParseInLocation("2006-01-02_15-04-05", strings.TrimSuffix(stamp, ".log"), time.Local)
+	if err != nil {
+		t.Fatalf("log name %q: %v", base, err)
+	}
+	if ts.Before(before) || ts.After(time.Now()) {
+		t.Fatalf("log time %v not now", ts)
+	}
+	if _, err := f.WriteString("x\n"); err != nil {
+		t.Fatal(err)
+	}
+	if !l.IsInternal(p) {
+		t.Fatal("log must be internal")
+	}
+	if _, _, err := (&Library{root: filepath.Join(t.TempDir(), "missing")}).OpenLog("x"); err == nil {
+		t.Fatal("want error without a log directory")
 	}
 }

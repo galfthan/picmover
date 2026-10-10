@@ -92,6 +92,7 @@ type importParams struct {
 	noThumbs        bool
 	isNew           bool
 	recordInPlace   bool   // importer.Options.RecordInPlace (rebuild)
+	locked          bool   // the caller holds the library lock (rebuild)
 	logPrefix       string // log file name prefix; "" = "import"
 	what            string // operation name in messages; "" = "Import"
 }
@@ -106,16 +107,6 @@ func interruptContext(parent context.Context) (context.Context, context.CancelFu
 		stop()
 	}()
 	return ctx, stop
-}
-
-// openLog creates <library>/.picmover/logs/<prefix>_<time>.log.
-func openLog(lib *library.Library, prefix string) (*os.File, string, error) {
-	logPath := filepath.Join(lib.LogDir(), prefix+"_"+time.Now().Format("2006-01-02_15-04-05")+".log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, "", fmt.Errorf("create log: %w", err)
-	}
-	return f, logPath, nil
 }
 
 // runImport runs an import (with its thumbnail stage) and prints the
@@ -141,7 +132,14 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 	if err != nil {
 		return err
 	}
-	logFile, logPath, err := openLog(lib, p.logPrefix)
+	if !p.locked {
+		unlock, err := lockLibrary(ctx, lib, strings.ToLower(p.what), cmd.ErrOrStderr())
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	logFile, logPath, err := lib.OpenLog(p.logPrefix)
 	if err != nil {
 		return err
 	}

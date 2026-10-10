@@ -28,6 +28,7 @@ in <library>/.picmover.
 
 When a new version changes the catalog format, run 'picmover rebuild
 <library>' to recreate the catalog from the files.`,
+		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -35,7 +36,7 @@ When a new version changes the catalog format, run 'picmover rebuild
 		return usageError(c, err)
 	})
 	root.AddCommand(newImportCmd(), newDBCmd(), newUpdateMetadataCmd(), newVerifyCmd(), newThumbsCmd(),
-		newRebuildCmd())
+		newRebuildCmd(), newServeCmd())
 	return root
 }
 

@@ -340,9 +340,15 @@ catalog. The perceptual hash is the 64-bit DCT pHash computed from the
 preview reduced to 32x32 grayscale (implement it directly, about 60 lines;
 no new dependency needed), plus nothing else for now.
 
-ffmpeg frame grab: `ffmpeg -hide_banner -loglevel error -ss <t> -i <path>
+ffmpeg frame grab: `ffmpeg -hide_banner -loglevel warning -ss <t> -i <path>
 -frames:v 1 -vf scale='min(1600,iw)':-2 -f image2pipe -vcodec mjpeg -q:v 3 -`
-with a 60 s timeout; the JPEG comes from stdout.
+with a 60 s timeout; the JPEG comes from stdout. The log level is warning
+because FFmpeg reports unsupported features (its request-sample
+diagnostics, which name the cause) as warnings; stderr is read only when
+ffmpeg exits non-zero. The failure message is the first and last distinct
+stderr lines, joined with `; `, after removing `[ctx @ 0x...]` context
+prefixes (without `0x` on Windows) and boilerplate (the "update your FFmpeg"/"upload a sample"
+text and the line naming the input file), each capped at 200 bytes.
 
 ## internal/catalog: schema v3
 
@@ -495,8 +501,9 @@ Importer, cmd and the remaining glue (deviations and precisions):
   gone. `openExisting` and `import` (and so `rebuild`'s import) wrap
   `catalog.ErrNeedsRebuild` in an error that names
   `picmover rebuild <library>` with the actual path (quoted when needed) and
-  still `errors.Is` the sentinel. `rebuild` refuses a library without
-  `media.db` (suggesting `import`), renames `media.db`, `-wal`, `-shm` to
+  still `errors.Is` the sentinel. `rebuild` of a folder without
+  `media.db` records its files into a new catalog without a backup (naming
+  the newest `media.db.bak-*` if any; superseded the earlier refusal), renames `media.db`, `-wal`, `-shm` to
   `media.db.bak-<YYYYMMDD-HHMMSS>[-wal|-shm]` (never overwriting; renames
   already done are undone if one fails, so a catalog is never separated
   from its WAL) and then runs the shared import path with source = library,
@@ -559,8 +566,9 @@ Deviations from, and precisions to, the notes above:
   `OpenStore` walks the previews (one fan-out level, at most 2^20 entries,
   best effort) and, for each `*.old`, renames it back when the preview is
   missing (a crash between the two renames; its row was never replaced) or
-  removes it otherwise. Only one process may write a library at a time, so
-  this never races with another Put.
+  removes it otherwise. The library lock (`.picmover/lock`, see server.md
+  "Review fixes (jobs, locking, CLI)") keeps a second writing process out,
+  so this never races with another process's Put.
 - **`OpenStoreReadOnly`.** New
   `func OpenStoreReadOnly(lib *library.Library) (*Store, error)`. It needs
   an existing `thumbs.db` (no directory or file is created), opens it as

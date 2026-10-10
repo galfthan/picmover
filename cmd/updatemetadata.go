@@ -54,10 +54,11 @@ Exits with status 2 when any row could not be updated.`,
 				return err
 			}
 			ctx := cmd.Context()
-			lib, db, err := openExisting(ctx, args[0])
+			lib, db, unlock, err := openExistingLocked(ctx, args[0], "update-metadata", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
+			defer unlock()
 			defer db.Close()
 
 			rows, err := db.List(ctx, catalog.ListOptions{FileType: ft, OrderBy: "id"})

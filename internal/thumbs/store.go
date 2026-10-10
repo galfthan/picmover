@@ -180,7 +180,8 @@ func OpenStoreReadOnly(lib *library.Library) (*Store, error) {
 	}
 	if v != FormatVersion {
 		db.Close()
-		return nil, fmt.Errorf("%w: %s has format version %d, want %d", ErrFormat, s.path, v, FormatVersion)
+		return nil, fmt.Errorf("%w: %s has format version %d, want %d; delete it (and the %s directory) to regenerate the cache",
+			ErrFormat, s.path, v, FormatVersion, PreviewDir)
 	}
 	return s, nil
 }
@@ -314,7 +315,7 @@ func (s *Store) Put(ctx context.Context, hash uint64, thumb []byte, tw, th int, 
 	}
 	hadOld := false
 	if fi, err := os.Lstat(dst); err == nil && fi.Mode().IsRegular() {
-		if err := os.Rename(dst, old); err != nil {
+		if err := renameRetry(os.Rename, dst, old); err != nil {
 			os.Remove(tmp)
 			return fmt.Errorf("thumbs: put %016x: keep previous preview: %w", hash, err)
 		}
@@ -322,10 +323,10 @@ func (s *Store) Put(ctx context.Context, hash uint64, thumb []byte, tw, th int, 
 	}
 	restore := func() {
 		if hadOld {
-			_ = os.Rename(old, dst) // replaces a new preview still at dst
+			_ = renameRetry(os.Rename, old, dst) // replaces a new preview still at dst
 		}
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := renameRetry(os.Rename, tmp, dst); err != nil {
 		os.Remove(tmp)
 		restore()
 		return fmt.Errorf("thumbs: put %016x: %w", hash, err)
@@ -432,4 +433,29 @@ func (s *Store) Stats(ctx context.Context) (count int64, bytes int64, err error)
 		return 0, 0, fmt.Errorf("thumbs: stats: %w", err)
 	}
 	return count, bytes, nil
+}
+
+// Rename retries: on Windows a preview that is being served is open
+// without FILE_SHARE_DELETE (Go's os.Open), so renaming it fails with a
+// sharing violation until the response is done. Previews are small, so a
+// few short retries usually outlast the request.
+const (
+	renameAttempts = 5
+	renameBackoff  = 50 * time.Millisecond
+)
+
+// renameRetry calls rename(from, to) up to renameAttempts times, sleeping
+// renameBackoff between attempts, and returns the last error. A missing
+// source is not retried.
+func renameRetry(rename func(from, to string) error, from, to string) error {
+	var err error
+	for i := 0; i < renameAttempts; i++ {
+		if i > 0 {
+			time.Sleep(renameBackoff)
+		}
+		if err = rename(from, to); err == nil || errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return err
 }

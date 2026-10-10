@@ -43,6 +43,8 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
    make build
    ```
 
+   `make build` first builds the web frontend (`make web`, needs Node 24; the Makefile uses `~/.local/node/bin` when it exists) and embeds it in the binary. A plain `go build -tags nodynamic .` works without Node; `picmover serve` then answers the browser with a note that the frontend is not built, while the API works.
+
    The Makefile passes `-tags nodynamic` to every `go build`, `go test` and `go vet`, so the HEIC/AVIF/WebP codecs use their embedded WebAssembly builds and never load a system library. Pass the tag yourself when you run the Go tools directly, for example `go test -tags nodynamic ./...`.
 
    To cross-compile all targets, run `make build-all`. It writes:
@@ -80,6 +82,27 @@ Flags:
 
 Importing a library onto itself (the same path as source and library) records files that are in the library but not in the catalog; files outside the `<type>/YYYY/MM` layout are copied (or with `--move` moved) into it. To recreate the whole catalog without touching any file use `rebuild`.
 
+### Browsing: picmover serve
+
+To browse a library and import from a web browser:
+
+```
+./picmover serve /path/to/library
+```
+
+This starts a local web server on `127.0.0.1:7439` (another free port when that one is busy), prints `Serving <library> at http://127.0.0.1:7439/` and opens the browser. The page has a date-ordered photo grid, a map, an import wizard with live progress and library statistics. Imports started there run exactly like `picmover import` (same log files under `.picmover/logs/`, same exit codes shown as the outcome); one job runs at a time. Press Ctrl+C to stop: a running import is cancelled safely first, and the command exits with status 0.
+
+`serve` creates a new library when the directory does not exist or is empty, so the first import can be started from the browser. A folder that already holds files but no `media.db` is refused: record its files in place with `picmover rebuild <dir>` first, or import into it with `picmover import <source> <dir>`. The server answers only this machine and only its own page: requests with another `Host` or `Origin` are refused, so other web sites cannot read the library or start imports.
+
+Flags:
+
+- `--addr HOST:PORT`: listen address (default `127.0.0.1:7439`). A non-loopback address makes the library reachable from the network without any authentication; a warning is printed.
+- `--no-open`: do not open the browser (it is also not opened when stdout is not a terminal).
+- `--cors-origin URL`: allow a development page at URL (for example `http://localhost:5173`) to call the API cross-origin; repeatable.
+- `--verbose`: log every request to stderr.
+
+Frontend development: run `picmover serve /path/to/library --no-open --cors-origin http://localhost:5173` and, in `web/`, `npm run dev`; Vite serves the app on `http://localhost:5173` with hot reload and proxies `/api` to `127.0.0.1:7439` (the proxy rewrites the `Host` header, `changeOrigin: true`, so the server's host check passes). The `--cors-origin` flag accepts the dev page's `Origin` header, which browsers send on every POST even through the proxy, and also lets the page call `http://127.0.0.1:7439/api/...` directly, bypassing the proxy. `make check` runs the Go vet and tests plus the frontend checks and tests.
+
 ### Thumbnails
 
 To generate the thumbnails and previews that are still pending (after `import --no-thumbs` or a cancelled import), retry the files whose thumbnails failed before, and regenerate stale ones:
@@ -99,6 +122,10 @@ Every run retries the files whose thumbnails failed, so a file that can never be
 
 It exits with status 2 when thumbnails failed for some files (they are listed in the log in `.picmover/logs/`), and 130 when cancelled.
 
+### One writer at a time
+
+Commands that change a library (`serve` for as long as it runs, `import`, `rebuild`, `thumbs`, `update-metadata`, and `verify --rehash`/`--fill-size`) hold a lock on `<library>/.picmover/lock`. A second such command on the same library stops at once with `library is in use by another picmover process (pid N, <command>, since <time>)`; stop that process first (for example the browser server) and try again. `db` and plain `verify` only read and work at any time. The lock belongs to the running process, so it disappears when that process ends, even after a crash: there is never a stale lock to delete. On a file system that cannot lock files (some network mounts) a warning is printed and the command runs without the lock.
+
 ### Rebuild
 
 To recreate the catalog from the files in the library:
@@ -107,9 +134,11 @@ To recreate the catalog from the files in the library:
 ./picmover rebuild /path/to/library
 ```
 
-The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet` as for `import`.
+The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet`, `--no-thumbs` as for `import`.
 
-To undo a rebuild, delete the new `media.db` (and its `-wal`/`-shm`) and rename the newest `media.db.bak-<timestamp>` files back to `media.db`. If `media.db` is missing but backups exist, `rebuild` says so and explains this. To move stray files into the layout instead, use `picmover import <library> <library>`.
+A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
+
+To undo a rebuild, delete the new `media.db` (and its `-wal`/`-shm`) and rename the newest `media.db.bak-<timestamp>` files back to `media.db`. If `media.db` is missing but backups exist, `rebuild` names the newest one before recording the files, so a backup that should have been restored is noticed. To move stray files into the layout instead, use `picmover import <library> <library>`.
 
 ### Database Query
 

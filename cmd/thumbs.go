@@ -40,12 +40,13 @@ in the log under <library>/.picmover/logs/), 130 when cancelled.`,
 			}
 			ctx, stop := interruptContext(cmd.Context())
 			defer stop()
-			lib, db, err := openExisting(ctx, args[0])
+			lib, db, unlock, err := openExistingLocked(ctx, args[0], "thumbs", cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
+			defer unlock()
 			defer db.Close()
-			logFile, logPath, err := openLog(lib, "thumbs")
+			logFile, logPath, err := lib.OpenLog("thumbs")
 			if err != nil {
 				return err
 			}

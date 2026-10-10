@@ -506,7 +506,7 @@ func TestGenerateVideoFakeFFmpeg(t *testing.T) {
 	}
 	b, _ := os.ReadFile(args)
 	got := strings.Fields(string(b))
-	want := []string{"-hide_banner", "-loglevel", "error", "-ss", "0.500", "-i", "file:" + video,
+	want := []string{"-hide_banner", "-loglevel", "warning", "-ss", "0.500", "-i", "file:" + video,
 		"-frames:v", "1", "-vf", "scale='min(1600,iw)':-2", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "-"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("ffmpeg args\n got %q\nwant %q", got, want)
@@ -520,7 +520,7 @@ func TestGenerateVideoFakeFFmpeg(t *testing.T) {
 	failing, _ := fakeFFmpeg(t, nil)
 	g.FFmpeg = failing
 	res = g.Generate(context.Background(), Source{Path: video, Kind: metadata.KindVideo, Hash: 52}, false)
-	if res.State != StateError || res.Message != "ffmpeg: file:/x: Invalid data found when processing input" {
+	if res.State != StateError || res.Message != "ffmpeg: first line; file:/x: Invalid data found when processing input" {
 		t.Errorf("failing ffmpeg: %+v", res)
 	}
 }
@@ -561,5 +561,78 @@ func TestGenerateVideoRealFFmpeg(t *testing.T) {
 	res := g.Generate(context.Background(), Source{Path: video, Kind: metadata.KindVideo, Hash: 70, DurationMS: 2000}, false)
 	if res.State != StateOK || res.ThumbW != 256 || res.ThumbH != 144 {
 		t.Errorf("%+v", res)
+	}
+}
+
+func TestFFmpegMessage(t *testing.T) {
+	long := strings.Repeat("é", 150) // 300 bytes, two-byte runes
+	tests := []struct {
+		name      string
+		tail      string
+		truncated bool
+		want      string
+	}{
+		{"unsupported feature", `[mov,mp4,m4a,3gp,3g2,mj2 @ 0x58991ef07680] explicit position is not implemented. Update your FFmpeg version to the newest one from Git. If the problem still occurs, it means that your file has a feature which has not been implemented.
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x58991ef07680] If you want to help, upload a sample of this file to https://streams.videolan.org/upload/ and contact the ffmpeg-devel mailing list. (ffmpeg-devel@ffmpeg.org)
+[mov,mp4,m4a,3gp,3g2,mj2 @ 0x58991ef07680] error reading header
+[in#0 @ 0x58991ef06000] Error opening input: Not yet implemented in FFmpeg, patches welcome
+Error opening input file file:/lib/video/2018/10/VID_20181003_183222.mp4.
+Error opening input files: Not yet implemented in FFmpeg, patches welcome
+`, false, "explicit position is not implemented; Error opening input files: Not yet implemented in FFmpeg, patches welcome"},
+		{"damaged file", `[mov,mp4,m4a,3gp,3g2,mj2 @ 0x1] moov atom not found
+[in#0 @ 0x2] Error opening input: Invalid data found when processing input
+Error opening input file file:/x.mp4.
+Error opening input files: Invalid data found when processing input
+`, false, "moov atom not found; Error opening input files: Invalid data found when processing input"},
+		{"windows prefixes", `[mov,mp4,m4a,3gp,3g2,mj2 @ 000001e3f4a7c580] moov atom not found
+[in#0 @ 000001e3f4a7d000] Error opening input: Invalid data found when processing input
+`, false, "moov atom not found; Error opening input: Invalid data found when processing input"},
+		{"single line", "file:/x: Invalid data found when processing input\n", false, "file:/x: Invalid data found when processing input"},
+		{"repeated decoder errors", `[hevc @ 0xabc] Invalid NAL unit size (0 > 1234).
+[hevc @ 0xabc] Invalid NAL unit size (0 > 1234).
+[hevc @ 0xabc] Invalid NAL unit size (0 > 1234).
+
+[out#0/image2pipe @ 0xdef] Output file is empty, nothing was encoded
+`, false, "Invalid NAL unit size (0 > 1234); Output file is empty, nothing was encoded"},
+		{"same first and last", "[hevc @ 0x1] bad\n[hevc @ 0x2] bad.\n", false, "bad"},
+		{"truncated tail", "artial line from a dropped prefix\n[hevc @ 0x1] decode error\nConversion failed!\n", true, "decode error; Conversion failed!"},
+		{"only boilerplate", "\n  \nError opening input file file:/x.mp4.\n[mov @ 0x1] If you want to help, upload a sample of this file\n", false, ""},
+		{"empty", "", false, ""},
+		{"long line", long + "\nend\n", false, strings.Repeat("é", 100) + "…; end"},
+		{"long line odd cut", "x" + long + "\n", false, "x" + strings.Repeat("é", 99) + "…"},
+		{"no prefix kept", "[not a context] text\nplain @ 0x12] text\n", false, "[not a context] text; plain @ 0x12] text"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ffmpegMessage([]byte(tt.tail), tt.truncated); got != tt.want {
+				t.Errorf("got  %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTailBufferTruncated(t *testing.T) {
+	tb := &tailBuffer{max: 16}
+	tb.Write([]byte("short\n"))
+	if tb.truncated {
+		t.Fatal("truncated without overflow")
+	}
+	tb.Write([]byte("partial first line\nlast line\n"))
+	if !tb.truncated || len(tb.b) != 16 {
+		t.Fatalf("truncated=%v len=%d", tb.truncated, len(tb.b))
+	}
+	if got := ffmpegMessage(tb.b, tb.truncated); got != "last line" {
+		t.Errorf("got %q", got)
+	}
+
+	tb = &tailBuffer{max: maxStderrTail}
+	var in strings.Builder
+	for in.Len() <= maxStderrTail {
+		in.WriteString("[hevc @ 0x1] Invalid NAL unit size\n")
+	}
+	in.WriteString("Conversion failed!\n")
+	tb.Write([]byte(in.String()))
+	if got := ffmpegMessage(tb.b, tb.truncated); !tb.truncated || got != "Invalid NAL unit size; Conversion failed!" {
+		t.Errorf("truncated=%v got %q", tb.truncated, got)
 	}
 }

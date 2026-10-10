@@ -735,13 +735,12 @@ target copying to `/home/alfthan/bin/picmover` and
 Found by a targeted review of the import pipeline and deliberately left for
 later steps. None of them loses data during a normal single run.
 
-- **Concurrent imports into one library are unsupported.** There is no lock
-  file; a second run's `CleanTemp` would delete the first run's in-progress
-  files, and the never-overwrite guarantee between *processes* rests on an
-  `Lstat` check followed by `os.Rename`, which replaces an existing file on
-  every OS. Follow-up: a lock file under `.picmover/` and a rename that
-  refuses to replace (`RENAME_NOREPLACE` on Linux, `MoveFileEx` without
-  `REPLACE_EXISTING` on Windows).
+- **Concurrent imports into one library** are now refused by the library
+  lock (`.picmover/lock`, added with `serve`; see server.md). Within one
+  process the never-overwrite guarantee still rests on an `Lstat` check
+  followed by `os.Rename`; a rename that refuses to replace
+  (`RENAME_NOREPLACE`, `MoveFileEx` without `REPLACE_EXISTING`) remains a
+  follow-up.
 - **Case folding in the catalog is ASCII only.** `COLLATE NOCASE` does not
   fold non-ASCII letters, so `Ä.jpg` and `ä.jpg` can both be catalogued on
   Linux; the on-disk check folds with `strings.ToLower` and does catch it when

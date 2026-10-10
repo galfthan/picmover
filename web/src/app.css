@@ -1,0 +1,340 @@
+/* picmover — hand-written styles. Dark by default (photo tool), light when
+   the system prefers it. Components use these variables only. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0f1012;
+  --surface: #17181b;
+  --surface-2: #1f2024;
+  --surface-3: #2a2b30;
+  --border: #2f3036;
+  --text: #e9e9ec;
+  --muted: #9b9ca3;
+  --faint: #6b6c73;
+  --accent: #7cb2ff;
+  --accent-strong: #4f93f7;
+  --accent-text: #0b1220;
+  --ok: #5fd38d;
+  --warn: #f0c75e;
+  --danger: #ff7a7a;
+  --danger-bg: rgba(255, 122, 122, 0.12);
+  --placeholder: #212226;
+  --overlay: rgba(6, 6, 8, 0.96);
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  --radius: 8px;
+  --radius-sm: 5px;
+  --topbar-h: 48px;
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, Cantarell, 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f6f6f7;
+    --surface: #ffffff;
+    --surface-2: #f0f0f2;
+    --surface-3: #e4e4e8;
+    --border: #d9d9de;
+    --text: #18181b;
+    --muted: #5d5e66;
+    --faint: #8a8b93;
+    --accent: #2f6fd6;
+    --accent-strong: #1f5bbd;
+    --accent-text: #ffffff;
+    --ok: #1d8a4c;
+    --warn: #a37200;
+    --danger: #c62f2f;
+    --danger-bg: rgba(198, 47, 47, 0.08);
+    --placeholder: #e6e6ea;
+    --overlay: rgba(12, 12, 14, 0.96);
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.15);
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 0.6em;
+  font-weight: 600;
+  line-height: 1.25;
+}
+h1 {
+  font-size: 1.45rem;
+}
+h2 {
+  font-size: 1.15rem;
+}
+h3 {
+  font-size: 1rem;
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+/* ---- Controls ---- */
+
+button,
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: none;
+}
+button:hover:not(:disabled),
+.btn:hover {
+  background: var(--surface-3);
+  text-decoration: none;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.primary,
+.btn.primary {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #fff;
+}
+button.primary:hover:not(:disabled),
+.btn.primary:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+button.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+}
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+}
+button.ghost:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+button.small,
+.btn.small {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 0.9em;
+}
+
+input[type='text'],
+input[type='number'],
+input[type='search'],
+select {
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+input[type='checkbox'],
+input[type='radio'],
+input[type='range'] {
+  accent-color: var(--accent-strong);
+}
+
+/* ---- Common blocks ---- */
+
+.page {
+  height: 100%;
+  overflow: auto;
+}
+.page-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 24px 64px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 16px;
+}
+
+.muted {
+  color: var(--muted);
+}
+.small {
+  font-size: 0.88em;
+}
+.error-box {
+  border: 1px solid var(--danger);
+  background: var(--danger-bg);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 8px 0;
+}
+.notice {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 8px 0;
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  min-height: 240px;
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+}
+.empty h2 {
+  color: var(--text);
+  margin: 0;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+}
+table.data th,
+table.data td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+table.data th {
+  color: var(--muted);
+  font-weight: 500;
+}
+table.data td.num,
+table.data th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+.stat {
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.stat .v {
+  display: block;
+  font-size: 1.35rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.stat .k {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+.stat.bad .v {
+  color: var(--danger);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.spacer {
+  flex: 1;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Leaflet marker icons (L.divIcon) — global because Leaflet builds them. */
+.pm-cluster {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(79, 147, 247, 0.85);
+  border: 2px solid #fff;
+  color: #fff;
+  font: 600 12px/1 var(--font);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
+}
+.pm-single {
+  border: 2px solid #fff;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #333;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
+}
+.pm-single img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
