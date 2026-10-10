@@ -210,6 +210,7 @@ describe('backups', () => {
         targets: [
           { id: T, label: 'Red', path: '/mnt/red', reachable: true, lastBackupAt: 1760090000, lastScrubAt: null, set: { files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 } },
           { id: '0f1e2d3c4b5a6978', label: 'NAS', path: '\\\\nas\\photos', reachable: false },
+          { id: '086c53713dc7bcf4', label: 'Shared', path: '/mnt/s', reachable: true, lastBackupAt: null, lastScrubAt: null, set: null, error: 'the target already holds a backup of another library under this name' },
         ],
       });
     const list = await api.getBackups(true);
@@ -221,12 +222,18 @@ describe('backups', () => {
       reachable: true,
       lastBackupAt: 1760090000,
       lastScrubAt: null,
-      set: { files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 },
+      set: { name: '', files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 },
     });
     expect(list[1]).toMatchObject({ reachable: false, lastBackupAt: null, set: null });
+    expect(list[1]).not.toHaveProperty('error');
+    // A reachable target whose set cannot be used carries the server's reason.
+    expect(list[2]).toMatchObject({ reachable: true, set: null, error: 'the target already holds a backup of another library under this name' });
+    expect(list[2]).not.toHaveProperty('foreign');
+    reply = () => json({ targets: [{ id: T, label: 'Red', path: '/mnt/red', reachable: true, set: null, error: 'written by another copy', foreign: true }] });
+    expect((await api.getBackups())[0]).toMatchObject({ set: null, error: 'written by another copy', foreign: true });
     reply = () => json({ targets: null });
     expect(await api.getBackups()).toEqual([]);
-    expect(calls[1]?.path).toBe('/api/l/peter/backups');
+    expect(calls[2]?.path).toBe('/api/l/peter/backups');
   });
 
   it('adds, updates and forgets targets by id', async () => {
@@ -261,6 +268,17 @@ describe('backups', () => {
     expect(p.extra).toEqual({ count: 600, bytes: 6000, paths: ['x.jpg', 'y.jpg'] });
     expect(p.changed).toEqual({ count: 0, bytes: 0, paths: [] });
     expect(p.current).toEqual({ count: 0, bytes: 0, paths: [] });
+    // No restore class from this server: none is invented.
+    expect(p.restore).toBeUndefined();
+  });
+
+  it('reads the restore class and the set name', async () => {
+    reply = () => json({ extra: { count: 3, bytes: 30, paths: ['a.jpg', '.picmover/previous/b.jpg.1700000000'] }, restore: { count: 1, bytes: 10, paths: ['a.jpg'] } });
+    const p = await api.getPlan(T);
+    expect(p.restore).toEqual({ count: 1, bytes: 10, paths: ['a.jpg'] });
+    expect(p.extra.count).toBe(3);
+    reply = () => json({ targets: [{ id: T, label: 'Red', path: '/mnt/red', reachable: true, set: { name: 'peter', files: 0, bytes: 0, behind: { new: 6, changed: 0, moved: 0, bytes: 32127 }, extras: 0, damaged: 0, unverified: 0 } }] });
+    expect((await api.getBackups())[0]?.set?.name).toBe('peter');
   });
 
   it('reads runs newest first, with stats as an object or JSON text', async () => {
@@ -285,11 +303,13 @@ describe('backups', () => {
     await api.startJob({ kind: 'scrub', target: T, budget: 900, repair: true });
     await api.startJob({ kind: 'prune', target: T, confirm: true, expected: 3 });
     await api.startJob({ kind: 'restore', target: T, mode: 'missing' });
+    await api.startJob({ kind: 'backup', target: T, takeOver: true });
     expect(calls.map((c) => c.body)).toEqual([
       { kind: 'backup', target: T },
       { kind: 'scrub', target: T, budget: 900, repair: true },
       { kind: 'prune', target: T, confirm: true, expected: 3 },
       { kind: 'restore', target: T, mode: 'missing' },
+      { kind: 'backup', target: T, takeOver: true },
     ]);
     expect(calls.every((c) => c.path === '/api/l/peter/jobs')).toBe(true);
   });

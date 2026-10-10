@@ -4,18 +4,24 @@
   // set's size and the "behind" headline; Back up now, Scrub with a budget,
   // Prune (the plan's extras, confirmed by typing the count), Restore
   // missing (the files that would come back first), Forget; inline progress
-  // while one of its jobs runs; the problems of its last runs.
-  import { errorMessage, isBackupKind, type BackupPlan, type BackupTarget, type Job } from '../lib/api';
+  // while one of its jobs runs; the problems of its last runs. A target the
+  // server reports an `error` for (its set belongs to another library) shows
+  // the error and offers only Edit and Forget, plus Take over when the set
+  // was last written by another copy of this library (`foreign`).
+  import { tick } from 'svelte';
+  import { ApiError, errorMessage, type BackupPlan, type BackupTarget, type Job } from '../lib/api';
   import { backups } from '../lib/backups.svelte';
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatInstant, parseWhen } from '../lib/format';
-  import { outcome } from '../lib/jobtext';
+  import { backupStatusText, outcome } from '../lib/jobtext';
   import {
     agoText,
     behindCount,
     behindText,
     problemCount,
+    problemTotal,
     runProblems,
+    TRUNCATED_NOTE,
     SCRUB_BUDGETS,
     targetPathProblem,
     type ProblemList,
@@ -35,28 +41,63 @@
   const set = $derived(target.set);
   const behind = $derived(behindCount(set?.behind));
   const headline = $derived(behindText(target));
-  const headTone = $derived(!target.reachable ? 'warn' : behind === null ? 'muted' : behind === 0 ? 'ok' : 'warn');
+  const headTone = $derived(!target.reachable || target.error ? 'warn' : behind === null ? 'muted' : behind === 0 ? 'ok' : 'warn');
 
-  /** The running job of this target. */
-  const job = $derived(jobs.active && isBackupKind(jobs.active.kind) && backups.targetOf(jobs.active) === id ? jobs.active : null);
-  /** The newest finished job of this target seen by this server process. */
-  const lastJob = $derived<Job | null>(jobs.jobs.find((j) => isBackupKind(j.kind) && !isActive(j) && backups.targetOf(j) === id) ?? null);
+  /** The running job of this target in this library (another library's job on the same drive is not ours). */
+  const job = $derived(jobs.active && backups.isFor(jobs.active, id) ? jobs.active : null);
+  /** The newest finished job of this target and library seen by this server process. */
+  const lastJob = $derived<Job | null>(jobs.jobs.find((j) => !isActive(j) && backups.isFor(j, id)) ?? null);
   const lastOutcome = $derived(lastJob ? outcome(lastJob) : null);
   const busy = $derived(!!jobs.active);
-  const canRun = $derived(target.reachable && !busy);
+  const canRun = $derived(target.reachable && !target.error && !busy);
+  /** The set belongs to another copy of this library: it can be taken over by a backup. */
+  const canTakeOver = $derived(target.reachable && !!target.foreign && !!target.error);
+  /** What the live region says: the running job's phase, then its outcome. */
+  const announce = $derived(job ? backupStatusText(job) : (lastOutcome?.text ?? ''));
 
   const problems = $derived(runProblems(backups.runs[id] ?? []));
   const nProblems = $derived(problemCount(problems));
+  const nListed = $derived(problemTotal(problems));
+
+  // ---- Focus: buttons that disappear must not leave focus on <body> ----
+
+  let cardEl: HTMLElement | undefined = $state();
+  let editBtn: HTMLButtonElement | undefined = $state();
+  let backupBtn: HTMLButtonElement | undefined = $state();
+  let labelInput: HTMLInputElement | undefined = $state();
+
+  const focusLost = () => !document.activeElement || document.activeElement === document.body || !document.activeElement.isConnected;
+
+  /** After a job starts: focus its Cancel button (the actions row is gone). */
+  async function focusProgress() {
+    await tick();
+    // Focus that moved elsewhere on purpose stays there.
+    if (!focusLost() && !cardEl?.contains(document.activeElement)) return;
+    cardEl?.querySelector<HTMLButtonElement>('.bprogress button')?.focus();
+  }
+
+  // When the job ends its progress block (and Cancel) goes away: focus Back up now.
+  let hadJob = false;
+  $effect(() => {
+    const has = !!job;
+    if (hadJob && !has) {
+      void tick().then(() => {
+        if (focusLost()) backupBtn?.focus();
+      });
+    }
+    hadJob = has;
+  });
 
   let starting = $state(false);
   let actionError = $state('');
 
-  async function run(fn: () => Promise<unknown>) {
+  async function run(fn: () => Promise<unknown>, after?: () => Promise<void>) {
     if (starting) return;
     starting = true;
     actionError = '';
     try {
       await fn();
+      if (after) await after();
     } catch (e) {
       actionError = errorMessage(e);
     } finally {
@@ -64,13 +105,13 @@
     }
   }
 
-  const backupNow = () => run(() => backups.start({ kind: 'backup', target: id }));
+  const backupNow = () => run(() => backups.start({ kind: 'backup', target: id }), focusProgress);
 
   let budget = $state('900');
   function scrub() {
     const b = SCRUB_BUDGETS.find((x) => String(x.seconds) === budget);
     const seconds = b ? b.seconds : 900;
-    void run(() => backups.start(seconds === null ? { kind: 'scrub', target: id, repair: true } : { kind: 'scrub', target: id, budget: seconds, repair: true }));
+    void run(() => backups.start(seconds === null ? { kind: 'scrub', target: id, repair: true } : { kind: 'scrub', target: id, budget: seconds, repair: true }), focusProgress);
   }
 
   function forget() {
@@ -90,12 +131,23 @@
   let browsing = $state(false);
   const pathProblem = $derived(editPath.trim() ? targetPathProblem(editPath) : null);
 
-  function startEdit() {
+  async function startEdit() {
     editLabel = target.label;
     editPath = target.path;
     editError = '';
     editing = true;
+    await tick();
+    labelInput?.focus();
   }
+
+  async function endEdit() {
+    editing = false;
+    await tick();
+    if (focusLost()) editBtn?.focus();
+  }
+
+  /** The directory browser cannot open network shares: start it at the roots then. */
+  const browseStart = (p: string) => (/^[\\/]{2}/.test(p.trim()) ? '' : p);
 
   async function saveEdit(e: SubmitEvent) {
     e.preventDefault();
@@ -108,14 +160,14 @@
     if (editLabel.trim() && editLabel.trim() !== target.label) patch.label = editLabel.trim();
     if (editPath.trim() !== target.path) patch.path = editPath.trim();
     if (!patch.label && patch.path === undefined) {
-      editing = false;
+      await endEdit();
       return;
     }
     saving = true;
     editError = '';
     try {
       await backups.update(id, patch);
-      editing = false;
+      await endEdit();
     } catch (err) {
       editError = errorMessage(err);
     } finally {
@@ -125,7 +177,7 @@
 
   // ---- Prune and restore dialogs (both show the plan's extras) ----
 
-  let dialog = $state<'prune' | 'restore' | null>(null);
+  let dialog = $state<'prune' | 'restore' | 'takeover' | null>(null);
   let plan = $state<BackupPlan | null>(null);
   let planError = $state('');
   let planLoading = $state(false);
@@ -133,6 +185,18 @@
   let dialogError = $state('');
   let dialogBusy = $state(false);
   const extra = $derived(plan?.extra ?? null);
+  /** What a restore copies back: the plan's `restore` class; null when the server does not send one. */
+  const restoreClass = $derived(plan?.restore ?? null);
+  let typedInput: HTMLInputElement | undefined = $state();
+  /** The typed count without digit grouping ("1,204", "1 204" and "1204" all match 1204). */
+  const typedCount = $derived(typed.replace(/[\s,.'_\u00a0\u202f]/g, ''));
+  const typedOk = $derived(!!extra && typedCount === String(extra.count));
+
+  /** Focus the typed-count field once the plan is shown. */
+  async function focusTyped() {
+    await tick();
+    typedInput?.focus();
+  }
 
   async function openDialog(kind: 'prune' | 'restore') {
     dialog = kind;
@@ -149,16 +213,43 @@
     } finally {
       planLoading = false;
     }
+    if (kind === 'prune' && plan) await focusTyped();
   }
 
   async function confirmPrune(e: SubmitEvent) {
     e.preventDefault();
-    if (!extra || typed.trim() !== String(extra.count) || dialogBusy) return;
+    if (!extra || !typedOk || dialogBusy) return;
     dialogBusy = true;
     dialogError = '';
     try {
       await backups.start({ kind: 'prune', target: id, confirm: true, expected: extra.count });
       dialog = null;
+      await focusProgress();
+    } catch (err) {
+      dialogError = errorMessage(err);
+      // The files to remove changed: show the new list and ask for its count.
+      if (err instanceof ApiError && err.status === 409) {
+        typed = '';
+        try {
+          plan = await backups.plan(id, true);
+          await focusTyped();
+        } catch (e) {
+          planError = errorMessage(e);
+        }
+      }
+    } finally {
+      dialogBusy = false;
+    }
+  }
+
+  async function confirmTakeOver() {
+    if (dialogBusy) return;
+    dialogBusy = true;
+    dialogError = '';
+    try {
+      await backups.start({ kind: 'backup', target: id, takeOver: true });
+      dialog = null;
+      await focusProgress();
     } catch (err) {
       dialogError = errorMessage(err);
     } finally {
@@ -173,6 +264,7 @@
     try {
       await backups.start({ kind: 'restore', target: id, mode: 'missing' });
       dialog = null;
+      await focusProgress();
     } catch (err) {
       dialogError = errorMessage(err);
     } finally {
@@ -191,7 +283,7 @@
 {#snippet list(title: string, p: ProblemList, cls: string)}
   {#if p.count > 0}
     <div class="plist {cls}">
-      <h4>{title} <span class="muted">({formatCount(p.count)})</span></h4>
+      <h4>{title} <span class="muted">({formatCount(p.count)}{p.open < p.count ? `, ${formatCount(p.count - p.open)} repaired` : ''})</span></h4>
       {#if p.items.length}
         <ul>
           {#each p.items.slice(0, SHOWN) as it, i (i)}
@@ -204,6 +296,7 @@
         </ul>
         {#if p.count > Math.min(p.items.length, SHOWN)}<p class="muted small">and {formatCount(p.count - Math.min(p.items.length, SHOWN))} more; see the run log.</p>{/if}
       {/if}
+      {#if p.truncated}<p class="muted small truncated">The run's {TRUNCATED_NOTE}; the run log has every file.</p>{/if}
     </div>
   {/if}
 {/snippet}
@@ -215,19 +308,19 @@
   {#if count > list.length}<p class="muted small more">and {formatCount(count - list.length)} more</p>{/if}
 {/snippet}
 
-<li class="card target" data-target={id} aria-label="Backup target {target.label}">
+<li class="card target" data-target={id} aria-label="Backup target {target.label}" bind:this={cardEl}>
   <div class="top">
     <h2 class="label">{target.label || 'Unnamed target'}</h2>
     <span class="badge" class:ok={target.reachable} class:bad={!target.reachable}>{target.reachable ? 'Connected' : 'Not found'}</span>
     <span class="spacer"></span>
-    {#if !editing}<button class="small" onclick={startEdit}>Edit</button>{/if}
+    {#if !editing}<button class="small" bind:this={editBtn} onclick={startEdit}>Edit</button>{/if}
   </div>
 
   {#if editing}
     <form class="edit" onsubmit={saveEdit}>
       <label>
         <span>Label</span>
-        <input type="text" bind:value={editLabel} maxlength="200" autocomplete="off" />
+        <input type="text" bind:this={labelInput} bind:value={editLabel} maxlength="64" autocomplete="off" />
       </label>
       <label>
         <span>Folder</span>
@@ -239,7 +332,7 @@
       <p class="muted small">Point at the drive or share where this target is now; it must hold the target's marker file. Network shares can be typed (\\server\share).</p>
       {#if pathProblem || editError}<div class="error-box small" role="alert">{editError || pathProblem}</div>{/if}
       <div class="row end">
-        <button type="button" onclick={() => (editing = false)}>Cancel</button>
+        <button type="button" onclick={endEdit}>Cancel</button>
         <button type="submit" class="primary" disabled={saving || !!pathProblem}>Save</button>
       </div>
     </form>
@@ -272,11 +365,12 @@
     {/if}
   </dl>
 
+  <p class="sr-only" aria-live="polite">{announce}</p>
   {#if job}
-    <div class="progress"><BackupProgress {job} /></div>
+    <div class="progress"><BackupProgress {job} budget={backups.budgetOf(job)} live={false} /></div>
   {:else}
     <div class="row actions">
-      <button class="primary" disabled={!canRun || starting} onclick={backupNow}>Back up now</button>
+      <button class="primary" bind:this={backupBtn} disabled={!canRun || starting} onclick={backupNow}>Back up now</button>
       <span class="scrub">
         <select bind:value={budget} aria-label="Scrub budget" disabled={!canRun || starting}>
           {#each SCRUB_BUDGETS as b (b.label)}<option value={String(b.seconds)}>{b.label}</option>{/each}
@@ -285,6 +379,15 @@
       </span>
       <button disabled={!canRun || starting} onclick={() => openDialog('prune')}>Prune…</button>
       <button disabled={!canRun || starting} onclick={() => openDialog('restore')}>Restore missing…</button>
+      {#if canTakeOver}
+        <button
+          disabled={busy || starting}
+          onclick={() => {
+            dialogError = '';
+            dialog = 'takeover';
+          }}>Take over…</button
+        >
+      {/if}
       <span class="spacer"></span>
       <ConfirmButton
         label="Forget"
@@ -298,6 +401,8 @@
     </div>
     {#if !target.reachable}
       <p class="muted small">Connect the drive or share, or Edit the folder if it is mounted somewhere else now.</p>
+    {:else if target.error}
+      <p class="muted small">This library cannot use the target as it is: Edit the folder, or Forget the target (the files on it are not touched).</p>
     {:else if busy}
       <p class="muted small">Another job is running; wait until it has finished.</p>
     {/if}
@@ -307,7 +412,7 @@
 
   <details class="problems" open={nProblems > 0}>
     <summary>
-      {#if nProblems > 0}Problems <span class="count">{formatCount(nProblems)}</span>{:else}No problems in the last runs{/if}
+      {#if nProblems > 0}Problems <span class="count">{formatCount(nProblems)}</span>{:else if nListed > 0}No open problems in the last runs{:else}No problems in the last runs{/if}
     </summary>
     {@render list('Damaged files in the last scrub', problems.damaged, 'damaged')}
     {@render list('Copy failures in the last backup', problems.failed, 'failed')}
@@ -320,7 +425,7 @@
 {#if browsing}
   <Dialog title="Choose the target folder" wide onclose={() => (browsing = false)}>
     <FolderPicker
-      start={editPath}
+      start={browseStart(editPath)}
       chooseLabel="Use this folder"
       countsNote=""
       rootsHint="Choose the drive or folder that holds the backup."
@@ -353,16 +458,32 @@
         </p>
         {@render paths(extra.paths, extra.count)}
         <label class="field">
-          <span>Type <strong>{extra.count}</strong> to confirm</span>
-          <input type="text" inputmode="numeric" bind:value={typed} autocomplete="off" />
+          <span>Type <strong>{formatCount(extra.count)}</strong> to confirm</span>
+          <input type="text" inputmode="numeric" bind:this={typedInput} bind:value={typed} autocomplete="off" />
         </label>
         {#if dialogError}<div class="error-box small" role="alert">{dialogError}</div>{/if}
         <div class="row end">
           <button type="button" onclick={() => (dialog = null)}>Cancel</button>
-          <button type="submit" class="danger" disabled={typed.trim() !== String(extra.count) || dialogBusy || busy}>Prune {formatCount(extra.count)} files</button>
+          <button type="submit" class="danger" disabled={!typedOk || dialogBusy || busy}>Prune {files(extra.count)}</button>
         </div>
       </form>
     {/if}
+  </Dialog>
+{/if}
+
+{#if dialog === 'takeover'}
+  <Dialog title="Take over the backup on {target.label}" wide onclose={() => (dialog = null)}>
+    <p>{target.error}</p>
+    <p>
+      If you take it over, this library becomes the writer of that backup set: a backup starts now and brings the set in line with this library, and
+      the other copy's backups there are treated as this library's from then on. Back up the other copy to a different target (or set) if you keep using
+      it.
+    </p>
+    {#if dialogError}<div class="error-box small" role="alert">{dialogError}</div>{/if}
+    <div class="row end">
+      <button type="button" onclick={() => (dialog = null)}>Cancel</button>
+      <button class="primary" disabled={dialogBusy || busy} onclick={confirmTakeOver}>Take over and back up</button>
+    </div>
   </Dialog>
 {/if}
 
@@ -373,20 +494,26 @@
     {:else if planError}
       <div class="error-box small" role="alert">{planError}</div>
       <div class="row end"><button onclick={() => (dialog = null)}>Close</button></div>
-    {:else if extra && extra.count === 0}
-      <p>Nothing is missing: every file on the target is in the library.</p>
+    {:else if restoreClass && restoreClass.count === 0}
+      <p>Nothing is missing: every file of the backup is in the library.</p>
       <div class="row end"><button onclick={() => (dialog = null)}>Close</button></div>
-    {:else if extra}
-      <p>
-        {formatCount(extra.count)}
-        {extra.count === 1 ? 'file' : 'files'}{extra.bytes ? ` (${formatBytes(extra.bytes)})` : ''} on the target {extra.count === 1 ? 'is' : 'are'} missing
-        from the library and would be copied back. Files in the library are never overwritten.
-      </p>
-      {@render paths(extra.paths, extra.count)}
+    {:else if plan}
+      {#if restoreClass}
+        <p>
+          {files(restoreClass.count)}{restoreClass.bytes ? ` (${formatBytes(restoreClass.bytes)})` : ''} of the backup {restoreClass.count === 1 ? 'is' : 'are'} missing
+          from the library and would be copied back. Files in the library are never overwritten.
+        </p>
+        {@render paths(restoreClass.paths, restoreClass.count)}
+      {:else}
+        <p>
+          The files of the backup that are missing from the library are copied back. Files in the library are never overwritten; the job's summary
+          says how many were restored.
+        </p>
+      {/if}
       {#if dialogError}<div class="error-box small" role="alert">{dialogError}</div>{/if}
       <div class="row end">
         <button type="button" onclick={() => (dialog = null)}>Cancel</button>
-        <button class="primary" disabled={dialogBusy || busy} onclick={confirmRestore}>Restore {formatCount(extra.count)} files</button>
+        <button class="primary" disabled={dialogBusy || busy} onclick={confirmRestore}>{restoreClass ? `Restore ${files(restoreClass.count)}` : 'Restore missing files'}</button>
       </div>
     {/if}
   </Dialog>

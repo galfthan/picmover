@@ -265,6 +265,8 @@ export interface BackupBehind {
 
 /** One library's copy on one target, as summarized by GET …/backups. */
 export interface BackupSet {
+  /** The set folder's name on the target ("" when not sent). */
+  name: string;
   files: number;
   bytes: number;
   /** null until a plan has been computed (or the target is not reachable). */
@@ -286,6 +288,14 @@ export interface BackupTarget {
   lastScrubAt: number | string | null;
   /** null when the target holds no set of this library yet (or is not reachable). */
   set: BackupSet | null;
+  /** Why the set cannot be shown or used (reachable targets only), e.g. the set name holds another library's backup. */
+  error?: string;
+  /**
+   * The set was last written by another copy of this same library (the
+   * folder was copied or moved to another machine); `error` names it. A
+   * backup with `takeOver` makes this library the set's writer.
+   */
+  foreign?: boolean;
 }
 
 export type PlanClassName = 'current' | 'moved' | 'changed' | 'new' | 'extra';
@@ -298,7 +308,10 @@ export interface PlanClass {
   paths: string[];
 }
 
-export type BackupPlan = Record<PlanClassName, PlanClass>;
+export type BackupPlan = Record<PlanClassName, PlanClass> & {
+  /** What a restore `missing` copies back (set rows missing from the library); absent from older servers. */
+  restore?: PlanClass;
+};
 
 export type BackupRunKind = 'backup' | 'scrub' | 'prune' | 'restore';
 
@@ -322,6 +335,10 @@ export interface BackupProgressEvent {
   current?: string;
   /** Files that failed so far (a count). */
   failed?: number;
+  /** Bytes per second since the phase began (server-computed). */
+  rate?: number;
+  /** Seconds left (server-computed); -1 when unknown. */
+  eta?: number;
 }
 
 // ---- Jobs ----
@@ -375,6 +392,10 @@ export interface Job {
   distance?: number;
   /** Target id of a backup-kind job, when the server sends it. */
   target?: string;
+  /** Restore mode of a restore job. */
+  mode?: string;
+  /** Run stats of a finished backup-kind job (absent before it finishes); `stats` stays the importer's counters. */
+  result?: Record<string, unknown>;
   /** Server-side phase progress of a running similar job (also in listings). */
   progress?: JobPhase | null;
   /** Client-side: the last phase-style progress event (or `progress`). */
@@ -411,6 +432,8 @@ export interface BackupJobRequest {
   target: string;
   partial?: boolean;
   workers?: number;
+  /** Take over a set last written by another copy of this library (`foreign` targets). */
+  takeOver?: boolean;
 }
 
 export interface ScrubJobRequest {
@@ -909,6 +932,7 @@ function toBehind(v: unknown): BackupBehind | null {
 function toSet(v: unknown): BackupSet | null {
   if (!isRecord(v)) return null;
   return {
+    name: typeof v.name === 'string' ? v.name : '',
     files: num(v.files),
     bytes: num(v.bytes),
     behind: toBehind(v.behind),
@@ -929,6 +953,8 @@ export function toTarget(v: unknown): BackupTarget {
     lastBackupAt: when(r.lastBackupAt),
     lastScrubAt: when(r.lastScrubAt),
     set: toSet(r.set),
+    ...(typeof r.error === 'string' && r.error !== '' ? { error: r.error } : {}),
+    ...(r.foreign === true ? { foreign: true } : {}),
   };
 }
 
@@ -958,6 +984,7 @@ export function toPlan(v: unknown): BackupPlan {
     changed: toClass(r.changed),
     new: toClass(r.new),
     extra: toClass(r.extra ?? r.extras),
+    ...(r.restore !== undefined && r.restore !== null ? { restore: toClass(r.restore) } : {}),
   };
 }
 

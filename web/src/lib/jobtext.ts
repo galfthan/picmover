@@ -2,7 +2,7 @@
 // the terminal say the same thing.
 
 import { isBackupKind, type Job } from './api';
-import { runSummary } from './backupinfo';
+import { phaseLabel, runSummary } from './backupinfo';
 
 export type Tone = 'ok' | 'warn' | 'error' | 'muted';
 
@@ -59,20 +59,37 @@ export function outcome(j: Job): { tone: Tone; text: string } {
 /**
  * Backup kinds use the backup CLI's exit codes (docs/design/backups.md):
  * 0 clean, 1 some files failed (scrub: damage found), 2 the target or the
- * library could not be used, 130 cancelled.
+ * library could not be used, 130 cancelled. The run's stats are in
+ * `result` (`stats` stays the importer's zero counters); exit 1 carries
+ * the server's message in `error`.
  */
 function backupOutcome(j: Job, what: string, log: string): { tone: Tone; text: string } {
-  const stats = j.stats as unknown as Record<string, unknown>;
-  const summary = runSummary(j.kind, stats);
+  const summary = runSummary(j.kind, j.result ?? {});
   const code = exitCodeOf(j);
-  if (j.state === 'cancelled' || code === 130) return { tone: 'warn', text: `${what} cancelled.` };
+  if (j.state === 'cancelled' || code === 130) return { tone: 'warn', text: `${what} cancelled${summary && j.result ? ` (${summary})` : ''}.` };
   // Exit 1 is a partial success whatever state the job ended in.
   if (j.exitCode === 1) {
+    if (j.error) return { tone: 'warn', text: `${capitalize(j.error)}${j.logPath ? ` (${j.logPath})` : ''}` };
     const why = j.kind === 'scrub' ? 'found damaged files' : 'finished, but some files failed';
     return { tone: 'warn', text: `${what} ${why}${summary ? ` (${summary})` : ''}; see ${log}` };
   }
   if (j.state === 'failed' || code >= 2) return { tone: 'error', text: `${what} failed: ${j.error || 'unknown error'}` };
   return { tone: 'ok', text: `${what} finished${summary ? `: ${summary}` : ''}.` };
+}
+
+/**
+ * The short status of a running backup-kind job for a live region: it
+ * changes with the phase only ("Backup: copying"), never with counters.
+ */
+export function backupStatusText(j: Job): string {
+  return `${jobTitle(j)}: ${j.state === 'queued' ? 'queued' : phaseLabel(j.kind, j.phase?.phase).toLowerCase()}`;
+}
+
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** The run stats of a finished backup-kind job in one line ("" when there are none yet). */
+export function backupJobSummary(j: Job): string {
+  return j.result ? runSummary(j.kind, j.result) : '';
 }
 
 export const resultLabels: Record<string, string> = {

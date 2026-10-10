@@ -6,7 +6,7 @@
   import { libraries, holderText, libraryNameProblem } from '../lib/libraries.svelte';
   import { jobs } from '../lib/jobs.svelte';
   import { formatCount, parseWallClock } from '../lib/format';
-  import { statusLine, summaryFromListing } from '../lib/backupinfo';
+  import { statusLine, summaryFromLib } from '../lib/backupinfo';
   import { navigate } from '../lib/router';
   import { libHref, libPath } from '../lib/routes';
   import CopyButton from '../components/CopyButton.svelte';
@@ -119,9 +119,9 @@
     }
   }
 
-  /** The backup one-liner of a card; null when the listing carries no backup summary. */
+  /** The backup one-liner of a card ("No backup target yet" when the listing has no summary); null for a library in state error. */
   function backupLine(l: Lib) {
-    const b = summaryFromListing(l.backup);
+    const b = summaryFromLib(l);
     return b ? statusLine(b) : null;
   }
 
@@ -369,6 +369,9 @@
   }
   .backup.tone-warn {
     color: var(--warn);
+  }
+  .backup.tone-muted {
+    color: var(--muted);
   }
   .create label {
     display: flex;

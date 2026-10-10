@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { errorMessage, type Job } from '../lib/api';
+  import { errorMessage, isBackupKind, type Job } from '../lib/api';
   import { library } from '../lib/library.svelte';
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed, formatInstant, formatWallDate } from '../lib/format';
-  import { jobTitle, outcome } from '../lib/jobtext';
+  import { backupJobSummary, jobTitle, outcome } from '../lib/jobtext';
   import { libHref } from '../lib/routes';
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import JobProgress from '../components/JobProgress.svelte';
@@ -70,6 +70,8 @@
   }
 
   function jobSummary(j: Job): string {
+    // Backup kinds keep their run stats in `result`; `stats` is the importer's (zero) counters.
+    if (isBackupKind(j.kind)) return backupJobSummary(j);
     const st = j.stats;
     if (j.kind === 'thumbs') {
       return `${formatCount(st.thumbsDone)} done, ${formatCount(st.thumbsUnsupported)} unsupported, ${formatCount(st.thumbsFailed)} failed`;
@@ -322,6 +324,9 @@
   }
   .tone-error {
     color: var(--danger);
+  }
+  .tone-muted {
+    color: var(--muted);
   }
   .about dl {
     display: grid;

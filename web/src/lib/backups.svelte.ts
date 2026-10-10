@@ -5,7 +5,7 @@
 // The Backups page and the Library page's status line read it; pages call
 // `refresh()` after a job ends.
 
-import { errorMessage, libApi, type BackupJobKindRequest, type BackupPlan, type BackupRun, type BackupTarget, type Job } from './api';
+import { errorMessage, isBackupKind, libApi, type BackupJobKindRequest, type BackupPlan, type BackupRun, type BackupTarget, type Job } from './api';
 import { jobs } from './jobs.svelte';
 import { statusLine, summaryFromTargets, type StatusLine } from './backupinfo';
 
@@ -29,6 +29,8 @@ class BackupsStore {
   runs = $state<Record<string, BackupRun[]>>({});
   /** Job id → target id, for jobs started from this page (the job object may not name its target). */
   jobTargets = $state<Record<number, string>>({});
+  /** Job id → scrub budget in seconds, for budgeted scrubs started from this page (the job object does not carry it). */
+  jobBudgets = $state<Record<number, number>>({});
   /** Bumped by select(); answers for an older library are dropped. */
   #gen = 0;
 
@@ -45,6 +47,7 @@ class BackupsStore {
     this.planErrors = {};
     this.runs = {};
     this.jobTargets = {};
+    this.jobBudgets = {};
   }
 
   /** The status line of the Library page ("Backed up 2 hours ago to …"); null until loaded. */
@@ -146,6 +149,7 @@ class BackupsStore {
     if (lib === null) throw new Error('no library');
     const job = await jobs.start(lib, req);
     this.jobTargets = { ...this.jobTargets, [job.id]: req.target };
+    if (req.kind === 'scrub' && req.budget) this.jobBudgets = { ...this.jobBudgets, [job.id]: req.budget };
     // A prune or restore changes what the plan says.
     const { [req.target]: _p, ...plans } = this.plans;
     this.plans = plans;
@@ -157,6 +161,23 @@ class BackupsStore {
     if (!job) return null;
     if (typeof job.target === 'string' && job.target) return job.target;
     return this.jobTargets[job.id] ?? null;
+  }
+
+  /**
+   * Whether `job` is a backup-kind job of this library for target `id`.
+   * Marker ids are shared by every library backed up to the same drive, so
+   * the library must match too.
+   */
+  isFor(job: Job | null | undefined, id: string): boolean {
+    if (!job || !isBackupKind(job.kind)) return false;
+    if (job.library !== this.lib) return false;
+    return this.targetOf(job) === id;
+  }
+
+  /** The budget (seconds) of a budgeted scrub started from this page, else null. */
+  budgetOf(job: Job | null | undefined): number | null {
+    if (!job || job.kind !== 'scrub') return null;
+    return this.jobBudgets[job.id] ?? null;
   }
 }
 

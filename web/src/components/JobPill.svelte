@@ -7,6 +7,7 @@
   import { library } from '../lib/library.svelte';
   import { isBackupKind } from '../lib/api';
   import { progressFraction } from '../lib/backupinfo';
+  import { backups } from '../lib/backups.svelte';
 
   function backupPillVerb(kind: string): string {
     switch (kind) {
@@ -40,6 +41,10 @@
     if (isBackupKind(job.kind)) {
       const p = job.phase;
       const what = backupPillVerb(job.kind);
+      // The snapshot phase copies the catalogs; its counters say nothing to the user.
+      if (p?.phase === 'snapshot') return 'Saving catalog snapshots…';
+      // A budgeted scrub stops at its budget, not at the end of the pass.
+      if (backups.budgetOf(job) !== null) return `${what}: ${formatCount(p?.files ?? 0)} files checked…`;
       if (p && p.totalFiles) return `${what} ${formatCount(p.files ?? 0)} of ${formatCount(p.totalFiles)} files…`;
       return `${what}…`;
     }
@@ -64,7 +69,7 @@
   }
 
   const fraction = $derived.by(() => {
-    if (job && isBackupKind(job.kind)) return progressFraction(job.phase);
+    if (job && isBackupKind(job.kind)) return job.phase?.phase === 'snapshot' || backups.budgetOf(job) !== null ? null : progressFraction(job.phase);
     if (!job || job.kind !== 'import') return null;
     const s = job.stats;
     if (s.scanned <= 0) return null;
