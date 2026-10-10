@@ -53,12 +53,12 @@ func renditionHash(w http.ResponseWriter, r *http.Request) (uint64, bool) {
 	return h, ok
 }
 
-func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	hash, ok := renditionHash(w, r)
 	if !ok {
 		return
 	}
-	data, _, _, found, err := s.store.Thumb(r.Context(), hash)
+	data, _, _, found, err := l.store.Thumb(r.Context(), hash)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
@@ -75,12 +75,12 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 }
 
-func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	hash, ok := renditionHash(w, r)
 	if !ok {
 		return
 	}
-	f, err := openRegular(s.store.PreviewPath(hash))
+	f, err := openRegular(l.store.PreviewPath(hash))
 	if isMissing(err) {
 		writeError(w, http.StatusNotFound, "no preview")
 		return
@@ -125,10 +125,11 @@ func openRegular(p string) (*os.File, error) {
 }
 
 // handleFile serves the original of a catalog row. The path comes only
-// from the row (filePath), and must resolve inside the library, outside
-// picmover's own files, to a regular file whose last component is not a
-// symbolic link. Anything else is 404.
-func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
+// from the row, and must resolve inside the library, outside picmover's
+// own files, to a regular file whose last component is not a symbolic
+// link. A trashed row is served from its trash path with the same checks
+// against the trash directory. Anything else is 404.
+func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	download := false
 	switch v := r.URL.Query().Get("download"); v {
 	case "", "0":
@@ -138,11 +139,11 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid download value: want 1")
 		return
 	}
-	m, ok := s.mediaRow(w, r)
+	m, ok := s.mediaRow(w, r, l)
 	if !ok {
 		return
 	}
-	f, err := s.openOriginal(m.RelPath)
+	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
 	if isMissing(err) {
 		s.log.Debug("file not available", "id", m.ID, "rel_path", m.RelPath, "err", err)
 		writeError(w, http.StatusNotFound, "file not available")
@@ -173,7 +174,8 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 // errRefused is the isMissing error for a row whose path is refused.
 var errRefused = fmt.Errorf("path refused: %w", fs.ErrNotExist)
 
-// openOriginal opens the original at the catalog path rel:
+// openOriginal opens the original at the catalog path rel (in the trash
+// when trashed):
 //
 //  1. rel must have the shape of a library path (validRelPath), checked
 //     before any filesystem call;
@@ -184,13 +186,21 @@ var errRefused = fmt.Errorf("path refused: %w", fs.ErrNotExist)
 //  4. the last component of the unresolved path must be a regular file,
 //     not a link (Lstat), and the opened file must be that same file.
 //
+// A trashed row's file is at lib.TrashPath(rel); "inside the library and
+// not internal" then means inside lib.TrashDir() instead.
+//
 // A refusal is an error that isMissing reports.
-func (s *Server) openOriginal(rel string) (*os.File, error) {
+func (s *Server) openOriginal(lib *library.Library, rel string, trashed bool) (*os.File, error) {
 	if !validRelPath(rel) {
 		return nil, errRefused
 	}
-	p := s.lib.Abs(rel)
-	if !s.lib.Contains(p) || s.lib.IsInternal(p) {
+	p := lib.Abs(rel)
+	allowed := func(p string) bool { return lib.Contains(p) && !lib.IsInternal(p) }
+	if trashed {
+		p = lib.TrashPath(rel)
+		allowed = func(p string) bool { return within(lib.TrashDir(), p) }
+	}
+	if !allowed(p) {
 		return nil, errRefused
 	}
 	resolved, err := filepath.EvalSymlinks(p)
@@ -205,7 +215,7 @@ func (s *Server) openOriginal(rel string) (*os.File, error) {
 	default:
 		return nil, err
 	}
-	if !s.lib.Contains(resolved) || s.lib.IsInternal(resolved) {
+	if !allowed(resolved) {
 		return nil, errRefused
 	}
 	lst, err := os.Lstat(p)
@@ -226,10 +236,18 @@ func (s *Server) openOriginal(rel string) (*os.File, error) {
 	return f, nil
 }
 
+// within reports whether p lies strictly inside dir (lexically).
+func within(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) &&
+		!filepath.IsAbs(rel)
+}
+
 // validRelPath reports whether rel has the shape of a path in the
 // library: slash-separated components, none empty, "." or "..", none
 // containing \, : (drive letters, NTFS streams) or NUL, and a first
-// component that is not .picmover and does not start with media.db, nor
+// component that is not .picmover and does not start with media.db or
+// user.db, nor
 // (for a file at the root) an import_*.log, compared case-insensitively
 // after trimming trailing dots and spaces (NTFS and APFS ignore case,
 // Win32 drops trailing dots and spaces). The importer only writes
@@ -242,7 +260,8 @@ func validRelPath(rel string) bool {
 		}
 	}
 	first := strings.ToLower(strings.TrimRight(parts[0], ". "))
-	if first == "" || first == library.MetaDir || strings.HasPrefix(first, library.DBName) {
+	if first == "" || first == library.MetaDir || strings.HasPrefix(first, library.DBName) ||
+		strings.HasPrefix(first, library.UserDBName) {
 		return false
 	}
 	if len(parts) == 1 && strings.HasPrefix(first, "import_") && strings.HasSuffix(first, ".log") {

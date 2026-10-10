@@ -4,12 +4,10 @@
   import { onMount, untrack } from 'svelte';
   import {
     errorMessage,
-    getGeoClusters,
-    getGeoItems,
     isAbort,
     isHash,
-    thumbUrl,
     type BBox,
+    type LibApi,
     type Filters,
     type GeoCluster,
     type MediaDetail,
@@ -19,15 +17,17 @@
   import { formatCount, formatWallDate } from '../lib/format';
   import { href, navigate } from '../lib/router';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
-  import { openViewer, setSequenceProvider } from '../lib/viewer';
+  import { openViewer, setSequenceProvider, viewerHref } from '../lib/viewer';
+  import { libPath } from '../lib/routes';
   import { jobs } from '../lib/jobs.svelte';
   import FiltersBar from '../components/Filters.svelte';
 
   interface Props {
+    api: LibApi;
     filters: Filters;
     query: URLSearchParams;
   }
-  let { filters, query }: Props = $props();
+  let { api, filters, query }: Props = $props();
 
   const VIEW_KEY = 'picmover.map.view';
   const PANEL_LIMIT = 200;
@@ -94,7 +94,7 @@
     if (c.count === 1 && typeof c.id === 'number' && isHash(c.hash)) {
       return Lm.divIcon({
         className: 'pm-single',
-        html: `<img src="${thumbUrl({ hash: c.hash, thumbAt: c.thumbAt })}" alt="" loading="lazy" decoding="async">`,
+        html: `<img src="${api.thumbUrl({ hash: c.hash, thumbAt: c.thumbAt })}" alt="" loading="lazy" decoding="async">`,
         iconSize: [40, 40],
         iconAnchor: [20, 20],
       });
@@ -118,7 +118,7 @@
       const m = L.marker([c.lat, lon], { icon: clusterIcon(c), keyboard: true, title: c.count === 1 ? 'Open' : `${c.count} items` });
       const id = c.id;
       if (c.count === 1 && typeof id === 'number') {
-        m.on('click', () => openViewer(id));
+        m.on('click', () => openViewer(api.id, id));
       } else {
         m.on('click', () => map?.setView([c.lat, lon], Math.min(map.getMaxZoom(), map.getZoom() + 2)));
       }
@@ -137,8 +137,8 @@
     loading = true;
     try {
       const [clusters, items] = await Promise.all([
-        getGeoClusters(f, bbox, zoom, ctl.signal),
-        getGeoItems(f, bbox, PANEL_LIMIT, ctl.signal),
+        api.getGeoClusters(f, bbox, zoom, ctl.signal),
+        api.getGeoItems(f, bbox, PANEL_LIMIT, ctl.signal),
       ]);
       if (ctl.signal.aborted) return;
       error = '';
@@ -243,12 +243,12 @@
   );
 
   function applyFilters(f: Filters) {
-    navigate(href('/map', filtersToQuery(f)));
+    navigate(href(libPath(api.id, 'map'), filtersToQuery(f)));
   }
   function open(e: MouseEvent, id: number) {
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
     e.preventDefault();
-    openViewer(id);
+    openViewer(api.id, id);
   }
 </script>
 
@@ -281,8 +281,8 @@
       {/if}
       <div class="thumbs">
         {#each panelItems as it (it.id)}
-          <a href="#/view/{it.id}" onclick={(e) => open(e, it.id)} title={formatWallDate(it.takenAt)}>
-            <img src={thumbUrl(it)} alt="" loading="lazy" decoding="async" />
+          <a href={viewerHref(api.id, it.id)} onclick={(e) => open(e, it.id)} title={formatWallDate(it.takenAt)}>
+            <img src={api.thumbUrl(it)} alt="" loading="lazy" decoding="async" />
           </a>
         {/each}
       </div>

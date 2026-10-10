@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"picmover/internal/library"
+	"picmover/internal/userdata"
 )
 
 func newRebuildCmd() *cobra.Command {
@@ -33,6 +35,9 @@ copied, moved, renamed or deleted. A file whose content is already recorded
 (an identical copy elsewhere in the library) is reported as a duplicate and
 left in place. Zip archives are not extracted. To move files into the
 <type>/YYYY/MM layout use 'picmover import <library> <library>' instead.
+Files in the trash (<library>/.picmover/trash) are recorded as trashed, with
+the time they were trashed from user.db (else their modification time);
+user.db itself (ratings, tags, albums) is never changed by a rebuild.
 Finally the thumbnail stage runs (skip it with --no-thumbs and run
 'picmover thumbs' later); thumbnails and previews are cached by content
 hash in <library>/.picmover and are reused.
@@ -89,12 +94,18 @@ Exit status as for import.`,
 			ctx, stop := interruptContext(cmd.Context())
 			defer stop()
 			out := cmd.OutOrStdout()
+			// user.db is read before the backup: an unreadable one must
+			// never leave the library without its catalog.
+			if p.trashTimes, err = trashTimes(ctx, root); err != nil {
+				return err
+			}
 			if hasCatalog {
 				backup, err := backupCatalog(dbPath, time.Now())
 				if err != nil {
 					return err
 				}
 				fmt.Fprintf(out, "Old catalog saved as %s\n", backup)
+				p.backup = backup
 			} else {
 				fmt.Fprintln(out, missingCatalogNote(root))
 				p.isNew = true
@@ -112,6 +123,21 @@ Exit status as for import.`,
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.noThumbs, "no-thumbs", false, "do not generate thumbnails and previews (run 'picmover thumbs' later)")
 	return c
+}
+
+// trashTimes reads the trash timestamps from the library's user.db, or
+// returns nil when there is none (it is not created).
+func trashTimes(ctx context.Context, root string) (map[uint64]time.Time, error) {
+	p := filepath.Join(root, userdata.FileName)
+	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	u, err := userdata.Open(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	defer u.Close()
+	return u.TrashedAt(ctx, nil)
 }
 
 // missingCatalogNote describes a rebuild of a library that has no media.db
@@ -139,42 +165,7 @@ func missingCatalogNote(root string) string {
 		len(mains), filepath.Base(newest), library.DBName, library.DBName)
 }
 
-// catalogFileSuffixes are the files that make up a catalog: the database,
-// its WAL and shared memory, and a rollback journal. They are renamed
-// together so a catalog is never separated from them.
-var catalogFileSuffixes = []string{"", "-wal", "-shm", "-journal"}
-
-// backupCatalog renames dbPath and its -wal/-shm/-journal files to
-// <dbPath>.bak-<YYYYMMDD-HHMMSS> (plus the same suffixes), so SQLite still
-// finds the WAL or journal of the backup. It never overwrites: an existing
-// backup name is an error. If a rename fails, the renames already done are
-// undone, so a catalog is never separated from its WAL. It returns the
-// backup path of the main file.
+// backupCatalog is library.BackupCatalog.
 func backupCatalog(dbPath string, now time.Time) (string, error) {
-	backup := dbPath + ".bak-" + now.Format(library.BackupStampLayout)
-	suffixes := catalogFileSuffixes
-	for _, s := range suffixes {
-		if _, err := os.Lstat(backup + s); err == nil {
-			return "", fmt.Errorf("backup %s already exists; try again in a second", backup+s)
-		}
-	}
-	var done []string
-	for _, s := range suffixes {
-		err := os.Rename(dbPath+s, backup+s)
-		if err == nil {
-			done = append(done, s)
-			continue
-		}
-		if s != "" && errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		for i := len(done) - 1; i >= 0; i-- {
-			if uerr := os.Rename(backup+done[i], dbPath+done[i]); uerr != nil {
-				return "", fmt.Errorf("back up catalog: %w; undo failed, move %s back to %s by hand: %v",
-					err, backup+done[i], dbPath+done[i], uerr)
-			}
-		}
-		return "", fmt.Errorf("back up catalog: %w", err)
-	}
-	return backup, nil
+	return library.BackupCatalog(dbPath, now)
 }

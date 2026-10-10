@@ -163,7 +163,7 @@ func TestRebuildMissingCatalog(t *testing.T) {
 func TestBackupCatalogJournal(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "media.db")
-	for _, s := range catalogFileSuffixes {
+	for _, s := range library.CatalogFileSuffixes {
 		writeBytes(t, db+s, []byte("x"+s))
 	}
 	now := time.Date(2026, 10, 10, 9, 8, 7, 0, time.UTC)
@@ -171,7 +171,7 @@ func TestBackupCatalogJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range catalogFileSuffixes {
+	for _, s := range library.CatalogFileSuffixes {
 		if b, err := os.ReadFile(got + s); err != nil || string(b) != "x"+s {
 			t.Errorf("backup%s: %q %v", s, b, err)
 		}

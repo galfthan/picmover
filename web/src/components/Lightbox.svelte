@@ -1,27 +1,26 @@
 <script lang="ts">
   import { tick, untrack } from 'svelte';
-  import {
-    errorMessage,
-    fileUrl,
-    getMedia,
-    isAbort,
-    previewUrl,
-    thumbUrl,
-    type MediaDetail,
-    type MediaItem,
-  } from '../lib/api';
-  import { formatBytes, formatCoord, formatDuration, formatInstant, formatTakenAt } from '../lib/format';
-  import { closeViewer, sequenceProvider, showInViewer, type Neighbours } from '../lib/viewer';
-  import { href } from '../lib/router';
+  import { errorMessage, isAbort, type LibApi, type MediaDetail, type MediaItem } from '../lib/api';
+  import { formatAgo, formatBytes, formatCoord, formatDuration, formatInstant, formatTakenAt, formatWallDate, parseLocalWallClock } from '../lib/format';
+  import { closeViewer, sequenceProvider, showInViewer, viewerHref, type Neighbours } from '../lib/viewer';
+  import { libHref } from '../lib/routes';
   import { isBoolean, loadJSON, saveJSON } from '../lib/storage';
+  import { library } from '../lib/library.svelte';
+  import { toasts } from '../lib/toast.svelte';
+  import { addToAlbum, deleteItems, failureText, rateItems, removeFromAlbum, restoreItems, tagItems, trashItems, undoTrash } from '../lib/actions';
   import CopyButton from './CopyButton.svelte';
+  import RatingStars from './RatingStars.svelte';
+  import TagInput, { type Pick } from './TagInput.svelte';
+  import AlbumPicker from './AlbumPicker.svelte';
+  import ConfirmButton from './ConfirmButton.svelte';
 
   interface Props {
     id: number;
+    api: LibApi;
     /** Hash of the page underneath, used when closing a deep-linked viewer. */
     baseHash: string;
   }
-  let { id, baseHash }: Props = $props();
+  let { id, api, baseHash }: Props = $props();
 
   const INFO_KEY = 'picmover.viewer.info';
 
@@ -64,7 +63,7 @@
       loadError = '';
       nb = { prev: null, next: null };
     });
-    getMedia(cur, ac.signal)
+    api.getMedia(cur, ac.signal)
       .then((md) => {
         if (ac.signal.aborted) return;
         detail = md;
@@ -74,7 +73,7 @@
           if (ac.signal.aborted) return;
           nb = n;
           for (const x of [n.next, n.prev]) {
-            if (x) new Image().src = previewUrl(x);
+            if (x) new Image().src = api.previewUrl(x);
           }
         });
       })
@@ -89,6 +88,8 @@
   // (the grid scrolls it into view), else the element that opened the
   // viewer, else the page's main scroll area; never leave it on <body>.
   $effect(() => {
+    // Props must not be read once the component is gone: take the library now.
+    const lib = untrack(() => api.id);
     untrack(() => dialog?.focus({ preventScroll: true }));
     return () => {
       const shown = lastId;
@@ -97,7 +98,7 @@
           const ae = document.activeElement;
           if (ae && ae !== document.body && ae.isConnected) return; // something else took focus
           const target =
-            document.querySelector<HTMLElement>(`a[href="#/view/${shown}"]`) ??
+            document.querySelector<HTMLElement>(`a[href="${viewerHref(lib, shown)}"]`) ??
             (opener?.isConnected ? opener : null) ??
             document.querySelector<HTMLElement>('[data-focus-return], .leaflet-container');
           target?.focus({ preventScroll: true });
@@ -109,7 +110,133 @@
   function go(target: MediaItem | null) {
     if (!target) return;
     hint = target;
-    showInViewer(target.id);
+    showInViewer(api.id, target.id);
+  }
+
+  // ---- Editing (rating, tags, albums, trash) ----
+
+  let tagInput: HTMLInputElement | undefined = $state();
+  let albumOpen = $state(false);
+  let working = $state(false);
+  let editError = $state('');
+
+  const trashed = $derived(!!d?.deletedAt);
+  const rating = $derived(d?.rating ?? 0);
+  const itemTags = $derived(d?.tags ?? []);
+  const itemAlbums = $derived(d?.albums ?? []);
+
+  /** Runs an edit on the shown item; `apply` patches the detail when it is still shown. */
+  async function edit(fn: (cur: MediaDetail) => Promise<((x: MediaDetail) => MediaDetail) | void>) {
+    const cur = d;
+    if (!cur || working) return;
+    working = true;
+    editError = '';
+    try {
+      const apply = await fn(cur);
+      if (apply && detail && detail.id === cur.id) detail = apply(detail);
+    } catch (e) {
+      editError = errorMessage(e);
+    } finally {
+      working = false;
+    }
+  }
+
+  function rate(v: number) {
+    void edit(async (cur) => {
+      await rateItems(api, [cur.hash], v);
+      return (x) => ({ ...x, rating: v });
+    });
+  }
+
+  function addTag(p: Pick) {
+    void edit(async (cur) => {
+      const tags = await tagItems(api, [cur.hash], 'create' in p ? { create: [p.create] } : { add: [p.item.id] });
+      const added = tags.length ? tags : 'create' in p ? [] : [{ id: p.item.id, name: p.item.name }];
+      return (x) => {
+        const have = x.tags ?? [];
+        const more = added.filter((t) => !have.some((h) => h.id === t.id)).map((t) => ({ id: t.id, name: t.name }));
+        return { ...x, tags: [...have, ...more].sort((a, b) => a.name.localeCompare(b.name)) };
+      };
+    });
+  }
+
+  function removeTag(tid: number) {
+    void edit(async (cur) => {
+      await tagItems(api, [cur.hash], { remove: [tid] });
+      return (x) => ({ ...x, tags: (x.tags ?? []).filter((t) => t.id !== tid) });
+    });
+  }
+
+  function addAlbum(p: Pick) {
+    void edit(async (cur) => {
+      const a = await addToAlbum(api, [cur.hash], 'create' in p ? { create: p.create } : { album: { id: p.item.id, name: p.item.name } });
+      return (x) => ({ ...x, albums: [...(x.albums ?? []).filter((y) => y.id !== a.id), a] });
+    });
+  }
+
+  function removeAlbum(aid: number) {
+    void edit(async (cur) => {
+      await removeFromAlbum(api, aid, [cur.hash]);
+      return (x) => ({ ...x, albums: (x.albums ?? []).filter((y) => y.id !== aid) });
+    });
+  }
+
+  /** After the shown item left this view: the next one, else the previous, else close. */
+  function leave() {
+    const after = nb.next ?? nb.prev;
+    if (after) go(after);
+    else close();
+  }
+
+  function trash() {
+    void edit(async (cur) => {
+      const target = nb;
+      const r = await trashItems(api, [cur.hash]);
+      if (r.failed.length) throw new Error(failureText(r.failed, 'moved to the trash'));
+      toasts.show('Moved to the trash', {
+        ms: 8000,
+        action: {
+          label: 'Undo',
+          run: () => undoTrash(api, [cur.hash]),
+        },
+      });
+      nb = target;
+      leave();
+    });
+  }
+
+  function restore() {
+    void edit(async (cur) => {
+      const target = nb;
+      const r = await restoreItems(api, [cur.hash]);
+      if (r.failed.length) throw new Error(failureText(r.failed, 'restored'));
+      toasts.show('Restored');
+      nb = target;
+      leave();
+    });
+  }
+
+  function deleteForever() {
+    void edit(async (cur) => {
+      const target = nb;
+      const r = await deleteItems(api, [cur.hash]);
+      if (r.failed.length) throw new Error(failureText(r.failed, 'deleted'));
+      toasts.show('Deleted permanently');
+      nb = target;
+      leave();
+    });
+  }
+
+  async function focusTags() {
+    if (!showInfo) toggleInfo();
+    await tick();
+    tagInput?.focus();
+  }
+
+  async function openAlbums() {
+    if (!showInfo) toggleInfo();
+    await tick();
+    albumOpen = true;
   }
   const close = () => closeViewer(baseHash);
 
@@ -162,6 +289,37 @@
           togglePlay();
         }
         break;
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+        if (!d || trashed) return;
+        e.preventDefault();
+        rate(Number(e.key));
+        break;
+      case 't':
+        if (!d || trashed) return;
+        e.preventDefault();
+        void focusTags();
+        break;
+      case 'b':
+        if (!d || trashed) return;
+        e.preventDefault();
+        void openAlbums();
+        break;
+      case 'Delete':
+      case 'Backspace':
+        if (!d || trashed) return;
+        e.preventDefault();
+        trash();
+        break;
+      case 'r':
+        if (!d || !trashed) return;
+        e.preventDefault();
+        restore();
+        break;
     }
   }
 
@@ -213,8 +371,13 @@
       {#if canFull}
         <button class="ghost" class:on={full} onclick={toggleFull} title="Original size (F, or double-click)">1:1</button>
       {/if}
+      {#if d && !trashed}
+        <button class="ghost" onclick={trash} disabled={working} title="Move to the trash (Delete)">Trash</button>
+      {:else if d}
+        <button class="ghost" onclick={restore} disabled={working} title="Restore (R)">Restore</button>
+      {/if}
       {#if d}
-        <a class="btn ghost" href={fileUrl(d.id, true)} download title="Download the original">Download</a>
+        <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original">Download</a>
       {/if}
       <button class="ghost" class:on={showInfo} onclick={toggleInfo} title="Info (I)" aria-pressed={showInfo}>Info</button>
     </div>
@@ -230,20 +393,20 @@
         {#key item.id}
           {#if playable && d}
             <!-- svelte-ignore a11y_media_has_caption -->
-            <video bind:this={videoEl} controls preload="metadata" src={fileUrl(d.id)} poster={previewUrl(d)}></video>
+            <video bind:this={videoEl} controls preload="metadata" src={api.fileUrl(d.id)} poster={api.previewUrl(d)}></video>
           {:else if full && d}
             <div class="full">
-              <img src={fileUrl(d.id)} alt="" />
+              <img src={api.fileUrl(d.id)} alt="" />
             </div>
           {:else}
             {#if thumbRequestable && !thumbFailed && !previewLoaded}
-              <img class="fit blur" src={thumbUrl(item)} alt="" onerror={() => (thumbFailed = true)} />
+              <img class="fit blur" src={api.thumbUrl(item)} alt="" onerror={() => (thumbFailed = true)} />
             {/if}
             {#if !previewFailed}
               <img
                 class="fit preview"
                 class:loaded={previewLoaded}
-                src={previewUrl(item)}
+                src={api.previewUrl(item)}
                 alt=""
                 onload={() => (previewLoaded = true)}
                 onerror={() => (previewFailed = true)}
@@ -257,7 +420,7 @@
             {#if d && !d.displayable}
               <div class="undisplayable">
                 <span>This browser cannot show the original {d.ext.replace(/^\./, '').toUpperCase()} file.</span>
-                <a class="btn small" href={fileUrl(d.id, true)} download>Download original</a>
+                <a class="btn small" href={api.fileUrl(d.id, true)} download>Download original</a>
               </div>
             {/if}
           {/if}
@@ -276,7 +439,71 @@
   {#if showInfo}
     <aside class="info" aria-label="Details">
       {#if d}
+        {#if trashed}
+          <div class="trashinfo">
+            <strong>In the trash</strong>
+            <span class="muted small">
+              Deleted {formatAgo(parseLocalWallClock(d.deletedAt))}{#if d.deletedAt}&nbsp;({formatWallDate(d.deletedAt)}){/if}
+            </span>
+            <div class="row">
+              <button class="primary small" disabled={working} onclick={restore}>Restore</button>
+              <ConfirmButton
+                label="Delete permanently"
+                question="Delete this file permanently?"
+                confirmLabel="Delete"
+                cancelLabel="Cancel"
+                danger
+                disabled={working}
+                onconfirm={deleteForever}
+              />
+            </div>
+          </div>
+        {/if}
+        {#if editError}<div class="error-box small" role="alert">{editError}</div>{/if}
         <dl>
+          {#if !trashed}
+            <dt>Rating</dt>
+            <dd><RatingStars value={rating} onchange={rate} disabled={working} /></dd>
+
+            <dt>Tags</dt>
+            <dd class="chips">
+              {#each itemTags as t (t.id)}
+                <span class="chip">
+                  <a href={libHref(api.id, '', { tag: t.id })}>{t.name}</a>
+                  <button class="ghost small" aria-label="Remove tag {t.name}" disabled={working} onclick={() => removeTag(t.id)}>×</button>
+                </span>
+              {/each}
+              <TagInput
+                bind:inputEl={tagInput}
+                options={library.tags}
+                exclude={itemTags.map((t) => t.id)}
+                label="Add tag (T)"
+                placeholder="Add tag… (T)"
+                disabled={working}
+                onpick={addTag}
+              />
+            </dd>
+
+            <dt>Albums</dt>
+            <dd class="chips">
+              {#each itemAlbums as a (a.id)}
+                <span class="chip">
+                  <a href={libHref(api.id, `albums/${a.id}`)}>{a.name}</a>
+                  <button class="ghost small" aria-label="Remove from album {a.name}" disabled={working} onclick={() => removeAlbum(a.id)}>×</button>
+                </span>
+              {/each}
+              <AlbumPicker
+                albums={library.albums}
+                exclude={itemAlbums.map((a) => a.id)}
+                label="Add to album (B)"
+                placement="down"
+                disabled={working}
+                bind:open={albumOpen}
+                onpick={addAlbum}
+              />
+            </dd>
+          {/if}
+
           <dt>Date</dt>
           <dd>
             {formatTakenAt(d.takenAt, d.offset)}
@@ -317,7 +544,7 @@
               <span class="mono">{formatCoord(d.lat)}, {formatCoord(d.lon)}</span>
               {#if typeof d.altitude === 'number'}<span class="muted"> · {Math.round(d.altitude)} m</span>{/if}
               <br />
-              <a href={href('/map', { at: `${d.lat},${d.lon}`, z: 15 })}>Show on map</a>
+              <a href={libHref(api.id, 'map', { at: `${d.lat},${d.lon}`, z: 15 })}>Show on map</a>
             </dd>
           {/if}
 
@@ -325,7 +552,7 @@
           <dd>
             {formatInstant(d.importedAt)}
             {#if d.sessionId}
-              <br /><a href={href('/', { session: d.sessionId })}>Session #{d.sessionId}</a>
+              <br /><a href={libHref(api.id, '', { session: d.sessionId })}>Session #{d.sessionId}</a>
             {/if}
           </dd>
 
@@ -528,6 +755,38 @@
   }
   .wrap {
     word-break: break-all;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    padding-left: 9px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    font-size: 0.92em;
+  }
+  .chip a {
+    color: var(--text);
+  }
+  .chip button {
+    min-height: 22px;
+    border-radius: 999px;
+  }
+  .trashinfo {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--danger);
+    border-radius: var(--radius-sm);
+    background: var(--danger-bg);
   }
   @media (max-width: 900px) {
     .info {

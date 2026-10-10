@@ -3,6 +3,7 @@
 package server
 
 import (
+	"errors"
 	"io/fs"
 	"syscall"
 
@@ -52,4 +53,9 @@ func isHidden(e fs.DirEntry, path string) bool {
 	}
 	attrs, err := windows.GetFileAttributes(p)
 	return err == nil && attrs&windows.FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+// isBusyErr reports a file another program holds open.
+func isBusyErr(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION)
 }

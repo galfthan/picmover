@@ -91,7 +91,27 @@ type Options struct {
 	// file whose path is already recorded under another case is an error
 	// result. Zip archives are not extracted and symbolic links are not
 	// recorded. Move is ignored.
+	//
+	// The trash (<library>/.picmover/trash, see library.TrashDir) is
+	// recorded too, after the library tree and with the same junk and
+	// extension rules: each file there becomes a trashed row
+	// (deleted_at set) whose rel_path is its path relative to the trash
+	// directory, i.e. where it is restored to. Trash files are never
+	// moved.
 	RecordInPlace bool
+	// TrashTimes gives deleted_at for trash files recorded in place, by
+	// content hash (the user.db trash timestamps); a file without an
+	// entry gets its mtime.
+	TrashTimes map[uint64]time.Time
+
+	// TrashLock, when set, is held while a trashed row is restored
+	// because its content was imported again (the server's per-library
+	// trash lock, so a restore never races a trash, restore or delete
+	// request).
+	TrashLock sync.Locker
+	// OnRestored is called after such a restore (the server and the CLI
+	// remove the user.db trash row); an error is only logged.
+	OnRestored func(ctx context.Context, hash uint64) error
 
 	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
 	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64
@@ -122,6 +142,8 @@ type Importer struct {
 	claimed  map[string]struct{}            // lower-cased rel paths reserved by in-flight files
 	dirNames map[string]map[string]struct{} // catalog dir -> lower-cased names on disk or claimed in this import
 
+	recorded atomic.Bool // the copy (or record) stage finished; see RecordStageDone
+
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
 }
@@ -139,6 +161,7 @@ type pending struct {
 	copied    bool   // the destination was created by a copy
 	bytes     int64  // bytes written by the copy
 	deleteSrc bool   // remove src after commit
+	trash     bool   // a trash file recorded in place
 }
 
 // New returns an importer for lib and db with opts, filling in defaults.
@@ -207,24 +230,18 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	defer cancel()
 	im.cancel = cancel
 
-	jobs := make(chan job, im.opts.Workers*4)
-	pend := make(chan *pending, batchSize)
-
 	stopProgress := im.startProgress()
-
-	writerErr := make(chan error, 1)
-	go func() { writerErr <- im.writer(pend) }()
-
-	var wg sync.WaitGroup
-	for range im.opts.Workers {
-		wg.Go(func() { im.worker(runCtx, jobs, pend) })
+	fatal := im.pipeline(runCtx, func(jobs chan<- job) { im.scan(runCtx, src, srcInfo, jobs, false) })
+	if fatal == nil && runCtx.Err() == nil && im.opts.RecordInPlace {
+		// The trash after the library tree: a file in both keeps its live
+		// row, and the trash copy is reported as a duplicate.
+		trash := im.lib.TrashDir()
+		if ti, err := os.Stat(trash); err == nil && ti.IsDir() {
+			fatal = im.pipeline(runCtx, func(jobs chan<- job) { im.scan(runCtx, trash, ti, jobs, true) })
+		} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			im.report(Result{Status: StatusError, Source: trash, Message: "cannot read the trash", Err: err})
+		}
 	}
-
-	im.scan(runCtx, src, srcInfo, jobs)
-	close(jobs)
-	wg.Wait()
-	close(pend)
-	fatal := <-writerErr
 	stopProgress()
 
 	stats := im.Stats()
@@ -245,6 +262,9 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if fatal != nil {
 		return stats, fatal
 	}
+	if runCtx.Err() == nil {
+		im.recorded.Store(true)
+	}
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -259,6 +279,24 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 		return stats, &ThumbStageError{Err: err}
 	}
 	return stats, err
+}
+
+// pipeline runs workers and the writer over the jobs scan sends and
+// returns the writer's fatal error.
+func (im *Importer) pipeline(ctx context.Context, scan func(jobs chan<- job)) error {
+	jobs := make(chan job, im.opts.Workers*4)
+	pend := make(chan *pending, batchSize)
+	writerErr := make(chan error, 1)
+	go func() { writerErr <- im.writer(pend) }()
+	var wg sync.WaitGroup
+	for range im.opts.Workers {
+		wg.Go(func() { im.worker(ctx, jobs, pend) })
+	}
+	scan(jobs)
+	close(jobs)
+	wg.Wait()
+	close(pend)
+	return <-writerErr
 }
 
 // ThumbStageError is returned by Run when the copy stage succeeded but the
@@ -300,6 +338,12 @@ func (im *Importer) startProgress() (stop func()) {
 	}
 }
 
+// RecordStageDone reports whether Run finished its copy (or record) stage:
+// every file was handled and the session recorded, without cancellation
+// or a fatal error. An error from Run after that comes from the thumbnail
+// stage (or a cancellation during it) and never affects the catalog rows.
+func (im *Importer) RecordStageDone() bool { return im.recorded.Load() }
+
 // SessionID returns the catalog import session of a running or finished
 // Run, or 0 before Run has begun the session. It is safe to call from any
 // goroutine.
@@ -334,7 +378,7 @@ func (im *Importer) worker(ctx context.Context, jobs <-chan job, pend chan<- *pe
 			im.processZip(ctx, j.path, pend)
 			continue
 		}
-		p, r := im.process(ctx, j.path, j.path, false)
+		p, r := im.process(ctx, j.path, j.path, false, j.trash)
 		im.dispatch(p, r, pend)
 	}
 }
@@ -354,7 +398,10 @@ func (im *Importer) dispatch(p *pending, r *Result, pend chan<- *pending) {
 // process handles one media file. It returns either a pending item for the
 // writer or a result to report; both are nil when the file was abandoned
 // because ctx was cancelled.
-func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip bool) (*pending, *Result) {
+//
+// trash marks a file of the trash directory recorded in place: its
+// catalog path is relative to the trash directory and its row is trashed.
+func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip, trash bool) (*pending, *Result) {
 	if ctx.Err() != nil {
 		return nil, nil
 	}
@@ -387,7 +434,12 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	}
 	// In record-in-place mode the file's own path is its catalog path.
 	ownRel := ""
-	if im.opts.RecordInPlace {
+	switch {
+	case trash:
+		if ownRel, err = trashRel(im.lib.TrashDir(), srcPath); err != nil {
+			return fail("record in place", err)
+		}
+	case im.opts.RecordInPlace:
 		if ownRel, err = im.lib.Rel(srcPath); err != nil {
 			return fail("record in place", err)
 		}
@@ -400,6 +452,17 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	if rel, found, err := im.db.LookupHash(ctx, hash); err != nil {
 		return fail("catalog lookup", err)
 	} else if found {
+		if !im.opts.RecordInPlace {
+			m, err := im.db.GetByHash(ctx, hash)
+			if err != nil {
+				return fail("catalog lookup", err)
+			}
+			if !m.DeletedAt.IsZero() {
+				// The content is in the trash: restore it rather than
+				// report a duplicate that "Empty trash" would delete.
+				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip)
+			}
+		}
 		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog"}
 	}
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
@@ -450,13 +513,21 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		}
 		claim = strings.ToLower(rel)
 		keep = true
+		m := im.newMedia(hash, size, rel, kind, takenAt, offsetKnown, source, info, origin, fi.ModTime())
+		if trash {
+			m.DeletedAt = fi.ModTime()
+			if at, ok := im.opts.TrashTimes[hash]; ok {
+				m.DeletedAt = at
+			}
+		}
 		return &pending{
-			media:  im.newMedia(hash, size, rel, kind, takenAt, offsetKnown, source, info, origin, fi.ModTime()),
+			media:  m,
 			status: StatusExisting,
 			src:    srcPath,
 			origin: origin,
 			hash:   hash,
 			claim:  claim,
+			trash:  trash,
 		}, nil
 	}
 
@@ -543,6 +614,19 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		bytes:     nbytes,
 		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
 	}, nil
+}
+
+// trashRel returns the catalog path of a trash file: its path relative to
+// the trash directory, in slash form.
+func trashRel(trashDir, p string) (string, error) {
+	rel, err := filepath.Rel(trashDir, p)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is outside the trash %s", p, trashDir)
+	}
+	return filepath.ToSlash(rel), nil
 }
 
 // newMedia builds the catalog row of a file recorded at rel.
@@ -713,10 +797,10 @@ func moveFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	if _, err := os.Lstat(dst); err == nil {
-		return fmt.Errorf("destination already exists: %s", dst)
-	}
-	if err := os.Rename(src, dst); err != nil {
+	if err := library.RenameNoReplace(src, dst); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("destination already exists: %s", dst)
+		}
 		return err
 	}
 	syncDir(filepath.Dir(dst))
@@ -804,7 +888,9 @@ func (im *Importer) commit(batch []*pending) error {
 		}
 		im.release(p)
 		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath}
-		if p.moved {
+		if p.trash {
+			r.Message = "in trash"
+		} else if p.moved {
 			r.Message = "moved"
 		} else if p.copied {
 			r.Message = "copied"
@@ -855,7 +941,7 @@ func (im *Importer) undo(p *pending) {
 		}
 		err := os.MkdirAll(filepath.Dir(p.src), 0o755)
 		if err == nil {
-			err = os.Rename(dst, p.src)
+			err = library.RenameNoReplace(dst, p.src)
 		}
 		if err != nil {
 			im.log.Error("undo move", "source", p.src, "dest", dst, "err", err)

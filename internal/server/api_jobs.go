@@ -5,18 +5,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
+
+	"picmover/internal/library"
+	"picmover/internal/similar"
 )
 
 type jobListJSON struct {
 	Jobs []jobJSON `json:"jobs"`
 }
 
+// handleJobList lists the jobs of every library.
 func (s *Server) handleJobList(w http.ResponseWriter, r *http.Request) {
-	jobs := s.jobs.list()
+	s.writeJobs(w, nil)
+}
+
+// handleLibJobList lists the jobs of one library.
+func (s *Server) handleLibJobList(w http.ResponseWriter, r *http.Request, l *libHandles) {
+	s.writeJobs(w, l.entry)
+}
+
+func (s *Server) writeJobs(w http.ResponseWriter, e *libEntry) {
+	jobs := s.jobs.list(e)
 	out := jobListJSON{Jobs: make([]jobJSON, 0, len(jobs))}
 	for _, j := range jobs {
 		out.Jobs = append(out.Jobs, j.snapshot())
@@ -24,9 +40,43 @@ func (s *Server) handleJobList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleJobStart validates the body and starts the job: 201 and the bare job object,
-// 409 while another job runs.
-func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
+// handleJobStart starts a job on an open library (POST /api/l/{lib}/jobs).
+func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request, l *libHandles) {
+	s.startJob(w, r, l.entry, l.lib)
+}
+
+// handleLibraryJobStart is POST /api/libraries/{lib}/jobs: like
+// handleJobStart for an open library, and also a rebuild of a folder
+// without media.db or of a library whose catalog cannot be opened.
+func (s *Server) handleLibraryJobStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("lib")
+	e, ok := s.libEntry(w, r, id)
+	if !ok {
+		return
+	}
+	state, h := e.snapshot()
+	if state == libClosed {
+		// A catalog that cannot even be peeked counts as unreadable.
+		if _, err := s.ws.peek(r.Context(), filepath.Join(e.path, library.DBName)); err != nil {
+			state = libError
+		}
+	}
+	switch state {
+	case libOpen:
+		s.startJob(w, r, e, h.lib)
+	case libRebuilding:
+		writeJSON(w, http.StatusServiceUnavailable, stateError{Error: "the library is being rebuilt", State: state})
+	case libFolder, libError:
+		s.startJob(w, r, e, nil)
+	default:
+		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open", State: state})
+	}
+}
+
+// startJob validates the body and starts the job on e: 201 and the bare
+// job object, 409 while another job runs. lib is nil when the library is
+// not open: only a rebuild is accepted then.
+func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, lib *library.Library) {
 	var p jobParams
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -43,12 +93,20 @@ func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid job: trailing data")
 		return
 	}
-	zone, err := s.validateJob(&p)
+	if lib == nil && p.Kind != kindRebuild {
+		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open; only a rebuild can run on it", State: func() string { st, _ := e.snapshot(); return st }()})
+		return
+	}
+	zone, err := s.validateJob(&p, lib)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	j, err := s.jobs.start(p, zone)
+	if lib != nil && e.checkFolder() != nil {
+		writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})
+		return
+	}
+	j, err := s.jobs.start(e, p, zone)
 	switch {
 	case errors.Is(err, errBusy):
 		writeError(w, http.StatusConflict, err.Error())
@@ -64,7 +122,8 @@ func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateJob checks a job request and returns the import time zone.
-func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
+// lib is the open library (nil for a rebuild of a library that is not).
+func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location, error) {
 	switch p.Kind {
 	case kindImport:
 		if p.MinDimension < 0 {
@@ -77,7 +136,15 @@ func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
 		p.Source = filepath.Clean(p.Source)
 		st, err := os.Stat(p.Source)
 		if err != nil {
-			return nil, fmt.Errorf("source: %w", err)
+			// No raw OS error text in the answer.
+			switch {
+			case errors.Is(err, fs.ErrNotExist):
+				return nil, errors.New("source: the path does not exist")
+			case errors.Is(err, fs.ErrPermission):
+				return nil, errors.New("source: permission denied")
+			}
+			s.log.Info("import source refused", "source", p.Source, "err", err)
+			return nil, errors.New("source: the path cannot be read")
 		}
 		if !st.IsDir() && !st.Mode().IsRegular() {
 			return nil, fmt.Errorf("source %s is not a directory or a file", p.Source)
@@ -87,9 +154,13 @@ func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
 			resolved = r
 		}
 		for _, c := range []string{p.Source, resolved} {
-			if s.lib.IsInternal(c) {
+			if lib.IsInternal(c) {
 				return nil, fmt.Errorf("source %s is inside picmover's own files", p.Source)
 			}
+		}
+		if s.overlapsLibraries(p.Source, resolved) {
+			return nil, fmt.Errorf("source %s is a library, lies inside one or contains one; "+
+				"import from a folder outside the libraries", p.Source)
 		}
 		if p.Timezone == "" {
 			// Like the CLI's --timezone default: the system zone.
@@ -105,8 +176,82 @@ func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
 			return nil, errors.New("limit must be >= 0")
 		}
 		return nil, nil
+	case kindSimilar:
+		if p.Distance < 0 || p.Distance > similar.MaxDistance {
+			return nil, fmt.Errorf("distance must be 1-%d", similar.MaxDistance)
+		}
+		if p.Distance == 0 {
+			p.Distance = similar.DefaultDistance
+		}
+		return nil, nil
+	case kindRebuild:
+		return nil, nil
 	}
-	return nil, fmt.Errorf("invalid kind %q: want import or thumbs", p.Kind)
+	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar or rebuild", p.Kind)
+}
+
+// overlapsLibraries reports whether an import source (as given and
+// resolved) is a library the server serves, lies inside one, or contains
+// one: in workspace mode every listed folder with a media.db or a
+// .picmover, and the workspace root itself; in single mode the library.
+// Importing from there would read another library's previews and, with
+// move, empty a library whose catalog still lists the files.
+func (s *Server) overlapsLibraries(source, resolved string) bool {
+	spellings := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && filepath.Clean(r) != filepath.Clean(p) {
+			out = append(out, filepath.Clean(r))
+		}
+		return out
+	}
+	sources := []string{filepath.Clean(source), filepath.Clean(resolved)}
+	if !s.ws.single {
+		// The workspace root itself, or a folder that contains it (a
+		// plain folder of the workspace is a fine source).
+		for _, r := range spellings(s.ws.root) {
+			for _, c := range sources {
+				if pathEqual(r, c) || within(c, r) {
+					return true
+				}
+			}
+		}
+	}
+	var roots []string
+	add := func(p string) { roots = append(roots, spellings(p)...) }
+	if s.ws.single {
+		add(s.ws.root)
+	} else {
+		all, err := s.ws.discover()
+		if err != nil {
+			return true // cannot tell: refuse
+		}
+		for _, l := range all {
+			if l.library || isLibraryDir(l.path) {
+				add(l.path)
+			}
+		}
+	}
+	for _, c := range sources {
+		for _, r := range roots {
+			if sameOrWithin(r, c) || within(c, r) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sameOrWithin reports whether p is dir or lies inside it (lexically,
+// case-insensitively on Windows and macOS file systems).
+func sameOrWithin(dir, p string) bool {
+	if pathEqual(dir, p) {
+		return true
+	}
+	return within(dir, p) || (caseInsensitiveFS && within(strings.ToLower(dir), strings.ToLower(p)))
+}
+
+func pathEqual(a, b string) bool {
+	return a == b || (caseInsensitiveFS && strings.EqualFold(a, b))
 }
 
 // jobFromPath returns the job named by the {id} path value or answers
@@ -220,3 +365,7 @@ func (s *Server) handleJobEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// caseInsensitiveFS: the default file systems of Windows and macOS ignore
+// case, so path comparisons for refusals do too there.
+var caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"

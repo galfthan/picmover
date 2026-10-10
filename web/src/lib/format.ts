@@ -126,3 +126,61 @@ export function formatCount(n: number): string {
 export function formatCoord(v: number): string {
   return v.toFixed(5);
 }
+
+/**
+ * Parses a wall-clock string that the server wrote in its own local zone
+ * (trash `deletedAt`) as a local instant of this browser. The server runs
+ * on the same machine as the browser, so the zones agree.
+ */
+export function parseLocalWallClock(s: string | null | undefined): Date | null {
+  const d = parseWallClock(s);
+  if (!d) return null;
+  const out = new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds());
+  out.setFullYear(d.getUTCFullYear()); // years 0-99
+  return Number.isNaN(out.getTime()) ? null : out;
+}
+
+const rtfCache = new Map<string, Intl.RelativeTimeFormat>();
+
+/** "3 minutes ago", "yesterday", "2 months ago"; "just now" under a minute. */
+export function formatAgo(when: Date | null, now: number = Date.now(), locale?: string): string {
+  if (!when) return '';
+  const sec = Math.round((when.getTime() - now) / 1000);
+  if (Math.abs(sec) < 60) return 'just now';
+  let rtf = rtfCache.get(locale ?? '');
+  if (!rtf) {
+    rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    rtfCache.set(locale ?? '', rtf);
+  }
+  const steps: [Intl.RelativeTimeFormatUnit, number][] = [
+    ['minute', 60],
+    ['hour', 3600],
+    ['day', 86400],
+    ['week', 7 * 86400],
+    ['month', 30 * 86400],
+    ['year', 365 * 86400],
+  ];
+  let unit: Intl.RelativeTimeFormatUnit = 'minute';
+  let size = 60;
+  for (const [u, s] of steps) {
+    if (Math.abs(sec) >= s) {
+      unit = u;
+      size = s;
+    }
+  }
+  return rtf.format(Math.round(sec / size), unit);
+}
+
+/**
+ * A server time that may be Unix seconds, an RFC 3339 instant or a
+ * wall-clock string in the server's zone (the similar run's `at`), as a Date.
+ */
+export function parseWhen(v: number | string | null | undefined): Date | null {
+  if (typeof v === 'number') return Number.isFinite(v) && v > 0 ? new Date(v * 1000) : null;
+  if (!v) return null;
+  if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(v)) {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return parseLocalWallClock(v);
+}

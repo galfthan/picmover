@@ -51,6 +51,7 @@ const detail = (id: number) => ({
 const runningJob = {
   id: 4,
   kind: 'import',
+  library: 'Photos',
   state: 'running',
   source: '/media/card',
   move: false,
@@ -71,8 +72,14 @@ function json(body: unknown, status = 200): Response {
 
 function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = new URL(String(input), 'http://127.0.0.1:7439');
-  const path = url.pathname;
-  requests.push(`${init?.method ?? 'GET'} ${path}${url.search}`);
+  requests.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`);
+  if (url.pathname === '/api/libraries') {
+    return Promise.resolve(json({ root: '/home/me/Photos', mode: 'single', libraries: [{ id: 'Photos', name: 'Photos', path: '/home/me/Photos', state: 'open' }], folders: [] }));
+  }
+  // Library-scoped endpoints: answered like the step 3 paths.
+  const scoped = url.pathname.startsWith('/api/l/Photos/');
+  const path = scoped ? '/api/' + url.pathname.slice('/api/l/Photos/'.length) : url.pathname;
+  if (!scoped && !path.startsWith('/api/jobs') && !path.startsWith('/api/fs')) return Promise.resolve(json({ error: 'not found' }, 404));
   if (init?.method === 'POST') {
     const h = new Headers(init.headers);
     if (h.get('X-Picmover') !== '1' || h.get('Content-Type') !== 'application/json') return Promise.resolve(json({ error: 'forbidden' }, 403));
@@ -94,6 +101,10 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
     res = json({ items: q.get('year') === '2024' ? bucket2407 : undated });
   } else if (path.startsWith('/api/media/')) {
     res = json(detail(Number(path.split('/').pop())));
+  } else if (path === '/api/tags') {
+    res = json({ tags: [{ id: 1, name: 'beach', count: 2 }] });
+  } else if (path === '/api/albums') {
+    res = json({ albums: [{ id: 2, name: 'Summer', count: 1, cover: null, createdAt: '', updatedAt: '' }] });
   } else if (path === '/api/jobs' && init?.method === 'POST') {
     res = json({ job: { ...runningJob, id: 5 } }, 201);
   } else if (path === '/api/jobs') {
@@ -184,20 +195,40 @@ describe('App smoke test', () => {
     app = mount(App, { target: document.body });
     await settle();
 
+    // Single mode: #/ redirects to the one library.
+    expect(location.hash).toBe('#/l/Photos/');
+
     // Shell
     expect(document.querySelector('.libchip .name')?.textContent).toBe('Photos');
     expect(document.querySelector('.libchip .root')?.textContent).toBe('/home/me/Photos');
-    expect(document.querySelector('.libchip')?.getAttribute('href')).toBe('#/library');
+    expect(document.querySelector('.libchip')?.getAttribute('title')).toBe('Library: /home/me/Photos');
+    expect([...document.querySelectorAll('nav a')].map((a) => a.textContent)).toEqual([
+      'Photos',
+      'Map',
+      'Albums',
+      'Trash',
+      'Duplicates',
+      'Import',
+      'Library',
+    ]);
     expect(document.querySelector('.pill')?.textContent).toContain('Importing 1,234 files');
+    expect(document.querySelector('.pill .lib')?.textContent).toBe('Photos');
+    // The switcher menu in single mode: the path, no other libraries.
+    document.querySelector<HTMLButtonElement>('.libchip')!.click();
+    await settle();
+    expect(document.querySelector('.menu')?.textContent).toContain('/home/me/Photos');
+    expect(document.querySelector('.menu')?.textContent).not.toContain('All libraries');
+    document.querySelector<HTMLButtonElement>('.libchip')!.click();
+    await settle();
 
     // Grid: buckets, tiles, badges
     const text = document.body.textContent ?? '';
     expect(text).toContain('July 2024');
     expect(text).toContain('Undated');
     const tiles = [...document.querySelectorAll<HTMLAnchorElement>('a.tile')];
-    expect(tiles.map((t) => t.getAttribute('href'))).toEqual(['#/view/3', '#/view/2', '#/view/1', '#/view/9']);
+    expect(tiles.map((t) => t.getAttribute('href'))).toEqual(['#/l/Photos/view/3', '#/l/Photos/view/2', '#/l/Photos/view/1', '#/l/Photos/view/9']);
     expect(tiles[1]?.textContent).toContain('0:07');
-    expect(requests).toContain('GET /api/media?year=2024&month=7');
+    expect(requests).toContain('GET /api/l/Photos/media?year=2024&month=7');
 
     // SSE: progress and done update the pill and trigger a refresh
     const es = FakeEventSource.instances.at(-1)!;
@@ -212,7 +243,7 @@ describe('App smoke test', () => {
     // Lightbox via tile click, info panel, neighbours
     tiles[0]!.click();
     await settle();
-    expect(location.hash).toBe('#/view/3');
+    expect(location.hash).toBe('#/l/Photos/view/3');
     const lb = document.querySelector('.lightbox');
     expect(lb).not.toBeNull();
     expect(lb?.textContent).toContain('image/2024/07/IMG_3.jpg');
@@ -221,37 +252,37 @@ describe('App smoke test', () => {
     expect(document.querySelector('.nav.next')).not.toBeNull();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     await settle();
-    expect(location.hash).toBe('#/view/2');
+    expect(location.hash).toBe('#/l/Photos/view/2');
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     await settle();
-    expect(location.hash).toBe('#/view/1');
+    expect(location.hash).toBe('#/l/Photos/view/1');
     // Last dated item → crosses into the undated bucket
     expect(document.querySelector('.nav.next')).not.toBeNull();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     await settle();
-    expect(location.hash).toBe('#/view/9');
+    expect(location.hash).toBe('#/l/Photos/view/9');
     expect(document.querySelector('.lightbox')?.textContent).toContain('Undated');
     expect(document.querySelector('.nav.next')).toBeNull();
     expect(document.querySelector('.nav.prev')).not.toBeNull();
     // ...and back across into July.
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft' }));
     await settle();
-    expect(location.hash).toBe('#/view/1');
+    expect(location.hash).toBe('#/l/Photos/view/1');
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
     await settle();
     // history.back() is asynchronous in jsdom.
-    for (let i = 0; i < 20 && location.hash !== '#/'; i++) await vi.advanceTimersByTimeAsync(10);
+    for (let i = 0; i < 20 && location.hash !== '#/l/Photos/'; i++) await vi.advanceTimersByTimeAsync(10);
     await settle();
-    expect(location.hash).toBe('#/');
+    expect(location.hash).toBe('#/l/Photos/');
     expect(document.querySelector('.lightbox')).toBeNull();
     expect(document.querySelectorAll('a.tile').length).toBe(4);
 
     // Filters: RAW → no match
-    await go('#/?type=image_raw');
+    await go('#/l/Photos/?type=image_raw');
     expect(document.body.textContent).toContain('Nothing matches these filters');
 
     // Import page shows the running job and its results
-    await go('#/import');
+    await go('#/l/Photos/import');
     expect(document.body.textContent).toContain('Import running');
     expect(document.body.textContent).toContain('boom');
     expect(document.querySelector('.dest')?.textContent).toContain('Importing into');
@@ -278,12 +309,12 @@ describe('App smoke test', () => {
     expect(document.body.textContent).toContain('Used for files without zone information');
     document.querySelector<HTMLFormElement>('form.options')!.requestSubmit();
     await settle();
-    expect(requests).toContain('POST /api/jobs');
+    expect(requests).toContain('POST /api/l/Photos/jobs');
     expect(FakeEventSource.instances.at(-1)?.url).toBe('/api/jobs/5/events');
     expect(document.body.textContent).toContain('Import running');
 
     // Library page
-    await go('#/library');
+    await go('#/l/Photos/library');
     expect(document.body.textContent).toContain('/home/me/Photos');
     expect(document.body.textContent).toContain('Canon EOS R6');
     expect(document.body.textContent).toContain('/home/me/Photos/media.db');
@@ -293,17 +324,18 @@ describe('App smoke test', () => {
     // Map page (Leaflet in jsdom; tiles fail without network)
     // Leaflet is imported dynamically: give the module loader real time.
     vi.useRealTimers();
-    location.hash = '#/map';
+    location.hash = '#/l/Photos/map';
     for (let i = 0; i < 100 && !document.querySelector('.pm-cluster'); i++) {
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(document.querySelector('.map-page .note.err')?.textContent ?? '').toBe('');
     expect(document.querySelector('.leaflet-container')).not.toBeNull();
-    expect(requests.some((r) => r.startsWith('GET /api/geo?bbox='))).toBe(true);
+    expect(requests.some((r) => r.startsWith('GET /api/l/Photos/geo?bbox='))).toBe(true);
     expect(document.querySelectorAll('.pm-cluster, .pm-single').length).toBe(2);
 
     location.hash = '#/';
     await new Promise((r) => setTimeout(r, 100));
+    expect(location.hash).toBe('#/l/Photos/');
     expect(document.querySelector('.leaflet-container')).toBeNull();
     expect(errors).toEqual([]);
   });

@@ -86,8 +86,20 @@ func TestIsInternal(t *testing.T) {
 		".picmover":                                 true,
 		".picmover/tmp/x.part":                      true,
 		".picmover/lock":                            true,
+		".picmover/trash/image/2020/01/a.jpg":       true,
+		"user.db":                                   true,
+		"user.db-wal":                               true,
+		"user.db-shm":                               true,
+		"user.db-journal":                           true,
+		"user.db.jpg":                               false,
+		"image/user.db":                             false,
 		"image/2020/01/a.jpg":                       false,
 		"image/import_x.log":                        false,
+		"USER.DB":                                   true,
+		"User.db-WAL":                               true,
+		"MEDIA.DB":                                  true,
+		".PicMover/trash/a.jpg":                     true,
+		"Import_x.LOG":                              true,
 	}
 	for rel, want := range cases {
 		if got := l.IsInternal(l.Abs(rel)); got != want {

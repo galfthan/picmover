@@ -3,14 +3,18 @@
   import { library } from '../lib/library.svelte';
   import { hasFilters } from '../lib/filters';
   import { parseWallClock } from '../lib/format';
+  import DateFilter, { type DateValue } from './DateFilter.svelte';
+  import TagInput, { type Pick } from './TagInput.svelte';
 
   interface Props {
     filters: Filters;
     onchange: (f: Filters) => void;
     /** Hide the "has location" toggle (the map implies it). */
     hideGps?: boolean;
+    /** Hide the album select (the album page implies it). */
+    hideAlbum?: boolean;
   }
-  let { filters, onchange, hideGps = false }: Props = $props();
+  let { filters, onchange, hideGps = false, hideAlbum = false }: Props = $props();
 
   const types: { value: FileType | ''; label: string }[] = [
     { value: '', label: 'All types' },
@@ -20,6 +24,8 @@
   ];
 
   const cameras = $derived(library.info?.cameras ?? []);
+  const tags = $derived(library.tags);
+  const albums = $derived(library.albums);
 
   const years = $derived.by(() => {
     const s = library.info?.summary;
@@ -35,14 +41,11 @@
     return out.sort((x, y) => y - x);
   });
 
-  const fromYear = $derived(filters.from ? filters.from.slice(0, 4) : '');
-  // `to` is exclusive: to=2025-01-01 means "through 2024".
-  const toYear = $derived(filters.to ? String(Number(filters.to.slice(0, 4)) - 1) : '');
-
   function set(patch: Partial<Filters>) {
     const f: Filters = { ...filters, ...patch };
     for (const k of Object.keys(f) as (keyof Filters)[]) {
-      if (f[k] === undefined || f[k] === '' || f[k] === false) delete f[k];
+      const v = f[k];
+      if (v === undefined || v === '' || v === false || (Array.isArray(v) && v.length === 0)) delete f[k];
     }
     onchange(f);
   }
@@ -55,14 +58,26 @@
     const v = (e.currentTarget as HTMLSelectElement).value;
     set({ camera: v || undefined });
   }
-  function onFrom(e: Event) {
-    const v = (e.currentTarget as HTMLSelectElement).value;
-    set({ from: v ? `${v}-01-01` : undefined });
+  function onRating(e: Event) {
+    const v = Number((e.currentTarget as HTMLSelectElement).value);
+    set({ rating: v > 0 ? v : undefined });
   }
-  function onTo(e: Event) {
-    const v = (e.currentTarget as HTMLSelectElement).value;
-    set({ to: v ? `${Number(v) + 1}-01-01` : undefined });
+  function onAlbum(e: Event) {
+    const v = Number((e.currentTarget as HTMLSelectElement).value);
+    set({ album: v > 0 ? v : undefined });
   }
+  function onDates(v: DateValue) {
+    set({ from: v.from, to: v.to, recur: v.recur });
+  }
+  function addTag(p: Pick) {
+    if ('create' in p) return;
+    const cur = filters.tags ?? [];
+    if (!cur.includes(p.item.id)) set({ tags: [...cur, p.item.id].sort((a, b) => a - b) });
+  }
+  function removeTag(id: number) {
+    set({ tags: (filters.tags ?? []).filter((t) => t !== id) });
+  }
+  const tagName = (id: number) => tags.find((t) => t.id === id)?.name ?? `#${id}`;
 </script>
 
 <div class="filters" role="search" aria-label="Filters">
@@ -89,17 +104,38 @@
     {/if}
   </select>
 
-  <span class="years">
-    <select aria-label="From year" value={fromYear} onchange={onFrom}>
-      <option value="">From</option>
-      {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
+  <DateFilter from={filters.from} to={filters.to} recur={filters.recur} {years} onchange={onDates} />
+
+  <select aria-label="Minimum rating" value={String(filters.rating ?? 0)} onchange={onRating}>
+    <option value="0">Any rating</option>
+    {#each [1, 2, 3, 4, 5] as n (n)}
+      <option value={String(n)}>{'★'.repeat(n)}{n < 5 ? ' or more' : ''}</option>
+    {/each}
+  </select>
+
+  {#if tags.length || filters.tags?.length}
+    <span class="tags">
+      {#each filters.tags ?? [] as id (id)}
+        <span class="chip">
+          {tagName(id)}
+          <button class="ghost small" aria-label="Remove tag filter {tagName(id)}" onclick={() => removeTag(id)}>×</button>
+        </span>
+      {/each}
+      <TagInput options={tags} exclude={filters.tags ?? []} allowCreate={false} placeholder="Tag…" label="Filter by tag" onpick={addTag} />
+    </span>
+  {/if}
+
+  {#if !hideAlbum && (albums.length || filters.album)}
+    <select aria-label="Album" value={String(filters.album ?? 0)} onchange={onAlbum}>
+      <option value="0">All albums</option>
+      {#each albums as a (a.id)}
+        <option value={String(a.id)}>{a.name}</option>
+      {/each}
+      {#if filters.album && !albums.some((a) => a.id === filters.album)}
+        <option value={String(filters.album)}>Album #{filters.album}</option>
+      {/if}
     </select>
-    <span class="muted">–</span>
-    <select aria-label="To year" value={toYear} onchange={onTo}>
-      <option value="">To</option>
-      {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
-    </select>
-  </span>
+  {/if}
 
   {#if filters.session}
     <span class="chip">
@@ -108,7 +144,7 @@
     </span>
   {/if}
 
-  {#if hasFilters(filters)}
+  {#if hasFilters(filters, { album: hideAlbum })}
     <button class="ghost small" onclick={() => onchange({})}>Clear</button>
   {/if}
 </div>
@@ -131,10 +167,15 @@
     white-space: nowrap;
     cursor: pointer;
   }
-  .years {
+  .tags {
     display: inline-flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 4px;
+  }
+  .tags :global(input) {
+    min-width: 90px;
+    width: 110px;
   }
   .chip {
     display: inline-flex;

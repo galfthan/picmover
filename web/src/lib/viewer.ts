@@ -6,6 +6,7 @@
 
 import type { MediaDetail, MediaItem } from './api';
 import { navigate } from './router';
+import { libHref, libPath } from './routes';
 
 export interface Neighbours {
   prev: MediaItem | null;
@@ -34,14 +35,19 @@ export function sequenceProvider(): SequenceProvider | null {
   return provider;
 }
 
-export function openViewer(id: number): void {
+/** Hash of the viewer for item `id` of library `lib` (the href of tiles). */
+export function viewerHref(lib: string, id: number): string {
+  return libHref(lib, `view/${id}`);
+}
+
+export function openViewer(lib: string, id: number): void {
   openedInApp = true;
-  navigate(`/view/${id}`);
+  navigate(libPath(lib, `view/${id}`));
 }
 
 /** Moves to another item without adding history entries. */
-export function showInViewer(id: number): void {
-  navigate(`/view/${id}`, { replace: true });
+export function showInViewer(lib: string, id: number): void {
+  navigate(libPath(lib, `view/${id}`), { replace: true });
 }
 
 /** Closes the viewer: back when we opened it, else replace with the base page. */

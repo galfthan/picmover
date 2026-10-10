@@ -159,8 +159,12 @@ func (im *Importer) feedThumbs(ctx context.Context, sessionID int64, all bool, j
 	}
 }
 
+// thumbBatchInterval is the thumbnail writer's commit interval; a test
+// shortens it so a cancellation can land between commits.
+var thumbBatchInterval = batchInterval
+
 // thumbWriter records results in transactions of up to batchSize rows,
-// flushing at least every batchInterval. A result that arrives after ctx
+// flushing at least every thumbBatchInterval. A result that arrives after ctx
 // was cancelled is not recorded, whatever its state, so its row keeps its
 // state (pending rows stay pending) and is retried by a later pass. It
 // writes with context.Background so cancellation never drops results
@@ -171,7 +175,7 @@ func (im *Importer) feedThumbs(ctx context.Context, sessionID int64, all bool, j
 // the writer then calls cancel, keeps draining and returns the error.
 func (im *Importer) thumbWriter(ctx context.Context, done <-chan thumbDone, cancel context.CancelFunc) error {
 	batch := make([]thumbDone, 0, batchSize)
-	tick := time.NewTicker(batchInterval)
+	tick := time.NewTicker(thumbBatchInterval)
 	defer tick.Stop()
 	var fatal error
 	flush := func() {

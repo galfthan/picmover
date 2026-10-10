@@ -77,7 +77,7 @@ func unmarshal[T any](t *testing.T, b []byte) T {
 
 func (l *live) startJob(body string) jobJSON {
 	l.t.Helper()
-	code, b := l.do(http.MethodPost, "/api/jobs", body)
+	code, b := l.do(http.MethodPost, "/api/l/lib/jobs", body)
 	if code != http.StatusCreated {
 		l.t.Fatalf("start job: %d %s", code, b)
 	}
@@ -252,7 +252,7 @@ func TestJobImportStream(t *testing.T) {
 		t.Fatalf("log: %v", err)
 	}
 	// The session filter shows what this import added.
-	w := l.get(fmt.Sprintf("/api/timeline?session=%d", *done.SessionID))
+	w := l.get(fmt.Sprintf("/api/l/lib/timeline?session=%d", *done.SessionID))
 	if got := decode[timelineJSON](t, w); len(got.Buckets) != 1 || got.Buckets[0] != (bucketJSON{2025, 3, 6}) {
 		t.Fatalf("session timeline %s", w.Body)
 	}
@@ -322,7 +322,7 @@ func TestJobConflictCancelAndLateSubscriber(t *testing.T) {
 	j := l.startJob(`{"kind":"import","source":` + jsonString(src) + `}`)
 	b.wait(t)
 
-	code, body := l.do(http.MethodPost, "/api/jobs", `{"kind":"thumbs"}`)
+	code, body := l.do(http.MethodPost, "/api/l/lib/jobs", `{"kind":"thumbs"}`)
 	if code != http.StatusConflict || !strings.Contains(string(body), "already running") {
 		t.Fatalf("second job: %d %s", code, body)
 	}
@@ -407,7 +407,7 @@ func TestJobThumbsAfterNoThumbs(t *testing.T) {
 			}
 		}
 	}
-	if w := l.get("/api/thumb/" + newHash); w.Code != http.StatusNotFound {
+	if w := l.get("/api/l/lib/thumb/" + newHash); w.Code != http.StatusNotFound {
 		t.Fatalf("thumb before thumbs job: %d", w.Code)
 	}
 
@@ -423,7 +423,7 @@ func TestJobThumbsAfterNoThumbs(t *testing.T) {
 		t.Fatalf("still pending: %d", pending)
 	}
 	// Served through the read-only store, which sees the committed writes.
-	if w := l.get("/api/thumb/" + newHash); w.Code != http.StatusOK {
+	if w := l.get("/api/l/lib/thumb/" + newHash); w.Code != http.StatusOK {
 		t.Fatalf("thumb after thumbs job: %d", w.Code)
 	}
 	wantExit := 0
@@ -457,7 +457,7 @@ func TestJobValidation(t *testing.T) {
 		{`not json`, "invalid job"},
 		{`{"kind":"import","move":"yes"}`, "invalid job"},
 	} {
-		code, b := l.do(http.MethodPost, "/api/jobs", c.body)
+		code, b := l.do(http.MethodPost, "/api/l/lib/jobs", c.body)
 		if code != http.StatusBadRequest || !strings.Contains(string(b), c.msg) {
 			t.Errorf("%s: %d %s, want 400 %q", c.body, code, b, c.msg)
 		}
@@ -493,7 +493,7 @@ func TestShutdownCancelsJob(t *testing.T) {
 	if d := unmarshal[jobJSON](t, []byte(evs[len(evs)-1].data)); d.State != "cancelled" || d.ExitCode != 130 {
 		t.Fatalf("after shutdown %+v", d)
 	}
-	if code, b := l.do(http.MethodPost, "/api/jobs", `{"kind":"thumbs"}`); code != http.StatusServiceUnavailable {
+	if code, b := l.do(http.MethodPost, "/api/l/lib/jobs", `{"kind":"thumbs"}`); code != http.StatusServiceUnavailable {
 		t.Fatalf("job after shutdown: %d %s", code, b)
 	}
 }
@@ -612,7 +612,7 @@ func TestProgressCoalesced(t *testing.T) {
 }
 
 func TestJobRetention(t *testing.T) {
-	m := newJobManager(nil, nil, "", nil, nil)
+	m := newJobManager(nil, "", nil, nil)
 	for i := range keepFinished + 5 {
 		m.jobs = append(m.jobs, &job{id: int64(i + 1)})
 	}
@@ -639,16 +639,17 @@ func TestOutcome(t *testing.T) {
 		msg   string
 	}{
 		{kindImport, importer.Stats{}, nil, stateDone, 0, ""},
-		{kindImport, importer.Stats{Errors: 2}, nil, stateDone, 2, "2 files could not be imported; see L"},
-		{kindImport, importer.Stats{ThumbsFailed: 3}, nil, stateDone, 2, "thumbnails failed for 3 files; see L"},
+		{kindImport, importer.Stats{Errors: 2}, nil, stateDone, 2, "2 files could not be imported; see the job log"},
+		{kindImport, importer.Stats{ThumbsFailed: 3}, nil, stateDone, 2, "thumbnails failed for 3 files; see the job log"},
 		{kindImport, importer.Stats{}, fmt.Errorf("x: %w", context.Canceled), stateCancelled, 130, ""},
-		{kindImport, importer.Stats{}, &importer.ThumbStageError{Err: fmt.Errorf("bad cache")}, stateDone, 2, "thumbnail stage failed (bad cache)"},
-		{kindImport, importer.Stats{}, fmt.Errorf("disk full"), stateFailed, 1, "disk full"},
+		{kindImport, importer.Stats{}, &importer.ThumbStageError{Err: fmt.Errorf("bad cache")}, stateDone, 2, "thumbnail stage failed (see the job log)"},
+		{kindImport, importer.Stats{}, fmt.Errorf("/abs/path: disk full"), stateFailed, 1, "import failed; see the job log"},
 		{kindThumbs, importer.Stats{ThumbsFailed: 1}, nil, stateDone, 2, "thumbnails failed for 1 files"},
 		{kindThumbs, importer.Stats{}, context.Canceled, stateCancelled, 130, ""},
 	} {
 		state, code, msg := outcome(c.kind, c.s, c.err, "L", "/lib")
-		if state != c.state || code != c.code || !strings.Contains(msg, c.msg) || (c.msg == "" && msg != "") {
+		if state != c.state || code != c.code || !strings.Contains(msg, c.msg) || (c.msg == "" && msg != "") ||
+			strings.Contains(msg, "bad cache") || strings.Contains(msg, "/abs") || strings.Contains(msg, " L") {
 			t.Errorf("%+v %v: %s %d %q", c.s, c.err, state, code, msg)
 		}
 	}

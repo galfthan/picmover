@@ -110,7 +110,7 @@ func TestJobSourceUNCRefused(t *testing.T) {
 	l := newLive(t, nil)
 	for _, src := range []string{`\\\\host\\share\\photos`, `//host/share/photos`, `\\\\?\\C:\\photos`, `\\\\.\\PhysicalDrive0`, "/tmp/a\\u0000b"} {
 		body := `{"kind":"import","source":"` + src + `"}`
-		code, b := l.do(http.MethodPost, "/api/jobs", body)
+		code, b := l.do(http.MethodPost, "/api/l/lib/jobs", body)
 		if code != http.StatusBadRequest || !strings.Contains(string(b), "source") {
 			t.Errorf("%s: %d %s, want 400", body, code, b)
 		}

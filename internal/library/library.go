@@ -28,6 +28,9 @@ const (
 	DBName = "media.db"
 	// MetaDir holds picmover's own files (temp files, logs).
 	MetaDir = ".picmover"
+	// UserDBName is the user data database (ratings, tags, albums) at
+	// the library root; see internal/userdata.
+	UserDBName = "user.db"
 )
 
 // ErrHashMismatch is returned by CopyVerified when the bytes written do not
@@ -185,15 +188,18 @@ func (l *Library) Contains(abs string) bool {
 }
 
 // IsInternal reports whether abs is a file picmover manages itself: the
-// catalog (media.db, media.db-wal, -shm, -journal), its backups
+// catalog (media.db, media.db-wal, -shm, -journal), the user data
+// database (user.db and its -wal, -shm, -journal), the catalog's backups
 // (media.db.bak-YYYYMMDD-HHMMSS[-wal|-shm|-journal], and the v1 media.db.v1-*.bak and their .tmp files), import_*.log at the root, and
-// everything under the .picmover directory. Importers skip these when the source
-// overlaps the library.
+// everything under the .picmover directory, all compared case-insensitively.
+// Importers skip these when the source overlaps the library.
 func (l *Library) IsInternal(abs string) bool {
 	rel, err := l.Rel(abs)
 	if err != nil {
 		return false
 	}
+	// Compared case-insensitively: on NTFS and APFS MEDIA.DB is media.db.
+	rel = strings.ToLower(rel)
 	if rel == MetaDir || strings.HasPrefix(rel, MetaDir+"/") {
 		return true
 	}
@@ -201,14 +207,25 @@ func (l *Library) IsInternal(abs string) bool {
 		return false
 	}
 	base := path.Base(rel)
-	switch base {
-	case DBName, DBName + "-wal", DBName + "-shm", DBName + "-journal":
-		return true
-	}
-	if isBackupName(base) {
+	if IsDatabaseName(base) {
 		return true
 	}
 	return strings.HasPrefix(base, "import_") && strings.HasSuffix(base, ".log")
+}
+
+// IsDatabaseName reports whether base, a file name, is one of a library's
+// databases, compared case-insensitively: media.db and user.db with their
+// -wal, -shm and -journal files, and the catalog backups. The importer
+// skips such files wherever they lie in a source (another library's
+// catalog is never imported).
+func IsDatabaseName(base string) bool {
+	base = strings.ToLower(base)
+	switch base {
+	case DBName, DBName + "-wal", DBName + "-shm", DBName + "-journal",
+		UserDBName, UserDBName + "-wal", UserDBName + "-shm", UserDBName + "-journal":
+		return true
+	}
+	return isBackupName(base)
 }
 
 // isBackupName matches the catalog backups written by "picmover rebuild",
@@ -391,12 +408,11 @@ func (l *Library) CopyVerified(ctx context.Context, src, dst string, want uint64
 		os.Remove(tmpName)
 		return 0, err
 	}
-	if _, err := os.Lstat(dst); err == nil {
+	if err := RenameNoReplace(tmpName, dst); err != nil {
 		os.Remove(tmpName)
-		return 0, fmt.Errorf("destination already exists: %s", dst)
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		os.Remove(tmpName)
+		if errors.Is(err, fs.ErrExist) {
+			return 0, fmt.Errorf("destination already exists: %s", dst)
+		}
 		return 0, err
 	}
 	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())

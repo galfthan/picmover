@@ -14,7 +14,16 @@ export function exitCodeOf(j: Job): number {
 }
 
 export function jobTitle(j: Job): string {
-  return j.kind === 'thumbs' ? 'Thumbnails' : 'Import';
+  switch (j.kind) {
+    case 'thumbs':
+      return 'Thumbnails';
+    case 'similar':
+      return 'Duplicate search';
+    case 'rebuild':
+      return 'Rebuild';
+    default:
+      return 'Import';
+  }
 }
 
 /** One-line outcome, e.g. "12 files could not be imported; see /lib/.picmover/logs/x.log". */

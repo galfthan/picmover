@@ -16,7 +16,7 @@ func TestHostCheck(t *testing.T) {
 		{"127.0.0.1:7440", false}, {"localhost:80", false}, {"localhost", false}, {"evil.example:7439", false},
 		{"evil.example", false}, {"192.168.1.5:7439", false}, {"127.0.0.2:7439", false}, {"", false},
 	} {
-		for _, p := range []string{"/api/library", "/", "/api/thumb/0000000000000001"} {
+		for _, p := range []string{"/api/l/lib/library", "/", "/api/l/lib/thumb/0000000000000001"} {
 			r := newReq(http.MethodGet, p)
 			r.Host = c.host
 			w := serve(f, r)
@@ -67,7 +67,7 @@ func TestOriginCheck(t *testing.T) {
 		{"http://evil.example", false}, {"http://evil.example:7439", false}, {"https://127.0.0.1:7439", false},
 		{"http://127.0.0.1:5173", false}, {"http://localhost:5173", false}, {"null", false}, {"file://", false},
 	} {
-		r := newReq(http.MethodGet, "/api/library")
+		r := newReq(http.MethodGet, "/api/l/lib/library")
 		r.Header.Set("Origin", c.origin)
 		w := serve(f, r)
 		if c.ok && w.Code != http.StatusOK {
@@ -122,19 +122,19 @@ func TestCORSOrigin(t *testing.T) {
 		h.Get("Vary") != "Origin" {
 		t.Fatalf("preflight: %d %v", w.Code, h)
 	}
-	r = newReq(http.MethodGet, "/api/library")
+	r = newReq(http.MethodGet, "/api/l/lib/library")
 	r.Header.Set("Origin", "http://localhost:5173")
 	w = serve(f, r)
 	if w.Code != http.StatusOK || w.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" || w.Header().Get("Vary") != "Origin" {
 		t.Fatalf("cors GET: %d %v", w.Code, w.Header())
 	}
 	// Same-origin requests get no Allow-Origin; other origins stay refused.
-	r = newReq(http.MethodGet, "/api/library")
+	r = newReq(http.MethodGet, "/api/l/lib/library")
 	r.Header.Set("Origin", "http://127.0.0.1:7439")
 	if w = serve(f, r); w.Code != http.StatusOK || w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatalf("same origin: %d %v", w.Code, w.Header())
 	}
-	r = newReq(http.MethodGet, "/api/library")
+	r = newReq(http.MethodGet, "/api/l/lib/library")
 	r.Header.Set("Origin", "http://localhost:5174")
 	if w = serve(f, r); w.Code != http.StatusForbidden || w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatalf("other origin: %d %v", w.Code, w.Header())
@@ -158,10 +158,10 @@ func TestMutationHeaders(t *testing.T) {
 		{map[string]string{"Content-Type": "application/json", "X-Picmover": "1"}, http.StatusBadRequest},
 		{map[string]string{"Content-Type": "application/json; charset=utf-8", "X-Picmover": "1"}, http.StatusBadRequest},
 	} {
-		for _, p := range []string{"/api/jobs", "/api/jobs/1/cancel"} {
+		for _, p := range []string{"/api/l/lib/jobs", "/api/jobs/1/cancel"} {
 			w := f.request(http.MethodPost, p, strings.NewReader(body), c.hdr)
 			want := c.code
-			if p != "/api/jobs" && want == http.StatusBadRequest {
+			if p != "/api/l/lib/jobs" && want == http.StatusBadRequest {
 				want = http.StatusNotFound // no job 1
 			}
 			if w.Code != want {
@@ -171,14 +171,14 @@ func TestMutationHeaders(t *testing.T) {
 	}
 	// Body cap.
 	big := `{"kind":"import","source":"` + strings.Repeat("x", 70<<10) + `"}`
-	w := f.post("/api/jobs", big)
+	w := f.post("/api/l/lib/jobs", big)
 	wantError(t, w, http.StatusRequestEntityTooLarge, "too large")
 	// Wrong methods.
-	if w := f.request(http.MethodDelete, "/api/jobs", nil, map[string]string{"Content-Type": "application/json", "X-Picmover": "1"}); w.Code != http.StatusMethodNotAllowed {
+	if w := f.request(http.MethodDelete, "/api/l/lib/jobs", nil, map[string]string{"Content-Type": "application/json", "X-Picmover": "1"}); w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("DELETE /api/jobs: %d", w.Code)
 	}
-	if w := f.post("/api/library", "{}"); w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("POST /api/library: %d", w.Code)
+	if w := f.post("/api/l/lib/library", "{}"); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /api/l/lib/library: %d", w.Code)
 	}
 }
 

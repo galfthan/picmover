@@ -26,7 +26,7 @@
 
   const s = $derived(job.stats);
   const thumbsStarted = $derived(s.thumbsDone + s.thumbsUnsupported + s.thumbsFailed > 0);
-  const fraction = $derived(job.kind === 'import' && s.scanned > 0 ? Math.min(1, processed(s) / s.scanned) : null);
+  const fraction = $derived((job.kind === 'import' || job.kind === 'rebuild') && s.scanned > 0 ? Math.min(1, processed(s) / s.scanned) : null);
 
   let cancelling = $state(false);
   let cancelError = $state('');
@@ -55,7 +55,13 @@
     {:else}
       <ConfirmButton
         label="Cancel"
-        question={job.kind === 'import' ? 'Stop the import? Files already imported stay in the library.' : 'Stop generating thumbnails?'}
+        question={job.kind === 'import'
+          ? 'Stop the import? Files already imported stay in the library.'
+          : job.kind === 'similar'
+            ? 'Stop the duplicate search?'
+            : job.kind === 'rebuild'
+              ? 'Stop recording? The catalog stays incomplete until a rebuild finishes.'
+              : 'Stop generating thumbnails?'}
         confirmLabel="Stop"
         cancelLabel="Keep going"
         danger
@@ -85,6 +91,21 @@
       <div class="stat" class:bad={s.errors > 0}><span class="v">{formatCount(s.errors)}</span><span class="k">Errors</span></div>
       <div class="stat"><span class="v">{formatBytes(s.bytesCopied)}</span><span class="k">Copied</span></div>
     </div>
+  {/if}
+  {#if job.kind === 'rebuild'}
+    <div class="stats">
+      <div class="stat"><span class="v">{formatCount(s.scanned)}</span><span class="k">Scanned</span></div>
+      <div class="stat"><span class="v">{formatCount(s.imported + s.existing)}</span><span class="k">Recorded</span></div>
+      <div class="stat" class:bad={s.errors > 0}><span class="v">{formatCount(s.errors)}</span><span class="k">Errors</span></div>
+    </div>
+  {/if}
+  {#if job.kind === 'similar'}
+    <p class="muted">
+      {#if job.phase?.phase === 'load'}Loading {formatCount(job.phase.items ?? 0)} images…
+      {:else if job.phase?.phase === 'compare'}Comparing{job.phase.bands ? ` (${formatCount(job.phase.bands)} bands)` : ''}…
+      {:else if job.phase?.phase === 'done'}Found {formatCount(job.phase.pairs ?? 0)} similar pairs.
+      {:else}Starting…{/if}
+    </p>
   {/if}
   {#if thumbsStarted || job.kind === 'thumbs'}
     <h3 class="sub">Thumbnails</h3>

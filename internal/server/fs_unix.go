@@ -3,10 +3,12 @@
 package server
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
+	"syscall"
 )
 
 // roots returns the directory browser's starting points: /, the home
@@ -29,3 +31,8 @@ var osMissingErrnos []error
 // evalSymlinksGaps: filepath.EvalSymlinks works on every Unix volume, so
 // a failure to resolve refuses the file.
 const evalSymlinksGaps = false
+
+// isBusyErr reports a file or mount point in use.
+func isBusyErr(err error) bool {
+	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.ETXTBSY)
+}

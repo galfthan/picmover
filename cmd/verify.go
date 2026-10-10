@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -29,6 +30,7 @@ const fillBatchSize = 500
 
 type verifyReport struct {
 	missing, sizeMismatch, hashMismatch, orphans, caseConflicts, duplicates, errs []string
+	trashOrphans                                                                  []string // trash files without a trashed row
 	filled                                                                        int
 }
 
@@ -46,6 +48,7 @@ func newVerifyCmd() *cobra.Command {
 		Long: `Check every catalog row against the library: the file must exist and have
 the recorded size (and, with --rehash, the recorded hash). Then list files
 under image/, image_raw/ and video/ that are not in the catalog (orphans),
+(trashed rows are checked at their path in .picmover/trash),
 files whose name matches a catalog row only when case is ignored (case
 conflicts) and catalog rows whose paths differ only in case. Exits with
 status 1 when any problem is found.`,
@@ -62,7 +65,7 @@ status 1 when any problem is found.`,
 			}
 			defer unlock()
 			defer db.Close()
-			rows, err := db.List(ctx, catalog.ListOptions{OrderBy: "rel_path"})
+			rows, err := db.List(ctx, catalog.ListOptions{OrderBy: "rel_path", IncludeDeleted: true})
 			if err != nil {
 				return err
 			}
@@ -73,6 +76,7 @@ status 1 when any problem is found.`,
 			if err := findOrphans(ctx, lib, rows, &r); err != nil {
 				return err
 			}
+			findTrashOrphans(lib, rows, &r)
 			r.duplicates = caseDuplicates(rows)
 
 			out := cmd.OutOrStdout()
@@ -82,6 +86,7 @@ status 1 when any problem is found.`,
 				printList(out, "Hash mismatches", r.hashMismatch)
 			}
 			printList(out, "Orphan files (not in catalog)", r.orphans)
+			printList(out, "Orphan files in trash (no trashed row; 'Empty trash' removes them)", r.trashOrphans)
 			printList(out, "Case conflicts (file name differs from the catalog only in case)", r.caseConflicts)
 			printList(out, "Catalog paths differing only in case", r.duplicates)
 			printList(out, "Errors", r.errs)
@@ -89,7 +94,7 @@ status 1 when any problem is found.`,
 				fmt.Fprintf(out, "Sizes filled: %d\n", r.filled)
 			}
 			problems := len(r.missing) + len(r.sizeMismatch) + len(r.hashMismatch) +
-				len(r.orphans) + len(r.caseConflicts) + len(r.duplicates) + len(r.errs)
+				len(r.orphans) + len(r.trashOrphans) + len(r.caseConflicts) + len(r.duplicates) + len(r.errs)
 			fmt.Fprintf(out, "\nChecked %d catalog rows: %d problems found.\n", len(rows), problems)
 			if problems > 0 {
 				return fmt.Errorf("verification found %d problems", problems)
@@ -109,6 +114,9 @@ func checkRows(ctx context.Context, lib *library.Library, db *catalog.DB, rows [
 			return err
 		}
 		abs := lib.Abs(m.RelPath)
+		if !m.DeletedAt.IsZero() {
+			abs = lib.TrashPath(m.RelPath) // a trashed row's file is in the trash
+		}
 		fi, err := os.Stat(abs)
 		if errors.Is(err, fs.ErrNotExist) {
 			r.missing = append(r.missing, m.RelPath)
@@ -176,11 +184,15 @@ func fillBatch(ctx context.Context, db *catalog.DB, batch []sizeFill) error {
 // is not in the catalog. A file that matches a catalog row only when case is
 // ignored is a case conflict: an uncatalogued file on a case-sensitive file
 // system, and a collision once the library is copied to Windows or macOS.
-// Soft-deleted rows are not in rows, so their files count as orphans too.
+// Trashed rows have their files in the trash, so a file at their path in
+// the library counts as an orphan.
 func findOrphans(ctx context.Context, lib *library.Library, rows []catalog.Media, r *verifyReport) error {
 	known := make(map[string]bool, len(rows))
 	folded := make(map[string]string, len(rows))
 	for _, m := range rows {
+		if !m.DeletedAt.IsZero() {
+			continue
+		}
 		known[m.RelPath] = true
 		folded[strings.ToLower(m.RelPath)] = m.RelPath
 	}
@@ -225,6 +237,28 @@ func findOrphans(ctx context.Context, lib *library.Library, rows []catalog.Media
 		}
 	}
 	return nil
+}
+
+// findTrashOrphans lists the files in the trash that no trashed row
+// names. A rebuild records no row for a trash file whose content is live
+// (a duplicate) or whose path is recorded live, so the UI cannot show or
+// delete it; "Empty trash" removes such files.
+func findTrashOrphans(lib *library.Library, rows []catalog.Media, r *verifyReport) {
+	files, err := lib.TrashFiles()
+	if err != nil {
+		r.errs = append(r.errs, fmt.Sprintf("%s: %v", lib.TrashDir(), err))
+	}
+	trashed := make(map[string]bool, len(rows))
+	for _, m := range rows {
+		if !m.DeletedAt.IsZero() {
+			trashed[strings.ToLower(m.RelPath)] = true
+		}
+	}
+	for _, rel := range files {
+		if !trashed[strings.ToLower(rel)] && !isJunk(path.Base(rel)) {
+			r.trashOrphans = append(r.trashOrphans, "orphan file in trash: "+rel)
+		}
+	}
 }
 
 // caseDuplicates returns one line per group of rows whose rel paths are

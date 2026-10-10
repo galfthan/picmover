@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -13,12 +15,15 @@ import (
 	"picmover/internal/importer"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
+	"picmover/internal/similar"
 )
 
 // Job kinds and states.
 const (
-	kindImport = "import"
-	kindThumbs = "thumbs"
+	kindImport  = "import"
+	kindThumbs  = "thumbs"
+	kindSimilar = "similar"
+	kindRebuild = "rebuild"
 
 	stateQueued    = "queued"
 	stateRunning   = "running"
@@ -42,7 +47,7 @@ var (
 	errTooManySubscribers = fmt.Errorf("too many event streams for this job (at most %d)", maxSubscribers)
 )
 
-// jobParams is the POST /api/jobs body.
+// jobParams is the POST .../jobs body.
 type jobParams struct {
 	Kind         string `json:"kind"`
 	Source       string `json:"source"`
@@ -52,6 +57,7 @@ type jobParams struct {
 	NoThumbs     bool   `json:"noThumbs"`
 	Rebuild      bool   `json:"rebuild"`
 	Limit        int    `json:"limit"`
+	Distance     int    `json:"distance"` // similar: 1-7, 0 = default
 }
 
 type statsJSON struct {
@@ -78,27 +84,42 @@ func newStats(s importer.Stats) statsJSON {
 
 // jobJSON is the job object of the API and of state/done events.
 type jobJSON struct {
-	ID           int64     `json:"id"`
-	Kind         string    `json:"kind"`
-	State        string    `json:"state"`
-	Source       string    `json:"source,omitempty"`
-	Move         bool      `json:"move"`
-	MinDimension int       `json:"minDimension,omitempty"`
-	Timezone     string    `json:"timezone,omitempty"`
-	NoThumbs     bool      `json:"noThumbs,omitempty"`
-	Rebuild      bool      `json:"rebuild,omitempty"`
-	Limit        int       `json:"limit,omitempty"`
-	StartedAt    string    `json:"startedAt"`
-	FinishedAt   *string   `json:"finishedAt"`
-	Stats        statsJSON `json:"stats"`
-	SessionID    *int64    `json:"sessionId"`
-	LogPath      string    `json:"logPath"`
-	Error        *string   `json:"error"`
-	ExitCode     int       `json:"exitCode"` // 0 until finished
+	ID           int64  `json:"id"`
+	Library      string `json:"library"`
+	Kind         string `json:"kind"`
+	State        string `json:"state"`
+	Source       string `json:"source,omitempty"`
+	Move         bool   `json:"move"`
+	MinDimension int    `json:"minDimension,omitempty"`
+	Timezone     string `json:"timezone,omitempty"`
+	NoThumbs     bool   `json:"noThumbs,omitempty"`
+	Rebuild      bool   `json:"rebuild,omitempty"`
+	Limit        int    `json:"limit,omitempty"`
+	Distance     int    `json:"distance,omitempty"` // similar jobs
+	// Progress is the phase of a similar job (omitted for other kinds and
+	// before the first phase).
+	Progress   *phaseJSON `json:"progress,omitempty"`
+	StartedAt  string     `json:"startedAt"`
+	FinishedAt *string    `json:"finishedAt"`
+	Stats      statsJSON  `json:"stats"`
+	SessionID  *int64     `json:"sessionId"`
+	LogPath    string     `json:"logPath"`
+	Error      *string    `json:"error"`
+	ExitCode   int        `json:"exitCode"` // 0 until finished
 }
 
 type progressJSON struct {
 	Stats statsJSON `json:"stats"`
+}
+
+// phaseJSON is the progress of a similar job: phase "load" (items),
+// "compare" (bands done, of 8) and "done" (pairs found). It is the data
+// of the job's progress events and the job object's progress field.
+type phaseJSON struct {
+	Phase string `json:"phase"`
+	Items int    `json:"items"`
+	Bands int    `json:"bands"`
+	Pairs int    `json:"pairs"`
 }
 
 // resultJSON is one importer result event.
@@ -130,6 +151,8 @@ type subscriber struct {
 // a non-blocking fan-out.
 type job struct {
 	id      int64
+	entry   *libEntry // the library the job runs on
+	libID   string
 	params  jobParams
 	zone    *time.Location
 	created time.Time
@@ -150,6 +173,7 @@ type job struct {
 	errRing   resultRing // the last errorRingSize error results
 	seq       int64
 	subs      map[*subscriber]struct{}
+	phase     *phaseJSON // similar jobs
 }
 
 func (j *job) finalLocked() bool {
@@ -159,7 +183,7 @@ func (j *job) finalLocked() bool {
 // jsonLocked returns the job object.
 func (j *job) jsonLocked() jobJSON {
 	out := jobJSON{
-		ID: j.id, Kind: j.params.Kind, State: j.state, Move: j.params.Move,
+		ID: j.id, Library: j.libID, Kind: j.params.Kind, State: j.state, Move: j.params.Move,
 		StartedAt: j.created.Format(time.RFC3339),
 		Stats:     newStats(j.stats),
 		LogPath:   j.logPath,
@@ -170,6 +194,14 @@ func (j *job) jsonLocked() jobJSON {
 		out.Source, out.MinDimension, out.Timezone, out.NoThumbs = j.params.Source, j.params.MinDimension, j.params.Timezone, j.params.NoThumbs
 	case kindThumbs:
 		out.Rebuild, out.Limit = j.params.Rebuild, j.params.Limit
+	case kindSimilar:
+		out.Distance = j.params.Distance
+		if j.phase != nil {
+			ph := *j.phase
+			out.Progress = &ph
+		}
+	case kindRebuild:
+		out.NoThumbs = j.params.NoThumbs
 	}
 	if !j.finished.IsZero() {
 		f := j.finished.Format(time.RFC3339)
@@ -266,6 +298,26 @@ func (j *job) onProgress(s importer.Stats, sessionID int64) {
 	data := mustJSON(progressJSON{Stats: newStats(s)})
 	for sub := range j.subs {
 		select { // replace an unsent progress event: only the latest counts
+		case <-sub.progress:
+		default:
+		}
+		sub.progress <- data
+	}
+}
+
+// onPhase records a similar job's progress and sends it as a coalesced
+// progress event.
+func (j *job) onPhase(p similar.Progress) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	ph := phaseJSON{Phase: p.Phase, Items: p.Items, Bands: p.Bands, Pairs: p.Pairs}
+	j.phase = &ph
+	if j.finalLocked() {
+		return
+	}
+	data := mustJSON(ph)
+	for sub := range j.subs {
+		select {
 		case <-sub.progress:
 		default:
 		}
@@ -385,10 +437,10 @@ func (j *job) finish(state string, exitCode int, stats importer.Stats, sessionID
 	close(j.done)
 }
 
-// jobManager runs at most one job at a time and keeps the recent ones.
+// jobManager runs at most one job at a time, across all libraries, and
+// keeps the recent ones.
 type jobManager struct {
-	lib    *library.Library
-	db     *catalog.DB
+	ws     *workspace
 	ffmpeg string
 	log    *slog.Logger
 	adjust func(*importer.Options)
@@ -401,12 +453,13 @@ type jobManager struct {
 	wg      sync.WaitGroup
 }
 
-func newJobManager(lib *library.Library, db *catalog.DB, ffmpeg string, log *slog.Logger, adjust func(*importer.Options)) *jobManager {
-	return &jobManager{lib: lib, db: db, ffmpeg: ffmpeg, log: log, adjust: adjust}
+func newJobManager(ws *workspace, ffmpeg string, log *slog.Logger, adjust func(*importer.Options)) *jobManager {
+	return &jobManager{ws: ws, ffmpeg: ffmpeg, log: log, adjust: adjust}
 }
 
-// start creates and starts a job; errBusy when one is running.
-func (m *jobManager) start(p jobParams, zone *time.Location) (*job, error) {
+// start creates and starts a job on the library of e; errBusy when one
+// is running (on any library).
+func (m *jobManager) start(e *libEntry, p jobParams, zone *time.Location) (*job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -417,7 +470,7 @@ func (m *jobManager) start(p jobParams, zone *time.Location) (*job, error) {
 	}
 	m.nextID++
 	ctx, cancel := context.WithCancel(context.Background())
-	j := &job{id: m.nextID, params: p, zone: zone, created: time.Now(), ctx: ctx, cancel: cancel,
+	j := &job{id: m.nextID, entry: e, libID: e.id, params: p, zone: zone, created: time.Now(), ctx: ctx, cancel: cancel,
 		done: make(chan struct{}), state: stateQueued}
 	m.running = j
 	m.jobs = append(m.jobs, j)
@@ -461,13 +514,16 @@ func (m *jobManager) get(id int64) *job {
 	return nil
 }
 
-// list returns the kept jobs, newest first.
-func (m *jobManager) list() []*job {
+// list returns the kept jobs, newest first: all of them for a nil e,
+// else those of e's library.
+func (m *jobManager) list(e *libEntry) []*job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]*job, 0, len(m.jobs))
 	for i := len(m.jobs) - 1; i >= 0; i-- {
-		out = append(out, m.jobs[i])
+		if e == nil || m.jobs[i].entry == e {
+			out = append(out, m.jobs[i])
+		}
 	}
 	return out
 }
@@ -513,13 +569,25 @@ func (m *jobManager) run(j *job) {
 }
 
 func (m *jobManager) execute(j *job) (state string, code int, stats importer.Stats, sessionID int64, msg string) {
-	lib, err := library.Open(m.lib.Root())
+	switch j.params.Kind {
+	case kindSimilar:
+		return m.runSimilar(j)
+	case kindRebuild:
+		return m.runRebuild(j)
+	}
+	libState, h := j.entry.snapshot()
+	if libState != libOpen {
+		return stateFailed, 1, stats, 0, "library is not open"
+	}
+	lib, err := library.Open(h.lib.Root())
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	logFile, logPath, err := lib.OpenLog(j.params.Kind)
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	defer logFile.Close()
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -541,13 +609,22 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		opts.MinDimension = j.params.MinDimension
 		opts.Extractor = metadata.Default{DefaultZone: j.zone}
 		opts.NoThumbs = j.params.NoThumbs
+		// Content found in the trash is restored under the library's
+		// trash lock, and its user.db trash row removed.
+		opts.TrashLock = &j.entry.trashMu
+		opts.OnRestored = func(ctx context.Context, hash uint64) error {
+			if h.user == nil {
+				return nil
+			}
+			return h.user.Untrash(ctx, []uint64{hash})
+		}
 	} else {
 		opts.ThumbLimit = j.params.Limit
 	}
 	if m.adjust != nil {
 		m.adjust(&opts)
 	}
-	im = importer.New(lib, m.db, opts)
+	im = importer.New(lib, h.db, opts)
 	m.log.Info("job started", "id", j.id, "kind", j.params.Kind, "source", j.params.Source, "log", logPath)
 
 	var runErr error
@@ -570,25 +647,217 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 
 // outcome maps a run's result to the job state, the CLI's exit code (0;
 // 2 for per-file or thumbnail failures; 130 cancelled; 1 otherwise) and
-// the CLI's error message.
+// the error message. Messages name no paths and carry no raw OS errors:
+// they point at the job log (the job object's logPath), and the detail
+// is in that log.
 func outcome(kind string, s importer.Stats, err error, logPath, root string) (state string, code int, msg string) {
+	_ = logPath
 	var stageErr *importer.ThumbStageError
 	switch {
 	case errors.Is(err, context.Canceled):
 		return stateCancelled, 130, ""
 	case errors.As(err, &stageErr):
-		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (%v); fix the cache and run 'picmover thumbs %s'",
-			stageErr.Err, library.QuoteArg(root))
+		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (see the job log); fix the cache and run 'picmover thumbs %s'",
+			library.QuoteArg(root))
 		if s.Errors > 0 {
-			msg = fmt.Sprintf("%d files could not be imported (see %s); %s", s.Errors, logPath, msg)
+			msg = fmt.Sprintf("%d files could not be imported (see the job log); %s", s.Errors, msg)
 		}
 		return stateDone, 2, msg
 	case err != nil:
-		return stateFailed, 1, err.Error()
-	case kind == kindImport && s.Errors > 0:
-		return stateDone, 2, fmt.Sprintf("%d files could not be imported; see %s", s.Errors, logPath)
+		if msg = publicLibError(err); msg == genericLibError {
+			msg = kind + " failed; see the job log"
+		}
+		return stateFailed, 1, msg
+	case (kind == kindImport || kind == kindRebuild) && s.Errors > 0:
+		return stateDone, 2, fmt.Sprintf("%d files could not be imported; see the job log", s.Errors)
 	case s.ThumbsFailed > 0:
-		return stateDone, 2, fmt.Sprintf("thumbnails failed for %d files; see %s", s.ThumbsFailed, logPath)
+		return stateDone, 2, fmt.Sprintf("thumbnails failed for %d files; see the job log", s.ThumbsFailed)
 	}
 	return stateDone, 0, ""
+}
+
+// runSimilar runs the near-duplicate search on the job's library: a log
+// under .picmover/logs (similar_<time>.log), similar.Run, exit code 0, 130
+// when cancelled, 1 on failure.
+func (m *jobManager) runSimilar(j *job) (state string, code int, stats importer.Stats, sessionID int64, msg string) {
+	libState, h := j.entry.snapshot()
+	if libState != libOpen {
+		return stateFailed, 1, stats, 0, "library is not open"
+	}
+	lib, err := library.Open(h.lib.Root())
+	if err != nil {
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
+	}
+	logFile, logPath, err := lib.OpenLog(kindSimilar)
+	if err != nil {
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	j.setState(stateRunning, logPath)
+	m.log.Info("job started", "id", j.id, "kind", kindSimilar, "library", j.entry.id, "log", logPath)
+	res, err := similar.Run(j.ctx, h.db, j.params.Distance, j.onPhase)
+	for _, b := range res.Skipped {
+		logger.Warn("bucket skipped: too many images share a band value (flat or dark images)",
+			"band", b.Band, "value", b.Value, "size", b.Size)
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		logger.Info("similar cancelled")
+		state, code = stateCancelled, 130
+	case err != nil:
+		logger.Error("similar failed", "err", err)
+		state, code, msg = stateFailed, 1, "the search failed; see the job log"
+	default:
+		logger.Info("similar finished", "items", res.Items, "pairs", res.Pairs, "distance", res.Distance,
+			"skipped_buckets", len(res.Skipped))
+		state = stateDone
+	}
+	m.log.Info("job finished", "id", j.id, "kind", kindSimilar, "state", state, "exit_code", code)
+	return state, code, stats, 0, msg
+}
+
+// runRebuild runs "picmover rebuild" on the job's library: it closes the
+// catalog and the store (requests get 503 meanwhile; user.db stays open;
+// trash operations wait), reads the trash times from user.db, renames
+// media.db to a backup when it exists, records the files and the trash in
+// place into a new catalog, runs the thumbnail stage unless noThumbs, and
+// reopens the library. A folder without media.db, or one whose catalog is
+// unreadable, is locked and turned into a library. The library lock is
+// held throughout.
+//
+// The new catalog becomes live only when the record stage finished. A
+// failure or a cancellation before that removes the incomplete catalog
+// and renames the backup back (a folder without one becomes a folder
+// again), so the library is never left with a partial or no catalog.
+func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.Stats, sessionID int64, msg string) {
+	ctx := context.Background() // the backup and reopening are not cancelled
+	lib, user, err := m.ws.beginRebuild(ctx, j.entry)
+	if err != nil {
+		m.log.Info("rebuild not started", "id", j.id, "library", j.entry.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
+	}
+	dbPath := lib.DBPath()
+	// reopenOld ends the rebuild on the catalog that was there before (or
+	// none) after a failure that left it in place.
+	reopenOld := func(err error) (string, int, importer.Stats, int64, string) {
+		m.log.Error("rebuild failed", "id", j.id, "library", j.entry.id, "err", err)
+		if old, oerr := catalog.OpenExisting(ctx, dbPath, m.log); oerr == nil {
+			m.ws.endRebuild(ctx, j.entry, old, nil)
+		} else {
+			m.ws.endRebuild(ctx, j.entry, nil, err)
+		}
+		return stateFailed, 1, stats, 0, publicLibError(err)
+	}
+	if _, err := library.Open(lib.Root()); err != nil { // the temp and log dirs
+		return reopenOld(err)
+	}
+	logFile, logPath, err := lib.OpenLog(kindRebuild)
+	if err != nil {
+		return reopenOld(err)
+	}
+	defer logFile.Close()
+	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	j.setState(stateRunning, logPath)
+	m.log.Info("job started", "id", j.id, "kind", kindRebuild, "library", j.entry.id, "log", logPath)
+
+	// Everything that can fail without touching the catalog comes first.
+	times, err := user.TrashedAt(ctx, nil)
+	if err != nil {
+		logger.Error("read trash times", "err", err)
+		return reopenOld(err)
+	}
+	backup := ""
+	switch fi, err := os.Stat(dbPath); {
+	case err == nil && !fi.Mode().IsRegular():
+		logger.Error("rebuild refused", "err", errNotRegularCatalog)
+		return reopenOld(errNotRegularCatalog)
+	case err == nil:
+		if backup, err = library.BackupCatalog(dbPath, time.Now()); err != nil {
+			logger.Error("back up catalog", "err", err)
+			return reopenOld(err)
+		}
+		logger.Info("old catalog saved", "backup", backup)
+	case !errors.Is(err, fs.ErrNotExist):
+		return reopenOld(err)
+	}
+	// rollback undoes the backup after a failure or cancellation before
+	// the new catalog was complete.
+	rollback := func(db *catalog.DB, cause error) string {
+		if db != nil {
+			db.Close()
+		}
+		if err := library.RestoreCatalogBackup(dbPath, backup); err != nil {
+			logger.Error("restore the previous catalog", "err", err)
+			m.log.Error("rebuild: restore the previous catalog", "id", j.id, "library", j.entry.id, "err", err)
+			m.ws.endRebuild(ctx, j.entry, nil, err)
+			return "the rebuild did not finish and the previous catalog could not be restored; see the job log"
+		}
+		what := "the previous catalog was restored"
+		if backup == "" {
+			what = "the incomplete catalog was removed"
+		}
+		logger.Info("rebuild rolled back", "cause", cause, "backup", backup)
+		if backup == "" {
+			m.ws.endRebuild(ctx, j.entry, nil, cause)
+		} else if old, err := catalog.OpenExisting(ctx, dbPath, m.log); err == nil {
+			m.ws.endRebuild(ctx, j.entry, old, nil)
+		} else {
+			m.ws.endRebuild(ctx, j.entry, nil, err)
+		}
+		return what
+	}
+	db, err := catalog.Open(ctx, dbPath, logger)
+	if err != nil {
+		logger.Error("create catalog", "err", err)
+		what := rollback(nil, err)
+		return stateFailed, 1, stats, 0, publicLibError(err) + "; " + what
+	}
+	var im *importer.Importer
+	opts := importer.Options{
+		Source:           lib.Root(),
+		RecordInPlace:    true,
+		TrashTimes:       times,
+		NoThumbs:         j.params.NoThumbs,
+		Extractor:        metadata.Default{DefaultZone: time.Local},
+		Logger:           logger,
+		FFmpeg:           m.ffmpeg,
+		OnResult:         j.onResult,
+		ProgressInterval: progressInterval,
+		OnProgress: func(s importer.Stats) {
+			j.onProgress(s, im.SessionID())
+		},
+	}
+	if m.adjust != nil {
+		m.adjust(&opts)
+	}
+	im = importer.New(lib, db, opts)
+	stats, runErr := im.Run(j.ctx)
+	sessionID = im.SessionID()
+	if !im.RecordStageDone() {
+		if runErr == nil {
+			runErr = errors.New("the record stage did not finish")
+		}
+		what := rollback(db, runErr)
+		if errors.Is(runErr, context.Canceled) {
+			logger.Info("rebuild cancelled")
+			m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", stateCancelled, "exit_code", 130)
+			return stateCancelled, 130, stats, sessionID, "rebuild cancelled; " + what
+		}
+		logger.Error("rebuild failed", "err", runErr)
+		m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", stateFailed, "exit_code", 1)
+		return stateFailed, 1, stats, sessionID, publicLibError(runErr) + "; " + what
+	}
+	m.ws.endRebuild(ctx, j.entry, db, nil)
+	state, code, msg = outcome(kindRebuild, stats, runErr, logPath, lib.Root())
+	switch {
+	case state == stateCancelled:
+		logger.Info("rebuild cancelled during the thumbnail stage; the catalog is complete")
+	case runErr != nil:
+		logger.Error("rebuild failed", "err", runErr)
+	}
+	m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", state, "exit_code", code)
+	return state, code, stats, sessionID, msg
 }

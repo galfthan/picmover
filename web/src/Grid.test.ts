@@ -40,9 +40,14 @@ function allItems(): MediaItem[] {
 
 async function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = new URL(String(input), 'http://127.0.0.1:7439');
-  const path = url.pathname;
-  requests.push(`${init?.method ?? 'GET'} ${path}${url.search}`);
+  requests.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`);
   const q = url.searchParams;
+  if (url.pathname === '/api/libraries') {
+    return json({ root: '/home/me/Photos', mode: 'single', libraries: [{ id: 'Photos', name: 'Photos', path: '/home/me/Photos', state: 'open' }], folders: [] });
+  }
+  if (url.pathname === '/api/l/Photos/tags') return json({ tags: [] });
+  if (url.pathname === '/api/l/Photos/albums') return json({ albums: [] });
+  const path = url.pathname.startsWith('/api/l/Photos/') ? '/api/' + url.pathname.slice('/api/l/Photos/'.length) : url.pathname;
   if (path === '/api/library') {
     return json({
       root: '/home/me/Photos',
@@ -145,7 +150,7 @@ async function go(hash: string) {
 async function closeViewer() {
   window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
   await settle();
-  for (let i = 0; i < 20 && location.hash.startsWith('#/view/'); i++) await vi.advanceTimersByTimeAsync(10);
+  for (let i = 0; i < 20 && location.hash.includes('/view/'); i++) await vi.advanceTimersByTimeAsync(10);
   await settle();
 }
 
@@ -155,7 +160,7 @@ const isInert = (sel: string) => {
 };
 const tiles = () => [...document.querySelectorAll<HTMLAnchorElement>('a.tile')];
 const placeholders = () => document.querySelectorAll('.canvas .ph').length;
-const mediaRequests = () => requests.filter((r) => r.startsWith('GET /api/media?'));
+const mediaRequests = () => requests.filter((r) => r.startsWith('GET /api/l/Photos/media?'));
 
 // Layout constants of Grid.svelte, with the fake 1000 px wide scroller.
 const layout = (b: TimelineBucket[], width = 1000) =>
@@ -213,7 +218,7 @@ describe('grid', () => {
     expect(placeholders()).toBe(3);
 
     // Same buckets under the new filter; the first fetch is now stale.
-    await go('#/?gps=1');
+    await go('#/l/Photos/?gps=1');
     open();
     gate = null;
     await settle();
@@ -242,7 +247,7 @@ describe('grid', () => {
     media.set('2024-7', july);
     media.set('2023-1', [item(10, '2023-01-01T10:00:00')]);
     await start();
-    expect(tiles().map((t) => t.getAttribute('href'))).toEqual([...july.map((x) => `#/view/${x.id}`), '#/view/10']);
+    expect(tiles().map((t) => t.getAttribute('href'))).toEqual([...july.map((x) => `#/l/Photos/view/${x.id}`), '#/l/Photos/view/10']);
     expect(placeholders()).toBe(0);
     const expected = layout([{ year: 2024, month: 7, count: 7 }, { year: 2023, month: 1, count: 1 }]);
     expect(expected.buckets[0]?.rows).toBe(2); // the patched bucket really grew a row
@@ -253,15 +258,15 @@ describe('grid', () => {
     // The viewer walks the extra items and crosses into the next bucket.
     tiles()[6]!.click();
     await settle();
-    expect(location.hash).toBe('#/view/26');
+    expect(location.hash).toBe('#/l/Photos/view/26');
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     await settle();
-    expect(location.hash).toBe('#/view/10');
+    expect(location.hash).toBe('#/l/Photos/view/10');
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft' }));
     await settle();
-    expect(location.hash).toBe('#/view/26');
+    expect(location.hash).toBe('#/l/Photos/view/26');
     await closeViewer();
-    expect(document.activeElement?.getAttribute('href')).toBe('#/view/26');
+    expect(document.activeElement?.getAttribute('href')).toBe('#/l/Photos/view/26');
   });
 
   it('zooms with many small ctrl+wheel deltas (trackpad pinch)', async () => {
@@ -323,10 +328,10 @@ describe('grid', () => {
     media.set('2024-7', [item(3, '2024-07-14T10:00:00', { thumbAt: 100 }), item(2, '2024-07-02T10:00:00'), item(1, '2024-07-01T10:00:00')]);
     jobList = [{ id: 4, kind: 'thumbs', state: 'running', startedAt: '2026-10-10T12:00:00+03:00', finishedAt: null, stats: {}, error: null }];
     await start();
-    const img3 = () => document.querySelector<HTMLImageElement>('a.tile[href="#/view/3"] img');
-    const img2 = () => document.querySelector<HTMLImageElement>('a.tile[href="#/view/2"] img');
-    expect(img3()?.getAttribute('src')).toBe('/api/thumb/0000000000000003?v=100');
-    expect(img2()?.getAttribute('src')).toBe('/api/thumb/0000000000000002');
+    const img3 = () => document.querySelector<HTMLImageElement>('a.tile[href="#/l/Photos/view/3"] img');
+    const img2 = () => document.querySelector<HTMLImageElement>('a.tile[href="#/l/Photos/view/2"] img');
+    expect(img3()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003?v=100');
+    expect(img2()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000002');
 
     // Both 404 while the job is running.
     img3()!.dispatchEvent(new Event('error'));
@@ -342,10 +347,10 @@ describe('grid', () => {
     es.emit('done', { ...(jobList[0] as object), state: 'done', finishedAt: '2026-10-10T12:01:00+03:00' });
     await settle();
     expect(mediaRequests().length).toBeGreaterThan(before);
-    expect(img3()?.getAttribute('src')).toBe('/api/thumb/0000000000000003?v=200');
+    expect(img3()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003?v=200');
     expect(requests.some((r) => r.includes('retry='))).toBe(false);
     // No thumbAt: one more try at the same URL, and only one.
-    expect(img2()?.getAttribute('src')).toBe('/api/thumb/0000000000000002');
+    expect(img2()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000002');
     img2()!.dispatchEvent(new Event('error'));
     await settle();
     expect(img2()).toBeNull();
@@ -361,7 +366,7 @@ describe('grid', () => {
     expect(document.activeElement).toBe(lb);
     lb.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
     await settle();
-    expect(location.hash).toBe('#/view/3');
+    expect(location.hash).toBe('#/l/Photos/view/3');
     // The page behind is inert and its shortcuts are off.
     // (jsdom has no inert semantics; Svelte sets the property.)
     expect(isInert('main')).toBe(true);
@@ -385,14 +390,14 @@ describe('grid', () => {
     // An item without a possible thumbnail does not request one.
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
     await settle();
-    expect(location.hash).toBe('#/view/2');
+    expect(location.hash).toBe('#/l/Photos/view/2');
     expect(document.querySelector('.lightbox img.blur')).toBeNull();
-    expect(document.querySelector('.lightbox img.preview')?.getAttribute('src')).toBe('/api/preview/0000000000000002');
+    expect(document.querySelector('.lightbox img.preview')?.getAttribute('src')).toBe('/api/l/Photos/preview/0000000000000002');
 
     await closeViewer();
     expect(document.querySelector('.lightbox')).toBeNull();
     expect(isInert('main')).toBe(false);
     // Focus goes to the tile of the item shown last, not to <body>.
-    expect(document.activeElement?.getAttribute('href')).toBe('#/view/2');
+    expect(document.activeElement?.getAttribute('href')).toBe('#/l/Photos/view/2');
   });
 });

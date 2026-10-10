@@ -39,6 +39,14 @@ type DB struct {
 // catalog is derived from the files and is rebuilt instead.
 var ErrNeedsRebuild = errors.New("catalog format changed; run 'picmover rebuild <library>'")
 
+// ErrNewerSchema is wrapped, next to ErrNeedsRebuild, when the catalog was
+// written by a newer picmover.
+var ErrNewerSchema = errors.New("catalog written by a newer picmover")
+
+// ErrNotCatalog is returned (wrapped) when the file is not a picmover
+// catalog at all.
+var ErrNotCatalog = errors.New("not a picmover catalog")
+
 // Open opens the catalog at path, creating it with schema SchemaVersion when
 // the file is missing, empty, or has user_version 0 and no media table. Any
 // other schema version is refused with an error wrapping ErrNeedsRebuild,
@@ -68,7 +76,28 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 		d.Close()
 		return nil, err
 	}
+	if err := d.ensureDerived(ctx); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+// ensureDerived creates the derived tables (similar_pairs, meta) when
+// absent. Cheap when they exist: no write happens.
+func (d *DB) ensureDerived(ctx context.Context) error {
+	var n int
+	if err := d.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('similar_pairs', 'meta')`).Scan(&n); err != nil {
+		return fmt.Errorf("catalog: inspect schema: %w", err)
+	}
+	if n == 2 {
+		return nil
+	}
+	if _, err := d.ExecContext(ctx, derivedTables); err != nil {
+		return fmt.Errorf("catalog: create derived tables: %w", err)
+	}
+	return nil
 }
 
 // OpenExisting opens the catalog at path like Open but never creates it. It
@@ -103,6 +132,9 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	if err == nil {
 		err = checkSchema(path, v, hasMedia, false)
 	}
+	if err == nil {
+		err = d.ensureDerived(ctx)
+	}
 	if err != nil {
 		d.Close()
 		return nil, err
@@ -120,10 +152,10 @@ func checkSchema(path string, v int, hasMedia, allowFresh bool) error {
 		if allowFresh {
 			return nil
 		}
-		return fmt.Errorf("catalog: %s is not a picmover catalog (no schema)", path)
+		return fmt.Errorf("catalog: %s is not a picmover catalog (no schema): %w", path, ErrNotCatalog)
 	case v > SchemaVersion:
-		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d (upgrade picmover): %w",
-			path, v, SchemaVersion, ErrNeedsRebuild)
+		return fmt.Errorf("catalog: %s has schema version %d, newer than the supported version %d (upgrade picmover): %w (%w)",
+			path, v, SchemaVersion, ErrNeedsRebuild, ErrNewerSchema)
 	}
 	return fmt.Errorf("catalog: %s has schema version %d, want %d: %w", path, v, SchemaVersion, ErrNeedsRebuild)
 }
