@@ -240,7 +240,7 @@ func TestMakePlanClasses(t *testing.T) {
 		{RelPath: "e.xmp", Hash: 55, Size: 5, MTime: 100},
 		{RelPath: "f.txt", Hash: 66, Size: 6, MTime: 199},
 		{RelPath: "a.jpg2", Hash: 9, Size: 1},
-		{RelPath: "gone.jpg", Hash: 99, Size: 1000},      // extra
+		{RelPath: "gone.jpg", Hash: 99, Size: 1000},       // extra
 		{RelPath: "trashed-elsewhere", Hash: 50, Size: 1}, // not extra: the catalog has the hash
 		{RelPath: "e-copy.xmp", Hash: 55, Size: 5},        // not extra: e.xmp has the hash
 	}
