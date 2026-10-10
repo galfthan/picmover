@@ -479,9 +479,12 @@ mode: also any listed folder), or the library root (single mode); then
   bookkeeping: `System Volume Information`, `$RECYCLE.BIN`, `lost+found`,
   `.Trashes`, `.Trash-*`, `.Spotlight-V100`, `.fseventsd`, `.DS_Store`,
   `desktop.ini`, `Thumbs.db`, `._*`), `CheckSeparate`.
-- `set.go`: `backup.db` exactly as in the contract (journal_mode DELETE,
-  synchronous FULL, busy_timeout 10 s); `meta` keys `name`, `library_id`,
-  `scrub_cursor`. `OpenSet`, `Sets`, `SetExists`, `FindSet` (by
+- `set.go`: `backup.db` as in the contract (journal_mode DELETE,
+  synchronous FULL, busy_timeout 10 s) except `files.mtime_ns` (the
+  source mtime in nanoseconds, instead of `mtime` in seconds) and a
+  `counts` table kept by triggers (see "Review fixes (resumability and
+  performance)"); `meta` keys `name`, `library_id`, `scrub_cursor`.
+  `OpenSet`, `Sets`, `SetExists`, `FindSet` (by
   library_id), `SetOwner`, `ResolveSetName`, `Claim` (see "Review fixes
   (file safety)" for ownership and instances), `Files`,
   `Summary`, `Runs`, `LastRun`. Rows whose path is not a set path (empty,
@@ -572,12 +575,14 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
   136k files on the target); a file deleted from the target is found by the
   next scrub (listed as missing, and copied again with repair).
 - **Scrub passes.** The cursor (`meta.scrub_cursor` = `{pass, v, p}`) keeps
-  a pass's position in `(coalesce(verified_at, -1), rel_path)` order;
-  rows verified at or after the pass start are left for the next pass. A
-  new pass starts one second after "now" (verified_at has second
-  resolution), so a pass started right after another reads everything
-  again. A scrub reads at least one file whatever the budget. Missing and
-  unknown files are found by walking the set on every scrub.
+  a pass's position in `(v, rel_path)` order, where `v` is `verified_at`,
+  or -1 when it is NULL or in the future; rows with `v` at or after the
+  pass start are left for the next pass. A new pass starts "now", or one
+  second later when rows were verified in this very second (verified_at
+  has second resolution), so a pass started right after another still
+  reads everything and a row is never read twice in one pass. A scrub
+  reads at least one file whatever the budget. Missing and unknown files
+  are found by walking the set on every scrub.
 - **Prune** removes folders its removals left empty (not the set,
   `.picmover`, `previous` or the trash folder itself). Unknown files (no
   row) are never pruned. A row whose file is already gone is dropped and
@@ -587,6 +592,8 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
   --dry-run` and plain `scrub` take none. In the server the job runs under
   the server's lock; trash operations are not blocked during a backup (a
   file moved meanwhile fails or is picked up as moved by the next run).
+  **The set lock** (`<set>/.picmover/lock`) is held by every backup, scrub,
+  prune and restore (not by dry runs), see below.
 - **CLI additions:** `--quiet` (no status line) on backup, scrub and
   restore; `--dry-run` and `--thumbs` (generate thumbnails in the rebuild
   after a restore) on `restore`; `prune <library> <target>` takes a folder
@@ -611,8 +618,8 @@ that reproduces the original failure: `internal/backup/review_fixes_test.go`,
   (the `InitTarget` list) and possibly an empty `.picmover`:
   `ErrLibraryFolder` ("the folder for this backup set on the target is a
   picmover library, not a backup set; choose another set name") when it
-  holds `media.db`, `user.db` or `.picmover/lock` (the lock is refused
-  even in a set), `ErrNotSetFolder` ("... already exists on the target
+  holds `media.db`, `user.db` or `.picmover/lock` (a set has its own
+  `.picmover/lock`, see the next section), `ErrNotSetFolder` ("... already exists on the target
   and is not a picmover backup set; choose another set name or move the
   folder away") otherwise. `CheckSetFolder` exposes the check:
   `targets add` (CLI and `POST .../targets`, 409) and the job checks use
@@ -756,6 +763,93 @@ that reproduces the original failure: `internal/backup/review_fixes_test.go`,
   ownership: a dry run writes nothing); `CheckSeparate` refusals match
   `ErrNotSeparate` and their path-free texts reach clients; plan, job and
   listing errors for these cases are 409, not 500.
+
+### Review fixes (resumability and performance)
+
+From the second backend review of step 5 (plan, resumability,
+concurrency, performance: H1, M1-M6, L1-L7). Tests:
+`internal/backup/review_resume_test.go`,
+`internal/server/backup_resume_test.go`, `cmd/backup_resume_test.go`,
+`internal/userdata/contenthash_test.go`, and updated cases in the
+existing tests.
+
+- **H1: set lock.** Every backup, scrub, prune and restore (not dry
+  runs) takes `<set>/.picmover/lock`, the same OS lock as the library's
+  (flock / LockFileEx, `library.LockFile`, released when the process
+  ends; the holder writes `pid=... cmd=... since=... host=...`). A
+  second one is refused with a `*library.ErrLocked`: "the backup set is
+  in use by another picmover process (pid N, scrub, on <host>, since
+  <time>)" (CLI exit 2; job checks 409 through `backup.SetBusy`; a job
+  that meets it fails with exit 2). A planted link or folder at the lock
+  name is refused. When the file system cannot lock, the run goes on
+  without the lock, like the library lock; a restore from a read-only
+  target also goes on without it. A `.picmover/lock` in a folder that
+  has `.picmover/backup.db` is the set lock; without `backup.db` it still
+  marks a library (H1 of the file-safety review). `ensureSchema` reads
+  `user_version` outside any transaction and takes the write lock only
+  to create the schema. `OpenSetReadOnly` opens `backup.db` with SQLite
+  `mode=ro`: the listing, the plan, the runs, the owner checks and
+  restore use it, so a GET never waits for a writer's transaction
+  (measured in the test: a reader opens and reads while another
+  connection holds BEGIN IMMEDIATE).
+- **M1.** A moved file whose old copy is gone from the target is copied
+  again (or adopted, after a run killed between the rename and its row)
+  and the row at the old path is dropped in the same batch. A row whose
+  path the library lacks and whose content another row at a library
+  path already holds is an extra (a redundant copy), so prune removes
+  leftovers from before this fix.
+- **M2.** A changed file whose destination already holds the new content
+  (a run killed after the rename into place) is adopted (`adopted`) and
+  its staged copy dropped; a correct copy never goes to `previous/`.
+- **M3.** Scrub writes `verified_at` (and damage) with the cursor in one
+  transaction per 64 rows or 5 s, and once at the end (also when
+  cancelled or out of budget); a damaged row is written before its
+  repair rewrites it. Measured on the review's 4,500-file set: a full
+  scrub 1.1 s (was about 50 s at 84 files/s).
+- **M4.** As M3 of the file-safety review (collisions).
+- **M5.** Restore opens the set read-only and works from a
+  write-protected target: the runs row and the set log are written when
+  they can be (a writable handle is opened for the runs row), skipped
+  otherwise. Taking over (`takeOver`) on a restore only skips the
+  instance check; a restore records no owner.
+- **M6.** Copies keep their fsync and read-back, but the folder of each
+  copy or rename is synced once per row batch, just before the batch's
+  rows are committed (`library.CopyReadBackDeferSync`), so a row still
+  only exists for a durable file. Measured on the same set: first backup
+  of 4,500 small files 12.7 s (about 350 files/s, was 77).
+- **L1.** A `verified_at` in the future (a machine with a fast clock)
+  counts as never verified in the scrub order and is overwritten when
+  read. **L2.** A new pass starts at "now" unless rows were verified in
+  this very second (then one second later), and the queue excludes rows
+  verified at or after the pass start, so a file verified in a pass's
+  first second is not read again in that pass.
+- **L3.** Snapshots are written only when their content changed. The
+  media.db snapshot is made (VACUUM INTO) and compared by hash with the
+  one recorded in set meta (`media_snapshot_hash`); `user.db` is compared
+  before any VACUUM by `userdata.ContentHash` (every row of every table,
+  ignoring `backup_targets.last_backup_at`/`last_scrub_at`, which each
+  backup itself changes), recorded as `user_content_hash`. In both cases
+  the snapshot on the target must still hash as recorded; otherwise it is
+  written again. Run stats gain `userSnapshotUnchanged` and
+  `mediaSnapshotUnchanged`. Measured: a no-op backup of the 4,500-file
+  set 0.08 s, nothing added to `previous/`.
+- **L4.** A backup, scrub, prune or restore that holds the set lock
+  first marks runs rows left with `finished_at` NULL (killed runs) as
+  finished at their start time with `"interrupted": true` in their stats.
+- **L5.** `backup.db` keeps `counts(files, bytes, unverified)` up to date
+  with triggers on `files` (insert, delete, update of size or
+  verified_at); `Set.Summary` reads that row instead of scanning.
+- **L6.** `backup --dry-run` writes nothing: no library lock, `user.db`
+  opened read-only (`userdata.OpenReadOnly`, `mode=ro`, reading its WAL)
+  and never created or migrated ("Note: user.db has schema version 1 and
+  would be upgraded ..." / "the library has no user.db yet ..." is
+  printed instead), the instance peeked at (`PeekIdentity`), a target
+  folder given on the command line not attached, no set name stored, no
+  set created or claimed. The server's GET routes and job checks also
+  only peek at the instance; a job records it.
+- **L7.** `files.mtime_ns` stores the source mtime in nanoseconds and
+  non-media files match on size and that, so an edit of the same size in
+  the same second as the backup is noticed.
 
 ### Tests
 
