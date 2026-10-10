@@ -215,7 +215,8 @@ func (l *Library) IsInternal(abs string) bool {
 
 // IsDatabaseName reports whether base, a file name, is one of a library's
 // databases, compared case-insensitively: media.db and user.db with their
-// -wal, -shm and -journal files, and the catalog backups. The importer
+// -wal, -shm and -journal files, the catalog backups and the user.db
+// copies made before a migration (IsUserDBBackup). The importer
 // skips such files wherever they lie in a source (another library's
 // catalog is never imported).
 func IsDatabaseName(base string) bool {
@@ -225,7 +226,24 @@ func IsDatabaseName(base string) bool {
 		UserDBName, UserDBName + "-wal", UserDBName + "-shm", UserDBName + "-journal":
 		return true
 	}
-	return isBackupName(base)
+	return isBackupName(base) || IsUserDBBackup(base)
+}
+
+// IsUserDBBackup reports whether base is a copy of user.db made before a
+// schema migration: user.db.bak-YYYYMMDD-HHMMSS, optionally followed by
+// -wal, -shm or -journal (compared case-insensitively).
+func IsUserDBBackup(base string) bool {
+	ts, ok := strings.CutPrefix(strings.ToLower(base), UserDBName+".bak-")
+	if !ok {
+		return false
+	}
+	for _, s := range []string{"-wal", "-shm", "-journal"} {
+		if t, ok := strings.CutSuffix(ts, s); ok {
+			ts = t
+			break
+		}
+	}
+	return isBackupStamp(ts)
 }
 
 // isBackupName matches the catalog backups written by "picmover rebuild",
