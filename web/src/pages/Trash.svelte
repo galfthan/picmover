@@ -2,6 +2,7 @@
   // #/l/<id>/trash: the grid in trash mode. Tiles say when they were
   // deleted; the selection bar has Restore and Delete permanently; Empty
   // trash asks for the number of files to be typed.
+  import { untrack } from 'svelte';
   import { errorMessage, type Filters, type LibApi } from '../lib/api';
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
@@ -19,6 +20,11 @@
   }
   let { api, filters, viewId }: Props = $props();
 
+  // The count comes from the library summary; make it current on arrival.
+  $effect(() => {
+    void api.id;
+    untrack(() => void library.load());
+  });
   const count = $derived(library.trashed);
   let confirming = $state(false);
   let typed = $state('');

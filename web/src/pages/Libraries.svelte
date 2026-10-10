@@ -172,7 +172,7 @@
                 <span class="mono path">{l.path}</span>
                 {#if l.summary}
                   <span class="counts muted small">
-                    {formatCount(l.summary.images + l.summary.raw)} photos · {formatCount(l.summary.videos)} videos{#if span(l)}&nbsp;· {span(l)}{/if}
+                    {formatCount(l.summary.images + l.summary.raw)} photos · {formatCount(l.summary.videos)} videos{span(l) ? ` · ${span(l)}` : ''}
                   </span>
                 {/if}
               </span>

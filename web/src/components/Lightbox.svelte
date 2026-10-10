@@ -88,6 +88,8 @@
   // (the grid scrolls it into view), else the element that opened the
   // viewer, else the page's main scroll area; never leave it on <body>.
   $effect(() => {
+    // Props must not be read once the component is gone: take the library now.
+    const lib = untrack(() => api.id);
     untrack(() => dialog?.focus({ preventScroll: true }));
     return () => {
       const shown = lastId;
@@ -96,7 +98,7 @@
           const ae = document.activeElement;
           if (ae && ae !== document.body && ae.isConnected) return; // something else took focus
           const target =
-            document.querySelector<HTMLElement>(`a[href="${viewerHref(api.id, shown)}"]`) ??
+            document.querySelector<HTMLElement>(`a[href="${viewerHref(lib, shown)}"]`) ??
             (opener?.isConnected ? opener : null) ??
             document.querySelector<HTMLElement>('[data-focus-return], .leaflet-container');
           target?.focus({ preventScroll: true });
