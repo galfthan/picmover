@@ -813,11 +813,15 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
 ### Shapes relied on
 
 - `GET /api/libraries` → `{root, mode, libraries, folders}`; a folder's id
-  is its `name`. `POST /api/libraries/{id}/open`: 200 → the lib object
-  (state taken as `open` when empty); 409 → `body.holder` `{pid, cmd,
-  since}` with `since` an RFC 3339 instant; 503 → rebuilding; 404 → the
-  listing is reloaded. `POST /api/libraries` → 201 lib (state `closed`),
-  which the client then opens.
+  is its `name` (the server also sends `id` and `state: "folder"`).
+  `POST /api/libraries/{id}/open`: 200 → the lib object (state taken as
+  `open` when empty); 409 is read by its `state`: `busy` → `body.holder`
+  `{pid, cmd, since}` with `since` a wall-clock string in the server's
+  zone, shown as a local time (busy gate with Retry); `error` → the
+  server's message (error gate with Rebuild); `folder` → the listing is
+  reloaded; a 409 without `state` is treated as busy. 503 → rebuilding;
+  404 → the listing is reloaded. `POST /api/libraries` → 201 lib (state
+  `open`); the client still sends an open, which answers 200 again.
 - A library-scoped answer counts as "not open" only when it is 409 **and**
   carries a string `state` (409 without `state`, e.g. "another job is
   running" or a tag rename conflict, is an ordinary error); 503 counts as
@@ -848,18 +852,21 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   1000 in the create body, the rest through `…/albums/{aid}/items`.
   `…/albums/{aid}/items` chunks `add` and `remove` separately; the last
   `count` wins. Trash, restore and delete sum their counts and concatenate
-  `failed`. `similar/ignore` is not chunked (the server ignores pairs
-  *within* one call; a group is far below the cap). Empty trash sends
+  `failed`. "Ignore group" sends `similar/ignore {group: <hash>}` (any
+  hash of the group; the server ignores the whole current group, of any
+  size), one call per group. Empty trash sends
   `{all: true, confirm: true}`; per-item deletes always send `confirm:
   true`.
-- `/api/l/{id}/library`: the trash count in the nav is `userdb.trashed`,
-  falling back to `summary.deleted`; the Library page shows the `userdb`
+- `/api/l/{id}/library`: the trash count (nav, Trash header, Empty trash
+  and its typed count) is `summary.deleted`, the catalog rows the trash
+  page lists and `all: true` deletes; the Library page shows the `userdb`
   counts and `similar.pairs`.
 - Album `cover` is a hash or null and is shown through the scoped
   `thumb` endpoint.
-- Library cards use `GET /api/libraries/{id}/cover` (`libraryCoverUrl`):
-  a JPEG thumbnail for a library in any readable state, 404 when there is
-  none, cached by its ETag.
+- Library cards use `GET /api/libraries/{id}/cover?v=<cover hash>`
+  (`libraryCoverUrl`): a JPEG thumbnail for a library in any readable
+  state, 404 when there is none. The `v` parameter makes a new cover item
+  a new URL despite `max-age=3600`.
 
 ### Deviations and additions
 
@@ -890,8 +897,12 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
 - Date filter: the Range tab edits the inclusive last day (the URL keeps
   the exclusive `to`); editing it clears `recur`. The Every-year tab's
   month/day selects start at today until changed; its year limits are
-  whole years (`from=YYYY-01-01`, `to=` the next Jan 1). The step 3 year
-  selects moved into this panel.
+  whole years (`from=YYYY-01-01`, `to=` the next Jan 1). Changing one
+  limit keeps the other bound as it is (a day bound is shown as that day
+  in its select, not "Any"); limits that would cross move the other one to
+  the same year. The summary uses years only when every bound is a whole
+  year, else days on both sides. The step 3 year selects moved into this
+  panel.
 - `hasFilters` ignores what the page implies (the album page's `album`,
   the trash page's `trashed`), so their empty states and Clear button
   behave like the grid's.
@@ -900,14 +911,16 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   bytes, Windows device names) before the request.
 - "Set cover from selection" needs exactly one selected item.
 - Duplicates: the default Keep is the item with the most pixels, then the
-  larger file. Page size 50. Items trashed elsewhere (the lightbox) leave
-  their group; a group under two items disappears.
+  larger file. Page size 50. A handled group (trashed, ignored) or items
+  trashed elsewhere (the lightbox) leave the page at once, and the page is
+  then fetched again from the server so later groups move up; the empty
+  text shows only when the server's `total` is 0.
 - The Library page gained a "Your data" card: the `user.db` path and the
   user data counts with links (rated, albums, trash, duplicates).
 
 ### Tests
 
-`make web-check`: svelte-check (0 errors, 0 warnings), 123 vitest tests in
+`make web-check`: svelte-check (0 errors, 0 warnings), 139 vitest tests in
 16 files, plus `npm run build`.
 
 - `lib/routes.test.ts`: every route under `#/l/<id>/`, id decoding and
@@ -918,7 +931,7 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   months skipped and counted, toggle without anchor, scope clearing,
   removal of hashes and the anchor.
 - `lib/dates.test.ts`: `recur` parsing incl. `02-29` and wrapping ranges,
-  malformed values, canonical serialization, `inRecur`, presets (incl.
+  malformed values, canonical serialization, presets (incl.
   This month in February = `02-01..02-29`), real-day checks, inclusive /
   exclusive conversions, year ranges, summaries.
 - `lib/filters.test.ts`: the new query parameters, repeated `tag`,
@@ -953,3 +966,60 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   date presets, range, rating, tag and album filters in the URL and the
   requests), and the step 3 `App.test.ts` / `Grid.test.ts` moved under
   `#/l/<id>/`.
+
+### Review fixes (frontend)
+
+After review C (frontend and integration). The fake server
+(`testing/fakes.ts`) now sends the real shapes: open answers 409 `{error,
+state: "busy", holder}`, `{error, state: "error"}` and `{error, state:
+"folder"}`, 503 while rebuilding; `holder.since` is a wall-clock string;
+`POST /api/libraries` answers `state: "open"`; folders carry `id` and
+`state`; `summary.deleted` counts the trash; restore reports `failed`;
+similar groups are paginated and ignored by group.
+
+- **Enter on a duplicate thumbnail** opens the viewer; the group's Enter
+  (trash the others) acts only on the row itself or a Keep radio
+  (`Management.test.ts` "reviews near-duplicates").
+- **Open 409 by `state`**: `error` shows the server's reason with Rebuild,
+  `folder` reloads the listing, `busy` shows the holder with Retry
+  (`libraries.test.ts`, `Libraries.test.ts` "shows the reason when opening
+  fails with state error"). `holderText` formats the wall-clock `since`.
+- **Trash count** from `summary.deleted` everywhere (nav, header, Empty
+  trash, typed count), not `userdb.trashed` (trash page test with
+  `userdb.trashed` 0 and one catalog row in the trash).
+- **Duplicates pagination**: the current page is fetched again after a
+  group is handled or items are trashed elsewhere; the empty text needs
+  `total` 0; an emptied last page moves back (`Management.test.ts` "pages
+  through duplicates with the server").
+- **Ignore group** sends `{group: <hash>}` (`LibApi.ignoreSimilarGroup`);
+  the `hashes` form is gone from the client (`api.test.ts`, the
+  pagination test).
+- **Undo** of a trash (selection bar, lightbox, duplicates) goes through
+  `undoTrash`, which shows restore failures (`failed`) and request errors
+  as an error toast ("says so when Undo cannot restore").
+- **Library counts**: `library.load()` while a load is in flight loads
+  once more after it, so a write made meanwhile is reflected ("reloads the
+  library counts after a write made while a load was in flight").
+- **Empty trash** clears the selection; a Shift-clicked checkbox of a tile
+  that stays selected shows checked; the selection bar's error is cleared
+  with the selection (three tests in `Management.test.ts`).
+- **Similar job phase**: a job object's `progress` (listings, state and
+  done events) becomes `job.phase` (`jobs.test.ts`).
+- **Gates poll**: the error, folder and rebuilding gates reload the
+  listing every 10 s and watch the jobs ("keeps a gate current when a
+  rebuild starts elsewhere").
+- **Library covers** are `…/cover?v=<cover hash>`.
+- **Date filter** year limits keep the other bound, show a day bound as
+  that day, never cross; the summary is in days unless every bound is a
+  whole year (`dates.test.ts`, "keeps an existing day bound when a year
+  limit changes").
+- **Dialog**: rendered at the end of `<body>` with its siblings inert while
+  open; when the focused control becomes disabled, focus moves to the
+  dialog; Escape and Tab that reach the window from outside it are handled
+  by the topmost dialog ("keeps focus in a dialog whose focused button is
+  disabled").
+- **Removed** unused client code: `pagePath`, `inRecur` (with `wraps` and
+  `yearRange`, unused after the date filter change), `LibApi.listJobs`,
+  `createTag`, `renameTag`, `deleteTag`, and their tests.
+- Album counts and covers that include trashed members (review L6) are a
+  backend fix; the client shows what the server answers.
