@@ -2,10 +2,15 @@ package backup
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 
 	"picmover/internal/catalog"
 	"picmover/internal/library"
@@ -17,7 +22,7 @@ type Entry struct {
 	Hash      uint64
 	HashKnown bool // media (from the catalog), or a non-media file matched by size and mtime
 	Size      int64
-	MTime     int64 // Unix seconds; 0 for media (not stat'ed by the scan)
+	MTime     int64 // Unix nanoseconds; 0 for media (not stat'ed by the scan)
 	Media     bool
 	Trashed   bool
 }
@@ -29,9 +34,40 @@ type Scan struct {
 	Symlinks []string // set paths of symbolic links (never followed, never backed up)
 	Missing  []string // catalog rows whose file is not in the library
 	Invalid  []string // catalog rows whose path is not a library path
+	// Errors are the folders (and files) the walk could not read: their
+	// files are not in Entries, so the scan is incomplete.
+	Errors []Failure
+	// Collisions are files whose path differs from another file's only
+	// in letter case or Unicode normalization: a backup set (NOCASE rows,
+	// and targets that ignore case or normalization) cannot hold both.
+	// The first path in byte order of each group is backed up; the others
+	// are listed here and not in Entries.
+	Collisions []Collision
+	// Collided are the entries of Collisions: not backed up, but still
+	// the library's (prune must not remove their earlier copies).
+	Collided []Entry
 	// CatalogHashes are the content hashes of every catalog row, live or
 	// trashed.
 	CatalogHashes map[uint64]struct{}
+}
+
+// Collision is a file left out because another file's path differs from
+// it only in letter case or Unicode normalization.
+type Collision struct {
+	Path  string `json:"path"`
+	Other string `json:"other"` // the path that is backed up
+}
+
+// collisionKey folds a set path the way a case- and
+// normalization-insensitive file system compares it.
+func collisionKey(rel string) string {
+	return strings.ToLower(norm.NFC.String(rel))
+}
+
+// collisionFailure is the failure of a file left out by a collision.
+func collisionFailure(c Collision) Failure {
+	return Failure{Path: c.Path, Error: fmt.Sprintf("the name differs from %s only in upper/lower case or Unicode form; "+
+		"a backup cannot hold both: rename one of them", c.Other)}
 }
 
 // ScanLibrary walks the library: the catalog rows (newest first, the copy
@@ -73,7 +109,12 @@ func ScanLibrary(ctx context.Context, lib *library.Library, rows []catalog.PathR
 			if p == root {
 				return err
 			}
-			// An unreadable folder or a file that vanished: skip it.
+			// A file that vanished meanwhile is not an error; an
+			// unreadable folder (or file) makes the scan incomplete.
+			if !errors.Is(err, fs.ErrNotExist) {
+				rel, _ := filepath.Rel(root, p)
+				sc.Errors = append(sc.Errors, Failure{Path: filepath.ToSlash(rel), Error: PublicError(err)})
+			}
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
 			}
@@ -118,7 +159,7 @@ func ScanLibrary(ctx context.Context, lib *library.Library, rows []catalog.PathR
 		if err != nil || !fi.Mode().IsRegular() {
 			return nil
 		}
-		other = append(other, Entry{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().Unix(), Trashed: inTrash})
+		other = append(other, Entry{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Trashed: inTrash})
 		return nil
 	})
 	if err != nil {
@@ -141,7 +182,40 @@ func ScanLibrary(ctx context.Context, lib *library.Library, rows []catalog.PathR
 		return strings.Compare(a.Rel, b.Rel)
 	})
 	sc.Entries = append(sc.Entries, other...)
+	sc.dropCollisions()
 	return sc, nil
+}
+
+// dropCollisions moves every entry whose collisionKey another entry has
+// (all but the first path in byte order) to Collided and Collisions.
+func (sc *Scan) dropCollisions() {
+	first := make(map[string]string, len(sc.Entries))
+	clash := false
+	for _, e := range sc.Entries {
+		k := collisionKey(e.Rel)
+		if f, ok := first[k]; !ok || e.Rel < f {
+			if ok {
+				clash = true
+			}
+			first[k] = e.Rel
+		} else {
+			clash = true
+		}
+	}
+	if !clash {
+		return
+	}
+	kept := sc.Entries[:0]
+	for _, e := range sc.Entries {
+		if f := first[collisionKey(e.Rel)]; f != e.Rel {
+			sc.Collided = append(sc.Collided, e)
+			sc.Collisions = append(sc.Collisions, Collision{Path: e.Rel, Other: f})
+			continue
+		}
+		kept = append(kept, e)
+	}
+	sc.Entries = kept
+	sort.Slice(sc.Collisions, func(i, j int) bool { return sc.Collisions[i].Path < sc.Collisions[j].Path })
 }
 
 // validLibRel reports whether a catalog rel_path is a library path:

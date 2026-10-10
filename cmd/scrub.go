@@ -39,6 +39,7 @@ func newScrubCmd() *cobra.Command {
 	var (
 		budgetFlag, libDir string
 		allFlag, noRepair  bool
+		takeOver           bool
 		quiet              bool
 	)
 	c := &cobra.Command{
@@ -111,8 +112,10 @@ included); 2 the target or the library could not be used; 130 cancelled.`,
 			var logger *slog.Logger
 			logPath := ""
 			if b != nil {
-				owner, _ := set.LibraryID(ctx)
-				if owner != "" && owner != b.libID {
+				if err := set.CheckOwner(ctx, b.id, false); err != nil && !((takeOver || noRepair) && errors.Is(err, backup.ErrForeignInstance)) {
+					if errors.Is(err, backup.ErrForeignInstance) {
+						return unusable(fmt.Errorf("%w\n  to repair it from this library anyway, run again with --take-over", err))
+					}
 					return unusable(fmt.Errorf("the set %s belongs to another library; it cannot be repaired from %s", name, b.dir))
 				}
 				l, p, closeLog, err := libraryLog(b.lib, "scrub")
@@ -124,7 +127,7 @@ included); 2 the target or the library could not be used; 130 cancelled.`,
 				opts.Logger, opts.Library = logger, b.lib.Root()
 				if !noRepair {
 					src := b.source()
-					opts.Repair, opts.Source = true, &src
+					opts.Repair, opts.Source, opts.Owner, opts.TakeOver = true, &src, b.id, takeOver
 				}
 			}
 			progress, done := progressFunc(out, quiet)
@@ -156,6 +159,7 @@ included); 2 the target or the library could not be used; 130 cancelled.`,
 	f.BoolVar(&allFlag, "all", false, "read the whole set (the default)")
 	f.BoolVar(&noRepair, "no-repair", false, "only report; do not copy damaged files again")
 	f.StringVar(&libDir, "library", "", "the library the set backs up, to repair from")
+	f.BoolVar(&takeOver, "take-over", false, "with --library: repair a set last written by another copy of this library, making this library its owner")
 	f.BoolVar(&quiet, "quiet", false, "do not show the live status line")
 	return backupCommand(c)
 }
@@ -189,6 +193,7 @@ func newPruneCmd() *cobra.Command {
 	var (
 		keepFlag string
 		yes      bool
+		fl       pruneFlags
 	)
 	c := &cobra.Command{
 		Use:   "prune <library> <target>",
@@ -197,8 +202,15 @@ func newPruneCmd() *cobra.Command {
 target (a folder, or a remembered target's id) whose path and content are
 both gone from the library (live or in its trash), and the earlier
 versions under <set>/.picmover/previous/ older than --keep (default 30d).
-The user.db and media.db snapshots and files the set does not know are
-never removed; nothing in the library is touched.
+--keep 0d keeps no earlier versions. The user.db and media.db snapshots
+and files the set does not know are never removed; nothing in the
+library is touched.
+
+When the library could not be read completely (an unreadable folder) or
+catalog files are missing in it, files it still has could look deleted:
+the list is shown with a warning and --yes refuses unless --force. A set
+last written by another copy of this library is refused unless
+--take-over.
 
 Exit status: 0; 1 when files could not be removed; 2 the target or the
 library could not be used.`,
@@ -227,7 +239,7 @@ library could not be used.`,
 			if err != nil {
 				return unusable(err)
 			}
-			rt, err := reach(ctx, b, targets[0], "prune")
+			rt, err := reach(ctx, b, targets[0], "prune", fl.takeOver)
 			if err != nil {
 				return unusable(err)
 			}
@@ -239,15 +251,13 @@ library could not be used.`,
 				return unusable(err)
 			}
 			defer set.Close()
-			if err := set.Claim(ctx, b.libID); err != nil {
-				return unusable(err)
-			}
 			logger, logPath, closeLog, err := libraryLog(b.lib, "prune")
 			if err != nil {
 				return unusable(err)
 			}
 			defer closeLog()
-			code, err := pruneSet(ctx, cmd, b, set, keep, yes, logger)
+			fl.yes = yes
+			code, err := pruneSet(ctx, cmd, b, set, keep, fl, logger)
 			if err != nil {
 				return unusable(err)
 			}
@@ -262,15 +272,34 @@ library could not be used.`,
 	}
 	c.Flags().StringVar(&keepFlag, "keep", "30d", "keep earlier versions in previous/ for this long (e.g. 30d, 72h)")
 	c.Flags().BoolVar(&yes, "yes", false, "remove the listed files")
+	c.Flags().BoolVar(&fl.force, "force", false, "prune even when the library could not be read completely or catalog files are missing")
+	c.Flags().BoolVar(&fl.takeOver, "take-over", false, "prune a set last written by another copy of this library, making this library its owner")
 	return backupCommand(c)
 }
 
-// pruneSet lists what a prune removes and, with yes, removes it.
-func pruneSet(ctx context.Context, cmd *cobra.Command, b *backupLib, set *backup.Set, keep time.Duration, yes bool, logger *slog.Logger) (int, error) {
+// pruneFlags are the options of pruneSet.
+type pruneFlags struct {
+	yes      bool // remove the listed files
+	force    bool // even when the library scan was incomplete
+	takeOver bool // adopt a set last written by another copy of the library
+}
+
+// pruneSet lists what a prune removes and, with yes, removes it. While
+// the library could not be read completely (or catalog files are
+// missing) the list may name files the library still has: it is shown
+// with a warning, and removing needs force.
+func pruneSet(ctx context.Context, cmd *cobra.Command, b *backupLib, set *backup.Set, keep time.Duration, fl pruneFlags, logger *slog.Logger) (int, error) {
 	out := cmd.OutOrStdout()
+	yes := fl.yes
 	plan, err := backup.PlanFor(ctx, b.source(), set)
 	if err != nil {
 		return exitUnusable, err
+	}
+	incomplete := plan.CheckComplete()
+	if incomplete != nil {
+		printNonEmpty(out, "Could not be read in the library", failureLines(plan.Errors))
+		printNonEmpty(out, "In the catalog but missing in the library", plan.Missing)
+		fmt.Fprintf(out, "Warning: %v\n", incomplete)
 	}
 	pp, err := backup.PlanPrune(set, plan, keep, time.Now())
 	if err != nil {
@@ -290,8 +319,11 @@ func pruneSet(ctx context.Context, cmd *cobra.Command, b *backupLib, set *backup
 		fmt.Fprintf(out, "Nothing was removed; run again with --yes to remove these %d files.\n", pp.Count)
 		return 0, nil
 	}
+	if incomplete != nil && !fl.force {
+		return exitUnusable, fmt.Errorf("%w (--force)", incomplete)
+	}
 	st, err := backup.Prune(ctx, b.source(), set, backup.PruneOptions{Keep: keep, Expected: pp.Count,
-		Library: b.lib.Root(), Logger: logger})
+		Owner: b.id, TakeOver: fl.takeOver, Force: fl.force, Library: b.lib.Root(), Logger: logger})
 	if err != nil {
 		return exitUnusable, err
 	}

@@ -45,8 +45,16 @@ type Plan struct {
 	// CurrentPaths are the first MaxExamples current files.
 	CurrentPaths []string
 	Symlinks     []string
-	Missing      []string // catalog rows whose file is missing in the library
-	Invalid      []string // catalog rows whose path is not a library path
+	Missing      []string    // catalog rows whose file is missing in the library
+	Invalid      []string    // catalog rows whose path is not a library path
+	Errors       []Failure   // what the library walk could not read (the scan is incomplete)
+	Collisions   []Collision // files left out: their names differ from another's only in case or Unicode form
+	// Restore is what "restore --mode missing" copies back: the set's
+	// rows whose path the library does not have and whose content it
+	// does not have under another path. RestorePaths are the first
+	// MaxExamples of them, by path.
+	Restore      Count
+	RestorePaths []string
 	// LibraryHashes is every content hash the library has: the catalog
 	// (live and trashed) and the non-media files with a known hash.
 	LibraryHashes map[uint64]struct{}
@@ -84,6 +92,8 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 		Symlinks:      sc.Symlinks,
 		Missing:       sc.Missing,
 		Invalid:       sc.Invalid,
+		Errors:        sc.Errors,
+		Collisions:    sc.Collisions,
 		LibraryHashes: make(map[uint64]struct{}, len(sc.CatalogHashes)+len(sc.Entries)),
 		LibraryPaths:  make(map[string]struct{}, len(sc.Entries)),
 	}
@@ -96,6 +106,16 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 	}
 	for _, e := range sc.Entries {
 		p.LibraryPaths[keyOf(e.Rel)] = struct{}{}
+	}
+	// Files left out by a collision are still the library's: their
+	// earlier copies are neither extras nor to be restored.
+	present := make(map[uint64]struct{}, len(sc.Entries))
+	for _, e := range sc.Collided {
+		p.LibraryPaths[keyOf(e.Rel)] = struct{}{}
+		if e.HashKnown {
+			p.LibraryHashes[e.Hash] = struct{}{}
+			present[e.Hash] = struct{}{}
+		}
 	}
 	// Rows whose path the library no longer has, by hash: move sources.
 	gone := map[uint64][]*FileRow{}
@@ -144,24 +164,46 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 		}
 		if e.HashKnown {
 			p.LibraryHashes[e.Hash] = struct{}{}
+			present[e.Hash] = struct{}{}
 		}
 	}
 	p.Items = append(moves, copies...)
+	heldAtLibPath := make(map[uint64]bool)
+	for i := range rows {
+		if _, ok := p.LibraryPaths[keyOf(rows[i].RelPath)]; ok {
+			heldAtLibPath[rows[i].Hash] = true
+		}
+	}
+	var restore []string
 	for i := range rows {
 		r := &rows[i]
-		if used[r] {
-			continue
-		}
 		if _, ok := p.LibraryPaths[keyOf(r.RelPath)]; ok {
 			continue
 		}
-		if _, ok := p.LibraryHashes[r.Hash]; ok {
+		// Restore looks at the files present: a catalog row whose file
+		// is missing does not count as having the content.
+		if _, ok := present[r.Hash]; !ok {
+			p.Restore.add(r.Size)
+			restore = append(restore, r.RelPath)
+		}
+		if used[r] {
+			continue
+		}
+		// The content is the library's: keep the row, unless another row
+		// at a path the library has already holds it (a leftover of an
+		// interrupted move: a redundant copy).
+		if _, ok := p.LibraryHashes[r.Hash]; ok && !heldAtLibPath[r.Hash] {
 			continue
 		}
 		p.Extra.add(r.Size)
 		p.Extras = append(p.Extras, *r)
 	}
 	sort.Slice(p.Extras, func(i, j int) bool { return p.Extras[i].RelPath < p.Extras[j].RelPath })
+	sort.Strings(restore)
+	if len(restore) > MaxExamples {
+		restore = restore[:MaxExamples]
+	}
+	p.RestorePaths = restore
 	return p
 }
 

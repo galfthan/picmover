@@ -59,7 +59,7 @@ target or the library could not be used; 130 cancelled.`,
 			if err := backup.CheckSeparate(t.Root, args[2]); err != nil {
 				return unusable(err)
 			}
-			set, err := backup.OpenSet(ctx, t, args[1], false)
+			set, err := backup.OpenSetReadOnly(ctx, t, args[1]) // a restore also works from a write-protected target
 			if err != nil {
 				return unusable(err)
 			}
@@ -100,6 +100,9 @@ target or the library could not be used; 130 cancelled.`,
 				printNonEmpty(out, "Would restore", st.Paths)
 				fmt.Fprintf(out, "Would restore %d files (%s); %d are in the library already, %d under another path. user.db: %s\n",
 					st.Restored, humanSize(st.Bytes), st.Present, st.Elsewhere, st.UserDB)
+				if st.UserDBWarning != "" {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", st.UserDBWarning)
+				}
 				return nil
 			}
 			fmt.Fprintf(out, "Restore summary:\n")
@@ -108,6 +111,9 @@ target or the library could not be used; 130 cancelled.`,
 			fmt.Fprintf(out, "Under another path: %d\n", st.Elsewhere)
 			fmt.Fprintf(out, "Failed:            %d\n", st.FailedCount)
 			fmt.Fprintf(out, "user.db:           %s\n", st.UserDB)
+			if st.UserDBWarning != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", st.UserDBWarning)
+			}
 			var failed []string
 			for _, f := range st.Failures {
 				failed = append(failed, f.Path+": "+f.Error)

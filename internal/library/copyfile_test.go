@@ -39,7 +39,7 @@ func TestCopyReadBack(t *testing.T) {
 	}
 	// A copy that does not read back as written.
 	readBack = func(ctx context.Context, p string) (uint64, int64, error) { return 1, 12, nil }
-	defer func() { readBack = HashFileContext }()
+	defer func() { readBack = readBackUncached }()
 	if _, err := CopyReadBack(ctx, src, dst2, tmp, nil); !errors.Is(err, ErrHashMismatch) {
 		t.Fatalf("read-back mismatch: %v", err)
 	}

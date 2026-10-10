@@ -284,7 +284,9 @@ Job progress events: `{phase: "plan"|"copy"|"snapshot"|"scrub"|"prune"|"restore"
 - The library lock is held for the whole run (backup reads the tree while
   nothing moves). Scrub of a target does not need the library lock unless
   repairing.
-- Errors to clients carry relative paths only.
+- Errors to clients carry relative paths only. (One exception, added by
+  the review fixes: "this backup set was last written by the library at
+  <folder> on <host>" names the other copy's folder and host.)
 
 ## Tests
 
@@ -339,6 +341,13 @@ matched exactly. Where this section is silent, the contract holds.
   update or forget drops the cache. `error` (reachable targets only) is set
   when the set cannot be shown, e.g. the set name holds another library's
   backup; `behind` is then `null`. Addition: `set.name` (the set folder).
+  Review fixes: a set that belongs to another library, or that was last
+  written by another copy of this library, is reported with `set: null`
+  and `error` (`"the folder <name> on this target holds another library's
+  backup"`, or the `"this backup set was last written by the library at
+  <folder> on <host> ..."` text); the second also carries `foreign: true`
+  (a backup job with `takeOver: true` adopts the set). `set.restorable`
+  is the plan's `restore.count` (0 without a plan).
 - **(frontend)** `POST /api/l/{lib}/backups/targets {path, label?, set?}` →
   201 target. `path` rules below; an existing target (marker present) is
   attached as it is, an empty folder gets a new marker. `label` defaults to
@@ -361,7 +370,8 @@ matched exactly. Where this section is silent, the contract holds.
 - **(frontend)** `POST .../targets/{id}/forget` → `{}`; the target is not
   touched.
 - **(frontend)** `GET .../targets/{id}/plan[?keepDays=N]` → `{new, changed,
-  moved, current, extra, setName, symlinks, missing, keepDays}`; each class
+  moved, current, extra, restore, setName, symlinks, missing, errors,
+  collisions, keepDays}`; each class
   is `{count, bytes, paths}` with at most 500 set-relative paths (strings;
   for `moved` `{from, to}` objects). `extra` is exactly what a prune with
   that keep window removes: the set's files whose path and content the
@@ -370,7 +380,13 @@ matched exactly. Where this section is silent, the contract holds.
   `extra.count` is the `expected` of a prune. `symlinks` and `missing`
   (catalog rows whose file is missing in the library) are counts. The plan
   is computed on every call. 409 when the target is unreachable or the set
-  is another library's.
+  is another library's (or another copy's). Review fixes: `restore` (a
+  class) is what a restore job copies back: the set's files whose path the
+  library does not have and whose content no file present in it has;
+  `errors` (`[{path, error}]`, at most 500) are the library folders the
+  walk could not read; `collisions` (`[{path, other}]`, at most 500) are
+  files left out because their name differs from `other`'s only in case
+  or Unicode form.
 - **(frontend)** `GET .../targets/{id}/runs` → `{runs: [{id, kind,
   startedAt, finishedAt, stats}]}`, newest first, at most 50; `[]` before
   the first run; 409 when unreachable.
@@ -379,10 +395,15 @@ matched exactly. Where this section is silent, the contract holds.
   route. Every POST is under the step 3 rules (JSON content type,
   `X-Picmover: 1`, origin checks).
 - **(frontend)** Jobs, `POST /api/l/{lib}/jobs`:
-  - `{kind: "backup", target, partial?, workers?}` (`workers` 0-16, 0 = 2);
+  - `{kind: "backup", target, partial?, workers?, takeOver?}` (`workers`
+    0-16, 0 = 2; `takeOver: true` adopts a set last written by another
+    copy of this library, see Review fixes, and is accepted by every
+    backup kind);
   - `{kind: "scrub", target, budget?: seconds, repair?: bool}` (no or 0
     `budget`: the whole set; `repair` defaults to true);
-  - `{kind: "prune", target, keepDays?, confirm: true, expected: n}`:
+  - `{kind: "prune", target, keepDays?, confirm: true, expected: n,
+    force?}` (`keepDays` absent: 30; 0 keeps no earlier versions;
+    `force`: prune although the library scan was incomplete):
     400 without `confirm` or `expected`; the plan is computed when the job
     is requested and a different `extra.count` is 409 `{error: "the files
     to remove changed: the plan now lists N, not M; review them again"}`
@@ -394,7 +415,9 @@ matched exactly. Where this section is silent, the contract holds.
   job runs (one job at a time, imports included).
 - **(frontend)** Job object: backup kinds carry `target` (the marker id)
   next to `library`, in `GET /api/jobs`, `GET /api/l/{lib}/jobs`, replays
-  and SSE `state`/`done`; restore jobs carry `mode`; `progress` is the
+  and SSE `state`/`done`; restore jobs carry `mode`; scrub jobs carry
+  `budget` (seconds; omitted when the scrub has no budget) in the POST
+  answer, the listings and the SSE state events; `progress` is the
   backup progress object (below); `result` is the run's stats once the job
   has finished (absent before). `stats` (the importer counters) stays
   present and zero.
@@ -411,7 +434,8 @@ matched exactly. Where this section is silent, the contract holds.
   scrub: damage or missing files found, repaired ones included; prune and
   restore: files failed); 2 `failed` (target or library unusable: not
   reachable, another library's set, not enough space without `partial`,
-  count changed); 130 `cancelled`. Messages carry no absolute paths.
+  count changed); 130 `cancelled`. Messages carry no absolute paths (except
+  the foreign-set text, see Review fixes).
 - **(frontend)** Run stats (`result`, and `stats` in `runs`); every list
   is capped at 500 with `truncated: true` on the stats when one was:
   - backup: `{copied, moved, changed, bytes, failed: [{path, error}]}` plus
@@ -455,11 +479,14 @@ mode: also any listed folder), or the library root (single mode); then
   bookkeeping: `System Volume Information`, `$RECYCLE.BIN`, `lost+found`,
   `.Trashes`, `.Trash-*`, `.Spotlight-V100`, `.fseventsd`, `.DS_Store`,
   `desktop.ini`, `Thumbs.db`, `._*`), `CheckSeparate`.
-- `set.go`: `backup.db` exactly as in the contract (journal_mode DELETE,
-  synchronous FULL, busy_timeout 10 s); `meta` keys `name`, `library_id`,
-  `scrub_cursor`. `OpenSet`, `Sets`, `SetExists`, `FindSet` (by
-  library_id), `SetOwner`, `ResolveSetName`, `Claim` (a set without owner
-  takes the library's id; another id is `ErrOtherLibrary`), `Files`,
+- `set.go`: `backup.db` as in the contract (journal_mode DELETE,
+  synchronous FULL, busy_timeout 10 s) except `files.mtime_ns` (the
+  source mtime in nanoseconds, instead of `mtime` in seconds) and a
+  `counts` table kept by triggers (see "Review fixes (resumability and
+  performance)"); `meta` keys `name`, `library_id`, `scrub_cursor`.
+  `OpenSet`, `Sets`, `SetExists`, `FindSet` (by
+  library_id), `SetOwner`, `ResolveSetName`, `Claim` (see "Review fixes
+  (file safety)" for ownership and instances), `Files`,
   `Summary`, `Runs`, `LastRun`. Rows whose path is not a set path (empty,
   `.`/`..` components, `\`, `:`, NUL, under `.picmover` other than
   `.picmover/trash/`, a database name at the root) are ignored. Every
@@ -483,8 +510,8 @@ mode: also any listed folder), or the library root (single mode); then
   A changed file's new content is staged and verified first; only then
   does the old file move to `previous/<rel>.<unix>` and the new one take
   its place. A destination that exists without a row (a killed run) is
-  hashed: the right content is adopted (`adopted`), anything else is moved
-  to `previous/` first. Rows are written 64 per transaction (and at least
+  hashed: the right content is adopted (`adopted`), anything else is a
+  conflict failure for that file and is left alone (review fix H1). Rows are written 64 per transaction (and at least
   every 5 s); a cancelled run writes the rows of the files done and its
   runs row. The partial budget is taken in copy order by the feeder, so
   the newest files get the space whatever the workers' timing.
@@ -528,7 +555,9 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
 - **user.db snapshot history.** The previous `user.db` snapshot is moved to
   `previous/user.db.<unix>` (pruned with the keep window) instead of being
   replaced: user data is the one thing a rebuild cannot recreate. The
-  `media.db` snapshot is replaced (it is derived).
+  `media.db` snapshot is put in place the same way (old one to
+  `previous/`, new one in without replacing), and the old one is then
+  removed (it is derived).
 - **Exit codes.** Usage errors of the backup commands exit 2 (not 1), so a
   scheduled job never reads them as "some files failed". `--partial`
   leaving files is exit 1 (the backup is incomplete).
@@ -546,12 +575,14 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
   136k files on the target); a file deleted from the target is found by the
   next scrub (listed as missing, and copied again with repair).
 - **Scrub passes.** The cursor (`meta.scrub_cursor` = `{pass, v, p}`) keeps
-  a pass's position in `(coalesce(verified_at, -1), rel_path)` order;
-  rows verified at or after the pass start are left for the next pass. A
-  new pass starts one second after "now" (verified_at has second
-  resolution), so a pass started right after another reads everything
-  again. A scrub reads at least one file whatever the budget. Missing and
-  unknown files are found by walking the set on every scrub.
+  a pass's position in `(v, rel_path)` order, where `v` is `verified_at`,
+  or -1 when it is NULL or in the future; rows with `v` at or after the
+  pass start are left for the next pass. A new pass starts "now", or one
+  second later when rows were verified in this very second (verified_at
+  has second resolution), so a pass started right after another still
+  reads everything and a row is never read twice in one pass. A scrub
+  reads at least one file whatever the budget. Missing and unknown files
+  are found by walking the set on every scrub.
 - **Prune** removes folders its removals left empty (not the set,
   `.picmover`, `previous` or the trash folder itself). Unknown files (no
   row) are never pruned. A row whose file is already gone is dropped and
@@ -561,6 +592,8 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
   --dry-run` and plain `scrub` take none. In the server the job runs under
   the server's lock; trash operations are not blocked during a backup (a
   file moved meanwhile fails or is picked up as moved by the next run).
+  **The set lock** (`<set>/.picmover/lock`) is held by every backup, scrub,
+  prune and restore (not by dry runs), see below.
 - **CLI additions:** `--quiet` (no status line) on backup, scrub and
   restore; `--dry-run` and `--thumbs` (generate thumbnails in the rebuild
   after a restore) on `restore`; `prune <library> <target>` takes a folder
@@ -570,6 +603,253 @@ LastHost, SetName})`, `ForgetBackupTarget`, `MarkBackup`, `MarkScrub`,
   (label = folder name) and the run goes on.
 - **Logs:** `<library>/.picmover/logs/{backup,scrub,prune,restore}_<time>.log`
   (the job's `logPath`) and the same names in `<set>/.picmover/logs/`.
+
+### Review fixes (file safety)
+
+From the file-safety review of step 5 (findings H1, H2, M1-M4, L1-L4)
+and the backend items of the frontend review (B1-B3). Each has a test
+that reproduces the original failure: `internal/backup/review_fixes_test.go`,
+`internal/server/backup_review_test.go`, `cmd/backup_review_test.go`,
+`internal/userdata/identity_test.go`.
+
+- **H1: an existing folder is never taken over.** `OpenSet(create)`
+  refuses an existing `<target>/<name>` that has no
+  `.picmover/backup.db` unless it holds only file system bookkeeping
+  (the `InitTarget` list) and possibly an empty `.picmover`:
+  `ErrLibraryFolder` ("the folder for this backup set on the target is a
+  picmover library, not a backup set; choose another set name") when it
+  holds `media.db`, `user.db` or `.picmover/lock` (a set has its own
+  `.picmover/lock`, see the next section), `ErrNotSetFolder` ("... already exists on the target
+  and is not a picmover backup set; choose another set name or move the
+  folder away") otherwise. `CheckSetFolder` exposes the check:
+  `targets add` (CLI and `POST .../targets`, 409) and the job checks use
+  it, and the listing shows it as the target's `error`. Run, Prune,
+  Restore and a repairing Scrub also refuse a set folder that fails
+  `CheckSeparate` against the library. A file without a row at a
+  destination (new or moved file) is adopted when it has the content
+  (an interrupted run) and is otherwise a per-file conflict failure, "a
+  file the backup set does not know is already at this path on the
+  target; move it away or remove it, then back up again": it is never
+  moved into `previous/`. Only a changed file (which has a row) moves
+  its earlier content to `previous/`. The `media.db` snapshot is placed
+  like `user.db` (old one to `previous/`, new one renamed in without
+  replacing; a folder at that name is refused) and the old one is then
+  removed.
+- **H2: ownership everywhere.** `ResolveSetName` checks the owner of a
+  remembered set name too (`*OtherLibraryError`, matching
+  `ErrOtherLibrary`, text "the folder <name> on this target holds another
+  library's backup", the name only). The server's `openBackup` (listing,
+  plan, runs, every job check and job) and the CLI's `reach` (backup,
+  prune) refuse another library's set and, unless taking over, another
+  copy's (M1). Inside the package `Prune`, `Restore` (when given
+  `Owner`, as the server does; the CLI's restore names the set itself)
+  and a repairing `Scrub` require the set to belong to the library
+  (`Set.Claim` with owned, else `ErrNotOwned`, "the target has no backup
+  of this library yet"). GETs write nothing to `user.db`: the set name is
+  stored by a backup (job or CLI) after the run has claimed the set.
+  `Set.Claim(ctx, id, owned, takeOver)` is one immediate transaction
+  (`INSERT ... ON CONFLICT DO NOTHING` of `library_id`, re-read, check,
+  write the last writer), so of two libraries claiming a new set at once
+  exactly one wins. Scrub, restore and prune jobs on a set nobody owns
+  yet are 409 `the target has no backup of this library yet`.
+- **M1: library instances.** `user.db` meta gains `instance` (16 random
+  hex digits), `root` (the library folder, absolute, links resolved) and
+  `host`; `userdata.Identity` returns them, creating a new instance (in
+  one transaction) when none is stored or the stored root or host differ
+  from where the database is now (the library was copied, moved or is
+  used from another host; `library_id` travels with the copy). The set's
+  meta stores its last writer: `instance`, `writer_root`, `writer_host`,
+  written by backup, prune, repairing scrub and take-over. A backup,
+  prune, repair or (server) restore from another instance is refused
+  with a `*backup.ForeignError` (matches `ErrForeignInstance`): "this
+  backup set was last written by the library at <folder> on <host> (a
+  copy of this library, or this library before it was moved); take the
+  set over to back up into it from here". **This is the one client text
+  with an absolute path**: the user needs the folder and host to tell
+  the copies apart; it appears in the CLI output (with "run again with
+  --take-over") and in the listing's `error`, job 409s and job messages.
+  `--take-over` (backup, prune, `scrub --library`) and `takeOver: true`
+  (every backup job kind) adopt the set: its last writer becomes this
+  instance. A set written before instances existed (no `instance` in its
+  meta) is adopted silently. Listing: such a target has `set: null`,
+  `error` and `foreign: true` (another library's set has `error` without
+  `foreign`). Runs of a foreign set can still be read (`GET .../runs`);
+  its plan is 409. `scrub --library --no-repair` reads a foreign set.
+  Consequence: a library folder that is moved or renamed (or opened from
+  another host) is a new instance and needs one `--take-over`.
+- **M2: incomplete scans.** The library walk reports what it cannot read
+  (`Plan.Errors`, `[{path, error}]` with relative paths; a file that
+  vanished is not an error). A backup lists them (`scanErrorCount`,
+  `scanErrors` in the run stats) and, like catalog files missing in the
+  library, ends with exit 1 (job: `failed`, exit 1, message "N folders
+  of the library could not be read; their files were not backed up" or
+  "N files in the catalog are missing in the library"). `Prune` refuses
+  with an `*IncompleteScanError` (`ErrIncompleteScan`; "prune refused:
+  the library could not be read completely (N unreadable folders or
+  files, M catalog files missing), so files it still has could look
+  deleted; fix that first, or force the prune") unless `Force`: CLI
+  `prune --force` / `backup --prune --yes --force` (exit 2 without),
+  API `force: true` on the prune job (409 without, before starting).
+- **M3: name collisions.** Library files whose paths are equal after
+  NFC normalization and lower-casing (`golang.org/x/text`, now a direct
+  dependency; it was already in the module graph through
+  `golang.org/x/image`) cannot both live in a set (NOCASE rows; targets
+  that ignore case or normalization). Of each group the first path in
+  byte order is backed up; the others are per-file failures ("the name
+  differs from <other> only in upper/lower case or Unicode form; a
+  backup cannot hold both: rename one of them"), counted in
+  `collisionCount` and `failedCount` (exit 1), listed in the plan's
+  `collisions`, and still count as the library's (their earlier copies
+  are neither extras nor restorable). Runs are stable: nothing is copied
+  again and nothing goes to `previous/`.
+- **M4: safe user.db restore.** The backup stores the hash of the
+  `user.db` snapshot in set meta `user_snapshot_hash`. Restoring
+  `user.db` (missing mode into a library without one, or `user-data`)
+  copies the snapshot into the library's `.picmover/tmp` with
+  `CopyReadBack` (verified against that hash when the root snapshot is
+  used and a hash was recorded), checks the copy with `PRAGMA
+  integrity_check` and its `user_version` (1 or 2), and only then moves
+  the current `user.db` (with `-wal`/`-shm`/`-journal`) aside as
+  `user.db.bak-<time>` and renames the copy in without replacing; when
+  that fails the backup is renamed back (`RestoreCatalogBackup`). A
+  snapshot that fails is `ErrBadUserSnapshot` ("the backup set's user.db
+  snapshot is damaged or not a user.db this picmover can read; nothing
+  was changed"); the library is left exactly as it was.
+- **L1.** The set's `.picmover`, `tmp` and `logs` must be real folders
+  (`Lstat`), never links: the temp cleanup and the logs refuse to follow
+  them (a run fails with "a folder in the backup set's .picmover is a
+  link or a file; picmover does not follow it"; the set log is then not
+  written).
+- **L2.** One rule for keep 0 everywhere: 0 keeps no earlier versions.
+  `PruneOptions.Keep` 0 means 0 (callers pass `DefaultKeep`; negative is
+  an error); `prune --keep 0d` works; API `keepDays` absent = 30 days,
+  `0` = none (job body and `?keepDays=0` of the plan).
+- **L3.** On Linux the read-back check drops the copy's cached pages
+  first (`posix_fadvise(DONTNEED)` after the fsync), so it reads from the
+  disk. Elsewhere (macOS, BSD, Windows) there is no portable way to do
+  that: the read-back may come from the cache and proves the bytes
+  reached the file system, not the medium. Windows also has no directory
+  fsync, so a completed rename is durable only once the file system
+  flushes its metadata.
+- **L4.** Restore checks the nearest existing folder of a destination,
+  links resolved, before creating any folder (and again after), so no
+  empty folders appear outside the library through a link. A moved file
+  whose old copy is gone from the target is copied again and the row at
+  the old path is dropped (no duplicate rows for scrub to repair).
+  `EDQUOT` counts as a full target, like `ENOSPC`. A set folder that can
+  no longer be resolved (target unplugged mid-run) fails each file with
+  "the backup set's folder cannot be reached any more (was the target
+  unplugged or disconnected?)" instead of "a link on the target". A run
+  killed between moving the old `user.db` snapshot to `previous/` and
+  renaming the new one in leaves no `<set>/user.db`: restore then uses the
+  newest `previous/user.db.<unix>` (integrity-checked, logged). Restoring
+  into a library whose `user.db` belongs to another library id leaves it
+  alone with a warning (`userDBWarning` in the stats; printed by the
+  CLI).
+- **B1.** Targets are listed in the order they were added (`added_at`,
+  then insertion order), not by id.
+- **B2.** See H2 and M1: the listing reports another library's set with
+  `set: null` and the named `error`, like the job refusal.
+- **B3.** The plan has a `restore` class `{count, bytes, paths}` (the
+  set's rows whose path the library does not have and whose content no
+  present library file has: a catalog row whose file is missing does not
+  count as present). It approximates `restore --mode missing`, which also
+  hashes same-size files whose hash the scan does not know (changed
+  non-media files). `set.restorable` in the listing is its count.
+- **Scrub job budget.** Scrub jobs carry `budget` (seconds; omitted for
+  a whole-set scrub) on the job object (POST answer, listings, SSE
+  `state` events), so the UI can show the time-based bar after a reload.
+- **Also:** `backup --dry-run` no longer claims the set (it only checks
+  ownership: a dry run writes nothing); `CheckSeparate` refusals match
+  `ErrNotSeparate` and their path-free texts reach clients; plan, job and
+  listing errors for these cases are 409, not 500.
+
+### Review fixes (resumability and performance)
+
+From the second backend review of step 5 (plan, resumability,
+concurrency, performance: H1, M1-M6, L1-L7). Tests:
+`internal/backup/review_resume_test.go`,
+`internal/server/backup_resume_test.go`, `cmd/backup_resume_test.go`,
+`internal/userdata/contenthash_test.go`, and updated cases in the
+existing tests.
+
+- **H1: set lock.** Every backup, scrub, prune and restore (not dry
+  runs) takes `<set>/.picmover/lock`, the same OS lock as the library's
+  (flock / LockFileEx, `library.LockFile`, released when the process
+  ends; the holder writes `pid=... cmd=... since=... host=...`). A
+  second one is refused with a `*library.ErrLocked`: "the backup set is
+  in use by another picmover process (pid N, scrub, on <host>, since
+  <time>)" (CLI exit 2; job checks 409 through `backup.SetBusy`; a job
+  that meets it fails with exit 2). A planted link or folder at the lock
+  name is refused. When the file system cannot lock, the run goes on
+  without the lock, like the library lock; a restore from a read-only
+  target also goes on without it. A `.picmover/lock` in a folder that
+  has `.picmover/backup.db` is the set lock; without `backup.db` it still
+  marks a library (H1 of the file-safety review). `ensureSchema` reads
+  `user_version` outside any transaction and takes the write lock only
+  to create the schema. `OpenSetReadOnly` opens `backup.db` with SQLite
+  `mode=ro`: the listing, the plan, the runs, the owner checks and
+  restore use it, so a GET never waits for a writer's transaction
+  (measured in the test: a reader opens and reads while another
+  connection holds BEGIN IMMEDIATE).
+- **M1.** A moved file whose old copy is gone from the target is copied
+  again (or adopted, after a run killed between the rename and its row)
+  and the row at the old path is dropped in the same batch. A row whose
+  path the library lacks and whose content another row at a library
+  path already holds is an extra (a redundant copy), so prune removes
+  leftovers from before this fix.
+- **M2.** A changed file whose destination already holds the new content
+  (a run killed after the rename into place) is adopted (`adopted`) and
+  its staged copy dropped; a correct copy never goes to `previous/`.
+- **M3.** Scrub writes `verified_at` (and damage) with the cursor in one
+  transaction per 64 rows or 5 s, and once at the end (also when
+  cancelled or out of budget); a damaged row is written before its
+  repair rewrites it. Measured on the review's 4,500-file set: a full
+  scrub 1.1 s (was about 50 s at 84 files/s).
+- **M4.** As M3 of the file-safety review (collisions).
+- **M5.** Restore opens the set read-only and works from a
+  write-protected target: the runs row and the set log are written when
+  they can be (a writable handle is opened for the runs row), skipped
+  otherwise. Taking over (`takeOver`) on a restore only skips the
+  instance check; a restore records no owner.
+- **M6.** Copies keep their fsync and read-back, but the folder of each
+  copy or rename is synced once per row batch, just before the batch's
+  rows are committed (`library.CopyReadBackDeferSync`), so a row still
+  only exists for a durable file. Measured on the same set: first backup
+  of 4,500 small files 12.7 s (about 350 files/s, was 77).
+- **L1.** A `verified_at` in the future (a machine with a fast clock)
+  counts as never verified in the scrub order and is overwritten when
+  read. **L2.** A new pass starts at "now" unless rows were verified in
+  this very second (then one second later), and the queue excludes rows
+  verified at or after the pass start, so a file verified in a pass's
+  first second is not read again in that pass.
+- **L3.** Snapshots are written only when their content changed. The
+  media.db snapshot is made (VACUUM INTO) and compared by hash with the
+  one recorded in set meta (`media_snapshot_hash`); `user.db` is compared
+  before any VACUUM by `userdata.ContentHash` (every row of every table,
+  ignoring `backup_targets.last_backup_at`/`last_scrub_at`, which each
+  backup itself changes), recorded as `user_content_hash`. In both cases
+  the snapshot on the target must still hash as recorded; otherwise it is
+  written again. Run stats gain `userSnapshotUnchanged` and
+  `mediaSnapshotUnchanged`. Measured: a no-op backup of the 4,500-file
+  set 0.08 s, nothing added to `previous/`.
+- **L4.** A backup, scrub, prune or restore that holds the set lock
+  first marks runs rows left with `finished_at` NULL (killed runs) as
+  finished at their start time with `"interrupted": true` in their stats.
+- **L5.** `backup.db` keeps `counts(files, bytes, unverified)` up to date
+  with triggers on `files` (insert, delete, update of size or
+  verified_at); `Set.Summary` reads that row instead of scanning.
+- **L6.** `backup --dry-run` writes nothing: no library lock, `user.db`
+  opened read-only (`userdata.OpenReadOnly`, `mode=ro`, reading its WAL)
+  and never created or migrated ("Note: user.db has schema version 1 and
+  would be upgraded ..." / "the library has no user.db yet ..." is
+  printed instead), the instance peeked at (`PeekIdentity`), a target
+  folder given on the command line not attached, no set name stored, no
+  set created or claimed. The server's GET routes and job checks also
+  only peek at the instance; a job records it.
+- **L7.** `files.mtime_ns` stores the source mtime in nanoseconds and
+  non-media files match on size and that, so an edit of the same size in
+  the same second as the backup is noticed.
 
 ### Tests
 

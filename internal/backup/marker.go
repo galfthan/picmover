@@ -248,16 +248,25 @@ func CheckSeparate(targetDir, libRoot string) error {
 		for _, l := range ls {
 			switch {
 			case samePath(t, l):
-				return errors.New("the backup target is the library folder itself")
+				return separateError("the backup target is the library folder itself")
 			case inside(l, t):
-				return errors.New("the backup target lies inside the library; choose a folder on another drive or outside the library")
+				return separateError("the backup target lies inside the library; choose a folder on another drive or outside the library")
 			case inside(t, l):
-				return errors.New("the library lies inside the backup target; choose a folder outside the library")
+				return separateError("the library lies inside the backup target; choose a folder outside the library")
 			}
 		}
 	}
 	return nil
 }
+
+// ErrNotSeparate is matched by every CheckSeparate refusal (their texts
+// name no path).
+var ErrNotSeparate = errors.New("the backup target and the library overlap")
+
+type separateError string
+
+func (e separateError) Error() string        { return string(e) }
+func (e separateError) Is(target error) bool { return target == ErrNotSeparate }
 
 // spellings returns p cleaned and absolute, and its resolved form when
 // that differs.

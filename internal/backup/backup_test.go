@@ -29,6 +29,7 @@ type fx struct {
 	user   *userdata.DB
 	target *Target
 	libID  string
+	id     Identity
 	hashes map[string]uint64 // by rel
 }
 
@@ -50,7 +51,7 @@ func newFx(t *testing.T) *fx {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { user.Close() })
-	id, err := user.LibraryID(ctx)
+	ident, err := user.Identity(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func newFx(t *testing.T) *fx {
 	if err != nil || !created {
 		t.Fatalf("init target %v %v", created, err)
 	}
-	f := &fx{t: t, ctx: ctx, lib: lib, db: db, user: user, target: tg, libID: id, hashes: map[string]uint64{}}
+	f := &fx{t: t, ctx: ctx, lib: lib, db: db, user: user, target: tg, libID: ident.LibraryID, id: ident, hashes: map[string]uint64{}}
 	f.media("image/2024/07/a.jpg", "AAAA", 2024)
 	f.media("image/2023/01/b.jpg", "BBBBBB", 2023)
 	f.media("video/2022/05/c.mp4", "CCCCCCCCCC", 2022)
@@ -112,7 +113,7 @@ func (f *fx) set(create bool) *Set {
 
 func (f *fx) run(opts Options) Stats {
 	f.t.Helper()
-	opts.LibraryID = f.libID
+	opts.Owner = f.id
 	st, err := Run(f.ctx, f.src(), f.set(true), opts)
 	if err != nil {
 		f.t.Fatalf("run: %v (%+v)", err, st)
@@ -242,7 +243,7 @@ func TestMakePlanClasses(t *testing.T) {
 		{RelPath: "a.jpg2", Hash: 9, Size: 1},
 		{RelPath: "gone.jpg", Hash: 99, Size: 1000},       // extra
 		{RelPath: "trashed-elsewhere", Hash: 50, Size: 1}, // not extra: the catalog has the hash
-		{RelPath: "e-copy.xmp", Hash: 55, Size: 5},        // not extra: e.xmp has the hash
+		{RelPath: "e-copy.xmp", Hash: 55, Size: 5},        // extra: e.xmp's row already holds the content
 	}
 	p := MakePlan(sc, rows)
 	check := func(name string, c Count, files, bytes int64) {
@@ -254,11 +255,11 @@ func TestMakePlanClasses(t *testing.T) {
 	check("moved", p.Moved, 1, 20)
 	check("changed", p.Changed, 2, 36)
 	check("new", p.New, 4, 57)
-	check("extra", p.Extra, 1, 1000)
+	check("extra", p.Extra, 2, 1005)
 	if p.Items[0].Class != ClassMoved || p.Items[0].From != "old/b.jpg" || p.Items[0].Rel != "new/b.jpg" {
 		t.Errorf("first item %+v", p.Items[0])
 	}
-	if len(p.Extras) != 1 || p.Extras[0].RelPath != "gone.jpg" {
+	if len(p.Extras) != 2 || p.Extras[0].RelPath != "e-copy.xmp" || p.Extras[1].RelPath != "gone.jpg" {
 		t.Errorf("extras %+v", p.Extras)
 	}
 	var order []string
@@ -332,10 +333,22 @@ func TestBackupRunAndIncremental(t *testing.T) {
 		t.Fatalf("runs %+v", runs)
 	}
 
-	// Nothing changed: nothing copied; user.db snapshot kept in previous/.
+	// Nothing changed: nothing copied; the snapshots are unchanged and
+	// not written again (L3 of the resumability review).
 	st = f.run(Options{})
-	if st.Copied != 0 || st.Current != 6 || st.ExitCode() != 0 {
+	if st.Copied != 0 || st.Current != 6 || st.ExitCode() != 0 || !st.UserSnapshotUnchanged || !st.MediaSnapshotUnchanged {
 		t.Fatalf("second run %+v", st)
+	}
+	if ents, _ := os.ReadDir(set.PreviousDir()); len(ents) != 0 {
+		t.Fatalf("previous %v", ents)
+	}
+	// A changed user.db: the earlier snapshot is kept in previous/.
+	if _, err := f.user.SetRating(f.ctx, []uint64{f.hashes["image/2023/01/b.jpg"]}, 3); err != nil {
+		t.Fatal(err)
+	}
+	st = f.run(Options{})
+	if st.UserSnapshotUnchanged || !st.UserSnapshot {
+		t.Fatalf("third run %+v", st)
 	}
 	if ents, _ := os.ReadDir(set.PreviousDir()); len(ents) != 1 || !strings.HasPrefix(ents[0].Name(), "user.db.") {
 		t.Fatalf("previous %v", ents)
@@ -389,7 +402,7 @@ func TestBackupRunAndIncremental(t *testing.T) {
 func TestBackupOtherLibrary(t *testing.T) {
 	f := newFx(t)
 	f.run(Options{})
-	_, err := Run(f.ctx, f.src(), f.set(false), Options{LibraryID: "ffffffffffffffff"})
+	_, err := Run(f.ctx, f.src(), f.set(false), Options{Owner: Identity{LibraryID: "ffffffffffffffff", Instance: "1111111111111111"}})
 	if !errors.Is(err, ErrOtherLibrary) {
 		t.Fatalf("other library: %v", err)
 	}
@@ -436,7 +449,7 @@ func TestBackupResumeAfterKill(t *testing.T) {
 		f.media(fmt.Sprintf("image/2010/01/x%03d.jpg", i), fmt.Sprintf("content %d", i), 2010)
 	}
 	crashAfter = func(done int) bool { return done == 100 }
-	_, err := Run(f.ctx, f.src(), f.set(true), Options{LibraryID: f.libID, Workers: 3})
+	_, err := Run(f.ctx, f.src(), f.set(true), Options{Owner: f.id, Workers: 3})
 	crashAfter = nil
 	if !errors.Is(err, errSimulatedCrash) {
 		t.Fatalf("crash: %v", err)
@@ -472,7 +485,7 @@ func TestBackupFreeSpace(t *testing.T) {
 	defer func() { freeSpace = diskFree }()
 	snap := snapshotBytes(f.src())
 	freeSpace = func(string) int64 { return 10 }
-	_, err := Run(f.ctx, f.src(), f.set(true), Options{LibraryID: f.libID})
+	_, err := Run(f.ctx, f.src(), f.set(true), Options{Owner: f.id})
 	var ns *NoSpaceError
 	if !errors.As(err, &ns) || ns.Free != 10 || ns.Need < 30 {
 		t.Fatalf("no space: %v", err)
@@ -535,7 +548,7 @@ func TestScrub(t *testing.T) {
 	}
 	// Repair from the library.
 	src := f.src()
-	st, err = Scrub(f.ctx, set, ScrubOptions{Repair: true, Source: &src})
+	st, err = Scrub(f.ctx, set, ScrubOptions{Repair: true, Source: &src, Owner: f.id})
 	if err != nil || st.DamagedCount != 1 || !st.Damaged[0].Repaired || st.Repaired != 2 {
 		t.Fatalf("repair %+v %v", st, err)
 	}
@@ -585,13 +598,13 @@ func TestPrune(t *testing.T) {
 	if !slices.Equal(paths, want) || pp.Count != 3 {
 		t.Fatalf("prune plan %v, want %v", paths, want)
 	}
-	if _, err := Prune(f.ctx, f.src(), set, PruneOptions{Expected: 2}); !errors.Is(err, ErrPruneCount) {
+	if _, err := Prune(f.ctx, f.src(), set, PruneOptions{Keep: DefaultKeep, Owner: f.id, Expected: 2}); !errors.Is(err, ErrPruneCount) {
 		t.Fatalf("wrong count: %v", err)
 	}
 	if _, err := os.Stat(set.Abs("notes.txt")); err != nil {
 		t.Fatal("removed with a wrong count")
 	}
-	st, err := Prune(f.ctx, f.src(), set, PruneOptions{Expected: 3})
+	st, err := Prune(f.ctx, f.src(), set, PruneOptions{Keep: DefaultKeep, Owner: f.id, Expected: 3})
 	if err != nil || st.Removed != 3 {
 		t.Fatalf("prune %+v %v", st, err)
 	}
@@ -622,7 +635,7 @@ func TestPrune(t *testing.T) {
 		set.apply(f.ctx, []rowOp{{upsert: &FileRow{RelPath: "evil/victim.txt", Hash: 12345, Size: 7}}})
 		plan, _ := PlanFor(f.ctx, f.src(), set)
 		pp, _ := PlanPrune(set, plan, DefaultKeep, time.Now())
-		st, _ := Prune(f.ctx, f.src(), set, PruneOptions{Expected: pp.Count})
+		st, _ := Prune(f.ctx, f.src(), set, PruneOptions{Keep: DefaultKeep, Owner: f.id, Expected: pp.Count})
 		if readFile(t, outside) != "keep me" || len(st.Failures) != 1 {
 			t.Fatalf("prune followed a link: %+v", st)
 		}

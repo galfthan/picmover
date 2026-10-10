@@ -35,6 +35,19 @@ type CopyResult struct {
 // nothing is left at dst and the temp file is removed. Missing parent
 // directories of dst are created.
 func CopyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64) (CopyResult, error) {
+	return copyReadBack(ctx, src, dst, tmpDir, want, true)
+}
+
+// CopyReadBackDeferSync is CopyReadBack without the final sync of dst's
+// folder: the copy is fsynced, but its name is durable only after the
+// caller's SyncDir(filepath.Dir(dst)), which a caller copying many files
+// into few folders does once per folder (the backup does it before
+// committing the rows of a batch).
+func CopyReadBackDeferSync(ctx context.Context, src, dst, tmpDir string, want *uint64) (CopyResult, error) {
+	return copyReadBack(ctx, src, dst, tmpDir, want, false)
+}
+
+func copyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64, sync bool) (CopyResult, error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return CopyResult{}, err
@@ -104,13 +117,36 @@ func CopyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64) (C
 	if err := RenameNoReplace(tmpName, dst); err != nil {
 		return fail(err)
 	}
-	syncDir(filepath.Dir(dst))
+	if sync {
+		syncDir(filepath.Dir(dst))
+	}
 	return CopyResult{Hash: srcHash, Size: n, MTime: mtime}, nil
 }
 
 // readBack hashes the written copy; tests replace it to simulate a copy
 // that does not read back as written.
-var readBack = HashFileContext
+var readBack = readBackUncached
+
+// readBackUncached hashes the written (and fsynced) copy, first asking
+// the kernel to drop its cached pages where it can (Linux:
+// posix_fadvise DONTNEED), so the bytes come from the disk rather than
+// from the page cache the write just filled. Elsewhere the read may be
+// served from the cache: the check then proves the bytes reached the
+// file system, not the platter.
+func readBackUncached(ctx context.Context, p string) (uint64, int64, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	dropCache(f)
+	h := xxhash.New()
+	n, err := copyBuffered(ctx, h, f)
+	if err != nil {
+		return 0, 0, err
+	}
+	return h.Sum64(), n, nil
+}
 
 // HashFileContext is HashFile with cancellation checked between reads.
 func HashFileContext(ctx context.Context, p string) (uint64, int64, error) {

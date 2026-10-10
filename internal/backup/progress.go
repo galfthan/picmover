@@ -175,8 +175,22 @@ func PublicError(err error) string {
 		return errOutsideSet.Error()
 	case errors.Is(err, errOutsideLibrary):
 		return errOutsideLibrary.Error()
-	case errors.Is(err, ErrUserDBExists), errors.Is(err, ErrNoUserSnapshot):
+	case errors.Is(err, ErrNotSeparate):
+		var se separateError
+		if errors.As(err, &se) {
+			return se.Error()
+		}
+		return ErrNotSeparate.Error()
+	case errors.Is(err, errTargetGone):
+		return errTargetGone.Error()
+	case errors.Is(err, errConflict):
+		return errConflict.Error()
+	case errors.Is(err, errNotRealDir):
+		return errNotRealDir.Error()
+	case errors.Is(err, ErrUserDBExists), errors.Is(err, ErrNoUserSnapshot), errors.Is(err, ErrBadUserSnapshot):
 		return err.Error()
+	case errors.Is(err, syscall.EDQUOT):
+		return "the disk quota is exceeded"
 	case errors.Is(err, library.ErrNotRegularFile), errors.Is(err, errNotRegular):
 		return "the path is a folder or a link, not a file"
 	case errors.Is(err, fs.ErrExist):

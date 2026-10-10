@@ -54,15 +54,24 @@ type moveJSON struct {
 // set's files the library no longer has (by path and content) and the
 // earlier versions under previous/ older than the keep window.
 type planJSON struct {
-	New      classJSON `json:"new"`
-	Changed  classJSON `json:"changed"`
-	Moved    classJSON `json:"moved"`
-	Current  classJSON `json:"current"`
-	Extra    classJSON `json:"extra"`
+	New     classJSON `json:"new"`
+	Changed classJSON `json:"changed"`
+	Moved   classJSON `json:"moved"`
+	Current classJSON `json:"current"`
+	Extra   classJSON `json:"extra"`
+	// Restore is what a restore job (mode missing) copies back: the
+	// set's files whose path and content the library does not have.
+	Restore  classJSON `json:"restore"`
 	SetName  string    `json:"setName"`
 	Symlinks int       `json:"symlinks"` // library links, never backed up
 	Missing  int       `json:"missing"`  // catalog rows whose file is missing in the library
-	KeepDays int       `json:"keepDays"`
+	// Errors are the folders the library walk could not read (a prune
+	// is refused while there are any, or missing files, unless forced).
+	Errors []backup.Failure `json:"errors"`
+	// Collisions are files left out because their name differs from
+	// another file's only in case or Unicode form.
+	Collisions []backup.Collision `json:"collisions"`
+	KeepDays   int                `json:"keepDays"`
 }
 
 type behindJSON struct {
@@ -80,6 +89,7 @@ type setJSON struct {
 	Extras     int64       `json:"extras"`
 	Damaged    int64       `json:"damaged"` // damaged and not repaired in the last scrub
 	Unverified int64       `json:"unverified"`
+	Restorable int64       `json:"restorable"` // the plan's restore.count (0 without a plan)
 }
 
 // targetJSON is a target of GET /backups and of the target endpoints.
@@ -92,6 +102,9 @@ type targetJSON struct {
 	LastScrubAt  *int64   `json:"lastScrubAt"`
 	Set          *setJSON `json:"set"`
 	Error        string   `json:"error,omitempty"` // why the set cannot be shown (reachable targets)
+	// Foreign: the set belongs to this library but was last written by
+	// another copy of it; a job with takeOver adopts it.
+	Foreign bool `json:"foreign,omitempty"`
 }
 
 type backupsJSON struct {
@@ -112,6 +125,17 @@ func unixOrNull(t time.Time) *int64 {
 	}
 	v := t.Unix()
 	return &v
+}
+
+// capped returns at most backup.MaxExamples entries of list, never nil.
+func capped[T any](list []T) []T {
+	if len(list) > backup.MaxExamples {
+		list = list[:backup.MaxExamples]
+	}
+	if list == nil {
+		return []T{}
+	}
+	return list
 }
 
 func paths(list []string) []string {
@@ -144,13 +168,18 @@ type backupContext struct {
 	h       *libHandles
 	bt      userdata.BackupTarget
 	t       *backup.Target
-	libID   string
+	id      backup.Identity
 	setName string
 }
 
 // openBackup resolves a target of the library: the remembered target,
-// reachable, and its set name (stored in user.db once resolved).
-func (s *Server) openBackup(ctx context.Context, h *libHandles, id string) (*backupContext, error) {
+// reachable, and its set, which must belong to this library (an
+// *backup.OtherLibraryError otherwise, also for a remembered set name)
+// and have been last written by this copy of it (a *backup.ForeignError
+// otherwise, unless takeOver). Nothing is written (unless write, for a
+// job: a new library instance is recorded in user.db); the set name is
+// stored by a backup job once the set is claimed.
+func (s *Server) openBackup(ctx context.Context, h *libHandles, id string, takeOver, write bool) (*backupContext, error) {
 	if h.user == nil {
 		return nil, errors.New("user.db is not open")
 	}
@@ -162,28 +191,48 @@ func (s *Server) openBackup(ctx context.Context, h *libHandles, id string) (*bac
 	if err != nil {
 		return &backupContext{h: h, bt: bt}, err
 	}
-	libID, err := h.user.LibraryID(ctx)
+	// Only a job writes the library's instance (userdata.Identity);
+	// the GET routes and the job checks peek at it.
+	identity := h.user.PeekIdentity
+	if write {
+		identity = h.user.Identity
+	}
+	ident, err := identity(ctx)
 	if err != nil {
 		return nil, err
 	}
-	name, err := backup.ResolveSetName(ctx, t, bt.SetName, libID, h.entry.path)
+	bc := &backupContext{h: h, bt: bt, t: t, id: ident}
+	name, err := backup.ResolveSetName(ctx, t, bt.SetName, ident.LibraryID, h.entry.path)
 	if err != nil {
-		return &backupContext{h: h, bt: bt, t: t, libID: libID}, err
+		return bc, err
 	}
-	if name != bt.SetName {
-		if _, err := h.user.UpdateBackupTarget(ctx, id, userdata.TargetUpdate{SetName: &name}); err != nil {
-			return nil, err
-		}
-		bt.SetName = name
+	if err := backup.CheckSetOwner(ctx, t, name, ident); err != nil && !(takeOver && errors.Is(err, backup.ErrForeignInstance)) {
+		return bc, err
 	}
-	return &backupContext{h: h, bt: bt, t: t, libID: libID, setName: name}, nil
+	bc.setName = name
+	return bc, nil
+}
+
+// rememberSetName stores the set name in user.db once a backup has
+// claimed it.
+func (bc *backupContext) rememberSetName(ctx context.Context) error {
+	if bc.setName == bc.bt.SetName {
+		return nil
+	}
+	name := bc.setName
+	if _, err := bc.h.user.UpdateBackupTarget(ctx, bc.bt.ID, userdata.TargetUpdate{SetName: &name}); err != nil {
+		return err
+	}
+	bc.bt.SetName = name
+	return nil
 }
 
 func (bc *backupContext) source() backup.Source {
 	return backup.Source{Lib: bc.h.lib, Catalog: bc.h.db, User: bc.h.user}
 }
 
-// openSet opens the set; nil (no error) when it does not exist yet.
+// openSet opens the set for writing; nil (no error) when it does not
+// exist yet (unless create).
 func (bc *backupContext) openSet(ctx context.Context, create bool) (*backup.Set, error) {
 	if !create && !backup.SetExists(bc.t, bc.setName) {
 		return nil, nil
@@ -191,9 +240,18 @@ func (bc *backupContext) openSet(ctx context.Context, create bool) (*backup.Set,
 	return backup.OpenSet(ctx, bc.t, bc.setName, create)
 }
 
+// openSetReadOnly opens the set read-only (the GET routes and restore:
+// they never take a write lock on backup.db); nil when there is none.
+func (bc *backupContext) openSetReadOnly(ctx context.Context) (*backup.Set, error) {
+	if !backup.SetExists(bc.t, bc.setName) {
+		return nil, nil
+	}
+	return backup.OpenSetReadOnly(ctx, bc.t, bc.setName)
+}
+
 // computePlan makes the plan of a target and caches it.
 func (s *Server) computePlan(ctx context.Context, bc *backupContext, keep time.Duration) (planJSON, error) {
-	set, err := bc.openSet(ctx, false)
+	set, err := bc.openSetReadOnly(ctx)
 	if err != nil {
 		return planJSON{}, err
 	}
@@ -205,14 +263,17 @@ func (s *Server) computePlan(ctx context.Context, bc *backupContext, keep time.D
 		return planJSON{}, err
 	}
 	out := planJSON{
-		New:      classJSON{Count: plan.New.Files, Bytes: plan.New.Bytes},
-		Changed:  classJSON{Count: plan.Changed.Files, Bytes: plan.Changed.Bytes},
-		Moved:    classJSON{Count: plan.Moved.Files, Bytes: plan.Moved.Bytes},
-		Current:  classJSON{Count: plan.Current.Files, Bytes: plan.Current.Bytes, Paths: paths(plan.CurrentPaths)},
-		SetName:  bc.setName,
-		Symlinks: len(plan.Symlinks),
-		Missing:  len(plan.Missing),
-		KeepDays: int(keep / (24 * time.Hour)),
+		New:        classJSON{Count: plan.New.Files, Bytes: plan.New.Bytes},
+		Changed:    classJSON{Count: plan.Changed.Files, Bytes: plan.Changed.Bytes},
+		Moved:      classJSON{Count: plan.Moved.Files, Bytes: plan.Moved.Bytes},
+		Current:    classJSON{Count: plan.Current.Files, Bytes: plan.Current.Bytes, Paths: paths(plan.CurrentPaths)},
+		Restore:    classJSON{Count: plan.Restore.Files, Bytes: plan.Restore.Bytes, Paths: paths(plan.RestorePaths)},
+		SetName:    bc.setName,
+		Symlinks:   len(plan.Symlinks),
+		Missing:    len(plan.Missing),
+		Errors:     capped(plan.Errors),
+		Collisions: capped(plan.Collisions),
+		KeepDays:   int(keep / (24 * time.Hour)),
 	}
 	var newPaths, changedPaths []string
 	moved := []moveJSON{}
@@ -283,17 +344,26 @@ func (e *libEntry) clearPlans() {
 func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.BackupTarget, maxAge time.Duration) targetJSON {
 	out := targetJSON{ID: bt.ID, Label: bt.Label, Path: bt.LastPath,
 		LastBackupAt: unixOrNull(bt.LastBackupAt), LastScrubAt: unixOrNull(bt.LastScrubAt)}
-	bc, err := s.openBackup(ctx, h, bt.ID)
+	bc, err := s.openBackup(ctx, h, bt.ID, false, false)
 	if errors.Is(err, errUnreachable) {
 		return out
 	}
 	out.Reachable = true
 	if err != nil {
+		// Another library's set, or one last written by another copy of
+		// this library (foreign: a backup job with takeOver adopts it):
+		// no set is shown.
+		out.Error = s.backupError(err)
+		out.Foreign = errors.Is(err, backup.ErrForeignInstance)
+		return out
+	}
+	if err := backup.CheckSetFolder(bc.t, bc.setName); err != nil {
+		// The set's folder exists and is not a set: a backup is refused.
 		out.Error = s.backupError(err)
 		return out
 	}
 	sj := &setJSON{Name: bc.setName}
-	if set, err := bc.openSet(ctx, false); err != nil {
+	if set, err := bc.openSetReadOnly(ctx); err != nil {
 		out.Error = s.backupError(err)
 		return out
 	} else if set != nil {
@@ -321,6 +391,7 @@ func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.
 	sj.Behind = &behindJSON{New: plan.New.Count, Changed: plan.Changed.Count, Moved: plan.Moved.Count,
 		Bytes: plan.New.Bytes + plan.Changed.Bytes}
 	sj.Extras = plan.Extra.Count
+	sj.Restorable = plan.Restore.Count
 	out.Set = sj
 	return out
 }
@@ -340,8 +411,29 @@ func countRepairedDamaged(st backup.ScrubStats) int64 {
 
 // backupError is the client-facing text of a backup error.
 func (s *Server) backupError(err error) string {
-	var ns *backup.NoSpaceError
+	var (
+		ns  *backup.NoSpaceError
+		ole *backup.OtherLibraryError
+		fe  *backup.ForeignError
+		ie  *backup.IncompleteScanError
+		le  *library.ErrLocked
+	)
 	switch {
+	case errors.As(err, &ole):
+		return ole.Error() // names the set folder only
+	case errors.As(err, &fe):
+		// The one client text with an absolute path: the folder and host
+		// of the copy that last wrote the set, which the user needs.
+		return fe.Error()
+	case errors.As(err, &ie):
+		return ie.Error()
+	case errors.As(err, &le):
+		return le.Error() // the set is in use: pid, command, host, time; no path
+	case errors.Is(err, backup.ErrNotSetFolder), errors.Is(err, backup.ErrLibraryFolder), errors.Is(err, backup.ErrNotOwned),
+		errors.Is(err, backup.ErrBadUserSnapshot):
+		return rootSentinel(err, backup.ErrNotSetFolder, backup.ErrLibraryFolder, backup.ErrNotOwned, backup.ErrBadUserSnapshot).Error()
+	case errors.Is(err, backup.ErrNotSeparate):
+		return backup.PublicError(err)
 	case errors.Is(err, errUnreachable), errors.Is(err, backup.ErrOtherLibrary), errors.Is(err, backup.ErrSetVersion),
 		errors.Is(err, backup.ErrNoMarker), errors.Is(err, backup.ErrNewerMarker), errors.Is(err, backup.ErrNotEmpty),
 		errors.Is(err, backup.ErrNotDir), errors.Is(err, backup.ErrPruneCount), errors.Is(err, backup.ErrUserDBExists),
@@ -376,6 +468,36 @@ func rootError(err error) error {
 			if e == backup.ErrPruneCount {
 				return err // "... (confirmed N, now M)"
 			}
+			return e
+		}
+	}
+	return err
+}
+
+// isBackupConflict reports the errors that make a target unusable for
+// now (409): unreachable, another library's set, a set last written by
+// another copy of this library, a set folder that is not a set, a set of
+// another picmover version, a bad set name, no backup of this library
+// yet, an incomplete library scan (prune).
+func isBackupConflict(err error) bool {
+	var le *library.ErrLocked
+	if errors.As(err, &le) {
+		return true
+	}
+	for _, e := range []error{errUnreachable, backup.ErrOtherLibrary, backup.ErrForeignInstance, backup.ErrSetVersion,
+		backup.ErrInvalidSetName, backup.ErrNotSetFolder, backup.ErrLibraryFolder, backup.ErrNotOwned,
+		backup.ErrIncompleteScan, backup.ErrNotSeparate} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
+// rootSentinel returns the first of sentinels err matches.
+func rootSentinel(err error, sentinels ...error) error {
+	for _, e := range sentinels {
+		if errors.Is(err, e) {
 			return e
 		}
 	}
@@ -502,6 +624,8 @@ func (s *Server) checkTargetPath(w http.ResponseWriter, p string) (string, bool)
 func (s *Server) targetError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, backup.ErrOtherLibrary):
+		writeError(w, http.StatusConflict, backup.ErrOtherLibrary.Error())
+	case errors.Is(err, backup.ErrNotSetFolder), errors.Is(err, backup.ErrLibraryFolder):
 		writeError(w, http.StatusConflict, s.backupError(err))
 	case errors.Is(err, backup.ErrNotEmpty), errors.Is(err, backup.ErrNotDir), errors.Is(err, backup.ErrBadMarker),
 		errors.Is(err, backup.ErrNewerMarker), errors.Is(err, backup.ErrNoMarker), errors.Is(err, fs.ErrNotExist),
@@ -579,6 +703,9 @@ func (s *Server) handleTargetAdd(w http.ResponseWriter, r *http.Request, l *libH
 		err = oerr
 	} else if owner != "" && owner != libID {
 		err = backup.ErrOtherLibrary
+	}
+	if err == nil {
+		err = backup.CheckSetFolder(t, name)
 	}
 	if err != nil {
 		s.targetError(w, r, err)
@@ -671,7 +798,8 @@ func (s *Server) handleTargetForget(w http.ResponseWriter, r *http.Request, l *l
 	writeJSON(w, http.StatusOK, struct{}{})
 }
 
-// parseKeepDays reads ?keepDays= (default 30).
+// parseKeepDays reads ?keepDays= (absent: 30; 0 keeps no earlier
+// versions).
 func parseKeepDays(v string) (time.Duration, error) {
 	if v == "" {
 		return backup.DefaultKeep, nil
@@ -680,15 +808,16 @@ func parseKeepDays(v string) (time.Duration, error) {
 	if err != nil || n < 0 || n > maxKeepDays {
 		return 0, fmt.Errorf("keepDays must be 0-%d", maxKeepDays)
 	}
-	return keepFor(n), nil
+	return keepFor(&n), nil
 }
 
-// keepFor converts keepDays (0 = the default 30) to a duration.
-func keepFor(days int) time.Duration {
-	if days == 0 {
+// keepFor converts keepDays (nil: the default 30; 0: keep no earlier
+// versions) to a duration.
+func keepFor(days *int) time.Duration {
+	if days == nil {
 		return backup.DefaultKeep
 	}
-	return time.Duration(days) * 24 * time.Hour
+	return time.Duration(*days) * 24 * time.Hour
 }
 
 // handleTargetPlan is GET /api/l/{lib}/backups/targets/{id}/plan
@@ -703,7 +832,7 @@ func (s *Server) handleTargetPlan(w http.ResponseWriter, r *http.Request, l *lib
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	bc, err := s.openBackup(r.Context(), l, bt.ID)
+	bc, err := s.openBackup(r.Context(), l, bt.ID, false, false)
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -717,11 +846,11 @@ func (s *Server) handleTargetPlan(w http.ResponseWriter, r *http.Request, l *lib
 }
 
 // backupStateError answers 409 for a target that cannot be used now
-// (unreachable, another library's set), 500 otherwise.
+// (unreachable, another library's set, another copy's set, a set folder
+// that is not a set), 500 otherwise.
 func (s *Server) backupStateError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, errUnreachable), errors.Is(err, backup.ErrOtherLibrary), errors.Is(err, backup.ErrSetVersion),
-		errors.Is(err, backup.ErrInvalidSetName):
+	case isBackupConflict(err):
 		writeError(w, http.StatusConflict, s.backupError(err))
 	case r.Context().Err() != nil:
 		s.internalError(w, r, err)
@@ -737,7 +866,7 @@ func (s *Server) handleTargetRuns(w http.ResponseWriter, r *http.Request, l *lib
 	if !ok {
 		return
 	}
-	bc, err := s.openBackup(r.Context(), l, bt.ID)
+	bc, err := s.openBackup(r.Context(), l, bt.ID, true, false) // reading the runs of a foreign set is harmless
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -745,7 +874,7 @@ func (s *Server) handleTargetRuns(w http.ResponseWriter, r *http.Request, l *lib
 	out := struct {
 		Runs []runJSON `json:"runs"`
 	}{Runs: []runJSON{}}
-	set, err := bc.openSet(r.Context(), false)
+	set, err := bc.openSetReadOnly(r.Context())
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -790,7 +919,7 @@ func (s *Server) checkBackupJob(ctx context.Context, e *libEntry, p *jobParams) 
 		if p.Expected == nil || *p.Expected < 0 {
 			return http.StatusBadRequest, "prune needs expected: the number of files the plan lists under extra"
 		}
-		if p.KeepDays < 0 || p.KeepDays > maxKeepDays {
+		if p.KeepDays != nil && (*p.KeepDays < 0 || *p.KeepDays > maxKeepDays) {
 			return http.StatusBadRequest, fmt.Sprintf("keepDays must be 0-%d", maxKeepDays)
 		}
 	case kindRestore:
@@ -808,12 +937,11 @@ func (s *Server) checkBackupJob(ctx context.Context, e *libEntry, p *jobParams) 
 		return http.StatusConflict, "library is not open (" + state + ")"
 	}
 	defer e.release()
-	bc, err := s.openBackup(ctx, h, p.Target)
+	bc, err := s.openBackup(ctx, h, p.Target, p.TakeOver, false)
 	switch {
 	case errors.Is(err, userdata.ErrNotFound):
 		return http.StatusNotFound, "no such target"
-	case errors.Is(err, errUnreachable), errors.Is(err, backup.ErrOtherLibrary), errors.Is(err, backup.ErrSetVersion),
-		errors.Is(err, backup.ErrInvalidSetName):
+	case isBackupConflict(err):
 		return http.StatusConflict, s.backupError(err)
 	case err != nil:
 		s.log.Error("backup job check", "err", err)
@@ -822,14 +950,32 @@ func (s *Server) checkBackupJob(ctx context.Context, e *libEntry, p *jobParams) 
 	if err := backup.CheckSeparate(bc.t.Root, h.lib.Root()); err != nil {
 		return http.StatusConflict, err.Error()
 	}
-	if (p.Kind == kindScrub || p.Kind == kindRestore || p.Kind == kindPrune) && !backup.SetExists(bc.t, bc.setName) {
-		return http.StatusConflict, "the target has no backup of this library yet"
+	if err := backup.CheckSetFolder(bc.t, bc.setName); err != nil {
+		return http.StatusConflict, s.backupError(err)
+	}
+	// A set another process is backing up, scrubbing, pruning or
+	// restoring is refused now, naming that process.
+	if err := backup.SetBusy(bc.t, bc.setName); err != nil {
+		return http.StatusConflict, err.Error()
+	}
+	if p.Kind == kindScrub || p.Kind == kindRestore || p.Kind == kindPrune {
+		owner, err := backup.SetOwner(ctx, bc.t, bc.setName)
+		if err != nil {
+			s.log.Error("backup job check", "err", err)
+			return http.StatusInternalServerError, internalErrorMsg
+		}
+		if owner == "" {
+			return http.StatusConflict, backup.ErrNotOwned.Error()
+		}
 	}
 	if p.Kind == kindPrune {
 		plan, err := s.computePlan(ctx, bc, keepFor(p.KeepDays))
 		if err != nil {
 			s.log.Error("prune plan", "err", err)
 			return http.StatusInternalServerError, internalErrorMsg
+		}
+		if !p.Force && (len(plan.Errors) > 0 || plan.Missing > 0) {
+			return http.StatusConflict, (&backup.IncompleteScanError{Unreadable: len(plan.Errors), Missing: plan.Missing}).Error()
 		}
 		if plan.Extra.Count != int64(*p.Expected) {
 			return http.StatusConflict, fmt.Sprintf("the files to remove changed: the plan now lists %d, not %d; review them again", plan.Extra.Count, *p.Expected)
@@ -884,14 +1030,19 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 		return stateFailed, 2, stats, 0, srv.backupError(err)
 	}
 	ctx := j.ctx
-	bc, err := srv.openBackup(ctx, h, j.params.Target)
+	bc, err := srv.openBackup(ctx, h, j.params.Target, j.params.TakeOver, true)
 	if err != nil {
 		return fail(err)
 	}
 	if err := backup.CheckSeparate(bc.t.Root, h.lib.Root()); err != nil {
 		return stateFailed, 2, stats, 0, err.Error()
 	}
-	set, err := bc.openSet(ctx, kind == kindBackup)
+	var set *backup.Set
+	if kind == kindRestore {
+		set, err = bc.openSetReadOnly(ctx) // works from a write-protected target
+	} else {
+		set, err = bc.openSet(ctx, kind == kindBackup)
+	}
 	if err == nil && set == nil {
 		err = backup.ErrNoSet
 	}
@@ -907,12 +1058,16 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 	var result any
 	switch kind {
 	case kindBackup:
-		st, err := backup.Run(ctx, src, set, backup.Options{LibraryID: bc.libID, Library: h.lib.Root(),
+		st, err := backup.Run(ctx, src, set, backup.Options{Owner: bc.id, TakeOver: j.params.TakeOver, Library: h.lib.Root(),
 			Workers: j.params.Workers, Partial: j.params.Partial, OnProgress: j.onBackupProgress,
 			OnFailure: j.onBackupFailure, Logger: logger})
 		j.setResult(&st)
 		if err != nil {
 			return fail(err)
+		}
+		// The set is claimed now: remember its name.
+		if err := bc.rememberSetName(context.WithoutCancel(ctx)); err != nil {
+			logger.Error("remember the set name", "err", err)
 		}
 		if err := h.user.MarkBackup(context.WithoutCancel(ctx), bc.bt.ID, time.Now()); err != nil {
 			logger.Error("record the backup time", "err", err)
@@ -925,11 +1080,16 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 			msg = fmt.Sprintf("the target is full: %d files were not backed up", st.LeftFiles)
 		case st.SnapshotError != "":
 			msg = st.SnapshotError
+		case st.ScanErrorCount > 0:
+			msg = fmt.Sprintf("%d folders of the library could not be read; their files were not backed up", st.ScanErrorCount)
+		case st.MissingCount > 0:
+			msg = fmt.Sprintf("%d files in the catalog are missing in the library", st.MissingCount)
 		}
 	case kindScrub:
 		repair := j.params.Repair == nil || *j.params.Repair
 		st, err := backup.Scrub(ctx, set, backup.ScrubOptions{Budget: time.Duration(j.params.Budget) * time.Second,
-			Repair: repair, Source: &src, Library: h.lib.Root(), OnProgress: j.onBackupProgress, Logger: logger})
+			Repair: repair, Source: &src, Owner: bc.id, TakeOver: j.params.TakeOver, Library: h.lib.Root(),
+			OnProgress: j.onBackupProgress, Logger: logger})
 		j.setResult(&st)
 		if err != nil {
 			return fail(err)
@@ -949,7 +1109,8 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 		}
 	case kindPrune:
 		st, err := backup.Prune(ctx, src, set, backup.PruneOptions{Keep: keepFor(j.params.KeepDays),
-			Expected: *j.params.Expected, Library: h.lib.Root(), OnProgress: j.onBackupProgress, Logger: logger})
+			Expected: *j.params.Expected, Owner: bc.id, TakeOver: j.params.TakeOver, Force: j.params.Force,
+			Library: h.lib.Root(), OnProgress: j.onBackupProgress, Logger: logger})
 		j.setResult(&st)
 		if err != nil {
 			return fail(err)
@@ -960,8 +1121,9 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 			msg = fmt.Sprintf("%d files could not be removed; see the job log", len(st.Failures))
 		}
 	case kindRestore:
+		owner := bc.id
 		st, err := backup.Restore(ctx, set, lib, backup.RestoreOptions{Mode: j.params.Mode, Library: h.lib.Root(),
-			OnProgress: j.onBackupProgress, OnFailure: j.onBackupFailure, Logger: logger})
+			Owner: &owner, TakeOver: j.params.TakeOver, OnProgress: j.onBackupProgress, OnFailure: j.onBackupFailure, Logger: logger})
 		j.setResult(&st)
 		if err != nil {
 			return fail(err)

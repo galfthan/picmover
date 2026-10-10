@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,7 +51,7 @@ CREATE TABLE files (
     rel_path    TEXT PRIMARY KEY COLLATE NOCASE,
     hash        INTEGER NOT NULL,
     size        INTEGER NOT NULL,
-    mtime       INTEGER NOT NULL,
+    mtime_ns    INTEGER NOT NULL,
     backed_at   INTEGER NOT NULL,
     verified_at INTEGER
 );
@@ -63,6 +66,25 @@ CREATE TABLE runs (
     stats       TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE counts (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    files      INTEGER NOT NULL,
+    bytes      INTEGER NOT NULL,
+    unverified INTEGER NOT NULL
+);
+INSERT INTO counts VALUES (1, 0, 0, 0);
+CREATE TRIGGER files_ins AFTER INSERT ON files BEGIN
+    UPDATE counts SET files = files + 1, bytes = bytes + new.size,
+        unverified = unverified + (new.verified_at IS NULL) WHERE id = 1;
+END;
+CREATE TRIGGER files_del AFTER DELETE ON files BEGIN
+    UPDATE counts SET files = files - 1, bytes = bytes - old.size,
+        unverified = unverified - (old.verified_at IS NULL) WHERE id = 1;
+END;
+CREATE TRIGGER files_upd AFTER UPDATE OF size, verified_at ON files BEGIN
+    UPDATE counts SET bytes = bytes + new.size - old.size,
+        unverified = unverified + (new.verified_at IS NULL) - (old.verified_at IS NULL) WHERE id = 1;
+END;
 `
 
 // Errors about sets.
@@ -75,6 +97,16 @@ var (
 	ErrSetVersion = errors.New("the backup set was written by another picmover version")
 	// ErrInvalidSetName: not a usable folder name.
 	ErrInvalidSetName = errors.New("invalid backup set name")
+	// ErrNotSetFolder: the set's folder exists on the target, is not a
+	// backup set and is not empty.
+	ErrNotSetFolder = errors.New("the folder for this backup set already exists on the target and is not a picmover backup set; choose another set name or move the folder away")
+	// ErrLibraryFolder: the set's folder on the target is a picmover
+	// library.
+	ErrLibraryFolder = errors.New("the folder for this backup set on the target is a picmover library, not a backup set; choose another set name")
+	// ErrNotOwned: the set has no owner yet (nothing was backed up into
+	// it), so there is nothing of this library to prune, repair or
+	// restore.
+	ErrNotOwned = errors.New("the target has no backup of this library yet")
 )
 
 // ValidSetName reports whether name can name a set folder: one path
@@ -118,7 +150,7 @@ type FileRow struct {
 	RelPath    string // forward slashes, relative to the set
 	Hash       uint64
 	Size       int64
-	MTime      int64 // the source's mtime, Unix seconds
+	MTime      int64 // the source's mtime, Unix nanoseconds (mtime_ns)
 	BackedAt   int64
 	VerifiedAt int64 // 0: never verified
 }
@@ -130,6 +162,8 @@ type Set struct {
 	Dir    string // <target>/<name>
 	db     *sql.DB
 	now    func() time.Time
+	// readOnly: opened with OpenSetReadOnly (backup.db mode=ro).
+	readOnly bool
 }
 
 // SetExists reports whether the target has a set called name (a folder
@@ -157,7 +191,11 @@ func Sets(t *Target) ([]string, error) {
 // OpenSet opens the set called name on t. With create, a missing set is
 // created (its folder, .picmover and backup.db); otherwise it is
 // ErrNoSet. The set folder and its .picmover must be real folders, not
-// links.
+// links. An existing folder is only made a set when it is empty (file
+// system bookkeeping aside, see InitTarget): a folder that is not a set
+// is ErrNotSetFolder, one that looks like a picmover library (media.db,
+// user.db or .picmover/lock) ErrLibraryFolder, so a backup never moves
+// away or overwrites files it did not write.
 func OpenSet(ctx context.Context, t *Target, name string, create bool) (*Set, error) {
 	if !ValidSetName(name) {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidSetName, name)
@@ -167,6 +205,9 @@ func OpenSet(ctx context.Context, t *Target, name string, create bool) (*Set, er
 	dbPath := filepath.Join(meta, DBName)
 	if !create && !SetExists(t, name) {
 		return nil, ErrNoSet
+	}
+	if err := checkSetFolder(dir); err != nil {
+		return nil, err
 	}
 	for _, d := range []string{dir, meta} {
 		fi, err := os.Lstat(d)
@@ -199,22 +240,208 @@ func OpenSet(ctx context.Context, t *Target, name string, create bool) (*Set, er
 	return s, nil
 }
 
-func (s *Set) ensureSchema(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("backup: open backup.db: %w", err)
+// OpenSetReadOnly opens the existing set called name on t with backup.db
+// read-only (SQLite mode=ro): for the listing, the plan and the runs,
+// which then never take a write lock, and for restore, which also works
+// from a write-protected target. Writes through it fail.
+func OpenSetReadOnly(ctx context.Context, t *Target, name string) (*Set, error) {
+	if !ValidSetName(name) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidSetName, name)
 	}
-	defer tx.Rollback()
-	var v, tables int
-	if err := tx.QueryRowContext(ctx, `SELECT (SELECT user_version FROM pragma_user_version),
-		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table')`).Scan(&v, &tables); err != nil {
+	if !SetExists(t, name) {
+		return nil, ErrNoSet
+	}
+	dir := filepath.Join(t.Root, name)
+	if err := checkSetFolder(dir); err != nil {
+		return nil, err
+	}
+	for _, d := range []string{dir, filepath.Join(dir, library.MetaDir)} {
+		if fi, err := os.Lstat(d); err != nil {
+			return nil, err
+		} else if !fi.IsDir() {
+			return nil, fmt.Errorf("%s is not a folder", d)
+		}
+	}
+	dbPath := filepath.Join(dir, library.MetaDir, DBName)
+	p := filepath.ToSlash(dbPath)
+	if runtime.GOOS == "windows" && !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	u := url.URL{Scheme: "file", Path: p}
+	db, err := sql.Open("sqlite", u.String()+"?mode=ro&_pragma=busy_timeout(10000)")
+	if err != nil {
+		return nil, err
+	}
+	s := &Set{Target: t, Name: name, Dir: dir, db: db, now: time.Now, readOnly: true}
+	if err := s.ensureSchema(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// ReadOnly reports whether the set was opened with OpenSetReadOnly.
+func (s *Set) ReadOnly() bool { return s.readOnly }
+
+// lockName is the set lock inside <set>/.picmover (the same name as the
+// library lock: a set folder has .picmover/backup.db, which tells them
+// apart).
+const lockName = library.LockName
+
+// Lock takes the set's lock, <set>/.picmover/lock (an OS lock as for the
+// library: released when unlock is called or the process ends), for a
+// backup, scrub, prune or restore named cmd. A held lock is a
+// *library.ErrLocked naming the holder (pid, command, host, time). When
+// the file system cannot lock, or (a read-only set, for a restore) the
+// lock file cannot be created, the run goes on without it, unlock is a
+// no-op and held is false.
+func (s *Set) Lock(cmd string) (unlock func(), held bool, err error) {
+	if err := realDir(s.MetaDir(), false); err != nil {
+		return nil, false, err
+	}
+	p := filepath.Join(s.MetaDir(), lockName)
+	if fi, err := os.Lstat(p); err == nil && !fi.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("%s: %w", lockName, errNotRealDir)
+	}
+	unlock, err = library.LockFile(p, cmd)
+	var le *library.ErrLocked
+	switch {
+	case err == nil:
+		return unlock, true, nil
+	case errors.As(err, &le):
+		le.What = "backup set"
+		return nil, false, le
+	case unlock != nil: // locking unsupported
+		return unlock, false, nil
+	case s.readOnly:
+		return func() {}, false, nil
+	}
+	return nil, false, err
+}
+
+// closeInterrupted marks the runs rows a killed process left unfinished
+// as finished at their start, with "interrupted": true in their stats.
+// The caller holds the set lock, so no other run is going on.
+func (s *Set) closeInterrupted(ctx context.Context, log *slog.Logger) {
+	res, err := s.db.ExecContext(ctx, `UPDATE runs SET finished_at = started_at,
+		stats = json_set(CASE WHEN json_valid(stats) THEN stats ELSE '{}' END, '$.interrupted', json('true'))
+		WHERE finished_at IS NULL`)
+	if err != nil {
+		log.Error("close interrupted runs", "err", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Info("earlier runs were interrupted", "count", n)
+	}
+}
+
+// SetBusy reports whether another process holds the lock of the set
+// called name on t: a *library.ErrLocked when it does, nil otherwise
+// (also when there is no set or it cannot be locked).
+func SetBusy(t *Target, name string) error {
+	if !SetExists(t, name) {
+		return nil
+	}
+	s := &Set{Target: t, Name: name, Dir: filepath.Join(t.Root, name), now: time.Now, readOnly: true}
+	unlock, _, err := s.Lock("check")
+	var le *library.ErrLocked
+	if errors.As(err, &le) {
+		return le
+	}
+	if unlock != nil {
+		unlock()
+	}
+	return nil
+}
+
+// CheckSetFolder reports whether the set called name on t could be
+// opened or created (nil), or is a folder OpenSet refuses
+// (ErrNotSetFolder, ErrLibraryFolder, ErrInvalidSetName).
+func CheckSetFolder(t *Target, name string) error {
+	if !ValidSetName(name) {
+		return fmt.Errorf("%w: %q", ErrInvalidSetName, name)
+	}
+	return checkSetFolder(filepath.Join(t.Root, name))
+}
+
+// checkSetFolder refuses an existing folder that is not a backup set (no
+// .picmover/backup.db): one holding a library lock is ErrLibraryFolder; one without
+// .picmover/backup.db must be empty apart from file system bookkeeping
+// (and an empty .picmover a killed first run left), else it is
+// ErrLibraryFolder when it holds media.db or user.db and ErrNotSetFolder
+// otherwise.
+func checkSetFolder(dir string) error {
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%w (it is a file or a link)", ErrNotSetFolder)
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, library.MetaDir, DBName)); err == nil && fi.Mode().IsRegular() {
+		return nil // a set (its .picmover/lock is the set lock)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, library.MetaDir, library.LockName)); err == nil {
+		return ErrLibraryFolder
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	notEmpty := false
+	for _, e := range ents {
+		n := strings.ToLower(e.Name())
+		switch {
+		case n == library.DBName || n == library.UserDBName:
+			return ErrLibraryFolder
+		case isSystemEntry(e.Name()):
+		case n == library.MetaDir && e.IsDir() && emptyDir(filepath.Join(dir, e.Name())):
+		default:
+			notEmpty = true
+		}
+	}
+	if notEmpty {
+		return ErrNotSetFolder
+	}
+	return nil
+}
+
+func emptyDir(p string) bool {
+	ents, err := os.ReadDir(p)
+	return err == nil && len(ents) == 0
+}
+
+func (s *Set) ensureSchema(ctx context.Context) error {
+	// Read without a transaction: opening an existing set never waits
+	// for (or blocks) a writer.
+	v, tables, err := s.version(ctx, s.db)
+	if err != nil {
 		return fmt.Errorf("backup: open backup.db: %w", err)
 	}
 	switch {
 	case v == SchemaVersion:
 		return nil
-	case v == 0 && tables == 0:
+	case v == 0 && tables == 0 && !s.readOnly:
 	default:
+		return fmt.Errorf("%w (backup.db schema version %d, this picmover reads %d)", ErrSetVersion, v, SchemaVersion)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("backup: open backup.db: %w", err)
+	}
+	defer tx.Rollback()
+	// Checked again in the write transaction: another process may have
+	// created the schema in between.
+	if v, tables, err = s.version(ctx, tx); err != nil {
+		return fmt.Errorf("backup: open backup.db: %w", err)
+	}
+	if v == SchemaVersion {
+		return nil
+	}
+	if v != 0 || tables != 0 {
 		return fmt.Errorf("%w (backup.db schema version %d, this picmover reads %d)", ErrSetVersion, v, SchemaVersion)
 	}
 	if _, err := tx.ExecContext(ctx, setSchema); err != nil {
@@ -227,6 +454,14 @@ func (s *Set) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("backup: create backup.db: %w", err)
 	}
 	return tx.Commit()
+}
+
+func (s *Set) version(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (v, tables int, err error) {
+	err = q.QueryRowContext(ctx, `SELECT (SELECT user_version FROM pragma_user_version),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table')`).Scan(&v, &tables)
+	return v, tables, err
 }
 
 // Close closes backup.db.
@@ -273,25 +508,12 @@ func (s *Set) SetMeta(ctx context.Context, key, value string) error {
 // that has not been written yet).
 func (s *Set) LibraryID(ctx context.Context) (string, error) { return s.Meta(ctx, "library_id") }
 
-// Claim makes the set the backup of the library with id libraryID: a set
-// without an owner takes it; a set of another library is ErrOtherLibrary.
-func (s *Set) Claim(ctx context.Context, libraryID string) error {
-	id, err := s.LibraryID(ctx)
-	if err != nil {
-		return err
-	}
-	switch id {
-	case libraryID:
-		return nil
-	case "":
-		return s.SetMeta(ctx, "library_id", libraryID)
-	}
-	return ErrOtherLibrary
-}
-
 // FindSet returns the name of the set on t that belongs to libraryID, or
 // "" when none does.
 func FindSet(ctx context.Context, t *Target, libraryID string) (string, error) {
+	if libraryID == "" {
+		return "", nil
+	}
 	names, err := Sets(t)
 	if err != nil {
 		return "", err
@@ -306,29 +528,30 @@ func FindSet(ctx context.Context, t *Target, libraryID string) (string, error) {
 }
 
 // ResolveSetName returns the set of the library libraryID on t: stored
-// when the library remembers one; else the set on t that belongs to the
+// when the library remembers one (which must not belong to another
+// library: an *OtherLibraryError); else the set on t that belongs to the
 // library (found by its library_id, so a renamed library folder keeps
 // its set); else the default name for libDir (DefaultSetName), which
-// must not belong to another library (ErrOtherLibrary).
+// must not belong to another library either.
 func ResolveSetName(ctx context.Context, t *Target, stored, libraryID, libDir string) (string, error) {
+	name := stored
 	if stored != "" {
 		if !ValidSetName(stored) {
 			return "", fmt.Errorf("%w: %q", ErrInvalidSetName, stored)
 		}
-		return stored, nil
-	}
-	if name, err := FindSet(ctx, t, libraryID); err != nil {
+	} else if found, err := FindSet(ctx, t, libraryID); err != nil {
 		return "", err
-	} else if name != "" {
-		return name, nil
+	} else if found != "" {
+		return found, nil
+	} else {
+		name = DefaultSetName(libDir)
 	}
-	name := DefaultSetName(libDir)
 	owner, err := SetOwner(ctx, t, name)
 	if err != nil {
 		return "", err
 	}
 	if owner != "" && owner != libraryID {
-		return "", ErrOtherLibrary
+		return "", &OtherLibraryError{Name: name}
 	}
 	return name, nil
 }
@@ -343,7 +566,7 @@ func SetOwner(ctx context.Context, t *Target, name string) (string, error) {
 }
 
 func readSetLibraryID(ctx context.Context, t *Target, name string) (string, error) {
-	s, err := OpenSet(ctx, t, name, false)
+	s, err := OpenSetReadOnly(ctx, t, name)
 	if err != nil {
 		return "", err
 	}
@@ -354,7 +577,7 @@ func readSetLibraryID(ctx context.Context, t *Target, name string) (string, erro
 // Files returns every row of the files table (rows whose path is not a
 // valid set path are dropped: they are never acted on).
 func (s *Set) Files(ctx context.Context) ([]FileRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT rel_path, hash, size, mtime, backed_at, coalesce(verified_at, 0) FROM files`)
+	rows, err := s.db.QueryContext(ctx, `SELECT rel_path, hash, size, mtime_ns, backed_at, coalesce(verified_at, 0) FROM files`)
 	if err != nil {
 		return nil, fmt.Errorf("backup: files: %w", err)
 	}
@@ -387,8 +610,9 @@ type SetSummary struct {
 // Summary returns the row counts.
 func (s *Set) Summary(ctx context.Context) (SetSummary, error) {
 	var out SetSummary
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), coalesce(SUM(size), 0),
-		coalesce(SUM(verified_at IS NULL), 0) FROM files`).Scan(&out.Files, &out.Bytes, &out.Unverified)
+	// The counts table is kept by triggers on files: no row is counted.
+	err := s.db.QueryRowContext(ctx, `SELECT files, bytes, unverified FROM counts WHERE id = 1`).
+		Scan(&out.Files, &out.Bytes, &out.Unverified)
 	if err != nil {
 		return SetSummary{}, fmt.Errorf("backup: summary: %w", err)
 	}
@@ -526,9 +750,9 @@ func (s *Set) apply(ctx context.Context, ops []rowOp) error {
 			if r.VerifiedAt != 0 {
 				verified = r.VerifiedAt
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO files (rel_path, hash, size, mtime, backed_at, verified_at)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO files (rel_path, hash, size, mtime_ns, backed_at, verified_at)
 				VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (rel_path) DO UPDATE SET rel_path = excluded.rel_path,
-				hash = excluded.hash, size = excluded.size, mtime = excluded.mtime, backed_at = excluded.backed_at,
+				hash = excluded.hash, size = excluded.size, mtime_ns = excluded.mtime_ns, backed_at = excluded.backed_at,
 				verified_at = excluded.verified_at`,
 				r.RelPath, int64(r.Hash), r.Size, r.MTime, r.BackedAt, verified); err != nil {
 				return fmt.Errorf("backup: write rows: %w", err)
@@ -537,19 +761,6 @@ func (s *Set) apply(ctx context.Context, ops []rowOp) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("backup: write rows: %w", err)
-	}
-	return nil
-}
-
-// setVerified records a scrub result for one row: at > 0 verified then,
-// 0 clears verified_at (damaged).
-func (s *Set) setVerified(ctx context.Context, rel string, at int64) error {
-	var v any
-	if at > 0 {
-		v = at
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE files SET verified_at = ? WHERE rel_path = ?`, v, rel); err != nil {
-		return fmt.Errorf("backup: verified: %w", err)
 	}
 	return nil
 }
@@ -597,17 +808,19 @@ func keyOf(rel string) string {
 	return string(b)
 }
 
-// inSet reports whether p (absolute, inside the set as spelled) still
-// lies inside the set after resolving the symbolic links of its parent
+// within checks that p (absolute, inside the set as spelled) still lies
+// inside the set after resolving the symbolic links of its parent
 // folder, so a link planted on the target never makes a write or a
-// removal land outside it.
-func (s *Set) inSet(p string) bool {
+// removal land outside it: errOutsideSet when it does not. When the set
+// folder itself cannot be resolved (the target was unplugged) that error
+// is returned instead, so the failure says what happened.
+func (s *Set) within(p string) error {
 	if !inside(s.Dir, p) {
-		return false
+		return errOutsideSet
 	}
 	root, err := filepath.EvalSymlinks(s.Dir)
 	if err != nil {
-		return false
+		return fmt.Errorf("%w: %w", errTargetGone, err)
 	}
 	parent, err := filepath.EvalSymlinks(filepath.Dir(p))
 	if err != nil {
@@ -617,7 +830,7 @@ func (s *Set) inSet(p string) bool {
 		for {
 			up := filepath.Dir(dir)
 			if up == dir {
-				return false
+				return errOutsideSet
 			}
 			dir = up
 			if r, err := filepath.EvalSymlinks(dir); err == nil {
@@ -626,8 +839,14 @@ func (s *Set) inSet(p string) bool {
 			}
 		}
 	}
-	return samePath(parent, root) || inside(root, parent)
+	if samePath(parent, root) || inside(root, parent) {
+		return nil
+	}
+	return errOutsideSet
 }
+
+// inSet is within(p) == nil.
+func (s *Set) inSet(p string) bool { return s.within(p) == nil }
 
 // previousPath returns <set>/.picmover/previous/<rel>.<unix>.
 func (s *Set) previousPath(rel string, at time.Time) string {
@@ -635,36 +854,77 @@ func (s *Set) previousPath(rel string, at time.Time) string {
 }
 
 // keepPrevious moves the file at the set path rel to previous/, never
-// replacing a file there (a later second is tried).
-func (s *Set) keepPrevious(rel string) error {
+// replacing a file there (a later second is tried), and returns where it
+// went.
+func (s *Set) keepPrevious(rel string) (string, error) {
 	src := s.Abs(rel)
 	now := s.now()
+	if err := realDir(s.MetaDir(), false); err != nil {
+		return "", err
+	}
 	for i := 0; i < 100; i++ {
 		dst := s.previousPath(rel, now.Add(time.Duration(i)*time.Second))
-		if !s.inSet(dst) {
-			return errOutsideSet
+		if err := s.within(dst); err != nil {
+			return "", err
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
+			return "", err
 		}
 		err := library.RenameNoReplace(src, dst)
-		if err == nil || !errors.Is(err, fs.ErrExist) {
-			return err
+		if err == nil {
+			return dst, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
 		}
 	}
-	return errors.New("no free name in previous/")
+	return "", errors.New("no free name in previous/")
 }
 
 // errOutsideSet: a path on the target resolves outside the set (a
 // symbolic link on the target).
 var errOutsideSet = errors.New("the path leads outside the backup set (a link on the target)")
 
-// cleanTmp removes the temp files a killed run left in the set's tmp
-// folder (copy-*.part, stage-*, snap-*): only picmover's own names.
-func (s *Set) cleanTmp() {
+// errTargetGone: the set folder cannot be reached any more (the target
+// was unplugged or disconnected during the run).
+var errTargetGone = errors.New("the backup set's folder cannot be reached any more (was the target unplugged or disconnected?)")
+
+// errNotRealDir: one of the set's own folders is a link or a file.
+var errNotRealDir = errors.New("a folder in the backup set's .picmover is a link or a file; picmover does not follow it")
+
+// realDir makes sure p is a real folder (not a link), creating it when
+// create and it is missing.
+func realDir(p string, create bool) error {
+	fi, err := os.Lstat(p)
+	if errors.Is(err, fs.ErrNotExist) && create {
+		if err := os.Mkdir(p, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		fi, err = os.Lstat(p)
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s: %w", filepath.Base(p), errNotRealDir)
+	}
+	return nil
+}
+
+// prepareTmp makes sure the set's .picmover and tmp are real folders
+// (never links: the cleanup below would follow them) and removes the
+// temp files a killed run left there (copy-*.part, stage-*, snap-*: only
+// picmover's own names).
+func (s *Set) prepareTmp() error {
+	if err := realDir(s.MetaDir(), false); err != nil {
+		return err
+	}
+	if err := realDir(s.TmpDir(), true); err != nil {
+		return err
+	}
 	ents, err := os.ReadDir(s.TmpDir())
 	if err != nil {
-		return
+		return err
 	}
 	for _, e := range ents {
 		n := e.Name()
@@ -672,6 +932,49 @@ func (s *Set) cleanTmp() {
 			os.Remove(filepath.Join(s.TmpDir(), n))
 		}
 	}
+	return nil
+}
+
+// checkSeparate refuses a set folder that is, holds or lies inside the
+// library (CheckSeparate, with links resolved).
+func (s *Set) checkSeparate(lib *library.Library) error {
+	if lib == nil {
+		return nil
+	}
+	return CheckSeparate(s.Dir, lib.Root())
+}
+
+// userSnapshotPath returns the user.db snapshot to restore from: the one
+// at the set root, else (a run killed between moving the old snapshot to
+// previous/ and putting the new one in place) the newest
+// previous/user.db.<unix>; latest is false for the fallback.
+func (s *Set) userSnapshotPath() (p string, latest bool, ok bool) {
+	p = s.Abs(UserSnapshot)
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+		return p, true, true
+	}
+	ents, err := os.ReadDir(s.PreviousDir())
+	if err != nil {
+		return "", false, false
+	}
+	best, bestAt := "", int64(-1)
+	for _, e := range ents {
+		rest, found := strings.CutPrefix(e.Name(), UserSnapshot+".")
+		if !found || !e.Type().IsRegular() {
+			continue
+		}
+		n, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil {
+			continue
+		}
+		if n > bestAt {
+			best, bestAt = e.Name(), n
+		}
+	}
+	if best == "" {
+		return "", false, false
+	}
+	return filepath.Join(s.PreviousDir(), best), false, true
 }
 
 // caseInsensitiveFS: Windows and macOS file systems ignore case by
