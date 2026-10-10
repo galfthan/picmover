@@ -230,4 +230,17 @@ describe('job store', () => {
     await flush();
     expect(jobs.current?.phase).toEqual({ phase: 'done', items: 136000, bands: 8, pairs: 42 });
   });
+  it('keeps backup progress from the top level, `progress` or `stats` of a progress event', async () => {
+    const backupJob = (state: string, extra: Record<string, unknown> = {}): Job => ({ ...job(6, state), kind: 'backup', source: undefined, ...extra });
+    routes['GET /api/jobs'] = () => json({ jobs: [backupJob('running', { progress: { phase: 'plan', files: 0, bytes: 0 } })] });
+    await jobs.init();
+    expect(jobs.current?.phase).toEqual({ phase: 'plan', files: 0, bytes: 0 });
+    const p = { phase: 'copy', files: 2, bytes: 2048, totalFiles: 10, totalBytes: 10240, current: 'image/2024/07/a.jpg', failed: 0 };
+    lastES().emit('progress', p);
+    expect(jobs.current?.phase).toEqual(p);
+    lastES().emit('progress', { progress: { ...p, files: 3 } });
+    expect(jobs.current?.phase?.files).toBe(3);
+    lastES().emit('progress', { stats: { ...p, files: 4, failed: 1 } });
+    expect(jobs.current?.phase).toMatchObject({ phase: 'copy', files: 4, failed: 1 });
+  });
 });

@@ -199,3 +199,98 @@ describe('errors', () => {
     ]);
   });
 });
+
+describe('backups', () => {
+  const api = libApi('peter');
+  const T = 'a1b2c3d4e5f60718';
+
+  it('lists targets, asking for a fresh plan with ?plan=1, and fills missing fields', async () => {
+    reply = () =>
+      json({
+        targets: [
+          { id: T, label: 'Red', path: '/mnt/red', reachable: true, lastBackupAt: 1760090000, lastScrubAt: null, set: { files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 } },
+          { id: '0f1e2d3c4b5a6978', label: 'NAS', path: '\\\\nas\\photos', reachable: false },
+        ],
+      });
+    const list = await api.getBackups(true);
+    expect(calls.map((c) => c.path)).toEqual(['/api/l/peter/backups?plan=1']);
+    expect(list[0]).toEqual({
+      id: T,
+      label: 'Red',
+      path: '/mnt/red',
+      reachable: true,
+      lastBackupAt: 1760090000,
+      lastScrubAt: null,
+      set: { files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 },
+    });
+    expect(list[1]).toMatchObject({ reachable: false, lastBackupAt: null, set: null });
+    reply = () => json({ targets: null });
+    expect(await api.getBackups()).toEqual([]);
+    expect(calls[1]?.path).toBe('/api/l/peter/backups');
+  });
+
+  it('adds, updates and forgets targets by id', async () => {
+    reply = (c) => json(c.path.endsWith('/forget') ? {} : { id: T, label: 'Red', path: '/mnt/red', reachable: true }, c.path.endsWith('/targets') ? 201 : 200);
+    expect((await api.addTarget('\\\\nas\\photos', 'NAS')).id).toBe(T);
+    await api.updateTarget(T, { path: 'E:\\Backup' });
+    await api.forgetTarget(T);
+    expect(calls.map((c) => [c.method, c.path, c.body])).toEqual([
+      ['POST', '/api/l/peter/backups/targets', { path: '\\\\nas\\photos', label: 'NAS' }],
+      ['POST', `/api/l/peter/backups/targets/${T}`, { path: 'E:\\Backup' }],
+      ['POST', `/api/l/peter/backups/targets/${T}/forget`, {}],
+    ]);
+  });
+
+  it('never puts an invalid target id into a URL', async () => {
+    await expect(api.getPlan('../../x')).rejects.toBeInstanceOf(ApiError);
+    await expect(api.forgetTarget('A1B2C3D4E5F60718')).rejects.toBeInstanceOf(ApiError);
+    expect(calls).toEqual([]);
+  });
+
+  it('reads the plan per class, with examples as strings or objects', async () => {
+    reply = () =>
+      json({
+        new: { count: 2, bytes: 20, paths: ['a.jpg', 'b.jpg'] },
+        moved: { count: 1, bytes: 0, examples: [{ from: 'c.jpg', to: 'd/c.jpg' }] },
+        extra: { count: 600, bytes: 6000, paths: [{ path: 'x.jpg' }, 'y.jpg'] },
+      });
+    const p = await api.getPlan(T);
+    expect(calls[0]?.path).toBe(`/api/l/peter/backups/targets/${T}/plan`);
+    expect(p.new).toEqual({ count: 2, bytes: 20, paths: ['a.jpg', 'b.jpg'] });
+    expect(p.moved.paths).toEqual(['c.jpg → d/c.jpg']);
+    expect(p.extra).toEqual({ count: 600, bytes: 6000, paths: ['x.jpg', 'y.jpg'] });
+    expect(p.changed).toEqual({ count: 0, bytes: 0, paths: [] });
+    expect(p.current).toEqual({ count: 0, bytes: 0, paths: [] });
+  });
+
+  it('reads runs newest first, with stats as an object or JSON text', async () => {
+    reply = () =>
+      json({
+        runs: [
+          { id: 2, kind: 'scrub', startedAt: 10, finishedAt: 20, stats: { damaged: 1 } },
+          { id: 1, kind: 'backup', startedAt: '2026-10-10T10:00:00Z', finishedAt: null, stats: '{"copied":3}' },
+        ],
+      });
+    const runs = await api.getRuns(T);
+    expect(calls[0]?.path).toBe(`/api/l/peter/backups/targets/${T}/runs`);
+    expect(runs).toEqual([
+      { id: 2, kind: 'scrub', startedAt: 10, finishedAt: 20, stats: { damaged: 1 } },
+      { id: 1, kind: 'backup', startedAt: '2026-10-10T10:00:00Z', finishedAt: null, stats: { copied: 3 } },
+    ]);
+  });
+
+  it('starts the backup job kinds with their bodies', async () => {
+    reply = (c) => json({ id: 7, kind: c.body?.kind, state: 'queued', startedAt: null, finishedAt: null, stats: {}, error: null }, 201);
+    await api.startJob({ kind: 'backup', target: T });
+    await api.startJob({ kind: 'scrub', target: T, budget: 900, repair: true });
+    await api.startJob({ kind: 'prune', target: T, confirm: true, expected: 3 });
+    await api.startJob({ kind: 'restore', target: T, mode: 'missing' });
+    expect(calls.map((c) => c.body)).toEqual([
+      { kind: 'backup', target: T },
+      { kind: 'scrub', target: T, budget: 900, repair: true },
+      { kind: 'prune', target: T, confirm: true, expected: 3 },
+      { kind: 'restore', target: T, mode: 'missing' },
+    ]);
+    expect(calls.every((c) => c.path === '/api/l/peter/jobs')).toBe(true);
+  });
+});

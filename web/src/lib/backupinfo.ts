@@ -241,7 +241,7 @@ export class RateMeter {
     }
     this.#samples.push({ t, v });
     const from = t - this.windowMs;
-    while (this.#samples.length > 2 && (this.#samples[1] as { t: number }).t <= from) this.#samples.shift();
+    while (this.#samples.length > 2 && (this.#samples[0] as { t: number }).t < from) this.#samples.shift();
   }
 
   /** Units per second, or null until the samples span at least a second. */

@@ -61,6 +61,31 @@ export interface Call {
   body: Record<string, unknown> | null;
 }
 
+/** Unix seconds of a local wall-clock time (the fake clock runs at 2026-10-10T12:00:00 local). */
+export const unix = (wall: string) => Math.floor(new Date(wall).getTime() / 1000);
+
+/** Marker ids of the fake's targets. */
+export const T1 = 'a1b2c3d4e5f60718';
+export const T2 = '0f1e2d3c4b5a6978';
+
+interface FakeTarget {
+  id: string;
+  label: string;
+  path: string;
+  reachable: boolean;
+  lastBackupAt: number | null;
+  lastScrubAt: number | null;
+  set: { files: number; bytes: number; extras: number; damaged: number; unverified: number } | null;
+}
+
+interface FakeClass {
+  count: number;
+  bytes: number;
+  paths: unknown[];
+}
+
+const cls = (count: number, bytes: number, paths: unknown[] = []): FakeClass => ({ count, bytes, paths });
+
 const summary = (n: number) => ({ total: n, images: n, raw: 0, videos: 0, withGps: 0, deleted: 0, bytes: 1, earliest: '2024-06-01T10:00:00', latest: '2024-07-31T10:00:00' });
 
 /** A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver. */
@@ -85,12 +110,176 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** user.db counts that differ from the catalog's (null: the same). */
   const userdb: { trashed: number | null } = { trashed: null };
 
+  /**
+   * Backups of "peter" (docs/design/backups.md "HTTP API"): targets as
+   * user.db and backup.db would describe them, the plan per target (its
+   * `behind` is what GET …/backups reports once planned), and the runs.
+   */
+  const backup = {
+    targets: [
+      {
+        id: T1,
+        label: 'Red WD drive',
+        path: '/mnt/red',
+        reachable: true,
+        lastBackupAt: unix('2026-10-10T10:00:00'),
+        lastScrubAt: unix('2026-10-01T10:00:00'),
+        set: { files: 8, bytes: 8000, extras: 3, damaged: 1, unverified: 2 },
+      },
+      {
+        id: T2,
+        label: 'NAS',
+        path: '\\\\nas\\photos',
+        reachable: false,
+        lastBackupAt: unix('2026-08-01T10:00:00'),
+        lastScrubAt: null,
+        set: null,
+      },
+    ] as FakeTarget[],
+    /** Targets whose plan has been computed (GET …/backups?plan=1 or GET …/plan): their `behind` is reported. */
+    planned: new Set<string>(),
+    plans: {
+      [T1]: {
+        current: cls(5, 5000),
+        new: cls(2, 2048, ['image/2024/07/1.jpg', 'image/2024/07/2.jpg']),
+        changed: cls(0, 0),
+        moved: cls(1, 1000, [{ from: 'image/2024/06/7.jpg', to: 'image/2024/06/7b.jpg' }]),
+        extra: cls(3, 3000, ['image/2023/01/x.jpg', 'image/2023/01/y.jpg']),
+      },
+    } as Record<string, Record<string, FakeClass>>,
+    runs: {
+      [T1]: [
+        {
+          id: 3,
+          kind: 'scrub',
+          startedAt: unix('2026-10-01T10:00:00'),
+          finishedAt: unix('2026-10-01T10:15:00'),
+          stats: {
+            checked: 8,
+            bytes: 8000,
+            damaged: [
+              { path: 'image/2024/06/7.jpg', repaired: true },
+              { path: 'image/2024/06/8.jpg', repaired: false, error: 'the library copy differs too' },
+            ],
+            unknown: ['notes/stray.txt'],
+            missing: 0,
+          },
+        },
+        {
+          id: 2,
+          kind: 'backup',
+          startedAt: unix('2026-10-10T09:50:00'),
+          finishedAt: unix('2026-10-10T10:00:00'),
+          stats: { copied: 7, moved: 0, changed: 0, bytes: 7000, failed: [{ path: 'image/2024/07/3.jpg', error: 'read: input/output error' }] },
+        },
+      ],
+    } as Record<string, { id: number; kind: string; startedAt: number; finishedAt: number | null; stats: Record<string, unknown> }[]>,
+    nextId: 0x100,
+  };
+  const TARGET_RE = /^[0-9a-f]{16}$/;
+  const behindOf = (id: string) => {
+    const p = backup.plans[id];
+    if (!p || !backup.planned.has(id)) return null;
+    const c = (k: string) => p[k] ?? cls(0, 0);
+    return { new: c('new').count, changed: c('changed').count, moved: c('moved').count, bytes: c('new').bytes + c('changed').bytes };
+  };
+  const targetJSON = (t: FakeTarget) => ({ ...t, set: t.set && t.reachable ? { ...t.set, behind: behindOf(t.id) } : null });
+  /** Absolute POSIX, drive or UNC path; no NUL and no device paths (as the server's check). */
+  const validTargetPath = (p: unknown): p is string =>
+    typeof p === 'string' && !p.includes('\u0000') && !/^[\\/]{2}[?.][\\/]/.test(p) && (/^\/(?!\/)/.test(p) || /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(p));
+
+  function backups(path: string, q: URLSearchParams, method: string, body: Record<string, unknown>): Response {
+    if (method === 'GET' && path === 'backups') {
+      if (q.get('plan') === '1') for (const t of backup.targets) if (t.reachable) backup.planned.add(t.id);
+      return json({ targets: backup.targets.map(targetJSON) });
+    }
+    if (method === 'POST' && path === 'backups/targets') {
+      if (!validTargetPath(body.path)) return json({ error: 'path: expected an absolute folder path' }, 400);
+      if (body.path.startsWith('/media/peter')) return json({ error: 'the target folder is inside the library' }, 400);
+      if (body.path === '/mnt/taken') return json({ error: 'the folder holds another library\'s backup set named peter' }, 409);
+      const t: FakeTarget = {
+        id: (backup.nextId++).toString(16).padStart(16, '0'),
+        label: typeof body.label === 'string' ? body.label : '',
+        path: body.path,
+        reachable: true,
+        lastBackupAt: null,
+        lastScrubAt: null,
+        set: null,
+      };
+      backup.targets.push(t);
+      return json(targetJSON(t), 201);
+    }
+    const m = /^backups\/targets\/([^/]+)(\/forget|\/plan|\/runs)?$/.exec(path);
+    if (!m) return json({ error: 'not found' }, 404);
+    const id = decodeURIComponent(m[1] ?? '');
+    if (!TARGET_RE.test(id)) return json({ error: 'invalid target id' }, 400);
+    const t = backup.targets.find((x) => x.id === id);
+    if (!t) return json({ error: 'no such target' }, 404);
+    if (method === 'GET' && m[2] === '/plan') {
+      if (!t.reachable) return json({ error: 'the target is not reachable' }, 409);
+      backup.planned.add(id);
+      return json(backup.plans[id] ?? { current: cls(0, 0), new: cls(0, 0), changed: cls(0, 0), moved: cls(0, 0), extra: cls(0, 0) });
+    }
+    if (method === 'GET' && m[2] === '/runs') return json({ runs: backup.runs[id] ?? [] });
+    if (method !== 'POST') return json({ error: 'not found' }, 404);
+    if (m[2] === '/forget') {
+      backup.targets.splice(backup.targets.indexOf(t), 1);
+      return json({});
+    }
+    if (m[2] === undefined) {
+      if (body.path !== undefined) {
+        if (!validTargetPath(body.path)) return json({ error: 'path: expected an absolute folder path' }, 400);
+        if (body.path === '/mnt/wrong') return json({ error: 'the marker in that folder belongs to another target' }, 409);
+        t.path = body.path;
+        t.reachable = true;
+      }
+      if (typeof body.label === 'string') t.label = body.label;
+      return json(targetJSON(t));
+    }
+    return json({ error: 'not found' }, 404);
+  }
+
+  /** Job bodies of the backup kinds, checked as the server does. */
+  function backupJob(body: Record<string, unknown>): Response | null {
+    const kind = body.kind;
+    if (kind !== 'backup' && kind !== 'scrub' && kind !== 'prune' && kind !== 'restore') return null;
+    if (typeof body.target !== 'string' || !TARGET_RE.test(body.target)) return json({ error: 'target: invalid id' }, 400);
+    const t = backup.targets.find((x) => x.id === body.target);
+    if (!t) return json({ error: 'no such target' }, 404);
+    if (!t.reachable) return json({ error: 'the target is not reachable' }, 409);
+    if (kind === 'scrub' && body.budget !== undefined && (typeof body.budget !== 'number' || body.budget <= 0)) return json({ error: 'budget: expected seconds' }, 400);
+    if (kind === 'prune') {
+      if (body.confirm !== true) return json({ error: 'confirm required' }, 400);
+      const n = backup.plans[t.id]?.extra?.count ?? 0;
+      if (body.expected !== n) return json({ error: `the plan changed: ${n} files would be removed` }, 409);
+    }
+    if (kind === 'restore' && body.mode !== 'missing' && body.mode !== 'user-data') return json({ error: 'mode: expected missing or user-data' }, 400);
+    // Like the server's job object: the target is not echoed, so the client remembers it.
+    return json({ id: ++jobId, kind, state: 'running', library: 'peter', startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
+  }
+
   const libs: Lib[] =
     mode === 'single'
       ? [{ id: 'peter', name: 'peter', path: '/media/peter', state: 'open', summary: summary(8) }]
       : [
-          { id: 'peter', name: 'peter', path: '/media/peter', state: 'closed', summary: summary(8), cover: hashOf(1) },
-          { id: 'penny', name: 'penny', path: '/media/penny', state: 'busy', summary: summary(3), holder: { pid: 812, cmd: 'import', since: '2026-10-10T09:00:00' } },
+          {
+            id: 'peter',
+            name: 'peter',
+            path: '/media/peter',
+            state: 'closed',
+            summary: summary(8),
+            cover: hashOf(1),
+            backup: { lastBackupAt: unix('2026-10-10T10:00:00'), behind: 3, targets: 2, label: 'Red WD drive' },
+          },
+          {
+            id: 'penny',
+            name: 'penny',
+            path: '/media/penny',
+            state: 'busy',
+            summary: summary(3),
+            holder: { pid: 812, cmd: 'import', since: '2026-10-10T09:00:00' },
+            backup: { lastBackupAt: unix('2026-08-01T10:00:00'), behind: { new: 4, changed: 1, moved: 0, bytes: 5000 }, targets: 1 },
+          },
           { id: 'broken', name: 'broken', path: '/media/broken', state: 'error', error: 'media.db needs a rebuild' },
         ];
   const folders = mode === 'single' ? [] : [{ id: 'scans', name: 'scans', path: '/media/scans', state: 'folder' }];
@@ -203,6 +392,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       return json({ groups, total: all.length, at: 1760090000, distance: 6 });
     }
     if (method === 'GET' && path === 'jobs') return json({ jobs: [] });
+    if (path === 'backups' || path.startsWith('backups/')) return backups(path, q, method, body);
     if (method !== 'POST') return json({ error: 'not found' }, 404);
     switch (path) {
       case 'ratings':
@@ -266,7 +456,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         return json({ ignored: ignoredPairs.size - before });
       }
       case 'jobs':
-        return json({ id: ++jobId, kind: body.kind, state: 'running', library: 'peter', startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
+        return backupJob(body) ?? json({ id: ++jobId, kind: body.kind, state: 'running', library: 'peter', startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
     }
     const am = /^albums\/(\d+)(\/items|\/delete)?$/.exec(path);
     if (am) {
@@ -323,6 +513,11 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       res = json({ id: ++jobId, kind: 'rebuild', state: 'running', library: id, startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
     } else if (p === '/api/jobs') {
       res = json({ jobs: [] });
+    } else if (p === '/api/fs') {
+      const at = url.searchParams.get('path') ?? '';
+      res = at
+        ? json({ path: at, parent: at === '/' ? '' : '/', dirs: [{ name: 'backup', path: `${at === '/' ? '' : at}/backup` }], mediaFiles: 0, otherFiles: 0 })
+        : json({ path: '', dirs: [{ name: '/', path: '/' }, { name: 'mnt', path: '/mnt' }] });
     } else if (p.startsWith('/api/l/peter/')) {
       res = lib(p.slice('/api/l/peter/'.length), url.searchParams, method, body);
     } else if (p.startsWith('/api/l/')) {
@@ -345,7 +540,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, libs, folders, similar, openErrors, userdb, install, posts };
+  return { calls, items, tags, albums, libs, folders, similar, openErrors, userdb, backup, install, posts };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;
