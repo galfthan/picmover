@@ -952,6 +952,10 @@ func TestThumbsCancellationLeavesPending(t *testing.T) {
 		writeFile(t, filepath.Join(e.src, "f"+string(rune('a'+i/10))+string(rune('0'+i%10))+".jpg"),
 			testimg.JPEG(testimg.Options{Width: 400, Height: 300, DateTime: date(2020, 3, 5), Seed: byte(i)}))
 	}
+	// With the 500 ms interval, 30 small thumbnails are often all
+	// committed by the first flush, after which a cancel comes too late.
+	thumbBatchInterval = 5 * time.Millisecond
+	t.Cleanup(func() { thumbBatchInterval = batchInterval })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	o := e.opts()

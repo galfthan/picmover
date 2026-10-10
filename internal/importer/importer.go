@@ -142,6 +142,8 @@ type Importer struct {
 	claimed  map[string]struct{}            // lower-cased rel paths reserved by in-flight files
 	dirNames map[string]map[string]struct{} // catalog dir -> lower-cased names on disk or claimed in this import
 
+	recorded atomic.Bool // the copy (or record) stage finished; see RecordStageDone
+
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
 }
@@ -260,6 +262,9 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if fatal != nil {
 		return stats, fatal
 	}
+	if runCtx.Err() == nil {
+		im.recorded.Store(true)
+	}
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -332,6 +337,12 @@ func (im *Importer) startProgress() (stop func()) {
 		im.opts.OnProgress(im.Stats())
 	}
 }
+
+// RecordStageDone reports whether Run finished its copy (or record) stage:
+// every file was handled and the session recorded, without cancellation
+// or a fatal error. An error from Run after that comes from the thumbnail
+// stage (or a cancellation during it) and never affects the catalog rows.
+func (im *Importer) RecordStageDone() bool { return im.recorded.Load() }
 
 // SessionID returns the catalog import session of a running or finished
 // Run, or 0 before Run has begun the session. It is safe to call from any
