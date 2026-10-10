@@ -144,7 +144,10 @@ func Scrub(ctx context.Context, set *Set, opts ScrubOptions) (ScrubStats, error)
 		return st, err
 	}
 	if cur.Pass == 0 {
-		cur = scrubCursor{Pass: set.now().Unix(), Verified: -2}
+		// A new pass takes every row verified before the next second, so
+		// one that starts in the second the previous pass ended reads
+		// the whole set again (verified_at has second resolution).
+		cur = scrubCursor{Pass: set.now().Unix() + 1, Verified: -2}
 	}
 	todo, err := set.scrubQueue(ctx, cur)
 	if err != nil {

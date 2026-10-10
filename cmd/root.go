@@ -36,7 +36,7 @@ When a new version changes the catalog format, run 'picmover rebuild
 		return usageError(c, err)
 	})
 	root.AddCommand(newImportCmd(), newDBCmd(), newUpdateMetadataCmd(), newVerifyCmd(), newThumbsCmd(),
-		newRebuildCmd(), newServeCmd())
+		newRebuildCmd(), newServeCmd(), newTargetsCmd(), newBackupCmd(), newScrubCmd(), newPruneCmd(), newRestoreCmd())
 	return root
 }
 
