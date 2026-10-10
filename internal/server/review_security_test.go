@@ -21,8 +21,8 @@ import (
 func TestSecFetchSite(t *testing.T) {
 	f := newFixtureWith(t, func(o *Options) { o.CORSOrigins = []string{"http://localhost:5173"} })
 	hex := hexHash(f.hashes["a.jpg"])
-	paths := []string{"/api/library", "/api/fs?path=" + url.QueryEscape("/"), "/api/thumb/" + hex,
-		"/api/preview/" + hex, "/api/file/" + itoa64(f.ids["a.jpg"]), "/"}
+	paths := []string{"/api/l/lib/library", "/api/fs?path=" + url.QueryEscape("/"), "/api/l/lib/thumb/" + hex,
+		"/api/l/lib/preview/" + hex, "/api/l/lib/file/" + itoa64(f.ids["a.jpg"]), "/"}
 	for _, p := range paths {
 		for _, c := range []struct {
 			site, origin string
@@ -60,7 +60,7 @@ func TestSecFetchSite(t *testing.T) {
 	}
 
 	// Mutations too, even with the right headers.
-	w := f.request(http.MethodPost, "/api/jobs", strings.NewReader(`{"kind":"thumbs"}`), map[string]string{
+	w := f.request(http.MethodPost, "/api/l/lib/jobs", strings.NewReader(`{"kind":"thumbs"}`), map[string]string{
 		"Content-Type": "application/json", "X-Picmover": "1", "Sec-Fetch-Site": "cross-site"})
 	wantError(t, w, http.StatusForbidden, "cross-site")
 	// A preflight from the --cors-origin (same-site) passes.
@@ -91,7 +91,7 @@ func TestSecFetchSite(t *testing.T) {
 		{"/", "iframe", http.StatusForbidden},
 		{"/api/fs?path=" + url.QueryEscape("/"), "document", http.StatusForbidden},
 		{"/api/fs?path=" + url.QueryEscape("/"), "", http.StatusForbidden},
-		{"/api/file/" + itoa64(f.ids["a.jpg"]), "document", http.StatusForbidden},
+		{"/api/l/lib/file/" + itoa64(f.ids["a.jpg"]), "document", http.StatusForbidden},
 	} {
 		if got := nav(c.path, c.dest); got != c.code {
 			t.Errorf("cross-site navigate %s dest=%q: %d, want %d", c.path, c.dest, got, c.code)
@@ -100,7 +100,7 @@ func TestSecFetchSite(t *testing.T) {
 
 	// Without --cors-origin, same-site is always refused.
 	g := newEmptyServer(t)
-	w = g.request(http.MethodGet, "/api/library", nil, map[string]string{"Sec-Fetch-Site": "same-site"})
+	w = g.request(http.MethodGet, "/api/l/lib/library", nil, map[string]string{"Sec-Fetch-Site": "same-site"})
 	wantError(t, w, http.StatusForbidden, "cross-site")
 }
 
@@ -112,14 +112,14 @@ func TestCORP(t *testing.T) {
 	})
 	hex := hexHash(f.hashes["a.jpg"])
 	reqs := []*http.Request{
-		newReq(http.MethodGet, "/api/library"), newReq(http.MethodGet, "/api/thumb/"+hex),
-		newReq(http.MethodGet, "/api/preview/"+hex), newReq(http.MethodGet, "/api/file/"+itoa64(f.ids["a.jpg"])),
+		newReq(http.MethodGet, "/api/l/lib/library"), newReq(http.MethodGet, "/api/l/lib/thumb/"+hex),
+		newReq(http.MethodGet, "/api/l/lib/preview/"+hex), newReq(http.MethodGet, "/api/l/lib/file/"+itoa64(f.ids["a.jpg"])),
 		newReq(http.MethodGet, "/"), newReq(http.MethodGet, "/assets/x.js"), newReq(http.MethodGet, "/assets/missing.js"),
-		newReq(http.MethodGet, "/api/nope"), newReq(http.MethodPost, "/api/jobs"),
+		newReq(http.MethodGet, "/api/nope"), newReq(http.MethodPost, "/api/l/lib/jobs"),
 	}
-	bad := newReq(http.MethodGet, "/api/library")
+	bad := newReq(http.MethodGet, "/api/l/lib/library")
 	bad.Host = "evil.example:7439"
-	cross := newReq(http.MethodGet, "/api/library")
+	cross := newReq(http.MethodGet, "/api/l/lib/library")
 	cross.Header.Set("Sec-Fetch-Site", "cross-site")
 	reqs = append(reqs, bad, cross)
 	seen := map[int]bool{}
@@ -197,7 +197,7 @@ func TestNormalizeOriginDefaultPorts(t *testing.T) {
 	}
 	// A --cors-origin with an explicit default port matches what browsers send.
 	f := newFixtureWith(t, func(o *Options) { o.CORSOrigins = []string{"http://localhost:80"} })
-	w := f.request(http.MethodGet, "/api/library", nil, map[string]string{"Origin": "http://localhost"})
+	w := f.request(http.MethodGet, "/api/l/lib/library", nil, map[string]string{"Origin": "http://localhost"})
 	if w.Code != http.StatusOK || w.Header().Get("Access-Control-Allow-Origin") != "http://localhost" {
 		t.Fatalf("default-port cors origin: %d %v", w.Code, w.Header())
 	}
@@ -237,10 +237,10 @@ func TestRefusalLogging(t *testing.T) {
 		log, buf := loggerAt(level)
 		f := newFixtureWith(t, func(o *Options) { o.Logger = log })
 		for i := 0; i < 5; i++ {
-			f.request(http.MethodGet, "/api/library", nil, map[string]string{"Origin": "http://evil.example"})
-			f.request(http.MethodGet, "/api/library", nil, map[string]string{"Sec-Fetch-Site": "cross-site"})
-			f.request(http.MethodPost, "/api/jobs", strings.NewReader("{}"), map[string]string{"Content-Type": "text/plain"})
-			r := newReq(http.MethodGet, "/api/library")
+			f.request(http.MethodGet, "/api/l/lib/library", nil, map[string]string{"Origin": "http://evil.example"})
+			f.request(http.MethodGet, "/api/l/lib/library", nil, map[string]string{"Sec-Fetch-Site": "cross-site"})
+			f.request(http.MethodPost, "/api/l/lib/jobs", strings.NewReader("{}"), map[string]string{"Content-Type": "text/plain"})
+			r := newReq(http.MethodGet, "/api/l/lib/library")
 			r.Host = "evil.example:7439"
 			serve(f, r)
 		}
@@ -262,7 +262,7 @@ func TestInternalErrorGeneric(t *testing.T) {
 	if err := f.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	w := f.get("/api/library")
+	w := f.get("/api/l/lib/library")
 	wantStatus(t, w, http.StatusInternalServerError)
 	if w.Body.String() != "{\"error\":\"internal error\"}\n" {
 		t.Fatalf("500 body %q", w.Body)
@@ -275,7 +275,7 @@ func TestInternalErrorGeneric(t *testing.T) {
 	f = newFixtureWith(t, func(o *Options) { o.Logger = log })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	r := newReq(http.MethodGet, "/api/library").WithContext(ctx)
+	r := newReq(http.MethodGet, "/api/l/lib/library").WithContext(ctx)
 	w = serve(f, r)
 	if w.Code == http.StatusInternalServerError || strings.Contains(w.Body.String(), "error") {
 		t.Fatalf("abandoned request answered %d %q", w.Code, w.Body)
@@ -297,7 +297,7 @@ func TestBodyReadDeadline(t *testing.T) {
 	}
 	defer conn.Close()
 	start := time.Now()
-	_, err = conn.Write([]byte("POST /api/jobs HTTP/1.1\r\nHost: " + testAddr + "\r\n" +
+	_, err = conn.Write([]byte("POST /api/l/lib/jobs HTTP/1.1\r\nHost: " + testAddr + "\r\n" +
 		"Content-Type: application/json\r\nX-Picmover: 1\r\nContent-Length: 100\r\n\r\n{\"kind\""))
 	if err != nil {
 		t.Fatal(err)

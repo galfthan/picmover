@@ -127,20 +127,25 @@ func (d *DB) ListTrashed(ctx context.Context) ([]Media, error) {
 // (taken_at DESC, id DESC; undated rows last); ok is false when there is
 // none.
 func (d *DB) Cover(ctx context.Context) (hash uint64, ok bool, err error) {
-	return cover(ctx, d.DB)
+	hash, _, ok, err = cover(ctx, d.DB)
+	return hash, ok, err
 }
 
-func cover(ctx context.Context, q queryRower) (uint64, bool, error) {
-	var h int64
-	err := q.QueryRowContext(ctx, `SELECT hash FROM media WHERE deleted_at IS NULL AND thumb_state = 'ok'
-		ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1`).Scan(&h)
+// cover returns the cover hash and its thumb_at (zero when unknown).
+func cover(ctx context.Context, q queryRower) (uint64, time.Time, bool, error) {
+	var (
+		h  int64
+		at sql.NullInt64
+	)
+	err := q.QueryRowContext(ctx, `SELECT hash, thumb_at FROM media WHERE deleted_at IS NULL AND thumb_state = 'ok'
+		ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1`).Scan(&h, &at)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
+		return 0, time.Time{}, false, nil
 	}
 	if err != nil {
-		return 0, false, fmt.Errorf("catalog: cover: %w", err)
+		return 0, time.Time{}, false, fmt.Errorf("catalog: cover: %w", err)
 	}
-	return uint64(h), true, nil
+	return uint64(h), fromUnix(at), true, nil
 }
 
 // NewestOf returns the newest live row among hashes (taken_at DESC, id
@@ -318,6 +323,8 @@ type Peek struct {
 	Summary  Summary
 	Cover    uint64 // newest live row with a thumbnail
 	HasCover bool
+	// CoverThumbAt is the cover row's thumb_at (zero when unknown).
+	CoverThumbAt time.Time
 }
 
 // PeekFile opens the catalog at path read-only (SQLite mode=ro and
@@ -347,7 +354,7 @@ func PeekFile(ctx context.Context, path string) (Peek, error) {
 	if p.Summary, err = d.Summary(ctx); err != nil {
 		return Peek{}, err
 	}
-	if p.Cover, p.HasCover, err = cover(ctx, sqldb); err != nil {
+	if p.Cover, p.CoverThumbAt, p.HasCover, err = cover(ctx, sqldb); err != nil {
 		return Peek{}, err
 	}
 	return p, nil

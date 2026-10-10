@@ -80,17 +80,32 @@ func wrapLon(lon float64) float64 {
 }
 
 // geoQuery parses the filters and the bbox of a geo request.
-func geoQuery(q url.Values) (catalog.Filter, bbox, error) {
-	f, err := parseFilter(q)
+func geoQuery(q url.Values) (catalog.Filter, userFilter, bbox, error) {
+	f, uf, err := parseFilter(q)
 	if err != nil {
-		return f, bbox{}, err
+		return f, uf, bbox{}, err
 	}
 	raw := q.Get("bbox")
 	if raw == "" {
-		return f, bbox{}, fmt.Errorf("bbox is required")
+		return f, uf, bbox{}, fmt.Errorf("bbox is required")
 	}
 	b, err := parseBBox(raw)
-	return f, b, err
+	return f, uf, b, err
+}
+
+// geoFilter parses and resolves a geo request's filter and box,
+// answering 400 or 500 itself when it returns false.
+func (s *Server) geoFilter(w http.ResponseWriter, r *http.Request, l *libHandles) (catalog.Filter, bbox, bool) {
+	f, uf, b, err := geoQuery(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return f, b, false
+	}
+	if err := resolveFilter(r.Context(), l, &f, uf); err != nil {
+		s.internalError(w, r, err)
+		return f, b, false
+	}
+	return f, b, true
 }
 
 type clusterJSON struct {
@@ -105,11 +120,10 @@ type clustersJSON struct {
 	Clusters []clusterJSON `json:"clusters"`
 }
 
-func (s *Server) handleGeo(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGeo(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	q := r.URL.Query()
-	f, b, err := geoQuery(q)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	f, b, ok := s.geoFilter(w, r, l)
+	if !ok {
 		return
 	}
 	zoom, err := strconv.Atoi(q.Get("zoom"))
@@ -117,7 +131,7 @@ func (s *Server) handleGeo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("zoom is required: an integer 0-%d", maxZoom))
 		return
 	}
-	pts, err := s.db.GeoPoints(r.Context(), f, b.west, b.south, b.east, b.north, 0)
+	pts, err := l.db.GeoPoints(r.Context(), f, b.west, b.south, b.east, b.north, 0)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
@@ -203,25 +217,30 @@ type geoItemsJSON struct {
 	Total int64      `json:"total"`
 }
 
-func (s *Server) handleGeoItems(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGeoItems(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	q := r.URL.Query()
-	f, b, err := geoQuery(q)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	f, b, ok := s.geoFilter(w, r, l)
+	if !ok {
 		return
 	}
 	limit := geoItemsDflt
 	if v := q.Get("limit"); v != "" {
+		var err error
 		limit, err = strconv.Atoi(v)
 		if err != nil || limit < 1 || limit > geoItemsMax {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid limit %q: want 1-%d", v, geoItemsMax))
 			return
 		}
 	}
-	items, total, err := s.db.GeoItems(r.Context(), f, b.west, b.south, b.east, b.north, limit)
+	rows, total, err := l.db.GeoItems(r.Context(), f, b.west, b.south, b.east, b.north, limit)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, geoItemsJSON{Items: itemList(items), Total: total})
+	items, err := itemList(r.Context(), l, rows)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, geoItemsJSON{Items: items, Total: total})
 }

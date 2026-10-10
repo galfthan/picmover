@@ -35,7 +35,14 @@ func (l *Library) TrashPath(rel string) string {
 // cross-device error (EXDEV, ERROR_NOT_SAME_DEVICE, for example a
 // mounted subfolder) is never turned into a copy and delete.
 func (l *Library) MoveToTrash(rel string) error {
-	src, dst := l.Abs(rel), l.TrashPath(rel)
+	return l.MoveToTrashAs(rel, rel)
+}
+
+// MoveToTrashAs is MoveToTrash for a file whose trash path is that of
+// another catalog path, trashRel: it undoes a Restore that picked a new
+// name.
+func (l *Library) MoveToTrashAs(rel, trashRel string) error {
+	src, dst := l.Abs(rel), l.TrashPath(trashRel)
 	if _, err := os.Lstat(src); err != nil {
 		return err
 	}

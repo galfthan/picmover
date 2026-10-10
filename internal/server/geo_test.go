@@ -80,7 +80,7 @@ func TestCluster(t *testing.T) {
 
 func TestGeoEndpoints(t *testing.T) {
 	f := newFixture(t)
-	w := f.get("/api/geo?bbox=-180,-90,180,90&zoom=3")
+	w := f.get("/api/l/lib/geo?bbox=-180,-90,180,90&zoom=3")
 	wantStatus(t, w, http.StatusOK)
 	got := decode[clustersJSON](t, w).Clusters
 	if len(got) != 2 || got[0].Count != 2 || got[0].ID != 0 || got[0].Hash != "" ||
@@ -93,49 +93,49 @@ func TestGeoEndpoints(t *testing.T) {
 		t.Fatalf("cluster carries id 0: %s", w.Body)
 	}
 	// Zoomed into Helsinki: the two photos are separate singles.
-	w = f.get("/api/geo?bbox=24.93,60.16,24.95,60.18&zoom=18")
+	w = f.get("/api/l/lib/geo?bbox=24.93,60.16,24.95,60.18&zoom=18")
 	got = decode[clustersJSON](t, w).Clusters
 	if len(got) != 2 || got[0].ID == 0 || got[1].ID == 0 {
 		t.Fatalf("zoom 18: %s", w.Body)
 	}
 	// Antimeridian box around Fiji holds nothing; one around Sydney's
 	// longitude written across the antimeridian holds Sydney.
-	w = f.get("/api/geo?bbox=170,-60,-170,0&zoom=3")
+	w = f.get("/api/l/lib/geo?bbox=170,-60,-170,0&zoom=3")
 	if got := decode[clustersJSON](t, w).Clusters; len(got) != 0 {
 		t.Fatalf("fiji: %s", w.Body)
 	}
-	w = f.get("/api/geo?bbox=150,-60,-170,0&zoom=3")
+	w = f.get("/api/l/lib/geo?bbox=150,-60,-170,0&zoom=3")
 	if got := decode[clustersJSON](t, w).Clusters; len(got) != 1 || got[0].ID != f.ids["c.jpg"] {
 		t.Fatalf("antimeridian: %s", w.Body)
 	}
 	// Filters apply.
-	w = f.get("/api/geo?bbox=-180,-90,180,90&zoom=3&camera=Z+6")
+	w = f.get("/api/l/lib/geo?bbox=-180,-90,180,90&zoom=3&camera=Z+6")
 	if got := decode[clustersJSON](t, w).Clusters; len(got) != 1 || got[0].ID != f.ids["c.jpg"] {
 		t.Fatalf("camera filter: %s", w.Body)
 	}
-	for _, bad := range []string{"/api/geo?zoom=3", "/api/geo?bbox=-180,-90,180,90", "/api/geo?bbox=-180,-90,180,90&zoom=23",
-		"/api/geo?bbox=-180,-90,180,90&zoom=-1", "/api/geo?bbox=1,2,3&zoom=1", "/api/geo?bbox=-180,-90,180,90&zoom=1&type=x"} {
+	for _, bad := range []string{"/api/l/lib/geo?zoom=3", "/api/l/lib/geo?bbox=-180,-90,180,90", "/api/l/lib/geo?bbox=-180,-90,180,90&zoom=23",
+		"/api/l/lib/geo?bbox=-180,-90,180,90&zoom=-1", "/api/l/lib/geo?bbox=1,2,3&zoom=1", "/api/l/lib/geo?bbox=-180,-90,180,90&zoom=1&type=x"} {
 		wantError(t, f.get(bad), http.StatusBadRequest, "")
 	}
 
-	w = f.get("/api/geo/items?bbox=-180,-90,180,90")
+	w = f.get("/api/l/lib/geo/items?bbox=-180,-90,180,90")
 	wantStatus(t, w, http.StatusOK)
 	items := decode[geoItemsJSON](t, w)
 	if items.Total != 3 || len(items.Items) != 3 || items.Items[0].ID != f.ids["b.jpg"] ||
 		items.Items[1].ID != f.ids["a.jpg"] || items.Items[2].ID != f.ids["c.jpg"] || !items.Items[0].GPS {
 		t.Fatalf("geo items %s", w.Body)
 	}
-	w = f.get("/api/geo/items?bbox=-180,-90,180,90&limit=1")
+	w = f.get("/api/l/lib/geo/items?bbox=-180,-90,180,90&limit=1")
 	items = decode[geoItemsJSON](t, w)
 	if items.Total != 3 || len(items.Items) != 1 || items.Items[0].ID != f.ids["b.jpg"] {
 		t.Fatalf("geo items limit: %s", w.Body)
 	}
-	w = f.get("/api/geo/items?bbox=0,0,1,1")
+	w = f.get("/api/l/lib/geo/items?bbox=0,0,1,1")
 	if w.Body.String() != "{\"items\":[],\"total\":0}\n" {
 		t.Fatalf("empty geo items %q", w.Body)
 	}
-	for _, bad := range []string{"/api/geo/items", "/api/geo/items?bbox=-180,-90,180,90&limit=0",
-		"/api/geo/items?bbox=-180,-90,180,90&limit=1001", "/api/geo/items?bbox=-180,-90,180,90&limit=x"} {
+	for _, bad := range []string{"/api/l/lib/geo/items", "/api/l/lib/geo/items?bbox=-180,-90,180,90&limit=0",
+		"/api/l/lib/geo/items?bbox=-180,-90,180,90&limit=1001", "/api/l/lib/geo/items?bbox=-180,-90,180,90&limit=x"} {
 		wantError(t, f.get(bad), http.StatusBadRequest, "")
 	}
 }

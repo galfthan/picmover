@@ -227,7 +227,7 @@ func wantError(t *testing.T, w *httptest.ResponseRecorder, code int, substr stri
 
 func TestLibrary(t *testing.T) {
 	f := newFixture(t)
-	w := f.get("/api/library")
+	w := f.get("/api/l/lib/library")
 	wantStatus(t, w, http.StatusOK)
 	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("headers %v", w.Header())
@@ -239,7 +239,7 @@ func TestLibrary(t *testing.T) {
 	}
 	earliest, latest := "2018-06-15T12:00:00", "2024-08-01T00:00:00"
 	want := libraryJSON{
-		Root: f.lib.Root(), Version: "test-1",
+		ID: "lib", Root: f.lib.Root(), Version: "test-1",
 		Summary: summaryJSON{Total: sum.Total, Images: sum.Images, Raw: 0, Videos: 0, WithGPS: 3, Deleted: 1,
 			Bytes: sum.TotalBytes, Earliest: &earliest, Latest: &latest},
 		// 5 imported with thumbnails; undated, outside and internal pending.
@@ -258,13 +258,13 @@ func TestLibrary(t *testing.T) {
 
 	// Empty library: empty arrays, null dates.
 	f2 := newEmptyServer(t)
-	body := f2.get("/api/library").Body.String()
+	body := f2.get("/api/l/lib/library").Body.String()
 	for _, s := range []string{`"cameras":[]`, `"earliest":null`, `"latest":null`, `"total":0`} {
 		if !strings.Contains(body, s) {
 			t.Errorf("empty library: %s missing in %s", s, body)
 		}
 	}
-	body = f2.get("/api/timeline").Body.String()
+	body = f2.get("/api/l/lib/timeline").Body.String()
 	if body != "{\"buckets\":[]}\n" {
 		t.Errorf("empty timeline %q", body)
 	}
@@ -273,7 +273,7 @@ func TestLibrary(t *testing.T) {
 // newEmptyServer serves a freshly created, empty library.
 func newEmptyServer(t *testing.T) *fixture {
 	t.Helper()
-	lib, err := library.Open(t.TempDir())
+	lib, err := library.Open(filepath.Join(t.TempDir(), "lib"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestTimelineAndMedia(t *testing.T) {
 		{"?session=1", catalog.Filter{SessionID: 1}, []bucketJSON{{2024, 8, 1}, {2024, 7, 2}, {2023, 1, 1}, {2018, 6, 1}}},
 		{"?session=99", catalog.Filter{SessionID: 99}, []bucketJSON{}},
 	} {
-		w := f.get("/api/timeline" + c.query)
+		w := f.get("/api/l/lib/timeline" + c.query)
 		wantStatus(t, w, http.StatusOK)
 		got := decode[timelineJSON](t, w)
 		direct, err := f.db.Buckets(ctx, c.f)
@@ -342,7 +342,7 @@ func TestTimelineAndMedia(t *testing.T) {
 			if c.query != "" {
 				sep = "&"
 			}
-			w := f.get("/api/media" + c.query + sep + "year=" + itoa(b.Year) + "&month=" + itoa(b.Month))
+			w := f.get("/api/l/lib/media" + c.query + sep + "year=" + itoa(b.Year) + "&month=" + itoa(b.Month))
 			wantStatus(t, w, http.StatusOK)
 			items := decode[itemsJSON](t, w).Items
 			direct, err := f.db.BucketItems(ctx, c.f, b.Year, b.Month)
@@ -361,7 +361,7 @@ func TestTimelineAndMedia(t *testing.T) {
 	}
 
 	// The compact item JSON, exactly.
-	w := f.get("/api/media?year=2024&month=7")
+	w := f.get("/api/l/lib/media?year=2024&month=7")
 	thumbAt := func(name string) string {
 		m, err := f.db.GetMedia(context.Background(), f.ids[name])
 		if err != nil || m.ThumbAt.IsZero() {
@@ -375,7 +375,7 @@ func TestTimelineAndMedia(t *testing.T) {
 	if w.Body.String() != want {
 		t.Fatalf("media JSON\n got %s\nwant %s", w.Body, want)
 	}
-	w = f.get("/api/media?year=0&month=0")
+	w = f.get("/api/l/lib/media?year=0&month=0")
 	undated := decode[itemsJSON](t, w).Items
 	if len(undated) != 3 || undated[0].TakenAt != nil || !strings.Contains(w.Body.String(), `"takenAt":null`) ||
 		strings.Contains(w.Body.String(), `"gps"`) || strings.Contains(w.Body.String(), `"dur"`) {
@@ -383,10 +383,10 @@ func TestTimelineAndMedia(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"/api/timeline?type=audio", "/api/timeline?gps=yes", "/api/timeline?session=abc", "/api/timeline?session=-1",
-		"/api/timeline?from=2024-13-01", "/api/timeline?to=yesterday", "/api/timeline?from=2024-7-1",
-		"/api/media", "/api/media?year=2024", "/api/media?year=2024&month=13", "/api/media?year=0&month=5",
-		"/api/media?year=x&month=1", "/api/media?year=2024&month=7&type=photo",
+		"/api/l/lib/timeline?type=audio", "/api/l/lib/timeline?gps=yes", "/api/l/lib/timeline?session=abc", "/api/l/lib/timeline?session=-1",
+		"/api/l/lib/timeline?from=2024-13-01", "/api/l/lib/timeline?to=yesterday", "/api/l/lib/timeline?from=2024-7-1",
+		"/api/l/lib/media", "/api/l/lib/media?year=2024", "/api/l/lib/media?year=2024&month=13", "/api/l/lib/media?year=0&month=5",
+		"/api/l/lib/media?year=x&month=1", "/api/l/lib/media?year=2024&month=7&type=photo",
 	} {
 		w := f.get(bad)
 		wantError(t, w, http.StatusBadRequest, "")
@@ -399,7 +399,7 @@ func itoa64(i int64) string { return strconvFormat(i) }
 func TestMediaDetail(t *testing.T) {
 	f := newFixture(t)
 	id := f.ids["a.jpg"]
-	w := f.get("/api/media/" + itoa64(id))
+	w := f.get("/api/l/lib/media/" + itoa64(id))
 	wantStatus(t, w, http.StatusOK)
 	d := decode[detailJSON](t, w)
 	m, err := f.db.GetMedia(context.Background(), id)
@@ -429,7 +429,7 @@ func TestMediaDetail(t *testing.T) {
 	}
 
 	// Unknown values are null or absent.
-	w = f.get("/api/media/" + itoa64(f.ids["undated"]))
+	w = f.get("/api/l/lib/media/" + itoa64(f.ids["undated"]))
 	body := w.Body.String()
 	for _, s := range []string{`"takenAt":null`, `"offset":null`, `"sessionId":null`, `"phash":null`, `"thumbState":"pending"`, `"takenAtSource":"none"`} {
 		if !strings.Contains(body, s) {
@@ -449,7 +449,7 @@ func TestMediaDetail(t *testing.T) {
 		{"b.jpg", "exif", `"offset":null`},
 		{"d.png", "mtime", `"offset":0`},
 	} {
-		w = f.get("/api/media/" + itoa64(f.ids[tc.name]))
+		w = f.get("/api/l/lib/media/" + itoa64(f.ids[tc.name]))
 		wantStatus(t, w, http.StatusOK)
 		body := w.Body.String()
 		if !strings.Contains(body, tc.want) || !strings.Contains(body, `"takenAtSource":"`+tc.source+`"`) {
@@ -459,22 +459,25 @@ func TestMediaDetail(t *testing.T) {
 	// A row whose offset is unknown but whose source is mtime still says null.
 	f.insertRow("mtime-unknown", catalog.Media{RelPath: "image/2020/01/m.jpg", FileType: "image", Hash: 0xdef,
 		TakenAt: wall(2020, 1, 2, 3, 4, 5), TakenAtSource: "mtime"})
-	w = f.get("/api/media/" + itoa64(f.ids["mtime-unknown"]))
+	w = f.get("/api/l/lib/media/" + itoa64(f.ids["mtime-unknown"]))
 	if body := w.Body.String(); !strings.Contains(body, `"offset":null`) || !strings.Contains(body, `"takenAt":"2020-01-02T03:04:05"`) {
 		t.Errorf("mtime row without offset: %s", body)
 	}
 	// A known non-UTC offset on an mtime row is reported as such.
 	f.insertRow("mtime-known", catalog.Media{RelPath: "image/2020/01/n.jpg", FileType: "image", Hash: 0xdf0,
 		TakenAt: time.Date(2020, 1, 2, 3, 4, 5, 0, time.FixedZone("", -5*3600)), OffsetKnown: true, TakenAtSource: "mtime"})
-	w = f.get("/api/media/" + itoa64(f.ids["mtime-known"]))
+	w = f.get("/api/l/lib/media/" + itoa64(f.ids["mtime-known"]))
 	if body := w.Body.String(); !strings.Contains(body, `"offset":-18000`) || !strings.Contains(body, `"takenAt":"2020-01-02T03:04:05"`) {
 		t.Errorf("mtime row with offset: %s", body)
 	}
 
-	wantError(t, f.get("/api/media/"+itoa64(f.ids["deleted"])), http.StatusNotFound, "no such media")
-	wantError(t, f.get("/api/media/999999"), http.StatusNotFound, "no such media")
-	wantError(t, f.get("/api/media/abc"), http.StatusBadRequest, "invalid id")
-	wantError(t, f.get("/api/media/0"), http.StatusBadRequest, "invalid id")
+	// A trashed row has a detail, with deletedAt.
+	if w := f.get("/api/l/lib/media/" + itoa64(f.ids["deleted"])); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"deletedAt":"`) {
+		t.Errorf("trashed detail: %d %s", w.Code, w.Body)
+	}
+	wantError(t, f.get("/api/l/lib/media/999999"), http.StatusNotFound, "no such media")
+	wantError(t, f.get("/api/l/lib/media/abc"), http.StatusBadRequest, "invalid id")
+	wantError(t, f.get("/api/l/lib/media/0"), http.StatusBadRequest, "invalid id")
 	wantError(t, f.get("/api/nope"), http.StatusNotFound, "no such endpoint")
 }
 

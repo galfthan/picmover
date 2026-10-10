@@ -22,7 +22,7 @@ func TestThumbAndPreview(t *testing.T) {
 	hex := hexHash(hash)
 	etag := `"` + hex + `-` + strconv.Itoa(thumbs.FormatVersion) + `-0"`
 
-	w := f.get("/api/thumb/" + hex)
+	w := f.get("/api/l/lib/thumb/" + hex)
 	wantStatus(t, w, http.StatusOK)
 	data, _, _, ok, err := f.store.Thumb(ctx, hash)
 	if err != nil || !ok {
@@ -33,14 +33,14 @@ func TestThumbAndPreview(t *testing.T) {
 		h.Get("Cache-Control") != "private, max-age=604800" || h.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("thumb: %d bytes %v", w.Body.Len(), h)
 	}
-	w = f.request(http.MethodGet, "/api/thumb/"+hex, nil, map[string]string{"If-None-Match": etag})
+	w = f.request(http.MethodGet, "/api/l/lib/thumb/"+hex, nil, map[string]string{"If-None-Match": etag})
 	if w.Code != http.StatusNotModified || w.Body.Len() != 0 {
 		t.Fatalf("thumb If-None-Match: %d", w.Code)
 	}
-	w = f.request(http.MethodGet, "/api/thumb/"+hex, nil, map[string]string{"If-None-Match": `"other"`})
+	w = f.request(http.MethodGet, "/api/l/lib/thumb/"+hex, nil, map[string]string{"If-None-Match": `"other"`})
 	wantStatus(t, w, http.StatusOK)
 
-	w = f.get("/api/preview/" + hex)
+	w = f.get("/api/l/lib/preview/" + hex)
 	wantStatus(t, w, http.StatusOK)
 	pdata, err := os.ReadFile(f.store.PreviewPath(hash))
 	if err != nil {
@@ -51,23 +51,23 @@ func TestThumbAndPreview(t *testing.T) {
 		h.Get("Cache-Control") != "private, max-age=604800" {
 		t.Fatalf("preview: %d bytes %v", w.Body.Len(), h)
 	}
-	w = f.request(http.MethodGet, "/api/preview/"+hex, nil, map[string]string{"If-None-Match": etag})
+	w = f.request(http.MethodGet, "/api/l/lib/preview/"+hex, nil, map[string]string{"If-None-Match": etag})
 	if w.Code != http.StatusNotModified {
 		t.Fatalf("preview If-None-Match: %d", w.Code)
 	}
 
 	// Pending rows have no renditions: 404, never cached.
 	pending := hexHash(f.hashes["undated"])
-	w = f.get("/api/thumb/" + pending)
+	w = f.get("/api/l/lib/thumb/" + pending)
 	wantError(t, w, http.StatusNotFound, "no thumbnail")
 	if w.Body.String() != "{\"error\":\"no thumbnail\"}\n" || w.Header().Get("ETag") != "" {
 		t.Fatalf("pending thumb: %q %v", w.Body, w.Header())
 	}
-	wantError(t, f.get("/api/preview/"+pending), http.StatusNotFound, "no preview")
+	wantError(t, f.get("/api/l/lib/preview/"+pending), http.StatusNotFound, "no preview")
 
 	for _, bad := range []string{"xyz", strings.ToUpper(hex), hex[:15], hex + "0", "-" + hex[1:], "0x" + hex[2:]} {
-		wantError(t, f.get("/api/thumb/"+bad), http.StatusBadRequest, "invalid hash")
-		wantError(t, f.get("/api/preview/"+bad), http.StatusBadRequest, "invalid hash")
+		wantError(t, f.get("/api/l/lib/thumb/"+bad), http.StatusBadRequest, "invalid hash")
+		wantError(t, f.get("/api/l/lib/preview/"+bad), http.StatusBadRequest, "invalid hash")
 	}
 }
 
@@ -83,7 +83,7 @@ func TestFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := "/api/file/" + itoa64(id)
+	url := "/api/l/lib/file/" + itoa64(id)
 	etag := `"` + hexHash(m.Hash) + `-` + itoa64(m.Size) + `"`
 	base := filepath.Base(m.RelPath)
 
@@ -110,30 +110,31 @@ func TestFile(t *testing.T) {
 		t.Fatalf("download: %d %v", w.Code, w.Header())
 	}
 	wantError(t, f.get(url+"?download=yes"), http.StatusBadRequest, "download")
-	if ct := f.get("/api/file/" + itoa64(f.ids["d.png"])).Header().Get("Content-Type"); ct != "image/png" {
+	if ct := f.get("/api/l/lib/file/" + itoa64(f.ids["d.png"])).Header().Get("Content-Type"); ct != "image/png" {
 		t.Fatalf("png type %q", ct)
 	}
 
 	// Names needing quoting are encoded, not injected.
 	f.insertFile("odd", `image/odd/a "b"; c.jpg`, []byte("odd"), catalog.Media{FileType: "image"})
-	w = f.get("/api/file/" + itoa64(f.ids["odd"]))
+	w = f.get("/api/l/lib/file/" + itoa64(f.ids["odd"]))
 	if cd := w.Header().Get("Content-Disposition"); cd != `inline; filename="a \"b\"; c.jpg"` {
 		t.Fatalf("odd name disposition %q", cd)
 	}
 
 	// Refused rows: outside the library, picmover's own files, deleted,
 	// missing, a directory, a symbolic link.
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["outside"])), http.StatusNotFound, "not available")
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["internal"])), http.StatusNotFound, "not available")
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["deleted"])), http.StatusNotFound, "no such media")
-	wantError(t, f.get("/api/file/424242"), http.StatusNotFound, "no such media")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["outside"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["internal"])), http.StatusNotFound, "not available")
+	// A trashed row is served from the trash, where this one has no file.
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["deleted"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/424242"), http.StatusNotFound, "no such media")
 	f.insertRow("missing", catalog.Media{RelPath: "image/2020/01/gone.jpg", FileType: "image", Hash: 0xdead})
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["missing"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["missing"])), http.StatusNotFound, "not available")
 	if err := os.MkdirAll(f.lib.Abs("image/dir.jpg"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	f.insertRow("dir", catalog.Media{RelPath: "image/dir.jpg", FileType: "image", Hash: 0xd1d})
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["dir"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["dir"])), http.StatusNotFound, "not available")
 
 	if runtime.GOOS == "windows" {
 		return // symbolic links need privileges
@@ -143,11 +144,11 @@ func TestFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.insertRow("link", catalog.Media{RelPath: "image/link.jpg", FileType: "image", Hash: 0x11c})
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["link"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["link"])), http.StatusNotFound, "not available")
 	// A link to a file inside the library is refused as well.
 	if err := os.Symlink(f.lib.Abs(m.RelPath), f.lib.Abs("image/link2.jpg")); err != nil {
 		t.Fatal(err)
 	}
 	f.insertRow("link2", catalog.Media{RelPath: "image/link2.jpg", FileType: "image", Hash: 0x11d})
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["link2"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["link2"])), http.StatusNotFound, "not available")
 }

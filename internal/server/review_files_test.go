@@ -34,7 +34,7 @@ func TestRenditionVersion(t *testing.T) {
 	hex := hexHash(f.hashes["a.jpg"])
 	fv := strconv.Itoa(thumbs.FormatVersion)
 	for _, kind := range []string{"thumb", "preview"} {
-		base := "/api/" + kind + "/" + hex
+		base := "/api/l/lib/" + kind + "/" + hex
 		tag := func(v string) string { return `"` + hex + "-" + fv + "-" + v + `"` }
 		w1, w2 := f.get(base+"?v=1"), f.get(base+"?v=2")
 		wantStatus(t, w1, http.StatusOK)
@@ -74,16 +74,16 @@ func TestThumbAtJSON(t *testing.T) {
 	if err != nil || m.ThumbAt.IsZero() {
 		t.Fatalf("fixture thumbAt %v %v", m.ThumbAt, err)
 	}
-	d := decode[detailJSON](t, f.get("/api/media/"+itoa64(m.ID)))
+	d := decode[detailJSON](t, f.get("/api/l/lib/media/"+itoa64(m.ID)))
 	if d.ThumbAt != m.ThumbAt.Unix() {
 		t.Fatalf("detail thumbAt %d, want %d", d.ThumbAt, m.ThumbAt.Unix())
 	}
-	w := f.get("/api/media/" + itoa64(f.ids["undated"]))
+	w := f.get("/api/l/lib/media/" + itoa64(f.ids["undated"]))
 	wantStatus(t, w, http.StatusOK)
 	if strings.Contains(w.Body.String(), "thumbAt") {
 		t.Fatalf("pending row has thumbAt: %s", w.Body)
 	}
-	items := decode[itemsJSON](t, f.get("/api/media?year=2024&month=7")).Items
+	items := decode[itemsJSON](t, f.get("/api/l/lib/media?year=2024&month=7")).Items
 	for _, it := range items {
 		if it.ThumbAt == 0 {
 			t.Fatalf("item without thumbAt: %+v", it)
@@ -123,11 +123,11 @@ func TestFileRelPathShape(t *testing.T) {
 		} else {
 			f.insertFile(name, rel, []byte("internal "+rel), catalog.Media{FileType: "image"})
 		}
-		wantError(t, f.get("/api/file/"+itoa64(f.ids[name])), http.StatusNotFound, "not available")
+		wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids[name])), http.StatusNotFound, "not available")
 	}
 	// A NUL byte is a malformed path: 404 with no path or OS error in the body.
 	f.insertRow("nul", catalog.Media{RelPath: "image/x\x00y.jpg", FileType: "image", Hash: 0x900})
-	w := f.get("/api/file/" + itoa64(f.ids["nul"]))
+	w := f.get("/api/l/lib/file/" + itoa64(f.ids["nul"]))
 	wantError(t, w, http.StatusNotFound, "not available")
 	if strings.Contains(w.Body.String(), f.base) {
 		t.Fatalf("body leaks the path: %s", w.Body)
@@ -147,7 +147,7 @@ func TestFileSymlinkedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.insertRow("viaLink", catalog.Media{RelPath: "image/linkdir/secret.jpg", FileType: "image", Hash: 0x51})
-	w := f.get("/api/file/" + itoa64(f.ids["viaLink"]))
+	w := f.get("/api/l/lib/file/" + itoa64(f.ids["viaLink"]))
 	wantError(t, w, http.StatusNotFound, "not available")
 	if strings.Contains(w.Body.String(), "SECRET") {
 		t.Fatal("served a file outside the library")
@@ -159,7 +159,7 @@ func TestFileSymlinkedDir(t *testing.T) {
 	}
 	writeFile(t, f.lib.Abs(".picmover/x.jpg"), []byte("internal"))
 	f.insertRow("viaMeta", catalog.Media{RelPath: "image/meta/x.jpg", FileType: "image", Hash: 0x52})
-	wantError(t, f.get("/api/file/"+itoa64(f.ids["viaMeta"])), http.StatusNotFound, "not available")
+	wantError(t, f.get("/api/l/lib/file/"+itoa64(f.ids["viaMeta"])), http.StatusNotFound, "not available")
 
 	// A linked directory that stays inside the library is served.
 	f.insertFile("inner", "image/real/in.jpg", []byte("INNER"), catalog.Media{FileType: "image"})
@@ -167,7 +167,7 @@ func TestFileSymlinkedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.insertRow("viaAlias", catalog.Media{RelPath: "image/alias/in.jpg", FileType: "image", Hash: 0x53, Ext: "jpg"})
-	w = f.get("/api/file/" + itoa64(f.ids["viaAlias"]))
+	w = f.get("/api/l/lib/file/" + itoa64(f.ids["viaAlias"]))
 	wantStatus(t, w, http.StatusOK)
 	if w.Body.String() != "INNER" {
 		t.Fatalf("aliased file body %q", w.Body)
