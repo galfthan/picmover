@@ -61,7 +61,7 @@ func TestFilterHashes(t *testing.T) {
 		if !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
-		if el := time.Since(start); el > 2*time.Second {
+		if el := time.Since(start); el > 10*time.Second { // a regression guard, generous for -race
 			t.Errorf("%s took %v", c.name, el)
 		}
 	}

@@ -19,6 +19,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -90,7 +95,66 @@ var (
 	ErrInvalidName = errors.New("invalid name")
 	// ErrInvalidRating: a rating outside 0-5.
 	ErrInvalidRating = errors.New("rating must be 0-5")
+	// ErrUnsupportedVersion: user.db has a schema version this picmover
+	// does not support (written by a newer one).
+	ErrUnsupportedVersion = errors.New("unsupported user.db schema version")
+	// ErrNotUserDB: the file has tables but no schema version.
+	ErrNotUserDB = errors.New("not a picmover user database")
 )
+
+// VersionError is returned (wrapped) for a user.db whose schema version
+// this picmover does not support; it matches ErrUnsupportedVersion. Its
+// text names no path, so it can be shown to clients.
+type VersionError struct {
+	Version int
+}
+
+func (e *VersionError) Error() string {
+	return fmt.Sprintf("user.db has schema version %d; this picmover supports %d: upgrade picmover", e.Version, SchemaVersion)
+}
+
+func (e *VersionError) Is(target error) bool { return target == ErrUnsupportedVersion }
+
+// CheckFile checks the user.db at path without creating or changing it:
+// nil when it is missing, empty, or has schema version SchemaVersion; an
+// error wrapping a *VersionError for another version and ErrNotUserDB for
+// a file with tables but no version. It reads PRAGMA user_version through
+// a read-only (immutable) open, so it works in read-only folders too and
+// creates no side files.
+func CheckFile(ctx context.Context, path string) error {
+	fi, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && fi.Size() == 0) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("userdata: %w", err)
+	}
+	if strings.Contains(path, "?") {
+		return fmt.Errorf("userdata: database path %q contains '?', which is not supported", path)
+	}
+	p := filepath.ToSlash(path)
+	if runtime.GOOS == "windows" && !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	u := url.URL{Scheme: "file", Path: p}
+	sqldb, err := sql.Open("sqlite", u.String()+"?mode=ro&immutable=1")
+	if err != nil {
+		return fmt.Errorf("userdata: open %s: %w", path, err)
+	}
+	defer sqldb.Close()
+	var v, tables int
+	if err := sqldb.QueryRowContext(ctx, `SELECT (SELECT user_version FROM pragma_user_version),
+		(SELECT COUNT(*) FROM sqlite_master WHERE type = 'table')`).Scan(&v, &tables); err != nil {
+		return fmt.Errorf("userdata: open %s: %w", path, err)
+	}
+	switch {
+	case v == SchemaVersion, v == 0 && tables == 0:
+		return nil
+	case v == 0:
+		return fmt.Errorf("userdata: %s: %w", path, ErrNotUserDB)
+	}
+	return fmt.Errorf("userdata: %s: %w", path, &VersionError{Version: v})
+}
 
 // Name limits, in runes after trimming.
 const (
@@ -146,10 +210,9 @@ func (d *DB) ensureSchema(ctx context.Context) error {
 		return nil
 	case v == 0 && tables == 0:
 	case v == 0:
-		return fmt.Errorf("userdata: %s is not a picmover user database (it has tables but no schema version)", d.path)
+		return fmt.Errorf("userdata: %s is not a picmover user database (it has tables but no schema version): %w", d.path, ErrNotUserDB)
 	default:
-		return fmt.Errorf("userdata: %s has schema version %d, this picmover supports %d (upgrade picmover; the file is left untouched)",
-			d.path, v, SchemaVersion)
+		return fmt.Errorf("userdata: %s: %w (the file is left untouched)", d.path, &VersionError{Version: v})
 	}
 	if _, err := tx.ExecContext(ctx, schemaV1); err != nil {
 		return fmt.Errorf("userdata: create schema: %w", err)

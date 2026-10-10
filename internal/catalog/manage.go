@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -331,12 +332,50 @@ type Peek struct {
 // query_only: no lock is taken, nothing is created or converted), checks
 // its schema version (an error wrapping ErrNeedsRebuild for another one)
 // and returns its summary and cover. It is for listing libraries that are
-// not opened.
+// not opened. In a folder picmover cannot write, the read-only open of a
+// WAL catalog fails because SQLite cannot create the -shm file; when no
+// -wal file holds data, the peek is retried with immutable=1 (no locks,
+// no side files), which is safe then.
 func PeekFile(ctx context.Context, path string) (Peek, error) {
 	if err := checkPath(path); err != nil {
 		return Peek{}, err
 	}
-	sqldb, err := sql.Open("sqlite", readOnlyDSN(path))
+	p, err := peekFile(ctx, path, false)
+	if err != nil && ctx.Err() == nil && cannotOpenReadOnly(err) && !walHasData(path) {
+		if p2, err2 := peekFile(ctx, path, true); err2 == nil {
+			return p2, nil
+		}
+	}
+	return p, err
+}
+
+// cannotOpenReadOnly reports SQLite's SQLITE_READONLY and SQLITE_CANTOPEN
+// (primary codes), what a read-only open of a WAL database in an
+// unwritable folder returns.
+func cannotOpenReadOnly(err error) bool {
+	var ce interface{ Code() int }
+	if !errors.As(err, &ce) {
+		return false
+	}
+	switch ce.Code() & 0xff {
+	case 8, 14: // SQLITE_READONLY, SQLITE_CANTOPEN
+		return true
+	}
+	return false
+}
+
+// walHasData reports whether path's -wal file exists and is not empty.
+func walHasData(path string) bool {
+	fi, err := os.Lstat(path + "-wal")
+	return err == nil && fi.Size() > 0
+}
+
+func peekFile(ctx context.Context, path string, immutable bool) (Peek, error) {
+	dsn := readOnlyDSN(path)
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return Peek{}, fmt.Errorf("catalog: open %s: %w", path, err)
 	}
