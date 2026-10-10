@@ -17,6 +17,7 @@ import (
 // addTarget attaches a fresh empty folder as a target and returns it.
 func (f *fixture) addTarget(name string) targetJSON {
 	f.t.Helper()
+	f.consistentTrash()
 	dir := filepath.Join(f.base, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		f.t.Fatal(err)
@@ -24,6 +25,24 @@ func (f *fixture) addTarget(name string) targetJSON {
 	w := f.post("/api/l/lib/backups/targets", `{"path":`+jsonString(dir)+`,"label":"Red WD"}`)
 	wantStatus(f.t, w, http.StatusCreated)
 	return decode[targetJSON](f.t, w)
+}
+
+// consistentTrash moves the fixture's trashed file (its row is trashed,
+// its file was left at the live path) into the trash, so a backup finds
+// every catalog file (a missing one makes the run exit 1).
+func (f *fixture) consistentTrash() {
+	f.t.Helper()
+	live := f.lib.Abs("image/2024/07/del.jpg")
+	if _, err := os.Stat(live); err != nil {
+		return
+	}
+	dst := f.lib.TrashPath("image/2024/07/del.jpg")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.Rename(live, dst); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 func (f *fixture) startBackupJob(body string) jobJSON {
@@ -248,7 +267,7 @@ func TestBackupTargetRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Claim(t.Context(), "ffffffffffffffff")
+	s.Claim(t.Context(), backup.Identity{LibraryID: "ffffffffffffffff", Instance: "ffffffffffffffff"}, false, false)
 	s.Close()
 	wantError(t, post(`{"path":`+jsonString(other)+`}`), http.StatusConflict, "another library")
 	// ... unless another set name is chosen.

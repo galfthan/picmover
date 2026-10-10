@@ -70,7 +70,9 @@ type jobParams struct {
 	Workers  int    `json:"workers"`  // backup: 0 = default
 	Budget   int64  `json:"budget"`   // scrub: seconds, 0 = the whole set
 	Repair   *bool  `json:"repair"`   // scrub: default true
-	KeepDays int    `json:"keepDays"` // prune: 0 = 30
+	KeepDays *int   `json:"keepDays"` // prune: absent = 30, 0 = keep no earlier versions
+	Force    bool   `json:"force"`    // prune: even when the library scan was incomplete
+	TakeOver bool   `json:"takeOver"` // backup kinds: adopt a set last written by another copy of this library
 	Confirm  bool   `json:"confirm"`  // prune
 	Expected *int   `json:"expected"` // prune: the plan's extra.count
 	Mode     string `json:"mode"`     // restore: missing (default)
@@ -119,6 +121,7 @@ type jobJSON struct {
 	Distance     int    `json:"distance,omitempty"` // similar jobs
 	Target       string `json:"target,omitempty"`   // backup kinds: the marker id
 	Mode         string `json:"mode,omitempty"`     // restore jobs
+	Budget       int64  `json:"budget,omitempty"`   // scrub jobs: seconds (omitted: the whole set)
 	// Progress is the phase of a similar job (omitted for other kinds and
 	// before the first phase).
 	Progress   *phaseJSON `json:"progress,omitempty"`
@@ -288,6 +291,9 @@ func (j *job) jsonLocked() jobJSON {
 		out.Target = j.params.Target
 		if j.params.Kind == kindRestore {
 			out.Mode = j.params.Mode
+		}
+		if j.params.Kind == kindScrub {
+			out.Budget = j.params.Budget
 		}
 		if j.bprog != nil {
 			bp := *j.bprog

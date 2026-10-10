@@ -193,7 +193,7 @@ func TestBackupOtherLibrarySet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Claim(context.Background(), "ffffffffffffffff")
+	s.Claim(context.Background(), backup.Identity{LibraryID: "ffffffffffffffff", Instance: "ffffffffffffffff"}, false, false)
 	s.Close()
 	out, err := run(t, "targets", "add", lib, drive)
 	wantExit(t, err, out, 2, "--set")

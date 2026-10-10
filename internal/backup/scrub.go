@@ -27,7 +27,12 @@ type ScrubOptions struct {
 	Repair bool
 	// Source is the library to repair from; nil (or a nil Lib): no
 	// repairs. The caller holds the library lock when repairing.
-	Source     *Source
+	Source *Source
+	// Owner is the library's identity, required to repair: the set must
+	// belong to it (and have been last written by this instance unless
+	// TakeOver).
+	Owner      Identity
+	TakeOver   bool
 	Library    string // recorded in the runs row
 	OnProgress func(Progress)
 	Logger     *slog.Logger
@@ -90,6 +95,20 @@ type scrubCursor struct {
 func Scrub(ctx context.Context, set *Set, opts ScrubOptions) (ScrubStats, error) {
 	st := ScrubStats{Damaged: []Damaged{}, Missing: []string{}, Unknown: []string{}}
 	started := time.Now()
+	repairing := opts.Repair && opts.Source != nil && opts.Source.Lib != nil
+	if repairing {
+		// Repairs write into the set from the library: it must be this
+		// library's set, written by this copy of it.
+		if err := set.checkSeparate(opts.Source.Lib); err != nil {
+			return st, err
+		}
+		if err := set.Claim(ctx, opts.Owner, true, opts.TakeOver); err != nil {
+			return st, err
+		}
+		if err := set.prepareTmp(); err != nil {
+			return st, err
+		}
+	}
 	m := newMeter(opts.OnProgress)
 	stop := m.run()
 	defer stop()
@@ -160,7 +179,7 @@ func Scrub(ctx context.Context, set *Set, opts ScrubOptions) (ScrubStats, error)
 	}
 	m.phase(PhaseScrub, int64(len(todo)), total)
 	var rep *repairer
-	if opts.Repair && opts.Source != nil && opts.Source.Lib != nil {
+	if repairing {
 		rep = &repairer{set: set, src: opts.Source, log: log}
 	}
 	isMissing := make(map[string]bool, len(missing))
@@ -327,8 +346,8 @@ func hashSetFile(ctx context.Context, set *Set, rel string) (uint64, int64, erro
 	if !fi.Mode().IsRegular() {
 		return 0, 0, library.ErrNotRegularFile
 	}
-	if !set.inSet(p) {
-		return 0, 0, errOutsideSet
+	if err := set.within(p); err != nil {
+		return 0, 0, err
 	}
 	return library.HashFileContext(ctx, p)
 }
@@ -442,7 +461,7 @@ func (rp *repairer) repair(ctx context.Context, r FileRow, exists bool) bool {
 		return false
 	}
 	if _, err := os.Lstat(dst); err == nil {
-		if err := set.keepPrevious(r.RelPath); err != nil {
+		if _, err := set.keepPrevious(r.RelPath); err != nil {
 			os.Remove(stage)
 			rp.log.Error("repair: keep the damaged file", "path", r.RelPath, "err", err)
 			return false

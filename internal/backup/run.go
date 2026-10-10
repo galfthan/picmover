@@ -33,9 +33,11 @@ const rowFlushInterval = 5 * time.Second
 
 // Options configure Run.
 type Options struct {
-	// LibraryID is the library's identity (user.db meta library_id); the
-	// set must belong to it or have no owner yet.
-	LibraryID string
+	// Owner is the library's identity (userdata Identity); the set must
+	// belong to it or have no owner yet, and must have been last written
+	// by this instance of the library unless TakeOver (see Set.Claim).
+	Owner    Identity
+	TakeOver bool
 	// Library is recorded in the runs row (the source root, for reports).
 	Library string
 	Workers int  // parallel copies; <=0: DefaultWorkers; at most MaxWorkers
@@ -72,13 +74,20 @@ type Stats struct {
 	LeftFiles int64 `json:"leftFiles"`
 	LeftBytes int64 `json:"leftBytes"`
 	// Reported, not backed up.
-	SymlinkCount int64     `json:"symlinkCount"`
-	Symlinks     []string  `json:"symlinks"`
-	MissingCount int64     `json:"missingCount"` // catalog rows without a file in the library
-	Missing      []string  `json:"missing"`
-	InvalidCount int64     `json:"invalidCount"`
-	Failures     []Failure `json:"failed"`
-	Truncated    bool      `json:"truncated,omitempty"`
+	SymlinkCount int64    `json:"symlinkCount"`
+	Symlinks     []string `json:"symlinks"`
+	MissingCount int64    `json:"missingCount"` // catalog rows without a file in the library
+	Missing      []string `json:"missing"`
+	InvalidCount int64    `json:"invalidCount"`
+	// The library walk could not read these (the backup is incomplete).
+	ScanErrorCount int64     `json:"scanErrorCount"`
+	ScanErrors     []Failure `json:"scanErrors"`
+	// Files left out because their name differs from another's only in
+	// case or Unicode form; also counted in failedCount and listed in
+	// failed.
+	CollisionCount int64     `json:"collisionCount"`
+	Failures       []Failure `json:"failed"`
+	Truncated      bool      `json:"truncated,omitempty"`
 	// Snapshots.
 	UserSnapshot  bool   `json:"userSnapshot"`
 	MediaSnapshot bool   `json:"mediaSnapshot"`
@@ -88,13 +97,14 @@ type Stats struct {
 }
 
 // ExitCode is the CLI exit status of a finished run: 0 when everything
-// was verified, 1 when files failed, did not fit (partial) or a snapshot
-// failed.
+// was verified, 1 when files failed, did not fit (partial), a snapshot
+// failed, the library walk could not read a folder, or catalog files are
+// missing in the library.
 func (s *Stats) ExitCode() int {
 	if s == nil {
 		return 0
 	}
-	if s.FailedCount > 0 || s.LeftFiles > 0 || s.SnapshotError != "" {
+	if s.FailedCount > 0 || s.LeftFiles > 0 || s.SnapshotError != "" || s.ScanErrorCount > 0 || s.MissingCount > 0 {
 		return 1
 	}
 	return 0
@@ -118,7 +128,7 @@ var crashAfter func(done int) bool
 // backup.db failed) or was cancelled (ctx.Err(); the rows of the files
 // done are written).
 func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error) {
-	st := Stats{Symlinks: []string{}, Missing: []string{}, Failures: []Failure{}}
+	st := Stats{Symlinks: []string{}, Missing: []string{}, Failures: []Failure{}, ScanErrors: []Failure{}}
 	started := time.Now()
 	workers := opts.Workers
 	if workers <= 0 {
@@ -131,7 +141,10 @@ func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error)
 	log, closeLog := setLogger(set, "backup", opts.Logger)
 	defer closeLog()
 
-	if err := set.Claim(ctx, opts.LibraryID); err != nil {
+	if err := set.checkSeparate(src.Lib); err != nil {
+		return st, err
+	}
+	if err := set.Claim(ctx, opts.Owner, false, opts.TakeOver); err != nil {
 		return st, err
 	}
 	m.phase(PhasePlan, 0, 0)
@@ -153,13 +166,27 @@ func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error)
 	for _, s := range plan.Invalid {
 		log.Warn("catalog path is not a library path; skipped", "path", s)
 	}
+	st.ScanErrorCount = int64(len(plan.Errors))
+	for _, f := range plan.Errors {
+		st.ScanErrors = appendFailure(st.ScanErrors, f, &st.Truncated)
+		log.Error("the library walk could not read this; its files are not backed up", "path", f.Path, "err", f.Error)
+	}
+	st.CollisionCount = int64(len(plan.Collisions))
+	for _, c := range plan.Collisions {
+		f := collisionFailure(c)
+		st.FailedCount++
+		st.Failures = appendFailure(st.Failures, f, &st.Truncated)
+		log.Error("name collision; not backed up", "path", c.Path, "other", c.Other)
+		if opts.OnFailure != nil {
+			opts.OnFailure(f)
+		}
+	}
 	log.Info("plan", "current", plan.Current.Files, "moved", plan.Moved.Files, "changed", plan.Changed.Files,
 		"new", plan.New.Files, "extra", plan.Extra.Files, "copy_bytes", plan.CopyBytes())
 
-	if err := os.MkdirAll(set.TmpDir(), 0o755); err != nil {
+	if err := set.prepareTmp(); err != nil {
 		return st, err
 	}
-	set.cleanTmp()
 	snapBytes := snapshotBytes(src)
 	budget := int64(-1) // no limit
 	if free := freeSpace(set.Dir); free >= 0 {
@@ -256,6 +283,7 @@ type runner struct {
 // result is a worker's outcome for one item.
 type result struct {
 	op    *rowOp
+	also  *rowOp // a second change in the same batch (a moved file copied again drops the row at From)
 	bytes int64
 }
 
@@ -337,6 +365,9 @@ func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error 
 			if res.op != nil {
 				batch = append(batch, *res.op)
 			}
+			if res.also != nil {
+				batch = append(batch, *res.also)
+			}
 			if crashAfter != nil && crashAfter(done) {
 				crashed = true
 				cancel()
@@ -360,7 +391,7 @@ func (r *runner) fail(it Item, err error, detail string) {
 	r.mu.Lock()
 	r.st.FailedCount++
 	r.st.Failures = appendFailure(r.st.Failures, f, &r.st.Truncated)
-	if errors.Is(err, syscall.ENOSPC) {
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
 		r.full = true
 	}
 	r.mu.Unlock()
@@ -410,10 +441,23 @@ func (r *runner) do(ctx context.Context, it Item) (result, bool) {
 			r.m.done(1, 0)
 			return res, ok
 		}
-		it.Class = ClassNew // the content is gone from the target: copy it
+		// The content is gone from the target: copy it, and drop the
+		// row at From, whose file is gone (else a scrub would copy it
+		// back there and the content would be kept twice for ever).
+		from := it.From
+		it.Class, it.From = ClassNew, ""
 		if !r.reserve(it) {
 			return result{}, false
 		}
+		res, ok = r.copy(ctx, it)
+		if !ok {
+			r.unreserve(it.Size)
+			return res, ok
+		}
+		if _, err := os.Lstat(r.set.Abs(from)); errors.Is(err, fs.ErrNotExist) {
+			res.also = &rowOp{delete: from}
+		}
+		return res, ok
 	}
 	res, ok := r.copy(ctx, it)
 	if !ok {
@@ -430,46 +474,48 @@ func (r *runner) row(it Item, hash uint64, size int64, mtime int64) *FileRow {
 // instead (the target no longer has the content at From).
 func (r *runner) move(ctx context.Context, it Item) (res result, ok, fallback bool) {
 	src, dst := r.set.Abs(it.From), r.set.Abs(it.Rel)
-	if !r.set.inSet(src) || !r.set.inSet(dst) {
-		r.fail(it, errOutsideSet, "move")
+	if err := r.set.within(src); err != nil {
+		r.fail(it, err, "move")
+		return result{}, false, false
+	}
+	if err := r.set.within(dst); err != nil {
+		r.fail(it, err, "move")
 		return result{}, false, false
 	}
 	if fi, err := os.Lstat(src); err != nil || !fi.Mode().IsRegular() {
 		return result{}, false, true
 	}
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			r.fail(it, err, "move")
-			return result{}, false, false
-		}
-		err := library.RenameNoReplace(src, dst)
-		if err == nil {
-			library.SyncDir(filepath.Dir(dst))
-			r.count(&r.st.Renamed, 0)
-			r.log.Debug("renamed", "from", it.From, "to", it.Rel)
-			return result{op: &rowOp{upsert: &FileRow{RelPath: it.Rel}, from: it.From}}, true, false
-		}
-		if !errors.Is(err, fs.ErrExist) {
-			if errors.Is(err, fs.ErrNotExist) {
-				return result{}, false, true
-			}
-			r.fail(it, err, "move")
-			return result{}, false, false
-		}
-		// Something is at the destination (an interrupted run renamed or
-		// copied it there): keep it when it is the content, else move it
-		// aside and try again.
-		if adopted, ok := r.adopt(ctx, it, dst); ok {
-			return adopted, true, false
-		}
-		if err := r.set.keepPrevious(it.Rel); err != nil {
-			r.fail(it, err, "keep previous")
-			return result{}, false, false
-		}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		r.fail(it, err, "move")
+		return result{}, false, false
 	}
-	r.fail(it, fs.ErrExist, "move")
+	err := library.RenameNoReplace(src, dst)
+	if err == nil {
+		library.SyncDir(filepath.Dir(dst))
+		r.count(&r.st.Renamed, 0)
+		r.log.Debug("renamed", "from", it.From, "to", it.Rel)
+		return result{op: &rowOp{upsert: &FileRow{RelPath: it.Rel}, from: it.From}}, true, false
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return result{}, false, true
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		r.fail(it, err, "move")
+		return result{}, false, false
+	}
+	// Something without a row is at the destination: an interrupted run
+	// renamed or copied the content there (adopted), or a file picmover
+	// did not write, which is never moved away.
+	if adopted, ok := r.adopt(ctx, it, dst); ok {
+		return adopted, true, false
+	}
+	r.fail(it, errConflict, "move")
 	return result{}, false, false
 }
+
+// errConflict: a file the set has no row for is at the destination and
+// does not have the content; picmover did not write it and leaves it.
+var errConflict = errors.New("a file the backup set does not know is already at this path on the target; move it away or remove it, then back up again")
 
 // adopt checks a file found at dst that has no row: when it hashes to the
 // item's content it is recorded as backed up (a run was interrupted after
@@ -518,8 +564,8 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 		return result{}, false
 	}
 	dst := r.set.Abs(it.Rel)
-	if !r.set.inSet(dst) {
-		r.fail(it, errOutsideSet, "copy")
+	if err := r.set.within(dst); err != nil {
+		r.fail(it, err, "copy")
 		return result{}, false
 	}
 	var want *uint64
@@ -529,13 +575,14 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 	}
 	if it.Class == ClassNew {
 		if _, err := os.Lstat(dst); err == nil {
+			// No row for this path: the content of an interrupted run
+			// is adopted; anything else picmover did not write and
+			// never moves away.
 			if res, ok := r.adopt(ctx, it, dst); ok {
 				return res, true
 			}
-			if err := r.set.keepPrevious(it.Rel); err != nil {
-				r.fail(it, err, "keep previous")
-				return result{}, false
-			}
+			r.fail(it, errConflict, "copy")
+			return result{}, false
 		}
 		res, err := library.CopyReadBack(ctx, libAbs, dst, r.set.TmpDir(), want)
 		if err != nil {
@@ -576,8 +623,10 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 			return result{}, false
 		}
 	}
+	// The file at dst is the one the row at this path recorded (changed
+	// items always have a row): its earlier content is kept.
 	if _, err := os.Lstat(dst); err == nil {
-		if err := r.set.keepPrevious(it.Rel); err != nil {
+		if _, err := r.set.keepPrevious(it.Rel); err != nil {
 			os.Remove(stage)
 			r.fail(it, err, "keep previous")
 			return result{}, false
@@ -605,29 +654,28 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-// snapshots writes user.db (the previous one is kept in previous/) and
-// media.db (replaced: it is derived) at the set root, each a consistent
-// copy (VACUUM INTO a temp file, fsync, rename).
+// metaUserSnapshotHash is the set meta key holding the hash (16 hex
+// digits) of the user.db snapshot at the set root, checked by restore.
+const metaUserSnapshotHash = "user_snapshot_hash"
+
+// snapshots writes user.db and media.db at the set root, each a
+// consistent copy (VACUUM INTO a temp file, fsync, then into place
+// without replacing anything: the previous snapshot moves to previous/
+// first). The previous user.db snapshot is kept (pruned with the keep
+// window); the previous media.db snapshot, derived data, is removed once
+// the new one is in place. The user.db snapshot's hash is stored in set
+// meta for restore to verify.
 func snapshots(ctx context.Context, src Source, set *Set, st *Stats, log *slog.Logger) error {
 	if src.User != nil {
 		tmp := filepath.Join(set.TmpDir(), "snap-user-"+randomSuffix()+".db")
-		if err := src.User.Snapshot(ctx, tmp); err != nil {
-			os.Remove(tmp)
+		h, err := writeSnapshot(ctx, src.User.Snapshot, tmp)
+		if err != nil {
 			return err
 		}
-		if err := syncFile(tmp); err != nil {
-			os.Remove(tmp)
-			return err
+		if _, err := placeSnapshot(set, tmp, UserSnapshot); err != nil {
+			return fmt.Errorf("the user.db snapshot: %w", err)
 		}
-		dst := set.Abs(UserSnapshot)
-		if _, err := os.Lstat(dst); err == nil {
-			if err := set.keepPrevious(UserSnapshot); err != nil {
-				os.Remove(tmp)
-				return fmt.Errorf("keep the previous user.db snapshot: %w", err)
-			}
-		}
-		if err := library.RenameNoReplace(tmp, dst); err != nil {
-			os.Remove(tmp)
+		if err := set.SetMeta(context.WithoutCancel(ctx), metaUserSnapshotHash, fmt.Sprintf("%016x", h)); err != nil {
 			return err
 		}
 		st.UserSnapshot = true
@@ -635,28 +683,65 @@ func snapshots(ctx context.Context, src Source, set *Set, st *Stats, log *slog.L
 	}
 	if src.Catalog != nil {
 		tmp := filepath.Join(set.TmpDir(), "snap-media-"+randomSuffix()+".db")
-		if err := src.Catalog.Snapshot(ctx, tmp); err != nil {
-			os.Remove(tmp)
+		if _, err := writeSnapshot(ctx, src.Catalog.Snapshot, tmp); err != nil {
 			return err
 		}
-		if err := syncFile(tmp); err != nil {
-			os.Remove(tmp)
-			return err
+		old, err := placeSnapshot(set, tmp, MediaSnapshot)
+		if err != nil {
+			return fmt.Errorf("the media.db snapshot: %w", err)
 		}
-		dst := set.Abs(MediaSnapshot)
-		if fi, err := os.Lstat(dst); err == nil && !fi.Mode().IsRegular() {
-			os.Remove(tmp)
-			return fmt.Errorf("%s: %w", dst, library.ErrNotRegularFile)
-		}
-		if err := os.Rename(tmp, dst); err != nil {
-			os.Remove(tmp)
-			return err
+		if old != "" && set.inSet(old) {
+			os.Remove(old)
 		}
 		st.MediaSnapshot = true
 		log.Info("media.db snapshot written")
 	}
 	library.SyncDir(set.Dir)
 	return nil
+}
+
+// writeSnapshot writes a snapshot to tmp with write, syncs it and
+// returns its hash; tmp is removed on failure.
+func writeSnapshot(ctx context.Context, write func(context.Context, string) error, tmp string) (uint64, error) {
+	if err := write(ctx, tmp); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	if err := syncFile(tmp); err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	h, _, err := library.HashFileContext(ctx, tmp)
+	if err != nil {
+		os.Remove(tmp)
+		return 0, err
+	}
+	return h, nil
+}
+
+// placeSnapshot puts tmp at the set root as name: the snapshot there
+// (a regular file; anything else is refused) moves to previous/ first,
+// then tmp is renamed in without replacing anything. It returns where
+// the previous snapshot went ("" when there was none). tmp is removed on
+// failure.
+func placeSnapshot(set *Set, tmp, name string) (string, error) {
+	dst := set.Abs(name)
+	old := ""
+	if fi, err := os.Lstat(dst); err == nil {
+		if !fi.Mode().IsRegular() {
+			os.Remove(tmp)
+			return "", fmt.Errorf("%s: %w", name, library.ErrNotRegularFile)
+		}
+		if old, err = set.keepPrevious(name); err != nil {
+			os.Remove(tmp)
+			return "", fmt.Errorf("keep the previous snapshot: %w", err)
+		}
+	}
+	if err := library.RenameNoReplace(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return old, nil
 }
 
 func syncFile(p string) error {
@@ -680,7 +765,7 @@ func setLogger(set *Set, prefix string, extra *slog.Logger) (*slog.Logger, func(
 		handlers = append(handlers, extra.Handler())
 	}
 	closeFn := func() {}
-	if err := os.MkdirAll(set.LogDir(), 0o755); err == nil {
+	if err := realDir(set.MetaDir(), false); err == nil && realDir(set.LogDir(), true) == nil {
 		if f, _, err := openUniqueLog(set.LogDir(), prefix); err == nil {
 			handlers = append(handlers, slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug}))
 			closeFn = func() { f.Close() }

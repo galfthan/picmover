@@ -108,11 +108,46 @@ type PruneStats struct {
 
 // PruneOptions configure Prune.
 type PruneOptions struct {
-	Keep       time.Duration // <=0: DefaultKeep
-	Expected   int           // the count the user confirmed
+	// Keep is how long earlier versions in previous/ are kept: 0 keeps
+	// none (pass DefaultKeep for the default); negative is an error.
+	Keep     time.Duration
+	Expected int // the count the user confirmed
+	// Owner is the library's identity: the set must belong to it (and
+	// have been last written by this instance unless TakeOver).
+	Owner    Identity
+	TakeOver bool
+	// Force prunes even when the library scan was incomplete (unreadable
+	// folders) or catalog files are missing in the library.
+	Force      bool
 	Library    string
 	OnProgress func(Progress)
 	Logger     *slog.Logger
+}
+
+// ErrIncompleteScan is matched by an *IncompleteScanError.
+var ErrIncompleteScan = errors.New("the library could not be read completely")
+
+// IncompleteScanError: prune refused because the library walk could not
+// read some folders or catalog files are missing in the library, so files
+// that still exist could look gone.
+type IncompleteScanError struct {
+	Unreadable, Missing int
+}
+
+func (e *IncompleteScanError) Error() string {
+	return fmt.Sprintf("prune refused: the library could not be read completely (%d unreadable folders or files, "+
+		"%d catalog files missing), so files it still has could look deleted; fix that first, or force the prune", e.Unreadable, e.Missing)
+}
+
+func (e *IncompleteScanError) Is(target error) bool { return target == ErrIncompleteScan }
+
+// CheckComplete returns an *IncompleteScanError when the plan's scan had
+// errors or catalog files are missing in the library.
+func (p *Plan) CheckComplete() error {
+	if len(p.Errors) > 0 || len(p.Missing) > 0 {
+		return &IncompleteScanError{Unreadable: len(p.Errors), Missing: len(p.Missing)}
+	}
+	return nil
 }
 
 // Prune plans again (PlanPrune) and, when the count equals
@@ -120,13 +155,20 @@ type PruneOptions struct {
 // (never through a link), each row with its file (a row whose file is
 // already gone is just dropped), then the folders the removals left
 // empty. Nothing else on the target and nothing in the library is
-// touched.
+// touched. The set must belong to opts.Owner (Set.Claim with owned), and
+// the library scan must be complete unless opts.Force.
 func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneStats, error) {
 	st := PruneStats{Failures: []Failure{}}
 	started := time.Now()
 	keep := opts.Keep
-	if keep <= 0 {
-		keep = DefaultKeep
+	if keep < 0 {
+		return st, errors.New("backup: negative keep window")
+	}
+	if err := set.checkSeparate(src.Lib); err != nil {
+		return st, err
+	}
+	if err := set.Claim(ctx, opts.Owner, true, opts.TakeOver); err != nil {
+		return st, err
 	}
 	m := newMeter(opts.OnProgress)
 	stop := m.run()
@@ -136,6 +178,10 @@ func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneS
 	m.phase(PhasePlan, 0, 0)
 	plan, err := PlanFor(ctx, src, set)
 	if err != nil {
+		return st, err
+	}
+	if err := plan.CheckComplete(); err != nil && !opts.Force {
+		log.Error("prune refused", "err", err)
 		return st, err
 	}
 	pp, err := PlanPrune(set, plan, keep, set.now())
@@ -203,8 +249,8 @@ func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneS
 // removeSetFile removes the regular file p inside the set; a link, a
 // folder or a path leading outside the set is refused.
 func removeSetFile(set *Set, p string) error {
-	if !set.inSet(p) {
-		return errOutsideSet
+	if err := set.within(p); err != nil {
+		return err
 	}
 	fi, err := os.Lstat(p)
 	if err != nil {

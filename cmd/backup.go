@@ -85,6 +85,7 @@ type backupLib struct {
 	db     *catalog.DB
 	user   *userdata.DB
 	libID  string
+	id     backup.Identity
 	unlock func()
 }
 
@@ -126,11 +127,26 @@ func openBackupLib(ctx context.Context, dir, lockName string, out, errOut io.Wri
 		fmt.Fprintf(out, "user.db upgraded from schema version %d to %d (the old file is kept as %s)\n",
 			from, userdata.SchemaVersion, filepath.Base(bak))
 	}
-	if b.libID, err = b.user.LibraryID(ctx); err != nil {
+	if b.id, err = b.user.Identity(ctx); err != nil {
 		b.close()
 		return nil, err
 	}
+	b.libID = b.id.LibraryID
 	return b, nil
+}
+
+// setError adds what the user can do to a set ownership error: another
+// set name for another library's set, --take-over for a set last written
+// by another copy of this library.
+func setError(err error, b *backupLib, t *backup.Target, bt userdata.BackupTarget) error {
+	switch {
+	case errors.Is(err, backup.ErrForeignInstance):
+		return fmt.Errorf("%w\n  if this library is the one to keep backing up, run again with --take-over", err)
+	case errors.Is(err, backup.ErrOtherLibrary):
+		return fmt.Errorf("%w (target %s); attach the target with another set name: picmover targets add --set <name> %s %s",
+			err, bt.ID, library.QuoteArg(b.dir), library.QuoteArg(t.Root))
+	}
+	return err
 }
 
 // resolvedTarget is a target of the library, reachable, with its set name.
@@ -245,8 +261,11 @@ func resolveTargets(ctx context.Context, b *backupLib, folder, id string, all bo
 		len(ts), library.QuoteArg(b.dir))
 }
 
-// reach opens a remembered target at its last path and resolves the set.
-func reach(ctx context.Context, b *backupLib, bt userdata.BackupTarget, command string) (*resolvedTarget, error) {
+// reach opens a remembered target at its last path and resolves the set,
+// which must belong to the library (also a remembered set name) and have
+// been last written by this copy of it unless takeOver. Nothing is
+// written: rememberSetName stores the name once a backup claimed it.
+func reach(ctx context.Context, b *backupLib, bt userdata.BackupTarget, command string, takeOver bool) (*resolvedTarget, error) {
 	t, err := backup.OpenTarget(bt.LastPath)
 	if err != nil || t.ID() != bt.ID {
 		return nil, targetNotFound(bt, b.dir, command)
@@ -256,19 +275,25 @@ func reach(ctx context.Context, b *backupLib, bt userdata.BackupTarget, command 
 	}
 	name, err := backup.ResolveSetName(ctx, t, bt.SetName, b.libID, b.dir)
 	if err != nil {
-		if errors.Is(err, backup.ErrOtherLibrary) {
-			return nil, fmt.Errorf("%w (%s on target %s); attach the target with another set name: picmover targets add --set <name> %s %s",
-				err, backup.DefaultSetName(b.dir), bt.ID, library.QuoteArg(b.dir), library.QuoteArg(t.Root))
-		}
-		return nil, err
+		return nil, setError(err, b, t, bt)
 	}
-	if name != bt.SetName {
-		if _, err := b.user.UpdateBackupTarget(ctx, bt.ID, userdata.TargetUpdate{SetName: &name}); err != nil {
-			return nil, err
-		}
-		bt.SetName = name
+	if err := backup.CheckSetOwner(ctx, t, name, b.id); err != nil && !(takeOver && errors.Is(err, backup.ErrForeignInstance)) {
+		return nil, setError(err, b, t, bt)
 	}
 	return &resolvedTarget{bt: bt, t: t, setName: name}, nil
+}
+
+// rememberSetName stores the set name once a backup claimed the set.
+func (rt *resolvedTarget) rememberSetName(ctx context.Context, b *backupLib) error {
+	if rt.setName == rt.bt.SetName {
+		return nil
+	}
+	name := rt.setName
+	if _, err := b.user.UpdateBackupTarget(ctx, rt.bt.ID, userdata.TargetUpdate{SetName: &name}); err != nil {
+		return err
+	}
+	rt.bt.SetName = name
+	return nil
 }
 
 // parseBudget parses a scrub budget: a Go duration ("30m", "2h") or days
@@ -361,6 +386,7 @@ func newBackupCmd() *cobra.Command {
 		targetID, scrubBudget string
 		all, dryRun, partial  bool
 		doPrune, yes, quiet   bool
+		takeOver, force       bool
 		workers               int
 	)
 	c := &cobra.Command{
@@ -382,13 +408,21 @@ The target is the folder given, --target <id>, every target with
 --all-targets, or the library's only one. --dry-run prints the plan.
 Logs go to <library>/.picmover/logs/ and <set>/.picmover/logs/.
 
-Exit status: 0 everything verified; 1 some files failed (listed), or
---partial left files; 2 the target or the library could not be used;
-130 cancelled.`,
+A set last written by another copy of this library (the library folder
+was copied, or moved, or is used from another host) is refused with the
+folder and host that wrote it; --take-over makes this library its owner.
+
+Exit status: 0 everything verified; 1 some files failed (listed),
+--partial left files, a library folder could not be read, or catalog
+files are missing in the library; 2 the target or the library could not
+be used; 130 cancelled.`,
 		Args: rangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if workers < 0 || workers > backup.MaxWorkers {
 				return unusable(fmt.Errorf("--workers must be 0-%d", backup.MaxWorkers))
+			}
+			if force && !doPrune {
+				return unusable(errors.New("--force needs --prune"))
 			}
 			if yes && !doPrune {
 				return unusable(errors.New("--yes needs --prune"))
@@ -429,7 +463,7 @@ Exit status: 0 everything verified; 1 some files failed (listed), or
 			worst := 0
 			for _, bt := range targets {
 				code, err := backupOne(ctx, cmd, b, bt, backupFlags{dryRun: dryRun, partial: partial, workers: workers,
-					prune: doPrune, yes: yes, scrub: scrubBudget != "", budget: budget, quiet: quiet})
+					prune: doPrune, yes: yes, scrub: scrubBudget != "", budget: budget, quiet: quiet, takeOver: takeOver, force: force})
 				if err != nil {
 					var ee *exitError
 					if errors.As(unusable(err), &ee) {
@@ -464,11 +498,14 @@ Exit status: 0 everything verified; 1 some files failed (listed), or
 	f.BoolVar(&yes, "yes", false, "with --prune: remove the listed files")
 	f.StringVar(&scrubBudget, "scrub", "", "afterwards, scrub the set for this long (e.g. 30m, or all)")
 	f.BoolVar(&quiet, "quiet", false, "do not show the live status line")
+	f.BoolVar(&takeOver, "take-over", false, "back up into a set last written by another copy of this library (a copied or moved library folder), making this library its owner")
+	f.BoolVar(&force, "force", false, "with --prune: prune even when the library could not be read completely or catalog files are missing")
 	return backupCommand(c)
 }
 
 type backupFlags struct {
 	dryRun, partial, prune, yes, scrub, quiet bool
+	takeOver, force                           bool
 	workers                                   int
 	budget                                    time.Duration
 }
@@ -477,21 +514,22 @@ type backupFlags struct {
 // of what it did (0 or 1); an error means the target could not be used.
 func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdata.BackupTarget, fl backupFlags) (int, error) {
 	out := cmd.OutOrStdout()
-	rt, err := reach(ctx, b, bt, "backup")
+	rt, err := reach(ctx, b, bt, "backup", fl.takeOver)
 	if err != nil {
 		return exitUnusable, err
 	}
 	fmt.Fprintf(out, "Target %s (%s) at %s, set %s\n", rt.bt.ID, rt.bt.Label, rt.t.Root, rt.setName)
+	if err := backup.CheckSetFolder(rt.t, rt.setName); err != nil {
+		return exitUnusable, err
+	}
 	if fl.dryRun {
+		// reach checked the owner; a dry run writes nothing.
 		var set *backup.Set
 		if backup.SetExists(rt.t, rt.setName) {
 			if set, err = backup.OpenSet(ctx, rt.t, rt.setName, false); err != nil {
 				return exitUnusable, err
 			}
 			defer set.Close()
-			if err := set.Claim(ctx, b.libID); errors.Is(err, backup.ErrOtherLibrary) {
-				return exitUnusable, err
-			}
 		}
 		plan, err := backup.PlanFor(ctx, b.source(), set)
 		if err != nil {
@@ -517,14 +555,17 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 	}
 	defer closeLog()
 	progress, done := progressFunc(out, fl.quiet)
-	st, err := backup.Run(ctx, b.source(), set, backup.Options{LibraryID: b.libID, Library: b.lib.Root(),
+	st, err := backup.Run(ctx, b.source(), set, backup.Options{Owner: b.id, TakeOver: fl.takeOver, Library: b.lib.Root(),
 		Workers: fl.workers, Partial: fl.partial, OnProgress: progress, Logger: logger})
 	done()
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			fmt.Fprintf(out, "Backup cancelled: %d files copied; the next run continues.\n", st.Copied)
 		}
-		return exitUnusable, err
+		return exitUnusable, setError(err, b, rt.t, rt.bt)
+	}
+	if err := rt.rememberSetName(ctx, b); err != nil {
+		logger.Error("remember the set name", "err", err)
 	}
 	if err := b.user.MarkBackup(ctx, rt.bt.ID, time.Now()); err != nil {
 		logger.Error("record the backup time", "err", err)
@@ -532,7 +573,7 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 	printBackupSummary(out, &st, logPath)
 	code := st.ExitCode()
 	if fl.prune {
-		c, err := pruneSet(ctx, cmd, b, set, backup.DefaultKeep, fl.yes, logger)
+		c, err := pruneSet(ctx, cmd, b, set, backup.DefaultKeep, pruneFlags{yes: fl.yes, force: fl.force}, logger)
 		if err != nil {
 			return max(code, exitUnusable), err
 		}
@@ -541,7 +582,7 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 	if fl.scrub {
 		src := b.source()
 		sst, err := backup.Scrub(ctx, set, backup.ScrubOptions{Budget: fl.budget, Repair: true, Source: &src,
-			Library: b.lib.Root(), Logger: logger})
+			Owner: b.id, Library: b.lib.Root(), Logger: logger})
 		if err != nil {
 			return max(code, exitUnusable), err
 		}
@@ -574,6 +615,20 @@ func printPlan(w io.Writer, p *backup.Plan) {
 	printNonEmpty(w, "Actions", news)
 	printNonEmpty(w, "Symbolic links (skipped)", p.Symlinks)
 	printNonEmpty(w, "In the catalog but missing in the library", p.Missing)
+	printNonEmpty(w, "Could not be read (their files are not backed up)", failureLines(p.Errors))
+	var coll []string
+	for _, c := range p.Collisions {
+		coll = append(coll, c.Path+" (same name as "+c.Other+" but for case or Unicode form; not backed up)")
+	}
+	printNonEmpty(w, "Name collisions", coll)
+}
+
+func failureLines(list []backup.Failure) []string {
+	out := make([]string, 0, len(list))
+	for _, f := range list {
+		out = append(out, f.Path+": "+f.Error)
+	}
+	return out
 }
 
 func printBackupSummary(w io.Writer, st *backup.Stats, logPath string) {
@@ -598,5 +653,6 @@ func printBackupSummary(w io.Writer, st *backup.Stats, logPath string) {
 	printNonEmpty(w, "Failed files", failed)
 	printNonEmpty(w, "Symbolic links (skipped)", st.Symlinks)
 	printNonEmpty(w, "In the catalog but missing in the library", st.Missing)
+	printNonEmpty(w, "Could not be read in the library (their files are not backed up)", failureLines(st.ScanErrors))
 	fmt.Fprintf(w, "Log: %s\n", logPath)
 }

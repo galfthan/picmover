@@ -107,6 +107,46 @@ func (d *DB) Identity(ctx context.Context) (Identity, error) {
 	return id, nil
 }
 
+// IntegrityCheck checks the user.db file at path read-only: PRAGMA
+// integrity_check reports ok and its schema version is one this picmover
+// reads (1, which Open migrates, or SchemaVersion).
+func IntegrityCheck(ctx context.Context, path string) error {
+	sqldb, err := openReadOnly(path)
+	if err != nil {
+		return err
+	}
+	defer sqldb.Close()
+	var v int
+	if err := sqldb.QueryRowContext(ctx, `SELECT user_version FROM pragma_user_version`).Scan(&v); err != nil {
+		return fmt.Errorf("userdata: check %s: %w", path, err)
+	}
+	if v != 1 && v != SchemaVersion {
+		return fmt.Errorf("userdata: %s: %w", path, &VersionError{Version: v})
+	}
+	rows, err := sqldb.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		return fmt.Errorf("userdata: check %s: %w", path, err)
+	}
+	defer rows.Close()
+	var problems []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return fmt.Errorf("userdata: check %s: %w", path, err)
+		}
+		if s != "ok" {
+			problems = append(problems, s)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("userdata: check %s: %w", path, err)
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("userdata: %s fails the integrity check: %s", path, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
 // PeekLibraryID reads the library id of the user.db at path read-only;
 // "" when the file is missing or empty or has no identity (version 1).
 func PeekLibraryID(ctx context.Context, path string) (string, error) {

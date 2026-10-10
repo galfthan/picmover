@@ -120,6 +120,9 @@ already holds another library's set under that name.`,
 			} else if owner != "" && owner != b.libID {
 				err = backup.ErrOtherLibrary
 			}
+			if err == nil {
+				err = backup.CheckSetFolder(t, name)
+			}
 			if err != nil {
 				if errors.Is(err, backup.ErrOtherLibrary) {
 					return unusable(fmt.Errorf("%w; choose one with --set <name>", err))
