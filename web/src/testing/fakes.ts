@@ -513,9 +513,13 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       res = json({ id: ++jobId, kind: 'rebuild', state: 'running', library: id, startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
     } else if (p === '/api/jobs') {
       res = json({ jobs: [] });
+    } else if (/^\/api\/jobs\/\d+\/cancel$/.test(p) && method === 'POST') {
+      res = json({});
     } else if (p === '/api/fs') {
       const at = url.searchParams.get('path') ?? '';
-      res = at
+      res = at && !at.startsWith('/')
+        ? json({ error: 'path must be absolute' }, 400)
+        : at
         ? json({ path: at, parent: at === '/' ? '' : '/', dirs: [{ name: 'backup', path: `${at === '/' ? '' : at}/backup` }], mediaFiles: 0, otherFiles: 0 })
         : json({ path: '', dirs: [{ name: '/', path: '/' }, { name: 'mnt', path: '/mnt' }] });
     } else if (p.startsWith('/api/l/peter/')) {

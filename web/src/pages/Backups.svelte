@@ -183,7 +183,7 @@
         <label>
           <span>Folder</span>
           <span class="pathfield">
-            <input type="text" class="mono" bind:value={newPath} spellcheck="false" autocomplete="off" aria-invalid={!!pathProblem} placeholder="/media/backup, E:\Backup or \\nas\photos" />
+            <input type="text" class="mono" bind:value={newPath} oninput={() => (addError = '')} spellcheck="false" autocomplete="off" aria-invalid={!!pathProblem} placeholder="/media/backup, E:\Backup or \\nas\photos" />
             <button type="button" onclick={() => (browsing = true)}>Browse…</button>
           </span>
         </label>
@@ -192,7 +192,7 @@
         </p>
         <label>
           <span>Label</span>
-          <input type="text" bind:value={newLabel} maxlength="200" autocomplete="off" placeholder="Red WD drive" />
+          <input type="text" bind:value={newLabel} oninput={() => (addError = '')} maxlength="200" autocomplete="off" placeholder="Red WD drive" />
         </label>
         {#if root}<p class="muted small">Backs up <span class="mono">{root}</span>.</p>{/if}
         {#if pathProblem || addError}<div class="error-box small" role="alert">{addError || pathProblem}</div>{/if}

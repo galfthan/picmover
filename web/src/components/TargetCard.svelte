@@ -181,6 +181,7 @@
   }
 
   const SHOWN = 100;
+  const files = (k: number) => `${formatCount(k)} ${k === 1 ? 'file' : 'files'}`;
   const when = (v: number | string | null) => {
     const d = parseWhen(v);
     return d ? formatInstant(d.toISOString()) : '';
@@ -231,7 +232,7 @@
       <label>
         <span>Folder</span>
         <span class="pathfield">
-          <input type="text" class="mono" bind:value={editPath} spellcheck="false" autocomplete="off" aria-invalid={!!pathProblem} aria-label="Target folder" />
+          <input type="text" class="mono" bind:value={editPath} oninput={() => (editError = '')} spellcheck="false" autocomplete="off" aria-invalid={!!pathProblem} aria-label="Target folder" />
           <button type="button" onclick={() => (browsing = true)}>Browse…</button>
         </span>
       </label>
@@ -255,10 +256,19 @@
     <dd title={when(target.lastScrubAt)}>{agoText(target.lastScrubAt)}</dd>
     {#if set}
       <dt>On the target</dt>
-      <dd>{formatCount(set.files)} files, {formatBytes(set.bytes)}</dd>
-      {#if set.unverified}<dt>Not verified yet</dt><dd>{formatCount(set.unverified)} files</dd>{/if}
-      {#if set.damaged}<dt>Damaged</dt><dd class="bad">{formatCount(set.damaged)} files</dd>{/if}
-      {#if set.extras}<dt>Not in the library</dt><dd>{formatCount(set.extras)} files</dd>{/if}
+      <dd>{files(set.files)}, {formatBytes(set.bytes)}</dd>
+      {#if set.unverified}
+        <dt>Not verified yet</dt>
+        <dd>{files(set.unverified)}</dd>
+      {/if}
+      {#if set.damaged}
+        <dt>Damaged</dt>
+        <dd class="bad">{files(set.damaged)}</dd>
+      {/if}
+      {#if set.extras}
+        <dt>Not in the library</dt>
+        <dd>{files(set.extras)}</dd>
+      {/if}
     {/if}
   </dl>
 

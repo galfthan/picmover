@@ -181,7 +181,7 @@ describe('target paths', () => {
 
 describe('backup job outcomes', () => {
   const base = { id: 1, startedAt: null, finishedAt: null, error: null, logPath: '/lib/.picmover/logs/backup.log' };
-  const j = (p: Partial<Job> & { stats?: Record<string, unknown> }): Job => ({ ...base, kind: 'backup', state: 'done', ...p, stats: (p.stats ?? {}) as unknown as Job['stats'] });
+  const j = (p: Omit<Partial<Job>, 'stats'> & { stats?: Record<string, unknown> }): Job => ({ ...base, kind: 'backup', state: 'done', ...p, stats: (p.stats ?? {}) as unknown as Job['stats'] });
   it('uses the backup exit codes', () => {
     expect(outcome(j({ exitCode: 0, stats: { copied: 2 } }))).toEqual({ tone: 'ok', text: 'Backup finished: copied 2 files.' });
     expect(outcome(j({ exitCode: 1, state: 'failed', stats: { copied: 2, failed: 1 } }))).toEqual({
