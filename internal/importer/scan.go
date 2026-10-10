@@ -11,8 +11,9 @@ import (
 
 // job is one unit of work for a worker: a media file or a zip archive.
 type job struct {
-	path string
-	zip  bool
+	path  string
+	zip   bool
+	trash bool // a file of the library's trash, recorded in place
 }
 
 var junkNames = map[string]bool{
@@ -44,13 +45,15 @@ func (im *Importer) overlaps(src string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// scan walks src and sends jobs. Non-media files are reported directly.
+// scan walks src and sends jobs. trash marks a walk of the library's
+// trash directory (record in place): its files are internal by location,
+// so only the junk and extension rules apply. Non-media files are reported directly.
 // When src overlaps the library the whole tree is listed before any job is
 // dispatched, so files moved or copied into the library during this import
 // are not picked up a second time.
-func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, jobs chan<- job) {
+func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, jobs chan<- job, trash bool) {
 	var deferred []job
-	overlap := srcInfo.IsDir() && im.overlaps(src)
+	overlap := srcInfo.IsDir() && im.overlaps(src) && !trash
 
 	send := func(j job) bool {
 		if overlap {
@@ -67,7 +70,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 
 	// visit handles one non-directory entry; false stops the scan.
 	visit := func(p string, name string) bool {
-		if im.lib.IsInternal(p) || isJunk(name) {
+		if (!trash && im.lib.IsInternal(p)) || isJunk(name) {
 			return true
 		}
 		if isZip(name) {
@@ -84,7 +87,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 			im.report(Result{Status: StatusNonMedia, Source: p, Message: "not a media file"})
 			return true
 		}
-		return send(job{path: p})
+		return send(job{path: p, trash: trash})
 	}
 
 	if !srcInfo.IsDir() {
@@ -106,7 +109,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 			return nil
 		}
 		if d.IsDir() {
-			if p != src && im.lib.IsInternal(p) {
+			if p != src && !trash && im.lib.IsInternal(p) {
 				return filepath.SkipDir
 			}
 			return nil
