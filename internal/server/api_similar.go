@@ -2,6 +2,7 @@ package server
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
@@ -76,20 +77,11 @@ func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request, l *libHan
 		s.internalError(w, r, err)
 		return
 	}
-	pairs, err := l.db.SimilarPairs(ctx)
+	_, _, groups, err := currentGroups(ctx, l)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
 	}
-	ignored, err := l.user.Ignored(ctx)
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	groups := similar.Groups(pairs, func(a, b uint64) bool {
-		_, ok := ignored[userdata.NewPair(a, b)]
-		return ok
-	})
 	out := similarGroupsJSON{Groups: []similarGroupJSON{}, Total: len(groups), At: info.At, Distance: info.Distance}
 	page := groups[min(offset, len(groups)):min(offset+limit, len(groups))]
 	var hashes []uint64
@@ -132,28 +124,110 @@ type ignoredJSON struct {
 	Ignored int64 `json:"ignored"`
 }
 
-// handleSimilarIgnore stores every pair among the given hashes (at most
-// 200) as "not duplicates" and returns the number of new pairs.
+// currentGroups returns the stored live pairs, the ignored set and the
+// groups as GET similar shows them.
+func currentGroups(ctx context.Context, l *libHandles) ([]catalog.SimilarPair, map[userdata.Pair]struct{}, []similar.Group, error) {
+	pairs, err := l.db.SimilarPairs(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	ignored, err := l.user.Ignored(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	groups := similar.Groups(pairs, func(a, b uint64) bool {
+		_, ok := ignored[userdata.NewPair(a, b)]
+		return ok
+	})
+	return pairs, ignored, groups, nil
+}
+
+type ignoreBody struct {
+	Hashes []string `json:"hashes"`
+	Group  *string  `json:"group"`
+}
+
+// handleSimilarIgnore stores pairs as "not duplicates" and returns the
+// number of new pairs. Two forms:
+//
+//   - {"group": "<hash>"}: the current group containing that hash (as GET
+//     similar computes it) is dismissed: its stored pairs that are not
+//     ignored yet are ignored, so the group disappears. 404 when the hash
+//     is in no group.
+//   - {"hashes": [...]} (2-200): the stored pairs among those hashes.
+//
+// Only pairs the search stored are written, so the cost follows the real
+// pairs, not every combination.
 func (s *Server) handleSimilarIgnore(w http.ResponseWriter, r *http.Request, l *libHandles) {
-	var body hashesBody
+	var body ignoreBody
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	hashes, err := parseHashes("hashes", body.Hashes, maxIgnoreHashes)
-	if err == nil && len(hashes) < 2 {
-		err = fmt.Errorf("hashes: give at least two")
-	}
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if (body.Group != nil) == (len(body.Hashes) > 0) {
+		writeError(w, http.StatusBadRequest, "give either \"group\" or \"hashes\"")
 		return
 	}
-	var pairs []userdata.Pair
-	for i := range hashes {
-		for j := i + 1; j < len(hashes); j++ {
-			pairs = append(pairs, userdata.NewPair(hashes[i], hashes[j]))
+	ctx := r.Context()
+	var members map[uint64]bool
+	if body.Group != nil {
+		hs, err := parseHashes("group", []string{*body.Group}, 1)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		members = map[uint64]bool{hs[0]: true}
+	} else {
+		hashes, err := parseHashes("hashes", body.Hashes, maxIgnoreHashes)
+		if err == nil && len(hashes) < 2 {
+			err = fmt.Errorf("hashes: give at least two")
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		members = make(map[uint64]bool, len(hashes))
+		for _, h := range hashes {
+			members[h] = true
 		}
 	}
-	n, err := l.user.Ignore(r.Context(), pairs)
+	pairs, ignored, groups, err := currentGroups(ctx, l)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	if body.Group != nil {
+		var g *similar.Group
+		for i := range groups {
+			for _, h := range groups[i].Hashes {
+				if members[h] {
+					g = &groups[i]
+					break
+				}
+			}
+			if g != nil {
+				break
+			}
+		}
+		if g == nil {
+			writeError(w, http.StatusNotFound, "the hash is in no group")
+			return
+		}
+		members = make(map[uint64]bool, len(g.Hashes))
+		for _, h := range g.Hashes {
+			members[h] = true
+		}
+	}
+	var add []userdata.Pair
+	for _, p := range pairs {
+		if !members[p.A] || !members[p.B] {
+			continue
+		}
+		np := userdata.NewPair(p.A, p.B)
+		if _, ok := ignored[np]; !ok {
+			add = append(add, np)
+		}
+	}
+	n, err := l.user.Ignore(ctx, add)
 	if err != nil {
 		s.internalError(w, r, err)
 		return

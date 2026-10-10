@@ -167,6 +167,10 @@ type Bucket struct {
 	Count       int64
 }
 
+// notIndexedHashes is the Filter.Hashes size above which Buckets scans
+// the table instead of looking every hash up in the hash index.
+const notIndexedHashes = 10000
+
 // Buckets returns the months matching f, newest first, undated last.
 // Implemented with one GROUP BY over strftime('%Y-%m', taken_at, 'unixepoch');
 // taken_at is wall-clock-as-UTC so no zone conversion is applied. Rows
@@ -176,7 +180,13 @@ func (d *DB) Buckets(ctx context.Context, f Filter) ([]Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	q := `SELECT CASE WHEN ` + datedRange + ` THEN strftime('%Y-%m', taken_at, 'unixepoch') END AS ym, COUNT(*) FROM media` +
+	from := " FROM media"
+	if len(f.Hashes) > notIndexedHashes {
+		// A large hash set: one scan beats that many index lookups
+		// (measured 159 -> 127 ms for 50k of 136k rows).
+		from = " FROM media NOT INDEXED"
+	}
+	q := `SELECT CASE WHEN ` + datedRange + ` THEN strftime('%Y-%m', taken_at, 'unixepoch') END AS ym, COUNT(*)` + from +
 		whereClause(conds) + ` GROUP BY ym ORDER BY ym IS NULL, ym DESC`
 	rows, err := d.QueryContext(ctx, q, args...)
 	if err != nil {
