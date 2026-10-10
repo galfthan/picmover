@@ -95,6 +95,11 @@ func TestIsInternal(t *testing.T) {
 		"image/user.db":                             false,
 		"image/2020/01/a.jpg":                       false,
 		"image/import_x.log":                        false,
+		"USER.DB":                                   true,
+		"User.db-WAL":                               true,
+		"MEDIA.DB":                                  true,
+		".PicMover/trash/a.jpg":                     true,
+		"Import_x.LOG":                              true,
 	}
 	for rel, want := range cases {
 		if got := l.IsInternal(l.Abs(rel)); got != want {
