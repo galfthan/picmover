@@ -261,6 +261,9 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       const l: Lib = { id: String(body.name), name: String(body.name), path: `/media/${String(body.name)}`, state: 'closed', summary: summary(0) };
       libs.push(l);
       res = json(l, 201);
+    } else if (/^\/api\/libraries\/[^/]+\/cover$/.test(p) && method === 'GET') {
+      const l = libs.find((x) => x.id === decodeURIComponent(p.split('/')[3] ?? ''));
+      res = l?.cover ? new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg', ETag: '"c1"' } }) : json({ error: 'no cover' }, 404);
     } else if (/^\/api\/libraries\/[^/]+\/open$/.test(p)) {
       const id = decodeURIComponent(p.split('/')[3] ?? '');
       const l = libs.find((x) => x.id === id);

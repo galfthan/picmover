@@ -632,13 +632,18 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   counts and `similar.pairs`.
 - Album `cover` is a hash or null and is shown through the scoped
   `thumb` endpoint.
+- Library cards use `GET /api/libraries/{id}/cover` (`libraryCoverUrl`):
+  a JPEG thumbnail for a library in any readable state, 404 when there is
+  none, cached by its ETag.
 
 ### Deviations and additions
 
-- **Covers on the Libraries page** are shown only for libraries that are
-  `open`: the scoped `thumb` endpoint answers 409 for a closed library, so
-  a closed one shows its initial instead. Serving covers of closed
-  libraries (a read-only thumbs peek) would need a server change.
+- **Covers on the Libraries page** come from the workspace route
+  `GET /api/libraries/{id}/cover` for every card, closed libraries
+  included (the scoped `thumb` endpoint answers 409 for a closed library;
+  the backend added the cover route for this). The lib object's `cover`
+  hash is not used by the page. A load error or 404 shows the library's
+  initial instead.
 - Step 3 hashes (`#/map`, `#/view/3`, `#/?session=4`) are redirected: in
   single mode to the same page of the one library, in workspace mode to
   `#/`. Unknown routes go home the same way. No `#/jobs` page (optional in
@@ -648,7 +653,10 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
   any of them clears it. A plain click on a tile still opens the lightbox
   while selecting; the checkbox, Ctrl/Cmd-click and Shift-click select.
   The bar shows "(N in months not loaded were skipped)" after a range over
-  unloaded months.
+  unloaded months. While the bar is shown, the grid (also on the album and
+  trash pages, which reuse it) grows at the bottom by the bar's measured
+  height plus its 24 px margin, so the last row can be scrolled clear of
+  the bar; the padding goes away with the selection.
 - Undo toasts (8 s) also follow Trash in the selection bar and "Trash the
   others" on the duplicates page, not only the lightbox's Delete.
 - Lightbox additions: Trash/Restore buttons in its top bar, × on album
@@ -674,7 +682,7 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
 
 ### Tests
 
-`make web-check`: svelte-check (0 errors, 0 warnings), 122 vitest tests in
+`make web-check`: svelte-check (0 errors, 0 warnings), 123 vitest tests in
 16 files, plus `npm run build`.
 
 - `lib/routes.test.ts`: every route under `#/l/<id>/`, id decoding and
@@ -702,14 +710,16 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
 - `lib/format.test.ts` (relative times, `parseWhen`), `lib/similar.test.ts`
   (`bestOf`), `lib/jobs.test.ts` (start in a library).
 - Component tests (jsdom, whole app or component mounted):
-  `Libraries.test.ts` (cards in every state, Retry, Record files in place
+  `Libraries.test.ts` (cards in every state, covers from the workspace
+  route with the initial on error, Retry, Record files in place
   with progress and opening afterwards, New library dialog: focus, Tab
   wrap, Escape with focus return, validation, create and open; opening a
   closed library, the switcher menu, gates for busy, error with Rebuild
   and missing), `SelectionBar.test.ts` (hidden when empty; rate and clear,
   tag autocomplete and create, album pick and create, trash with partial
   failure and Undo, 2500 hashes in three chunks, album and trash modes),
-  `Management.test.ts` (Ctrl and Shift selection, checkbox, in-place
+  `Management.test.ts` (Ctrl and Shift selection, the grid's bottom padding
+  while the bar is shown, checkbox, in-place
   rating without a timeline reload, trash with the nav count and Undo,
   Escape and filter change clear; lightbox `4`, `t` + create, `b`,
   Delete with Undo; trash page tiles, `r`, Empty trash typed count; albums

@@ -55,8 +55,16 @@ describe('Libraries page', () => {
     expect(peter.querySelector('a.main')?.getAttribute('href')).toBe('#/l/peter/');
     expect(peter.textContent).toContain('/media/peter');
     expect(peter.textContent).toContain('8 photos · 0 videos · 2024');
-    // A closed library's thumbnails cannot be served yet: a placeholder, not an <img>.
-    expect(peter.querySelector('img')).toBeNull();
+    // Every card asks the workspace cover endpoint, closed libraries included;
+    // a failed load (404: no cover) falls back to the initial.
+    expect(peter.querySelector('img')?.getAttribute('src')).toBe('/api/libraries/peter/cover');
+    const brokenImg = card('broken').querySelector('img')!;
+    expect(brokenImg.getAttribute('src')).toBe('/api/libraries/broken/cover');
+    brokenImg.dispatchEvent(new Event('error'));
+    await settle();
+    expect(card('broken').querySelector('img')).toBeNull();
+    expect(card('broken').querySelector('.ph')?.textContent).toBe('B');
+    expect(server.calls.some((c) => c.path.startsWith('/api/l/peter/thumb'))).toBe(false);
 
     const penny = card('penny');
     expect(penny.querySelector('.badge')?.textContent).toBe('In use');

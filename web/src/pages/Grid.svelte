@@ -78,6 +78,10 @@
   const timeline = $derived(
     layoutTimeline(buckets, { width: contentWidth, tileSize, gap: GAP, headerHeight: HEADER, bucketPadding: BUCKET_PAD }),
   );
+  /** Height of the selection bar while shown; the canvas grows by it (plus its margin) so the last row can scroll clear of it. */
+  let barHeight = $state(0);
+  const BAR_MARGIN = 24;
+  const padBottom = $derived(barHeight > 0 ? barHeight + BAR_MARGIN : 0);
   const totalCount = $derived(buckets.reduce((n, b) => n + b.count, 0));
 
   // ---- Data ----
@@ -323,7 +327,7 @@
 
   function scrollToY(y: number) {
     if (!scroller) return;
-    const max = Math.max(0, timeline.totalHeight - height);
+    const max = Math.max(0, timeline.totalHeight + padBottom - height);
     const t = Math.max(0, Math.min(max, y));
     scroller.scrollTop = t;
     scrollTop = t;
@@ -582,7 +586,7 @@
           {/if}
         </div>
       {:else}
-        <div class="canvas" style:height="{timeline.totalHeight}px">
+        <div class="canvas" style:height="{timeline.totalHeight + padBottom}px">
           {#each view as v (v.key)}
             <section class="bucket" style:top="{v.b.top}px" style:height="{v.b.height}px" aria-label={v.label}>
               <h2 class="header">
@@ -633,7 +637,7 @@
     {#if tlStatus === 'ready' && buckets.length > 0}
       <Scrubber {timeline} {scrollTop} viewportHeight={height} onjump={scrollToY} />
     {/if}
-    <SelectionBar {api} mode={mode} {albumId} currentRating={commonRating} />
+    <SelectionBar {api} mode={mode} {albumId} currentRating={commonRating} bind:height={barHeight} />
   </div>
 </div>
 

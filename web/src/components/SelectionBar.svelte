@@ -32,8 +32,15 @@
     albumId?: number | null;
     /** The rating all selected items share (0 when mixed or unrated). */
     currentRating?: number;
+    /** The bar's height while shown (0 when hidden), so the page can make room below its content. */
+    height?: number;
   }
-  let { api, mode, albumId = null, currentRating = 0 }: Props = $props();
+  let { api, mode, albumId = null, currentRating = 0, height = $bindable(0) }: Props = $props();
+  let measured = $state(0);
+  $effect(() => {
+    // jsdom (and the first frame) measure 0; assume one row of controls then.
+    height = selection.size > 0 ? Math.max(measured, 48) : 0;
+  });
 
   let busy = $state('');
   let progress = $state<[number, number] | null>(null);
@@ -143,7 +150,7 @@
 </script>
 
 {#if n > 0}
-  <div class="selbar" role="region" aria-label="Selection">
+  <div class="selbar" role="region" aria-label="Selection" bind:offsetHeight={measured}>
     <span class="count" aria-live="polite">
       <strong>{formatCount(n)}</strong> selected
       {#if selection.skipped > 0}

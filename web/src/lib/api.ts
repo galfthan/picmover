@@ -766,6 +766,14 @@ export function createLibrary(name: string): Promise<Lib> {
   return postJSON<Lib>('/api/libraries', { name });
 }
 
+/**
+ * Cover thumbnail of a library in any readable state (closed included):
+ * a 256 px JPEG, 404 when there is none. Cached by the server's ETag.
+ */
+export function libraryCoverUrl(id: string): string {
+  return `/api/libraries/${enc(id)}/cover`;
+}
+
 /** Opens a library: 200 lib; ApiError 409 (body.holder) when locked, 503 while rebuilding. */
 export function openLibrary(id: string): Promise<Lib> {
   return postJSON<Lib>(`/api/libraries/${enc(id)}/open`, {});

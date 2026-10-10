@@ -2,7 +2,7 @@
   // The workspace's start page (#/): a card per library and per plain
   // folder, with New library, Record files in place, Rebuild and Retry.
   import { untrack } from 'svelte';
-  import { errorMessage, libApi, type FolderEntry, type Lib } from '../lib/api';
+  import { errorMessage, libraryCoverUrl, type FolderEntry, type Lib } from '../lib/api';
   import { libraries, holderText, libraryNameProblem } from '../lib/libraries.svelte';
   import { jobs } from '../lib/jobs.svelte';
   import { formatCount, parseWallClock } from '../lib/format';
@@ -35,6 +35,8 @@
   });
 
   let errors = $state<Record<string, string>>({});
+  /** Libraries whose cover failed to load (404: none yet); they show their initial. */
+  let noCover = $state<Record<string, boolean>>({});
   let starting = $state<string | null>(null);
 
   async function record(id: string) {
@@ -161,8 +163,14 @@
           <li class="card libcard state-{l.state}">
             <a class="main" href={libHref(l.id, '')} aria-label="Open {l.name}, {l.path}">
               <span class="cover">
-                {#if l.cover && l.state === 'open'}
-                  <img src={libApi(l.id).thumbUrl({ hash: l.cover })} alt="" loading="lazy" decoding="async" />
+                {#if !noCover[l.id]}
+                  <img
+                    src={libraryCoverUrl(l.id)}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    onerror={() => (noCover = { ...noCover, [l.id]: true })}
+                  />
                 {:else}
                   <span class="ph" aria-hidden="true">{l.name.slice(0, 1).toUpperCase()}</span>
                 {/if}

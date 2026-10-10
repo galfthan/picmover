@@ -1,7 +1,7 @@
 // Library-scoped URLs and chunked mutations, against a recording fake fetch.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, chunks, filterParams, libApi, setUnavailableHandler } from './api';
+import { ApiError, chunks, filterParams, libApi, libraryCoverUrl, setUnavailableHandler } from './api';
 
 interface Call {
   method: string;
@@ -62,6 +62,10 @@ describe('thumbnail and preview URLs', () => {
   it('percent-encode the library id', () => {
     expect(libApi('my photos#1').thumbUrl({ hash })).toBe('/api/l/my%20photos%231/thumb/00000000000000ab');
     expect(libApi('peter')).toBe(api);
+  });
+  it('name library covers through the workspace route', () => {
+    expect(libraryCoverUrl('peter')).toBe('/api/libraries/peter/cover');
+    expect(libraryCoverUrl('my photos')).toBe('/api/libraries/my%20photos/cover');
   });
 });
 

@@ -56,8 +56,12 @@ describe('management flows', () => {
     expect(tiles()).toHaveLength(8);
 
     // Ctrl-click toggles, Shift-click selects the range in display order.
+    const canvasHeight = () => parseFloat(document.querySelector<HTMLElement>('.canvas')!.style.height);
+    const plain = canvasHeight();
     click(tile(2), { ctrlKey: true });
     await settle();
+    // While the bar is shown the grid grows by its height (48 px in jsdom) plus its margin.
+    expect(canvasHeight()).toBe(plain + 48 + 24);
     expect(location.hash).toBe('#/l/peter/');
     expect(document.querySelector('.selbar')?.textContent).toContain('1 selected');
     expect(tile(2).parentElement?.classList.contains('selected')).toBe(true);
@@ -100,6 +104,7 @@ describe('management flows', () => {
     key('Escape');
     await settle();
     expect(document.querySelector('.selbar')).toBeNull();
+    expect(canvasHeight()).toBe(plain);
     click(tile(1), { metaKey: true });
     await settle();
     await go('#/l/peter/?rating=3');
