@@ -312,3 +312,146 @@ Job progress events: `{phase: "plan"|"copy"|"snapshot"|"scrub"|"prune"|"restore"
 
 Cloud/object targets behind the same `Target` interface; scheduled runs
 from inside `serve`; cross-library dedup on a shared target.
+
+## As implemented (frontend)
+
+Built against this contract while the Go side was written in parallel, so
+it is tested against the fake server (`web/src/testing/fakes.ts`), not the
+real one. Everything in "Frontend" is implemented.
+
+### Files
+
+`lib/api.ts` (backup types, `LibApi.getBackups/addTarget/updateTarget/
+forgetTarget/getPlan/getRuns`, the four job request bodies, tolerant
+normalizers `toTarget`, `toPlan`, `pathOf`), `lib/backupinfo.ts` (pure:
+headline, status line and staleness, run problems, run summaries,
+`RateMeter`/`etaMs`, phase labels, `targetPathProblem`),
+`lib/backups.svelte.ts` (per-library store: targets, plan cache, runs, job
+→ target map, `refresh()`), `pages/Backups.svelte` (cards, Add target,
+status line, the library's path), `components/TargetCard.svelte`,
+`components/BackupProgress.svelte`. Touched: `App.svelte` (nav **Backups**
+between Import and Library, route `#/l/<id>/backups`), `lib/routes.ts`,
+`lib/jobtext.ts` (titles and outcomes of the backup kinds),
+`components/JobPill.svelte` ("Backing up 12 of 40 files…", opens the
+Backups page), `components/FolderPicker.svelte` (labels are props),
+`pages/Library.svelte` and `pages/Libraries.svelte` (status lines).
+
+### Shapes relied on
+
+- `GET …/backups[?plan=1]` → `{targets: [...]}` exactly as in the API
+  table. Missing fields are defaulted (`reachable` false unless `true`,
+  `set` and `behind` null when absent or not objects). `lastBackupAt` and
+  `lastScrubAt` may be Unix seconds, RFC 3339 or a wall-clock string in the
+  server's zone (`parseWhen`). The page calls the plain GET on arrival and
+  `?plan=1` once when a reachable target has no `behind`, after every job,
+  after re-pointing or adding a target, and on "Check now".
+- `POST …/backups/targets` and `POST …/backups/targets/{id}` answer the
+  target object (also accepted wrapped as `{target}`); errors are shown
+  from `error`. The update sends only the changed fields.
+- **Plan** (`GET …/targets/{id}/plan`; the contract leaves the JSON open):
+  one object per class, `{new, changed, moved, current, extra}`, each
+  `{count, bytes, paths}`. Also accepted: the classes under `classes` or
+  `plan`, `extras` for `extra`, `examples` for `paths`, example entries as
+  strings or objects with `path`, `relPath`, or `{from, to}` (shown as
+  "from → to"), and a bare number as the count.
+- **Prune** sends `{kind: "prune", target, confirm: true, expected}` with
+  `expected` = the `extra.count` of a plan fetched when the dialog opened
+  (never the cached one), after the user typed that number. The client
+  assumes the server's prune count is the plan's `extra.count`; if
+  `.picmover/previous/` entries are counted separately the backend must add
+  them to `extra` or the 409 will say so.
+- **Restore missing** previews the same `extra` class ("on the target but
+  not in the library": path and hash absent, which is what restore
+  `missing` copies back) and sends `{kind: "restore", target, mode:
+  "missing"}`. `user-data` mode is CLI-only for now.
+- **Scrub** sends `budget` in seconds (900, 3600) or omits it for "All",
+  and always `repair: true`. Backup sends `{kind, target}` only.
+- **Progress**: an SSE `progress` event whose data is `{phase, files,
+  bytes, totalFiles, totalBytes, current, failed}` at the top level, under
+  `progress`, or under `stats` (all three are read); a job object's
+  `progress` field (listings, state events) too. It is kept as `job.phase`
+  like the similar job's. `failed` is a count. Rate and ETA are computed in
+  the browser from `bytes` over a 20 s window; the fraction uses bytes when
+  `totalBytes` is known, else files.
+- **Job ↔ target**: the job object's `target` is used when present; else
+  the store remembers which target each job started from this page was for.
+  A running backup-kind job with no known target (started in another tab
+  or after a reload) is shown at the top of the page instead of in a card.
+- **Exit codes** of the backup kinds (`exitCode`): 0 clean, 1 partial
+  (some files failed; scrub: damage found), shown as a warning even when
+  the job's `state` is `failed`; 2 or `failed` without a code as an error;
+  130 / `cancelled` as cancelled. The job's `stats` (the run stats) feed
+  the one-line summary.
+- **Run stats** (`GET …/runs`, `stats` as an object or as JSON text). The
+  contract leaves the counters open; the UI reads: backup `copied`,
+  `moved`, `changed`, `bytes`, `failed` (or `failures`); scrub `checked`,
+  `bytes`, `damaged`, `repaired`, `unknown`, `missing`; prune `removed`,
+  `bytes`; restore `restored`, `bytes`, `failed`. Each of the problem
+  fields may be a count or a list of paths or of `{path, error?,
+  repaired?}` objects; `repaired` may also be a separate list of paths. The
+  problems panel takes `damaged`, `unknown` and `missing` from the newest
+  scrub run and `failed` from the newest backup run.
+- **Workspace listing**: a library may carry `backup: {lastBackupAt,
+  behind, targets, label?}` where `behind` is a count or a `behind` object
+  and `targets` a count or a list. Without it the card shows no line.
+
+### Deviations and additions
+
+- The status line says "Backed up 2 hours ago to Red WD drive; 0 behind"
+  (`Intl.RelativeTimeFormat` wording, not "2 h"); stale lines get a ⚠ and
+  "(older than 30 days)". Without a target: "No backup target yet"; with
+  targets but no backup: "Never backed up (N targets)". The Library page
+  line links to the Backups page ("Add a backup target" when there is
+  none). The "behind" count is that of the target with the newest backup.
+- The card headline counts new + changed + moved files and `behind.bytes`
+  ("1,204 files, 3.2 GiB not backed up yet", binary units as everywhere in
+  the UI); other states: "Up to date", "Not checked yet", "Not reachable",
+  "Nothing backed up here yet".
+- Label and path are edited together behind an Edit button (the contract
+  only asks for the path); Browse opens the directory browser in a dialog,
+  and the field takes any absolute path including `\\server\share`
+  (checked in the browser with the server's rules: absolute, no NUL, no
+  device paths; the directory browser itself still refuses UNC).
+- Add target defaults the label to the chosen folder's name and requires
+  one. A server error stays in the dialog until a field changes.
+- Forget asks inline (ConfirmButton) and says the files stay.
+- While any job runs, every card's actions are disabled (one job per
+  process); an unreachable target only offers Edit and Forget.
+- The last finished job of a target (this server process) is shown under
+  its actions with the job's outcome text.
+- The problems panel lists up to 100 entries per kind, then "and N more;
+  see the run log".
+
+### Tests
+
+`make web-check`: svelte-check (0 errors, 0 warnings), 171 vitest tests
+in 18 files (32 new), plus `npm run build` without warnings.
+
+- `lib/backupinfo.test.ts`: headline variants (incl. 1,204 files, 3.2
+  GiB), status line from targets (newest target, behind), no target, never,
+  older than 30 days vs 29 days, every time form; listing summary absent,
+  count and object `behind`, `targets` as list; run problems (newest scrub
+  and backup, separate `repaired` list, counts only), run summaries; rate
+  window, reset on a lower count, ETA math and wording, fraction by bytes
+  then files; target path checks (POSIX, drive, UNC accepted; relative,
+  `E:x`, bare `\\nas`, device and NUL refused); backup exit-code outcomes.
+- `lib/api.test.ts`: `?plan=1`, defaults, add/update/forget URLs and
+  bodies, invalid ids never reach `fetch`, plan normalization (`examples`,
+  `{from, to}`, missing classes), runs with JSON-text stats, the four job
+  bodies.
+- `lib/jobs.test.ts`: backup progress from a listing's `progress`, and SSE
+  progress at the top level, under `progress` and under `stats`.
+- `Backups.test.ts` (whole app, fake server): cards with headline, facts,
+  reachable state and problems (damaged with repaired / not repaired, copy
+  failures, unknown files), the automatic plan request, the status line;
+  Back up now with inline progress (files, bytes, current file, progress
+  bar, rate 2.0 MiB/s and "about 10s left" after 2 s, failed count), the
+  pill, Cancel, and the reload of plan and runs after `done`; scrub budgets
+  (900, 3600, omitted); prune dialog with the extras list, the typed count,
+  a 409 when the plan changed, and the fresh count on reopening; restore
+  preview and "Nothing is missing"; Add target with Browse, typed UNC, a
+  409 shown in the dialog, focus and Escape; Edit path with a marker
+  mismatch, rename sending only the label, Forget; the empty state; the
+  Library page line (recent, older than 30 days, no target); the Libraries
+  page lines (recent, stale, absent).
+- `App.test.ts`: the nav gained Backups.
