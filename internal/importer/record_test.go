@@ -12,8 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/library"
 	"picmover/internal/thumbs"
 )
 
@@ -414,5 +416,74 @@ func TestCorruptCachedPreviewRegenerated(t *testing.T) {
 	}
 	for _, r := range e.rows() {
 		assertThumbOK(t, store, r)
+	}
+}
+
+// RecordInPlace records the trash tree as trashed rows: rel_path relative
+// to the trash directory, deleted_at from TrashTimes when given, else the
+// file's mtime. Trash files are not moved, junk and non-media files there
+// follow the library rules, and a trash file identical to a live one is a
+// duplicate.
+func TestRecordInPlaceTrash(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "lib")
+	e := newEnvAt(t, root, root)
+	writeFile(t, e.lib.Abs("image/2020/03/live.jpg"), jpegAt(date(2020, 3, 5), 1))
+	trashA := e.lib.TrashPath("image/2021/01/a.jpg")
+	trashB := e.lib.TrashPath("old/b.jpg")
+	writeFile(t, trashA, jpegAt(date(2021, 1, 2), 2))
+	writeFile(t, trashB, jpegAt(date(2015, 1, 2), 3))
+	writeFile(t, e.lib.TrashPath("image/2020/03/live.jpg"), jpegAt(date(2020, 3, 5), 1)) // same content as live
+	writeFile(t, e.lib.TrashPath("Thumbs.db"), []byte("junk"))
+	writeFile(t, e.lib.TrashPath("notes.txt"), []byte("text"))
+	mtime := time.Date(2022, 5, 6, 7, 8, 9, 0, time.UTC)
+	if err := os.Chtimes(trashB, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	hashA, _, err := library.HashFile(trashA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trashedAt := time.Unix(1700000000, 0)
+	before := allFiles(t, root)
+
+	o := e.opts()
+	o.RecordInPlace = true
+	o.NoThumbs = true
+	o.TrashTimes = map[uint64]time.Time{hashA: trashedAt}
+	st, c := e.mustRun(o)
+	if st.Existing != 3 || st.Duplicates != 1 || st.NonMedia != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	if after := allFiles(t, root); !slices.Equal(after, before) {
+		t.Errorf("files changed:\nbefore %v\nafter  %v", before, after)
+	}
+	ms, err := e.db.List(context.Background(), catalog.ListOptions{IncludeDeleted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]catalog.Media{}
+	for _, m := range ms {
+		rows[m.RelPath] = m
+	}
+	if m := rows["image/2020/03/live.jpg"]; m.ID == 0 || !m.DeletedAt.IsZero() {
+		t.Errorf("live row %+v", m)
+	}
+	if m := rows["image/2021/01/a.jpg"]; !m.DeletedAt.Equal(trashedAt) {
+		t.Errorf("trashed a: deleted_at %v, want the user.db time", m.DeletedAt)
+	}
+	if m := rows["old/b.jpg"]; !m.DeletedAt.Equal(mtime) {
+		t.Errorf("trashed b: deleted_at %v, want the mtime", m.DeletedAt)
+	}
+	if len(rows) != 3 {
+		t.Errorf("rows %v", keys(rows))
+	}
+	inTrash := 0
+	for _, r := range c.byStatus(StatusExisting) {
+		if r.Message == "in trash" {
+			inTrash++
+		}
+	}
+	if inTrash != 2 {
+		t.Errorf("%d results say in trash", inTrash)
 	}
 }

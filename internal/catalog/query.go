@@ -23,6 +23,42 @@ type Filter struct {
 	SessionID      int64     // import_session_id
 	From, To       time.Time // wall-clock bounds on taken_at (To exclusive); zero = open
 	IncludeDeleted bool
+	// Trashed selects the trashed rows (deleted_at set) instead of the
+	// live ones; it takes precedence over IncludeDeleted.
+	Trashed bool
+	// Hashes restricts the rows to these content hashes. nil means no
+	// restriction; an empty non-nil slice matches nothing.
+	Hashes []uint64
+	// Recur restricts dated rows to a day range every year; nil = none.
+	// Undated rows never match.
+	Recur *Recur
+}
+
+// Recur is an inclusive day-of-year range repeated every year, as
+// "MM-DD" bounds. From > To wraps the year end (12-30..01-02); From ==
+// To is one day. 02-29 is a valid bound.
+type Recur struct {
+	From, To string
+}
+
+// ValidMonthDay reports whether s is "MM-DD" with a month 01-12 and a day
+// that exists in that month in a leap year.
+func ValidMonthDay(s string) bool {
+	if len(s) != 5 || s[2] != '-' {
+		return false
+	}
+	for _, i := range []int{0, 1, 3, 4} {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	m := int(s[0]-'0')*10 + int(s[1]-'0')
+	d := int(s[3]-'0')*10 + int(s[4]-'0')
+	if m < 1 || m > 12 || d < 1 {
+		return false
+	}
+	// 2000 is a leap year, so 02-29 exists.
+	return d <= time.Date(2000, time.Month(m)+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
 // File types stored in file_type.
@@ -50,8 +86,29 @@ func (f Filter) where() ([]string, []any, error) {
 		conds []string
 		args  []any
 	)
-	if !f.IncludeDeleted {
+	switch {
+	case f.Trashed:
+		conds = append(conds, "deleted_at IS NOT NULL")
+	case !f.IncludeDeleted:
 		conds = append(conds, "deleted_at IS NULL")
+	}
+	if f.Hashes != nil {
+		conds = append(conds, "hash IN (SELECT value FROM json_each(?))")
+		args = append(args, hashArray(f.Hashes))
+	}
+	if r := f.Recur; r != nil {
+		if !ValidMonthDay(r.From) || !ValidMonthDay(r.To) {
+			return nil, nil, fmt.Errorf("catalog: invalid recurring range %q..%q", r.From, r.To)
+		}
+		// Inside the dated-range guard: strftime cannot format years
+		// beyond 9999, and undated rows never match.
+		md := "strftime('%m-%d', taken_at, 'unixepoch')"
+		if r.From <= r.To {
+			conds = append(conds, datedRange+" AND "+md+" BETWEEN ? AND ?")
+		} else {
+			conds = append(conds, datedRange+" AND ("+md+" >= ? OR "+md+" <= ?)")
+		}
+		args = append(args, r.From, r.To)
 	}
 	if f.FileType != "" {
 		if !ValidFileType(f.FileType) {

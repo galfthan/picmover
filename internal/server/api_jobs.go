@@ -9,14 +9,27 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"picmover/internal/library"
+	"picmover/internal/similar"
 )
 
 type jobListJSON struct {
 	Jobs []jobJSON `json:"jobs"`
 }
 
+// handleJobList lists the jobs of every library.
 func (s *Server) handleJobList(w http.ResponseWriter, r *http.Request) {
-	jobs := s.jobs.list()
+	s.writeJobs(w, nil)
+}
+
+// handleLibJobList lists the jobs of one library.
+func (s *Server) handleLibJobList(w http.ResponseWriter, r *http.Request, l *libHandles) {
+	s.writeJobs(w, l.entry)
+}
+
+func (s *Server) writeJobs(w http.ResponseWriter, e *libEntry) {
+	jobs := s.jobs.list(e)
 	out := jobListJSON{Jobs: make([]jobJSON, 0, len(jobs))}
 	for _, j := range jobs {
 		out.Jobs = append(out.Jobs, j.snapshot())
@@ -24,9 +37,43 @@ func (s *Server) handleJobList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleJobStart validates the body and starts the job: 201 and the bare job object,
-// 409 while another job runs.
-func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
+// handleJobStart starts a job on an open library (POST /api/l/{lib}/jobs).
+func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request, l *libHandles) {
+	s.startJob(w, r, l.entry, l.lib)
+}
+
+// handleLibraryJobStart is POST /api/libraries/{lib}/jobs: like
+// handleJobStart for an open library, and also a rebuild of a folder
+// without media.db or of a library whose catalog cannot be opened.
+func (s *Server) handleLibraryJobStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("lib")
+	e, ok := s.libEntry(w, r, id)
+	if !ok {
+		return
+	}
+	state, h := e.snapshot()
+	if state == libClosed {
+		// A catalog that cannot even be peeked counts as unreadable.
+		if _, err := s.ws.peek(r.Context(), filepath.Join(e.path, library.DBName)); err != nil {
+			state = libError
+		}
+	}
+	switch state {
+	case libOpen:
+		s.startJob(w, r, e, h.lib)
+	case libRebuilding:
+		writeJSON(w, http.StatusServiceUnavailable, stateError{Error: "the library is being rebuilt", State: state})
+	case libFolder, libError:
+		s.startJob(w, r, e, nil)
+	default:
+		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open", State: state})
+	}
+}
+
+// startJob validates the body and starts the job on e: 201 and the bare
+// job object, 409 while another job runs. lib is nil when the library is
+// not open: only a rebuild is accepted then.
+func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, lib *library.Library) {
 	var p jobParams
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -43,12 +90,16 @@ func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid job: trailing data")
 		return
 	}
-	zone, err := s.validateJob(&p)
+	if lib == nil && p.Kind != kindRebuild {
+		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open; only a rebuild can run on it", State: func() string { st, _ := e.snapshot(); return st }()})
+		return
+	}
+	zone, err := s.validateJob(&p, lib)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	j, err := s.jobs.start(p, zone)
+	j, err := s.jobs.start(e, p, zone)
 	switch {
 	case errors.Is(err, errBusy):
 		writeError(w, http.StatusConflict, err.Error())
@@ -64,7 +115,8 @@ func (s *Server) handleJobStart(w http.ResponseWriter, r *http.Request) {
 }
 
 // validateJob checks a job request and returns the import time zone.
-func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
+// lib is the open library (nil for a rebuild of a library that is not).
+func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location, error) {
 	switch p.Kind {
 	case kindImport:
 		if p.MinDimension < 0 {
@@ -87,7 +139,7 @@ func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
 			resolved = r
 		}
 		for _, c := range []string{p.Source, resolved} {
-			if s.lib.IsInternal(c) {
+			if lib.IsInternal(c) {
 				return nil, fmt.Errorf("source %s is inside picmover's own files", p.Source)
 			}
 		}
@@ -105,8 +157,18 @@ func (s *Server) validateJob(p *jobParams) (*time.Location, error) {
 			return nil, errors.New("limit must be >= 0")
 		}
 		return nil, nil
+	case kindSimilar:
+		if p.Distance < 0 || p.Distance > similar.MaxDistance {
+			return nil, fmt.Errorf("distance must be 1-%d", similar.MaxDistance)
+		}
+		if p.Distance == 0 {
+			p.Distance = similar.DefaultDistance
+		}
+		return nil, nil
+	case kindRebuild:
+		return nil, nil
 	}
-	return nil, fmt.Errorf("invalid kind %q: want import or thumbs", p.Kind)
+	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar or rebuild", p.Kind)
 }
 
 // jobFromPath returns the job named by the {id} path value or answers

@@ -57,3 +57,18 @@ CREATE TABLE IF NOT EXISTS import_sessions (
     errors        INTEGER NOT NULL DEFAULT 0
 );
 `
+
+// derivedTables are tables added after schema version 3 that hold only
+// derived data (near-duplicate pairs, bookkeeping). They are created on
+// open when absent, with no version bump: a catalog without them is a
+// valid v3 catalog, and rebuild recreates them empty.
+const derivedTables = `
+CREATE TABLE IF NOT EXISTS similar_pairs (
+    hash_a   INTEGER NOT NULL,
+    hash_b   INTEGER NOT NULL,
+    distance INTEGER NOT NULL,
+    PRIMARY KEY (hash_a, hash_b)
+);
+CREATE INDEX IF NOT EXISTS similar_pairs_b ON similar_pairs(hash_b);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+`

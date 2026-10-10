@@ -68,7 +68,28 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 		d.Close()
 		return nil, err
 	}
+	if err := d.ensureDerived(ctx); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+// ensureDerived creates the derived tables (similar_pairs, meta) when
+// absent. Cheap when they exist: no write happens.
+func (d *DB) ensureDerived(ctx context.Context) error {
+	var n int
+	if err := d.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name IN ('similar_pairs', 'meta')`).Scan(&n); err != nil {
+		return fmt.Errorf("catalog: inspect schema: %w", err)
+	}
+	if n == 2 {
+		return nil
+	}
+	if _, err := d.ExecContext(ctx, derivedTables); err != nil {
+		return fmt.Errorf("catalog: create derived tables: %w", err)
+	}
+	return nil
 }
 
 // OpenExisting opens the catalog at path like Open but never creates it. It
@@ -102,6 +123,9 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	v, hasMedia, err = schemaState(ctx, d.DB)
 	if err == nil {
 		err = checkSchema(path, v, hasMedia, false)
+	}
+	if err == nil {
+		err = d.ensureDerived(ctx)
 	}
 	if err != nil {
 		d.Close()

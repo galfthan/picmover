@@ -16,6 +16,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	_ "time/tzdata" // IANA zones for job time zones on Windows
@@ -24,16 +26,28 @@ import (
 	"picmover/internal/importer"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
+	"picmover/internal/userdata"
 	"picmover/web"
 )
 
 // Options configure a Server.
+//
+// Single mode serves one library opened by the caller: Library, Catalog
+// and Store are required, the caller holds the library lock, and the
+// server takes ownership of the handles (Shutdown closes them; closing
+// them again is harmless). Workspace mode (Workspace set, the other three
+// nil) serves the libraries in the subfolders of a folder, opening and
+// locking each on request.
 type Options struct {
 	Library *library.Library
 	Catalog *catalog.DB   // read-write: jobs write through it
 	Store   *thumbs.Store // read-only store renditions are served from
-	Version string        // reported by /api/library
-	FFmpeg  string        // ffmpeg path for video thumbnails; "" = not found
+	// UserData is the library's user.db; nil opens <library>/user.db.
+	UserData *userdata.DB
+	// Workspace is the folder of libraries in workspace mode.
+	Workspace string
+	Version   string // reported by /api/l/{lib}/library
+	FFmpeg    string // ffmpeg path for video thumbnails; "" = not found
 	// Addr is the host:port the server listens on. Host and Origin
 	// headers must name it, or localhost / 127.0.0.1 / [::1] with its port.
 	Addr string
@@ -50,11 +64,10 @@ type Options struct {
 	jobOptions func(*importer.Options)
 }
 
-// Server serves the API, the jobs and the frontend of one library.
+// Server serves the API, the jobs and the frontend of one library or of a
+// workspace of libraries.
 type Server struct {
-	lib     *library.Library
-	db      *catalog.DB
-	store   *thumbs.Store
+	ws      *workspace
 	version string
 	ffmpeg  string
 	log     *slog.Logger
@@ -69,12 +82,10 @@ type Server struct {
 	bodyTimeout time.Duration
 }
 
-// New returns a server for opts. Library, Catalog, Store and Addr are
-// required. It raises the catalog's idle connection limit.
+// New returns a server for opts (see Options for the two modes). Addr is
+// required. In single mode it opens <library>/user.db when
+// Options.UserData is nil and raises the catalog's idle connection limit.
 func New(opts Options) (*Server, error) {
-	if opts.Library == nil || opts.Catalog == nil || opts.Store == nil {
-		return nil, errors.New("server: Library, Catalog and Store are required")
-	}
 	g, err := newGuard(opts.Addr, opts.CORSOrigins)
 	if err != nil {
 		return nil, err
@@ -83,10 +94,43 @@ func New(opts Options) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	ws := &workspace{log: log, libs: map[string]*libEntry{}, peeks: map[string]peekEntry{}, now: time.Now}
+	switch {
+	case opts.Workspace != "":
+		if opts.Library != nil || opts.Catalog != nil || opts.Store != nil {
+			return nil, errors.New("server: Workspace excludes Library, Catalog and Store")
+		}
+		root, err := filepath.Abs(opts.Workspace)
+		if err != nil {
+			return nil, err
+		}
+		if fi, err := os.Stat(root); err != nil {
+			return nil, fmt.Errorf("server: workspace: %w", err)
+		} else if !fi.IsDir() {
+			return nil, fmt.Errorf("server: workspace %s is not a directory", root)
+		}
+		ws.root = root
+	case opts.Library == nil || opts.Catalog == nil || opts.Store == nil:
+		return nil, errors.New("server: Library, Catalog and Store are required")
+	default:
+		ws.root, ws.single = opts.Library.Root(), true
+		user := opts.UserData
+		if user == nil {
+			user, err = userdata.Open(context.Background(), filepath.Join(opts.Library.Root(), userdata.FileName))
+			if err != nil {
+				return nil, err
+			}
+		}
+		// Keep enough idle connections for the concurrent reads of a page
+		// load and a parallel geo scan (database/sql keeps 2 by default and
+		// would reopen, re-running the connection pragmas, on every request).
+		opts.Catalog.SetMaxIdleConns(maxIdleConns)
+		id := singleID(ws.root)
+		ws.libs[id] = &libEntry{id: id, path: ws.root, state: libOpen, lib: opts.Library, db: opts.Catalog,
+			store: opts.Store, user: user}
+	}
 	s := &Server{
-		lib:     opts.Library,
-		db:      opts.Catalog,
-		store:   opts.Store,
+		ws:      ws,
 		version: opts.Version,
 		ffmpeg:  opts.FFmpeg,
 		log:     log,
@@ -105,11 +149,7 @@ func New(opts Options) (*Server, error) {
 			s.static = nil // an override without index.html: not built
 		}
 	}
-	// Keep enough idle connections for the concurrent reads of a page
-	// load and a parallel geo scan (database/sql keeps 2 by default and
-	// would reopen, re-running the connection pragmas, on every request).
-	s.db.SetMaxIdleConns(maxIdleConns)
-	s.jobs = newJobManager(s.lib, s.db, s.ffmpeg, log, opts.jobOptions)
+	s.jobs = newJobManager(ws, s.ffmpeg, log, opts.jobOptions)
 	s.handler = s.middleware(s.routes())
 	return s, nil
 }
@@ -118,13 +158,26 @@ func New(opts Options) (*Server, error) {
 // Origin and mutation checks before reaching a route.
 func (s *Server) Handler() http.Handler { return s.handler }
 
+// Mode is "single" or "workspace".
+func (s *Server) Mode() string {
+	if s.ws.single {
+		return modeSingle
+	}
+	return modeWorkspace
+}
+
 // Shutdown cancels the running job and waits for it to finish, bounded by
 // ctx and by 30 s, and ends every event stream. New jobs are refused
-// afterwards. Close the catalog only after Shutdown returns.
+// afterwards. Then every library is closed and its lock released (in
+// single mode too: the catalog, store and user.db of Options).
 func (s *Server) Shutdown(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, jobShutdownTimeout)
 	defer cancel()
-	return s.jobs.shutdown(ctx)
+	err := s.jobs.shutdown(ctx)
+	if err == nil {
+		s.ws.closeAll()
+	}
+	return err
 }
 
 // maxIdleConns is the catalog's idle connection pool size while serving.
@@ -135,23 +188,108 @@ const jobShutdownTimeout = 30 * time.Second
 
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/library", s.handleLibrary)
-	mux.HandleFunc("GET /api/timeline", s.handleTimeline)
-	mux.HandleFunc("GET /api/media", s.handleMediaList)
-	mux.HandleFunc("GET /api/media/{id}", s.handleMediaDetail)
-	mux.HandleFunc("GET /api/thumb/{hash}", s.handleThumb)
-	mux.HandleFunc("GET /api/preview/{hash}", s.handlePreview)
-	mux.HandleFunc("GET /api/file/{id}", s.handleFile)
-	mux.HandleFunc("GET /api/geo", s.handleGeo)
-	mux.HandleFunc("GET /api/geo/items", s.handleGeoItems)
+	mux.HandleFunc("GET /api/libraries", s.handleLibraries)
+	mux.HandleFunc("POST /api/libraries", s.handleLibraryCreate)
+	mux.HandleFunc("POST /api/libraries/{lib}/open", s.handleLibraryOpen)
+	mux.HandleFunc("GET /api/libraries/{lib}/cover", s.handleLibraryCover)
+	mux.HandleFunc("POST /api/libraries/{lib}/jobs", s.handleLibraryJobStart)
+
+	scoped := func(pattern string, h func(http.ResponseWriter, *http.Request, *libHandles)) {
+		mux.HandleFunc(pattern, s.scoped(h))
+	}
+	scoped("GET /api/l/{lib}/library", s.handleLibrary)
+	scoped("GET /api/l/{lib}/timeline", s.handleTimeline)
+	scoped("GET /api/l/{lib}/media", s.handleMediaList)
+	scoped("GET /api/l/{lib}/media/{id}", s.handleMediaDetail)
+	scoped("GET /api/l/{lib}/thumb/{hash}", s.handleThumb)
+	scoped("GET /api/l/{lib}/preview/{hash}", s.handlePreview)
+	scoped("GET /api/l/{lib}/file/{id}", s.handleFile)
+	scoped("GET /api/l/{lib}/geo", s.handleGeo)
+	scoped("GET /api/l/{lib}/geo/items", s.handleGeoItems)
+	scoped("GET /api/l/{lib}/jobs", s.handleLibJobList)
+	scoped("POST /api/l/{lib}/jobs", s.handleJobStart)
+
+	scoped("POST /api/l/{lib}/ratings", s.handleRatings)
+	scoped("GET /api/l/{lib}/tags", s.handleTags)
+	scoped("POST /api/l/{lib}/tags", s.handleTagCreate)
+	scoped("POST /api/l/{lib}/tags/{tid}", s.handleTagRename)
+	scoped("POST /api/l/{lib}/tags/{tid}/delete", s.handleTagDelete)
+	scoped("POST /api/l/{lib}/media/tags", s.handleMediaTags)
+	scoped("GET /api/l/{lib}/albums", s.handleAlbums)
+	scoped("POST /api/l/{lib}/albums", s.handleAlbumCreate)
+	scoped("POST /api/l/{lib}/albums/{aid}", s.handleAlbumUpdate)
+	scoped("POST /api/l/{lib}/albums/{aid}/delete", s.handleAlbumDelete)
+	scoped("POST /api/l/{lib}/albums/{aid}/items", s.handleAlbumItems)
+	scoped("POST /api/l/{lib}/trash", s.handleTrash)
+	scoped("POST /api/l/{lib}/trash/restore", s.handleRestore)
+	scoped("POST /api/l/{lib}/trash/delete", s.handleTrashDelete)
+	scoped("GET /api/l/{lib}/similar", s.handleSimilar)
+	scoped("POST /api/l/{lib}/similar/ignore", s.handleSimilarIgnore)
+
 	mux.HandleFunc("GET /api/fs", s.handleFS)
 	mux.HandleFunc("GET /api/jobs", s.handleJobList)
-	mux.HandleFunc("POST /api/jobs", s.handleJobStart)
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleJobGet)
 	mux.HandleFunc("GET /api/jobs/{id}/events", s.handleJobEvents)
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.handleJobCancel)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
+}
+
+// scoped wraps a library-scoped handler: the {lib} path value must name
+// an open library (acquire), whose handles the handler receives and keeps
+// for the request.
+func (s *Server) scoped(h func(http.ResponseWriter, *http.Request, *libHandles)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		l, ok := s.acquire(w, r, r.PathValue("lib"))
+		if !ok {
+			return
+		}
+		defer l.entry.release()
+		h(w, r, l)
+	}
+}
+
+// stateError is the body of 409/503 answers about a library's state.
+type stateError struct {
+	Error string `json:"error"`
+	State string `json:"state"`
+}
+
+// acquire resolves the library id of a scoped request: 404 when it is
+// malformed or not in the workspace listing, 409 {error, state} when the
+// library is not open, 503 while it is being rebuilt.
+func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) (*libHandles, bool) {
+	if s.ws.isClosed() {
+		writeError(w, http.StatusServiceUnavailable, errClosed.Error())
+		return nil, false
+	}
+	if !validLibID(id) {
+		writeError(w, http.StatusNotFound, errLibNotFound.Error())
+		return nil, false
+	}
+	e := s.ws.entry(id)
+	if e == nil {
+		l, err := s.ws.find(id)
+		if errors.Is(err, errLibNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return nil, false
+		}
+		if err != nil {
+			s.internalError(w, r, err)
+			return nil, false
+		}
+		e = s.ws.entryFor(l)
+	}
+	h, state, ok := e.acquire()
+	switch {
+	case ok:
+		return h, true
+	case state == libRebuilding:
+		writeJSON(w, http.StatusServiceUnavailable, stateError{Error: "the library is being rebuilt", State: state})
+	default:
+		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open", State: state})
+	}
+	return nil, false
 }
 
 // statusWriter records the status code for the request log. Unwrap lets

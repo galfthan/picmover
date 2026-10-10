@@ -77,7 +77,7 @@ func unmarshal[T any](t *testing.T, b []byte) T {
 
 func (l *live) startJob(body string) jobJSON {
 	l.t.Helper()
-	code, b := l.do(http.MethodPost, "/api/jobs", body)
+	code, b := l.do(http.MethodPost, "/api/l/lib/jobs", body)
 	if code != http.StatusCreated {
 		l.t.Fatalf("start job: %d %s", code, b)
 	}
@@ -252,7 +252,7 @@ func TestJobImportStream(t *testing.T) {
 		t.Fatalf("log: %v", err)
 	}
 	// The session filter shows what this import added.
-	w := l.get(fmt.Sprintf("/api/timeline?session=%d", *done.SessionID))
+	w := l.get(fmt.Sprintf("/api/l/lib/timeline?session=%d", *done.SessionID))
 	if got := decode[timelineJSON](t, w); len(got.Buckets) != 1 || got.Buckets[0] != (bucketJSON{2025, 3, 6}) {
 		t.Fatalf("session timeline %s", w.Body)
 	}
@@ -322,7 +322,7 @@ func TestJobConflictCancelAndLateSubscriber(t *testing.T) {
 	j := l.startJob(`{"kind":"import","source":` + jsonString(src) + `}`)
 	b.wait(t)
 
-	code, body := l.do(http.MethodPost, "/api/jobs", `{"kind":"thumbs"}`)
+	code, body := l.do(http.MethodPost, "/api/l/lib/jobs", `{"kind":"thumbs"}`)
 	if code != http.StatusConflict || !strings.Contains(string(body), "already running") {
 		t.Fatalf("second job: %d %s", code, body)
 	}
@@ -407,7 +407,7 @@ func TestJobThumbsAfterNoThumbs(t *testing.T) {
 			}
 		}
 	}
-	if w := l.get("/api/thumb/" + newHash); w.Code != http.StatusNotFound {
+	if w := l.get("/api/l/lib/thumb/" + newHash); w.Code != http.StatusNotFound {
 		t.Fatalf("thumb before thumbs job: %d", w.Code)
 	}
 
@@ -423,7 +423,7 @@ func TestJobThumbsAfterNoThumbs(t *testing.T) {
 		t.Fatalf("still pending: %d", pending)
 	}
 	// Served through the read-only store, which sees the committed writes.
-	if w := l.get("/api/thumb/" + newHash); w.Code != http.StatusOK {
+	if w := l.get("/api/l/lib/thumb/" + newHash); w.Code != http.StatusOK {
 		t.Fatalf("thumb after thumbs job: %d", w.Code)
 	}
 	wantExit := 0
@@ -457,7 +457,7 @@ func TestJobValidation(t *testing.T) {
 		{`not json`, "invalid job"},
 		{`{"kind":"import","move":"yes"}`, "invalid job"},
 	} {
-		code, b := l.do(http.MethodPost, "/api/jobs", c.body)
+		code, b := l.do(http.MethodPost, "/api/l/lib/jobs", c.body)
 		if code != http.StatusBadRequest || !strings.Contains(string(b), c.msg) {
 			t.Errorf("%s: %d %s, want 400 %q", c.body, code, b, c.msg)
 		}
@@ -493,7 +493,7 @@ func TestShutdownCancelsJob(t *testing.T) {
 	if d := unmarshal[jobJSON](t, []byte(evs[len(evs)-1].data)); d.State != "cancelled" || d.ExitCode != 130 {
 		t.Fatalf("after shutdown %+v", d)
 	}
-	if code, b := l.do(http.MethodPost, "/api/jobs", `{"kind":"thumbs"}`); code != http.StatusServiceUnavailable {
+	if code, b := l.do(http.MethodPost, "/api/l/lib/jobs", `{"kind":"thumbs"}`); code != http.StatusServiceUnavailable {
 		t.Fatalf("job after shutdown: %d %s", code, b)
 	}
 }
@@ -612,7 +612,7 @@ func TestProgressCoalesced(t *testing.T) {
 }
 
 func TestJobRetention(t *testing.T) {
-	m := newJobManager(nil, nil, "", nil, nil)
+	m := newJobManager(nil, "", nil, nil)
 	for i := range keepFinished + 5 {
 		m.jobs = append(m.jobs, &job{id: int64(i + 1)})
 	}

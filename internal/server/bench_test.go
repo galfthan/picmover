@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -24,7 +25,7 @@ import (
 func benchServer(b *testing.B) (*Server, uint64) {
 	b.Helper()
 	ctx := context.Background()
-	lib, err := library.Open(b.TempDir())
+	lib, err := library.Open(filepath.Join(b.TempDir(), "lib"))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -105,11 +106,11 @@ func benchGet(b *testing.B, srv *Server, target string) {
 
 func BenchmarkAPI(b *testing.B) {
 	srv, hash := benchServer(b)
-	b.Run("timeline", func(b *testing.B) { benchGet(b, srv, "/api/timeline") })
-	b.Run("timeline-filtered", func(b *testing.B) { benchGet(b, srv, "/api/timeline?type=image&camera=Model+3") })
-	b.Run("media-5k-bucket", func(b *testing.B) { benchGet(b, srv, "/api/media?year=2020&month=6") })
-	b.Run("thumb", func(b *testing.B) { benchGet(b, srv, "/api/thumb/"+hexHash(hash)) })
-	b.Run("geo-world-z2", func(b *testing.B) { benchGet(b, srv, "/api/geo?bbox=-180,-85,180,85&zoom=2") })
-	b.Run("geo-europe-z5", func(b *testing.B) { benchGet(b, srv, "/api/geo?bbox=-10,35,30,60&zoom=5") })
-	b.Run("geo-items-world", func(b *testing.B) { benchGet(b, srv, "/api/geo/items?bbox=-180,-85,180,85&limit=200") })
+	b.Run("timeline", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/timeline") })
+	b.Run("timeline-filtered", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/timeline?type=image&camera=Model+3") })
+	b.Run("media-5k-bucket", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/media?year=2020&month=6") })
+	b.Run("thumb", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/thumb/"+hexHash(hash)) })
+	b.Run("geo-world-z2", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/geo?bbox=-180,-85,180,85&zoom=2") })
+	b.Run("geo-europe-z5", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/geo?bbox=-10,35,30,60&zoom=5") })
+	b.Run("geo-items-world", func(b *testing.B) { benchGet(b, srv, "/api/l/lib/geo/items?bbox=-180,-85,180,85&limit=200") })
 }

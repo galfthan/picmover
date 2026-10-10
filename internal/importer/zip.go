@@ -57,7 +57,7 @@ func (im *Importer) processZip(ctx context.Context, zipPath string, pend chan<- 
 			im.report(Result{Status: StatusError, Source: origin, Message: "extract", Err: err})
 			continue
 		}
-		p, r := im.process(ctx, tmp, origin, true)
+		p, r := im.process(ctx, tmp, origin, true, false)
 		im.dispatch(p, r, pend)
 		// The copy into the library (if any) is complete; the temp file is
 		// no longer needed.
