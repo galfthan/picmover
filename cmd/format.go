@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
-	"strings"
 	"time"
 
 	"picmover/internal/catalog"
@@ -70,21 +70,56 @@ func stderrHandler() slog.Handler {
 // media.db behind. A catalog of another format is refused, unmodified, with
 // an error wrapping catalog.ErrNeedsRebuild that names the rebuild command.
 func openExisting(ctx context.Context, dir string) (*library.Library, *catalog.DB, error) {
-	lib, err := library.Attach(dir)
+	lib, db, _, err := openExistingLocked(ctx, dir, "", nil)
+	return lib, db, err
+}
+
+// openExistingLocked is openExisting for a command that writes: unless
+// lockName is "", it takes the library lock (see lockLibrary) before the
+// command starts writing. unlock releases it; it is a no-op without a lock.
+func openExistingLocked(ctx context.Context, dir, lockName string, errOut io.Writer) (lib *library.Library, db *catalog.DB, unlock func(), err error) {
+	lib, err = library.Attach(dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if _, err := os.Stat(lib.DBPath()); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, fmt.Errorf("no %s in %s: not a picmover library", library.DBName, lib.Root())
+			return nil, nil, nil, fmt.Errorf("no %s in %s: not a picmover library", library.DBName, lib.Root())
 		}
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	db, err := catalog.OpenExisting(ctx, lib.DBPath(), stderrLogger())
+	// The catalog is opened (and a catalog of another format refused,
+	// untouched) before the lock is taken, so a refused library gets no
+	// .picmover directory. Opening writes nothing.
+	db, err = catalog.OpenExisting(ctx, lib.DBPath(), stderrLogger())
 	if err != nil {
-		return nil, nil, catalogError(lib.Root(), err)
+		return nil, nil, nil, catalogError(lib.Root(), err)
 	}
-	return lib, db, nil
+	unlock = func() {}
+	if lockName != "" {
+		if unlock, err = lockLibrary(ctx, lib, lockName, errOut); err != nil {
+			db.Close()
+			return nil, nil, nil, err
+		}
+	}
+	return lib, db, unlock, nil
+}
+
+// lockLibrary takes the library lock for the command name. When the file
+// system cannot lock files it warns on errOut and goes on without the lock;
+// when another process holds it, the error names that process ("library
+// is in use by another picmover process (pid N, serve, since ...)").
+func lockLibrary(ctx context.Context, lib *library.Library, name string, errOut io.Writer) (func(), error) {
+	unlock, err := lib.Lock(ctx, name)
+	if errors.Is(err, library.ErrLockUnsupported) {
+		if errOut == nil {
+			errOut = os.Stderr
+		}
+		fmt.Fprintf(errOut, "Warning: %v; going on without the library lock, so do not run another "+
+			"picmover command that writes this library at the same time.\n", err)
+		return unlock, nil
+	}
+	return unlock, err
 }
 
 // rebuildError explains how to recover from a catalog of another format.
@@ -110,9 +145,4 @@ func catalogError(root string, err error) error {
 }
 
 // quoteArg quotes a path for a shell command line when it needs it.
-func quoteArg(s string) string {
-	if s != "" && !strings.ContainsAny(s, " \t'\"$&|;<>()*?[]#~`") {
-		return s
-	}
-	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
-}
+func quoteArg(s string) string { return library.QuoteArg(s) }

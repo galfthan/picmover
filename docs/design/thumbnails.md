@@ -495,8 +495,9 @@ Importer, cmd and the remaining glue (deviations and precisions):
   gone. `openExisting` and `import` (and so `rebuild`'s import) wrap
   `catalog.ErrNeedsRebuild` in an error that names
   `picmover rebuild <library>` with the actual path (quoted when needed) and
-  still `errors.Is` the sentinel. `rebuild` refuses a library without
-  `media.db` (suggesting `import`), renames `media.db`, `-wal`, `-shm` to
+  still `errors.Is` the sentinel. `rebuild` of a folder without
+  `media.db` records its files into a new catalog without a backup (naming
+  the newest `media.db.bak-*` if any; superseded the earlier refusal), renames `media.db`, `-wal`, `-shm` to
   `media.db.bak-<YYYYMMDD-HHMMSS>[-wal|-shm]` (never overwriting; renames
   already done are undone if one fails, so a catalog is never separated
   from its WAL) and then runs the shared import path with source = library,
@@ -559,8 +560,9 @@ Deviations from, and precisions to, the notes above:
   `OpenStore` walks the previews (one fan-out level, at most 2^20 entries,
   best effort) and, for each `*.old`, renames it back when the preview is
   missing (a crash between the two renames; its row was never replaced) or
-  removes it otherwise. Only one process may write a library at a time, so
-  this never races with another Put.
+  removes it otherwise. The library lock (`.picmover/lock`, see server.md
+  "Review fixes (jobs, locking, CLI)") keeps a second writing process out,
+  so this never races with another process's Put.
 - **`OpenStoreReadOnly`.** New
   `func OpenStoreReadOnly(lib *library.Library) (*Store, error)`. It needs
   an existing `thumbs.db` (no directory or file is created), opens it as

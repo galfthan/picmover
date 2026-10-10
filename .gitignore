@@ -1,6 +1,9 @@
-dist/
+/dist/
 /picmover
 *.exe
 *.db
 *.db-*
 .picmover/
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep

@@ -52,10 +52,15 @@ status 1 when any problem is found.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			lib, db, err := openExisting(ctx, args[0])
+			lockName := "" // a plain verify only reads and needs no lock
+			if rehash || fillSize {
+				lockName = "verify"
+			}
+			lib, db, unlock, err := openExistingLocked(ctx, args[0], lockName, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}
+			defer unlock()
 			defer db.Close()
 			rows, err := db.List(ctx, catalog.ListOptions{OrderBy: "rel_path"})
 			if err != nil {

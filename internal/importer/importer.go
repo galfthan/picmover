@@ -113,6 +113,7 @@ type Importer struct {
 	log  *slog.Logger
 
 	sessionID int64
+	session   atomic.Int64 // sessionID for SessionID, readable from other goroutines
 	cancel    context.CancelFunc
 
 	inflight sync.Map // uint64 hash -> origin, files between hashing and commit
@@ -198,6 +199,7 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return im.Stats(), fmt.Errorf("importer: %w", err)
 	}
+	im.session.Store(im.sessionID)
 	im.log.Info("import started", "source", src, "library", im.lib.Root(), "mode", mode,
 		"workers", im.opts.Workers, "session", im.sessionID)
 
@@ -297,6 +299,11 @@ func (im *Importer) startProgress() (stop func()) {
 		im.opts.OnProgress(im.Stats())
 	}
 }
+
+// SessionID returns the catalog import session of a running or finished
+// Run, or 0 before Run has begun the session. It is safe to call from any
+// goroutine.
+func (im *Importer) SessionID() int64 { return im.session.Load() }
 
 // Stats returns a snapshot of the counters.
 func (im *Importer) Stats() Stats {

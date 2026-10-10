@@ -108,18 +108,55 @@ func TestRebuildRecordsInPlace(t *testing.T) {
 	}
 }
 
-// Without media.db but with backups, rebuild explains how to restore.
-func TestRebuildMissingCatalogWithBackups(t *testing.T) {
+// Without media.db, rebuild records the files into a new catalog (no backup
+// is made) and names the newest existing backup so a mistaken rebuild is
+// noticed. --no-thumbs leaves the rows pending.
+func TestRebuildMissingCatalog(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"media.db.bak-20240101-000000", "media.db.bak-20250101-000000",
 		"media.db.bak-20250101-000000-wal", "media.db.bak-holiday.jpg"} {
 		writeBytes(t, filepath.Join(dir, n), []byte("x"))
 	}
-	_, err := run(t, "rebuild", dir)
-	if err == nil || !strings.Contains(err.Error(), "newest media.db.bak-20250101-000000.\n") ||
-		!strings.Contains(err.Error(), "2 catalog backup(s)") || !strings.Contains(err.Error(), "rename it") ||
-		!strings.Contains(err.Error(), "picmover import "+dir+" "+dir) {
-		t.Fatalf("rebuild without media.db: %v", err)
+	writeBytes(t, filepath.Join(dir, "image", "2020", "02", "noexif.png"), testimg.PNG(64, 64, 1))
+	out, err := run(t, "rebuild", "--no-thumbs", "--quiet", dir)
+	if err != nil {
+		t.Fatalf("rebuild without media.db: %v\n%s", err, out)
+	}
+	for _, want := range []string{"No media.db in " + dir, "2 catalog backup(s) exist, the newest media.db.bak-20250101-000000;",
+		"delete the new media.db (and its -wal/-shm files) afterwards and rename the backup"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Old catalog saved as") {
+		t.Errorf("a backup was reported without a catalog:\n%s", out)
+	}
+	for _, n := range []string{"media.db.bak-20240101-000000", "media.db.bak-20250101-000000",
+		"media.db.bak-20250101-000000-wal", "media.db.bak-holiday.jpg"} {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("backup touched: %v", err)
+		}
+	}
+	// media.db.bak-holiday.jpg is not a backup name, so it is media.
+	after := mediaSet(t, dir)
+	if len(after) != 2 {
+		t.Fatalf("rows after rebuild: %v", after)
+	}
+	for _, rel := range []string{"image/2020/02/noexif.png", "media.db.bak-holiday.jpg"} {
+		if _, ok := after[rel]; !ok {
+			t.Errorf("%s not recorded in place: %v", rel, after)
+		}
+	}
+	// --no-thumbs: no thumbnail cache, or an empty one.
+	if _, err := os.Stat(filepath.Join(dir, library.MetaDir, "thumbs.db")); err == nil {
+		if n := thumbRows(t, dir); n != 0 {
+			t.Errorf("thumbnails generated despite --no-thumbs: %d", n)
+		}
+	}
+	// A second rebuild now finds the catalog and backs it up.
+	out, err = run(t, "rebuild", "--no-thumbs", "--quiet", dir)
+	if err != nil || !strings.Contains(out, "Old catalog saved as ") {
+		t.Fatalf("second rebuild: %v\n%s", err, out)
 	}
 }
 
@@ -258,5 +295,16 @@ func TestUpdateMetadataOrientationMarksThumbStale(t *testing.T) {
 		if previews[p].Equal(mt) {
 			t.Errorf("stale preview %s not regenerated", p)
 		}
+	}
+}
+
+// A mistyped path must not become a library.
+func TestRebuildRequiresDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "typo")
+	if out, err := run(t, "rebuild", "--no-thumbs", "--quiet", dir); err == nil {
+		t.Fatalf("rebuild of a missing directory succeeded:\n%s", out)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("rebuild created %s: %v", dir, err)
 	}
 }

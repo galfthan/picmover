@@ -709,9 +709,12 @@ func TestThumbsAfterNoThumbsImport(t *testing.T) {
 }
 
 func TestRebuild(t *testing.T) {
-	if _, err := run(t, "rebuild", t.TempDir()); err == nil || !strings.Contains(err.Error(), "nothing to rebuild") ||
-		!strings.Contains(err.Error(), "picmover import") {
-		t.Fatalf("rebuild without media.db: %v", err)
+	// A folder without media.db gets a new catalog, without a backup.
+	empty := t.TempDir()
+	if out, err := run(t, "rebuild", "--quiet", empty); err != nil ||
+		!strings.Contains(out, "No media.db in "+empty+"; recording the files into a new catalog.") ||
+		strings.Contains(out, "Old catalog saved as") {
+		t.Fatalf("rebuild without media.db: %v\n%s", err, out)
 	}
 
 	src, dir := t.TempDir(), filepath.Join(t.TempDir(), "lib")

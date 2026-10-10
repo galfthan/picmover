@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -112,6 +113,41 @@ func (l *Library) TempDir() string { return filepath.Join(l.root, MetaDir, "tmp"
 
 // LogDir returns the directory for import logs.
 func (l *Library) LogDir() string { return filepath.Join(l.root, MetaDir, "logs") }
+
+// OpenLog creates <library>/.picmover/logs/<prefix>_<time>.log, time being
+// the local time as 2006-01-02_15-04-05, and returns the file and its path.
+// It never shares a file with another run: when that name exists (two runs
+// in the same second), -2, -3, ... is appended to the stem. The log
+// directory must exist (Open creates it).
+func (l *Library) OpenLog(prefix string) (*os.File, string, error) {
+	stem := filepath.Join(l.LogDir(), prefix+"_"+time.Now().Format("2006-01-02_15-04-05"))
+	for i := 1; i <= maxLogAttempts; i++ {
+		logPath := stem + ".log"
+		if i > 1 {
+			logPath = fmt.Sprintf("%s-%d.log", stem, i)
+		}
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+		if err == nil {
+			return f, logPath, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, "", fmt.Errorf("create log: %w", err)
+		}
+	}
+	return nil, "", fmt.Errorf("create log: no free name for %s.log after %d attempts", stem, maxLogAttempts)
+}
+
+// maxLogAttempts bounds the names OpenLog tries.
+const maxLogAttempts = 1000
+
+// QuoteArg quotes a path for a shell command line when it needs it, so a
+// suggested command such as "picmover thumbs <library>" can be pasted.
+func QuoteArg(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t'\"$&|;<>()*?[]#~`") {
+		return s
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
+}
 
 // Abs converts a catalog path (relative, forward slashes) to an absolute OS path.
 func (l *Library) Abs(rel string) string {
