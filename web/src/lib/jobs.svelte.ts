@@ -8,13 +8,15 @@ import {
   cancelJob,
   errorMessage,
   getJob,
+  libApi,
   listJobs,
-  startJob,
+  startWorkspaceJob,
   subscribeJob,
   type Job,
   type JobRequest,
   type JobResult,
   type JobStats,
+  type RebuildJobRequest,
 } from './api';
 import { library } from './library.svelte';
 
@@ -124,10 +126,15 @@ class JobStore {
     }
   }
 
-  async start(req: JobRequest): Promise<Job> {
+  /**
+   * Starts a job in library `lib`. A rebuild of a folder or of an unreadable
+   * catalog goes through the workspace route (`via: 'workspace'`).
+   */
+  async start(lib: string, req: JobRequest, via: 'library' | 'workspace' = 'library'): Promise<Job> {
     let started: Job;
     try {
-      started = await startJob(req);
+      started = via === 'workspace' && req.kind === 'rebuild' ? await startWorkspaceJob(lib, req as RebuildJobRequest) : await libApi(lib).startJob(req);
+      if (!started.library) started = { ...started, library: lib };
     } catch (e) {
       // 409: another job is running that this page does not know about
       // (started in another tab or by the CLI): show it right away.
@@ -161,6 +168,8 @@ class JobStore {
   #upsert(job: Job): void {
     const j = normalize(job);
     const i = this.jobs.findIndex((x) => x.id === j.id);
+    const prev = i >= 0 ? this.jobs[i] : undefined;
+    if (prev && j.phase === undefined && prev.phase && sameStart(prev.startedAt, j.startedAt)) j.phase = prev.phase;
     if (i >= 0) this.jobs[i] = j;
     else this.jobs = [j, ...this.jobs].sort((a, b) => b.id - a.id);
     if (j.id === this.currentId) {
@@ -212,6 +221,11 @@ class JobStore {
         if (!live()) return;
         const j = this.jobs.find((x) => x.id === id);
         if (j) j.stats = { ...emptyStats(), ...stats };
+      },
+      onPhase: (p) => {
+        if (!live()) return;
+        const j = this.jobs.find((x) => x.id === id);
+        if (j) j.phase = { ...p };
       },
       onResult: (r) => {
         if (live()) this.#addResult(r);

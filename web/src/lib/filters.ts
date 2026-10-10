@@ -1,10 +1,18 @@
-// Filters live in the route query (#/?type=video&gps=1) so they survive
-// reloads and links like "Show imported" (#/?session=17) work.
+// Filters live in the route query (#/l/peter/?type=video&gps=1) so they
+// survive reloads and links like "Show imported" (?session=17) work. `tag`
+// is repeatable. The trash page's `trashed` and the album page's `album`
+// come from the route, not from here, when the page implies them.
 
 import type { FileType, Filters } from './api';
+import { formatRecur, isDay, parseRecur } from './dates';
 
 const TYPES: readonly FileType[] = ['image', 'image_raw', 'video'];
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function positiveInt(s: string | null): number | null {
+  if (!s || !/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
 
 export function filtersFromQuery(q: URLSearchParams): Filters {
   const f: Filters = {};
@@ -13,31 +21,49 @@ export function filtersFromQuery(q: URLSearchParams): Filters {
   if (q.get('gps') === '1') f.gps = true;
   const cam = q.get('camera');
   if (cam) f.camera = cam;
-  const s = Number(q.get('session'));
-  if (Number.isInteger(s) && s > 0) f.session = s;
+  const s = positiveInt(q.get('session'));
+  if (s !== null) f.session = s;
   const from = q.get('from');
-  if (from && DATE_RE.test(from)) f.from = from;
+  if (isDay(from)) f.from = from;
   const to = q.get('to');
-  if (to && DATE_RE.test(to)) f.to = to;
+  if (isDay(to)) f.to = to;
+  const recur = parseRecur(q.get('recur'));
+  if (recur) f.recur = formatRecur(recur);
+  const rating = positiveInt(q.get('rating'));
+  if (rating !== null && rating <= 5) f.rating = rating;
+  const tags = [...new Set(q.getAll('tag').map(positiveInt).filter((n): n is number => n !== null))].sort((a, b) => a - b);
+  if (tags.length) f.tags = tags;
+  const album = positiveInt(q.get('album'));
+  if (album !== null) f.album = album;
   return f;
 }
 
-export function filtersToQuery(f: Filters): Record<string, string> {
-  const q: Record<string, string> = {};
-  if (f.type) q.type = f.type;
-  if (f.gps) q.gps = '1';
-  if (f.camera) q.camera = f.camera;
-  if (f.session) q.session = String(f.session);
-  if (f.from) q.from = f.from;
-  if (f.to) q.to = f.to;
+/** Query values for filters; `tag` becomes repeated entries. `trashed` is never part of the URL. */
+export function filtersToQuery(f: Filters): URLSearchParams {
+  const q = new URLSearchParams();
+  if (f.type) q.set('type', f.type);
+  if (f.gps) q.set('gps', '1');
+  if (f.camera) q.set('camera', f.camera);
+  if (f.session) q.set('session', String(f.session));
+  if (f.from) q.set('from', f.from);
+  if (f.to) q.set('to', f.to);
+  if (f.recur) q.set('recur', f.recur);
+  if (f.rating) q.set('rating', String(f.rating));
+  for (const t of [...(f.tags ?? [])].sort((a, b) => a - b)) q.append('tag', String(t));
+  if (f.album) q.set('album', String(f.album));
   return q;
 }
 
-/** Stable key for a filter set (used to reset state when filters change). */
+/** Stable key for a filter set (used to reset state when filters change). Includes `trashed`. */
 export function filtersKey(f: Filters): string {
-  return new URLSearchParams(filtersToQuery(f)).toString();
+  const q = filtersToQuery(f);
+  if (f.trashed) q.set('trashed', '1');
+  return q.toString();
 }
 
-export function hasFilters(f: Filters): boolean {
-  return filtersKey(f) !== '';
+/** Whether the user has narrowed the view (the page's own `album`/`trashed` do not count). */
+export function hasFilters(f: Filters, implied: { album?: boolean } = {}): boolean {
+  const g: Filters = { ...f, trashed: undefined };
+  if (implied.album) g.album = undefined;
+  return filtersKey(g) !== '';
 }

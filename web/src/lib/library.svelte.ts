@@ -1,36 +1,113 @@
-// Shared /api/library state: the shell (library name), filters (cameras),
-// the grid's empty state and the Library page all read it.
+// The open library's /api/l/<id>/library state plus its tag and album
+// lists: the shell (switcher, trash count), the filters (cameras, tags,
+// albums), the grid's empty state and the Library page read it. The shell
+// selects the library from the route (`select`).
 
-import { errorMessage, getLibrary, type LibraryInfo } from './api';
+import { errorMessage, libApi, type Album, type LibApi, type LibraryInfo, type Tag } from './api';
 import { baseName } from './paths';
 
 class LibraryStore {
+  /** Id of the library the UI is in; null on the Libraries page. */
+  id = $state<string | null>(null);
+  /** Display name from the workspace listing (falls back to the root's base name). */
+  displayName = $state('');
   info = $state<LibraryInfo | null>(null);
   error = $state<string | null>(null);
   loading = $state(false);
+  tags = $state.raw<Tag[]>([]);
+  albums = $state.raw<Album[]>([]);
+  /** Bumped by every load(); answers for an older library or generation are dropped. */
+  #gen = 0;
   #inflight: Promise<void> | null = null;
 
-  get name(): string {
-    return this.info ? baseName(this.info.root) : '';
+  get api(): LibApi | null {
+    return this.id === null ? null : libApi(this.id);
   }
 
-  /** Fetches /api/library; concurrent calls share one request. */
+  get name(): string {
+    return this.displayName || (this.info ? baseName(this.info.root) : (this.id ?? ''));
+  }
+
+  /** Items in the trash (user.db count, else the catalog's). */
+  get trashed(): number {
+    const i = this.info;
+    if (!i) return 0;
+    return i.userdb?.trashed ?? i.summary.deleted ?? 0;
+  }
+
+  /** Switches to library `id` (or none) and loads it. */
+  select(id: string | null, displayName = ''): void {
+    if (id === this.id) {
+      if (displayName) this.displayName = displayName;
+      return;
+    }
+    this.id = id;
+    this.displayName = displayName;
+    this.info = null;
+    this.error = null;
+    this.tags = [];
+    this.albums = [];
+    this.#inflight = null;
+    this.#gen++;
+    if (id !== null) void this.load();
+  }
+
+  /** Fetches the summary, tags and albums; concurrent calls share one request. */
   load(): Promise<void> {
+    const id = this.id;
+    if (id === null) return Promise.resolve();
     if (this.#inflight) return this.#inflight;
+    const g = ++this.#gen;
+    const api = libApi(id);
     this.loading = true;
-    this.#inflight = getLibrary()
-      .then((info) => {
-        this.info = { ...info, cameras: info.cameras ?? [] };
-        this.error = null;
-      })
-      .catch((e: unknown) => {
-        this.error = errorMessage(e);
-      })
-      .finally(() => {
-        this.loading = false;
-        this.#inflight = null;
-      });
-    return this.#inflight;
+    const p = Promise.all([
+      api.getLibrary().then(
+        (info) => {
+          if (g !== this.#gen) return;
+          this.info = { ...info, cameras: info.cameras ?? [] };
+          this.error = null;
+        },
+        (e: unknown) => {
+          if (g === this.#gen) this.error = errorMessage(e);
+        },
+      ),
+      this.#loadLists(g, api),
+    ]).then(() => {
+      if (g !== this.#gen) return;
+      this.loading = false;
+      this.#inflight = null;
+    });
+    this.#inflight = p;
+    return p;
+  }
+
+  /** Reloads the tag and album lists only (after an edit). Resolves to an error message, or null. */
+  loadLists(): Promise<string | null> {
+    const id = this.id;
+    if (id === null) return Promise.resolve(null);
+    return this.#loadLists(this.#gen, libApi(id));
+  }
+
+  async #loadLists(g: number, api: LibApi): Promise<string | null> {
+    // The lists are a convenience for pickers and filters; failures leave them as they were.
+    let err: string | null = null;
+    const fail = (e: unknown) => {
+      err ??= errorMessage(e);
+      return null;
+    };
+    const [tags, albums] = await Promise.all([api.getTags().catch(fail), api.getAlbums().catch(fail)]);
+    if (g !== this.#gen || api.id !== this.id) return err;
+    if (tags) this.tags = [...tags].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    if (albums) this.albums = albums;
+    return err;
+  }
+
+  /** Adds or replaces tags in the list (after a create). */
+  mergeTags(list: readonly Tag[]): void {
+    if (!list.length) return;
+    const m = new Map<number, Tag>(this.tags.map((t) => [t.id, t]));
+    for (const t of list) m.set(t.id, { ...m.get(t.id), ...t });
+    this.tags = [...m.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
   }
 }
 

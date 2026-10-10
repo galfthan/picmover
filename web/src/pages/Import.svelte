@@ -3,7 +3,7 @@
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed } from '../lib/format';
   import { exitCodeOf, outcome } from '../lib/jobtext';
-  import { href, navigate } from '../lib/router';
+  import { libHref } from '../lib/routes';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
   import { isWithin, joinPath } from '../lib/paths';
@@ -21,7 +21,13 @@
   const jobKey = (j: Job) => `${j.id}|${j.startedAt ?? ''}`;
   let dismissed = $state(loadJSON(DISMISSED_KEY, isString) ?? '');
 
-  const cur = $derived(jobs.current);
+  interface Props {
+    lib: string;
+  }
+  let { lib }: Props = $props();
+
+  // Jobs are global; this page shows the imports of its own library.
+  const cur = $derived(jobs.current && (!jobs.current.library || jobs.current.library === lib) ? jobs.current : null);
   const mode = $derived.by((): 'loading' | 'running' | 'done' | 'wizard' => {
     if (!jobs.loaded) return 'loading';
     if (cur && cur.kind === 'import' && isActive(cur)) return 'running';
@@ -31,7 +37,9 @@
   // Discover jobs started elsewhere (another tab, a restarted server) while idle.
   $effect(() => jobs.watch());
 
-  const otherActive = $derived(jobs.active && jobs.active.kind !== 'import' ? jobs.active : null);
+  const otherActive = $derived(
+    jobs.active && (jobs.active.kind !== 'import' || (!!jobs.active.library && jobs.active.library !== lib)) ? jobs.active : null,
+  );
 
   // ---- Wizard ----
 
@@ -78,7 +86,7 @@
     starting = true;
     startError = '';
     try {
-      await jobs.start({
+      await jobs.start(lib, {
         kind: 'import',
         source,
         move,
@@ -222,7 +230,7 @@
         {/if}
         <div class="row actions">
           {#if cur.sessionId}
-            <a class="btn primary" href={href('/', { session: cur.sessionId })}>Show imported</a>
+            <a class="btn primary" href={libHref(lib, '', { session: cur.sessionId })}>Show imported</a>
           {/if}
           <button onclick={importAnother}>Import another</button>
         </div>
@@ -236,8 +244,13 @@
     {:else}
       {#if otherActive}
         <div class="notice">
-          A thumbnail job is running; start the import when it has finished.
-          <a href="#/library">Show progress</a>
+          {#if otherActive.library && otherActive.library !== lib}
+            A job is running in library {otherActive.library}; start the import when it has finished.
+          {:else}
+            A {otherActive.kind === 'thumbs' ? 'thumbnail' : otherActive.kind === 'similar' ? 'duplicate search' : otherActive.kind} job is
+            running; start the import when it has finished.
+            <a href={libHref(lib, otherActive.kind === 'similar' ? 'similar' : 'library')}>Show progress</a>
+          {/if}
         </div>
       {/if}
 

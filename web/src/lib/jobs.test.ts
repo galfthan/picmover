@@ -46,7 +46,7 @@ function fakeFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
   const url = new URL(String(input), 'http://127.0.0.1:7439');
   const key = `${init?.method ?? 'GET'} ${url.pathname}`;
   requests.push(key);
-  if (url.pathname === '/api/library') return Promise.reject(new Error('not needed'));
+  if (url.pathname.endsWith('/library')) return Promise.reject(new Error('not needed'));
   const r = routes[key];
   return Promise.resolve(r ? r() : json({ error: 'not found' }, 404));
 }
@@ -155,8 +155,8 @@ describe('job store', () => {
     expect(count('GET /api/jobs/4')).toBe(1);
 
     // Meanwhile a new job is started and followed.
-    routes['POST /api/jobs'] = () => json(job(5, 'running'), 201);
-    await jobs.start({ kind: 'thumbs', rebuild: false, limit: 0 });
+    routes['POST /api/l/lib/jobs'] = () => json(job(5, 'running'), 201);
+    await jobs.start('lib', { kind: 'thumbs', rebuild: false, limit: 0 });
     const es5 = lastES();
     expect(es5.url).toBe('/api/jobs/5/events');
 
@@ -182,8 +182,8 @@ describe('job store', () => {
 
     // Another tab started a job.
     routes['GET /api/jobs'] = () => json({ jobs: [job(7, 'running')] });
-    routes['POST /api/jobs'] = () => json({ error: 'another job is running' }, 409);
-    await expect(jobs.start({ kind: 'thumbs', rebuild: false, limit: 0 })).rejects.toThrow('another job is running');
+    routes['POST /api/l/lib/jobs'] = () => json({ error: 'another job is running' }, 409);
+    await expect(jobs.start('lib', { kind: 'thumbs', rebuild: false, limit: 0 })).rejects.toThrow('another job is running');
     await flush();
     expect(jobs.active?.id).toBe(7);
     expect(lastES().url).toBe('/api/jobs/7/events');

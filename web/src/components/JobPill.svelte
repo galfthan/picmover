@@ -2,8 +2,12 @@
   import { jobs, processed } from '../lib/jobs.svelte';
   import { formatCount } from '../lib/format';
   import { navigate } from '../lib/router';
+  import { libPath } from '../lib/routes';
+  import { libraries } from '../lib/libraries.svelte';
+  import { library } from '../lib/library.svelte';
 
   const job = $derived(jobs.active);
+  const libName = $derived(job?.library ? (libraries.find(job.library)?.name ?? job.library) : '');
 
   const label = $derived.by(() => {
     if (!job) return '';
@@ -12,12 +16,30 @@
     if (job.kind === 'thumbs') {
       return `Thumbnails: ${formatCount(s.thumbsDone + s.thumbsUnsupported + s.thumbsFailed)} done…`;
     }
+    if (job.kind === 'similar') {
+      const p = job.phase;
+      if (p?.phase === 'compare') return 'Finding duplicates: comparing…';
+      if (p?.phase === 'load' && p.items) return `Finding duplicates in ${formatCount(p.items)} images…`;
+      return 'Finding duplicates…';
+    }
+    if (job.kind === 'rebuild') {
+      return s.scanned > 0 ? `Recording ${formatCount(s.scanned)} files…` : 'Recording files in place…';
+    }
     const done = processed(s);
     if (s.scanned > 0 && done >= s.scanned && s.thumbsDone + s.thumbsUnsupported + s.thumbsFailed > 0) {
       return `Thumbnails for ${formatCount(s.imported + s.existing)} files…`;
     }
     return `Importing ${formatCount(s.scanned)} files…`;
   });
+
+  function open() {
+    const j = job;
+    if (!j) return;
+    const lib = j.library ?? library.id;
+    if (lib === null) return;
+    if (j.kind === 'rebuild') navigate(libraries.mode === 'workspace' ? '/' : libPath(lib, 'library'));
+    else navigate(libPath(lib, j.kind === 'import' ? 'import' : j.kind === 'similar' ? 'similar' : 'library'));
+  }
 
   const fraction = $derived.by(() => {
     if (!job || job.kind !== 'import') return null;
@@ -28,8 +50,9 @@
 </script>
 
 {#if job}
-  <button class="pill" onclick={() => navigate('/import')} title="Show import progress">
+  <button class="pill" onclick={open} title="Show progress{libName ? ` (library ${libName})` : ''}">
     <span class="dot" aria-hidden="true"></span>
+    {#if libName}<span class="lib">{libName}</span>{/if}
     <span class="text">{label}</span>
     {#if fraction !== null}
       <span class="bar" aria-hidden="true"><span class="fill" style:width="{Math.round(fraction * 100)}%"></span></span>
@@ -50,6 +73,13 @@
     max-width: 420px;
     min-width: 0;
     background: var(--surface-2);
+  }
+  .lib {
+    flex: none;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
   }
   .text {
     min-width: 0;

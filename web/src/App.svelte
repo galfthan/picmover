@@ -1,68 +1,111 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { route, parseHash, type Route } from './lib/router';
+  import { onMount, untrack } from 'svelte';
+  import { route, parseHash, navigate, type Route } from './lib/router';
+  import { libHref, libPath, parseAppRoute, redirectFor, type AppRoute, type LibPage } from './lib/routes';
   import { library } from './lib/library.svelte';
+  import { libraries } from './lib/libraries.svelte';
   import { jobs } from './lib/jobs.svelte';
   import { filtersFromQuery } from './lib/filters';
+  import { formatCount } from './lib/format';
   import { viewerClosed } from './lib/viewer';
+  import { libApi, setUnavailableHandler } from './lib/api';
   import JobPill from './components/JobPill.svelte';
   import Lightbox from './components/Lightbox.svelte';
+  import LibrarySwitcher from './components/LibrarySwitcher.svelte';
+  import LibraryGate from './components/LibraryGate.svelte';
+  import Toasts from './components/Toasts.svelte';
   import Grid from './pages/Grid.svelte';
   import MapPage from './pages/Map.svelte';
   import Import from './pages/Import.svelte';
   import LibraryPage from './pages/Library.svelte';
+  import Libraries from './pages/Libraries.svelte';
+  import Albums from './pages/Albums.svelte';
+  import Album from './pages/Album.svelte';
+  import Trash from './pages/Trash.svelte';
+  import Similar from './pages/Similar.svelte';
 
-  type Page = 'grid' | 'map' | 'import' | 'library';
-
-  function pageOf(r: Route): Page | 'view' {
-    switch (r.segments[0] ?? '') {
-      case 'view':
-        return 'view';
-      case 'map':
-        return 'map';
-      case 'import':
-        return 'import';
-      case 'library':
-        return 'library';
-      default:
-        return 'grid';
-    }
-  }
+  type LibRoute = Extract<AppRoute, { kind: 'lib' }>;
 
   onMount(() => {
-    void library.load();
+    setUnavailableHandler((id, status, state) => libraries.unavailable(id, status, state));
+    void libraries.load();
     void jobs.init();
+    return () => setUnavailableHandler(null);
   });
 
-  // The page under the lightbox: the last grid or map route seen, so the
-  // grid keeps its filters and scroll position while #/view/<id> is open.
-  let viewBase: Route = parseHash('#/');
   const current = $derived(route.current);
-  const currentPage = $derived(pageOf(current));
-  const base = $derived.by(() => {
-    const p = pageOf(current);
-    if (p === 'grid' || p === 'map') viewBase = current;
-    return p === 'view' ? viewBase : current;
+  const app = $derived(parseAppRoute(current));
+
+  // Single mode sends #/ to its library; old step 3 links get the prefix.
+  $effect(() => {
+    const target = redirectFor(app, current, { mode: libraries.mode, singleId: libraries.singleId });
+    if (target !== null) untrack(() => navigate(target, { replace: true }));
   });
-  const page = $derived(pageOf(base) as Page);
-  const viewId = $derived.by(() => {
-    if (currentPage !== 'view') return null;
-    const n = Number(current.segments[1]);
-    return Number.isInteger(n) && n > 0 ? n : null;
+
+  const libId = $derived(app.kind === 'lib' ? app.lib : null);
+  const gate = $derived(libId !== null ? libraries.gate(libId) : null);
+  const open = $derived(gate?.kind === 'open');
+
+  // Navigating to a closed library opens it first.
+  $effect(() => {
+    const id = libId;
+    if (id !== null && gate?.kind === 'closed') untrack(() => void libraries.open(id));
   });
-  const filters = $derived(filtersFromQuery(base.query));
-  const baseHash = $derived('#' + (base.raw || '/'));
+
+  // The library store follows the open library of the route.
+  $effect(() => {
+    const id = open ? libId : null;
+    const name = gate?.kind === 'open' ? gate.lib.name : '';
+    untrack(() => library.select(id, name));
+  });
+
+  // A finished job can change any library's state (rebuild) or counts.
+  let seenDone = untrack(() => jobs.doneCount);
+  $effect(() => {
+    const d = jobs.doneCount;
+    if (d === seenDone) return;
+    seenDone = d;
+    untrack(() => void libraries.load());
+  });
+
+  // The page under the lightbox: the last library page seen, so the grid
+  // keeps its filters and scroll position while .../view/<id> is open. A
+  // deep link to the viewer shows it over the library's grid.
+  let viewBase: { route: Route; app: LibRoute } | null = null;
+  const base = $derived.by((): { route: Route; app: LibRoute } | null => {
+    if (app.kind !== 'lib') return null;
+    if (app.page !== 'view') {
+      viewBase = { route: current, app };
+      return viewBase;
+    }
+    if (viewBase && viewBase.app.lib === app.lib) return viewBase;
+    return { route: parseHash(libHref(app.lib, '')), app: { kind: 'lib', lib: app.lib, page: 'grid', albumId: null, viewId: null } };
+  });
+  const page = $derived<LibPage | null>(base ? base.app.page : null);
+  const viewId = $derived(app.kind === 'lib' && app.page === 'view' ? app.viewId : null);
+  const filters = $derived(filtersFromQuery(base ? base.route.query : new URLSearchParams()));
+  const baseHash = $derived(base ? '#' + (base.route.raw || '/') : '#/');
+  const api = $derived(libId !== null ? libApi(libId) : null);
 
   $effect(() => {
     if (viewId === null) viewerClosed();
   });
 
-  const nav: { page: Page; label: string; href: string }[] = [
-    { page: 'grid', label: 'Photos', href: '#/' },
-    { page: 'map', label: 'Map', href: '#/map' },
-    { page: 'import', label: 'Import', href: '#/import' },
-    { page: 'library', label: 'Library', href: '#/library' },
-  ];
+  interface NavItem {
+    pages: LibPage[];
+    label: string;
+    sub: string;
+    count?: number;
+  }
+  const nav = $derived<NavItem[]>([
+    { pages: ['grid'], label: 'Photos', sub: '' },
+    { pages: ['map'], label: 'Map', sub: 'map' },
+    { pages: ['albums', 'album'], label: 'Albums', sub: 'albums' },
+    { pages: ['trash'], label: 'Trash', sub: 'trash', count: library.trashed },
+    { pages: ['similar'], label: 'Duplicates', sub: 'similar' },
+    { pages: ['import'], label: 'Import', sub: 'import' },
+    { pages: ['library'], label: 'Library', sub: 'library' },
+  ]);
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -77,7 +120,7 @@
   }
 
   $effect(() => {
-    document.title = library.name ? `${library.name} — picmover` : 'picmover';
+    document.title = libId !== null && library.name ? `${library.name} — picmover` : 'picmover';
   });
 </script>
 
@@ -86,47 +129,76 @@
 <div class="shell">
   <!-- While the viewer is open the page behind it is inert: no Tab into it, no clicks. -->
   <header class="topbar" inert={viewId !== null}>
-    <a
-      class="libchip"
-      class:active={page === 'library'}
-      href="#/library"
-      title={library.info ? `Library: ${library.info.root}` : 'Library'}
-      aria-label={library.info ? `Library ${library.info.root}` : 'Library'}
-    >
-      <span class="logo" aria-hidden="true"></span>
-      <span class="name">{library.name || 'picmover'}</span>
-      {#if library.info}
-        <span class="root" aria-hidden="true"><span class="root-text">{library.info.root}</span></span>
+    {#if libId !== null}
+      <LibrarySwitcher />
+      {#if open}
+        <nav aria-label="Main">
+          {#each nav as n (n.sub)}
+            {@const active = page !== null && n.pages.includes(page)}
+            <a href={libHref(libId, n.sub)} class:active aria-current={active ? 'page' : undefined}>
+              {n.label}{#if n.count}<span class="count" aria-label="({n.count} items)">{formatCount(n.count)}</span>{/if}
+            </a>
+          {/each}
+        </nav>
       {/if}
-    </a>
-    <nav aria-label="Main">
-      {#each nav as n (n.page)}
-        <a href={n.href} class:active={page === n.page} aria-current={page === n.page ? 'page' : undefined}>{n.label}</a>
-      {/each}
-    </nav>
+    {:else}
+      <a class="brand" href="#/">
+        <span class="logo" aria-hidden="true"></span>
+        <span>picmover</span>
+        {#if libraries.root}<span class="root mono">{libraries.root}</span>{/if}
+      </a>
+    {/if}
     <div class="spacer"></div>
     <JobPill />
   </header>
 
-  {#if library.error && !library.info}
-    <div class="error-box conn" inert={viewId !== null}>Cannot reach the picmover server: {library.error}</div>
+  {#if libraries.error && !libraries.loaded}
+    <div class="error-box conn" inert={viewId !== null}>
+      Cannot reach the picmover server: {libraries.error}
+      <button class="small" onclick={() => libraries.load()}>Retry</button>
+    </div>
   {/if}
 
   <main inert={viewId !== null}>
-    {#if page === 'grid'}
-      <Grid {filters} {viewId} />
-    {:else if page === 'map'}
-      <MapPage {filters} query={base.query} />
-    {:else if page === 'import'}
-      <Import />
-    {:else}
-      <LibraryPage />
+    {#if app.kind === 'libraries' || app.kind === 'legacy' || app.kind === 'notfound'}
+      {#if libraries.mode === 'workspace' && app.kind === 'libraries'}
+        <Libraries />
+      {:else if !libraries.error}
+        <div class="empty">Loading…</div>
+      {/if}
+    {:else if libId !== null && gate && api}
+      {#if gate.kind === 'open' && base}
+        {#key libId}
+          {#if page === 'grid' || page === 'view'}
+            <Grid {api} {filters} {viewId} basePath={libPath(libId, '')} />
+          {:else if page === 'map'}
+            <MapPage {api} {filters} query={base.route.query} />
+          {:else if page === 'import'}
+            <Import lib={libId} />
+          {:else if page === 'library'}
+            <LibraryPage lib={libId} />
+          {:else if page === 'albums'}
+            <Albums {api} />
+          {:else if page === 'album' && base.app.albumId !== null}
+            {#key base.app.albumId}
+              <Album {api} albumId={base.app.albumId} {filters} {viewId} />
+            {/key}
+          {:else if page === 'trash'}
+            <Trash {api} {filters} {viewId} />
+          {:else if page === 'similar'}
+            <Similar {api} />
+          {/if}
+        {/key}
+      {:else}
+        <LibraryGate id={libId} {gate} />
+      {/if}
     {/if}
   </main>
 
-  {#if viewId !== null}
-    <Lightbox id={viewId} {baseHash} />
+  {#if viewId !== null && open && api}
+    <Lightbox id={viewId} {api} {baseHash} />
   {/if}
+  <Toasts />
 </div>
 
 <style>
@@ -146,55 +218,6 @@
     border-bottom: 1px solid var(--border);
     min-width: 0;
   }
-  /* Library chip: base name plus the full root, truncated from the left
-     so the end of the path stays visible. It is the only part of the bar
-     that shrinks. */
-  .libchip {
-    flex: 0 1 auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    max-width: 460px;
-    padding: 4px 10px 4px 6px;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    color: var(--text);
-    white-space: nowrap;
-  }
-  .libchip:hover {
-    text-decoration: none;
-    background: var(--surface-2);
-    border-color: var(--border);
-  }
-  .libchip.active {
-    border-color: var(--border);
-  }
-  .libchip .name {
-    flex: 0 1 auto;
-    min-width: 2.5em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-weight: 400;
-  }
-  .libchip .root {
-    /* Shrinks far faster than the name, so the name stays readable. */
-    flex: 0 20 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    /* The block runs right-to-left so overflow (and the ellipsis) falls on
-       the left; the inner span is an isolated left-to-right run, so the
-       characters of the path are never reordered. */
-    direction: rtl;
-    font-family: var(--mono);
-    font-size: 0.8em;
-    color: var(--faint);
-  }
-  .libchip .root-text {
-    direction: ltr;
-    unicode-bidi: isolate;
-  }
   .logo {
     flex: none;
     width: 18px;
@@ -203,10 +226,13 @@
     background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 55%, #b06cff 100%);
   }
   nav {
-    flex: none;
+    flex: 0 1 auto;
     display: flex;
     gap: 2px;
+    min-width: 0;
+    overflow-x: auto;
     white-space: nowrap;
+    scrollbar-width: none;
   }
   nav a {
     padding: 6px 12px;
@@ -222,6 +248,32 @@
     color: var(--text);
     background: var(--surface-3);
   }
+  .count {
+    margin-left: 6px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--muted);
+    font-size: 0.8em;
+    font-variant-numeric: tabular-nums;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .brand:hover {
+    text-decoration: none;
+  }
+  .brand .root {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--faint);
+    font-size: 0.8em;
+  }
   .spacer {
     flex: 1 1 0;
     min-width: 0;
@@ -236,16 +288,8 @@
       gap: 10px;
       padding: 0 10px;
     }
-    .libchip {
-      max-width: 300px;
-    }
     nav a {
       padding: 6px 8px;
-    }
-  }
-  @media (max-width: 640px) {
-    .libchip .root {
-      display: none;
     }
   }
   .conn {

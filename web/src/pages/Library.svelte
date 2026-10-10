@@ -4,13 +4,21 @@
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed, formatInstant, formatWallDate } from '../lib/format';
   import { jobTitle, outcome } from '../lib/jobtext';
-  import { href } from '../lib/router';
+  import { libHref } from '../lib/routes';
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import JobProgress from '../components/JobProgress.svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import { joinPath } from '../lib/paths';
 
+  interface Props {
+    lib: string;
+  }
+  let { lib }: Props = $props();
+
   const info = $derived(library.info);
+  const u = $derived(info?.userdb ?? null);
+  const sim = $derived(info?.similar ?? null);
+  const libJobs = $derived(jobs.jobs.filter((j) => !j.library || j.library === lib));
   const s = $derived(info?.summary);
   const t = $derived(info?.thumbs);
   const active = $derived(jobs.active);
@@ -22,7 +30,7 @@
     actionError = '';
     starting = true;
     try {
-      await jobs.start({ kind: 'thumbs', rebuild, limit: 0 });
+      await jobs.start(lib, { kind: 'thumbs', rebuild, limit: 0 });
     } catch (e) {
       actionError = errorMessage(e);
     } finally {
@@ -87,11 +95,11 @@
           <dd class="mono">{joinPath(info.root, '.picmover', '')}</dd>
         </dl>
         <div class="stats">
-          <a class="stat link" href="#/"><span class="v">{formatCount(s.total)}</span><span class="k">Items</span></a>
-          <a class="stat link" href={href('/', { type: 'image' })}><span class="v">{formatCount(s.images)}</span><span class="k">Photos</span></a>
-          <a class="stat link" href={href('/', { type: 'image_raw' })}><span class="v">{formatCount(s.raw)}</span><span class="k">RAW</span></a>
-          <a class="stat link" href={href('/', { type: 'video' })}><span class="v">{formatCount(s.videos)}</span><span class="k">Videos</span></a>
-          <a class="stat link" href="#/map"><span class="v">{formatCount(s.withGps)}</span><span class="k">With location</span></a>
+          <a class="stat link" href={libHref(lib, '')}><span class="v">{formatCount(s.total)}</span><span class="k">Items</span></a>
+          <a class="stat link" href={libHref(lib, '', { type: 'image' })}><span class="v">{formatCount(s.images)}</span><span class="k">Photos</span></a>
+          <a class="stat link" href={libHref(lib, '', { type: 'image_raw' })}><span class="v">{formatCount(s.raw)}</span><span class="k">RAW</span></a>
+          <a class="stat link" href={libHref(lib, '', { type: 'video' })}><span class="v">{formatCount(s.videos)}</span><span class="k">Videos</span></a>
+          <a class="stat link" href={libHref(lib, 'map')}><span class="v">{formatCount(s.withGps)}</span><span class="k">With location</span></a>
           <div class="stat"><span class="v">{formatBytes(s.bytes)}</span><span class="k">Size</span></div>
           {#if s.deleted}
             <div class="stat"><span class="v">{formatCount(s.deleted)}</span><span class="k">Deleted</span></div>
@@ -100,6 +108,23 @@
         {#if s.earliest || s.latest}
           <p class="muted range">From {formatWallDate(s.earliest)} to {formatWallDate(s.latest)}</p>
         {/if}
+      </section>
+
+      <section class="card">
+        <h2>Your data</h2>
+        <p class="muted small">
+          Ratings, tags, albums and the trash live in <span class="mono">{joinPath(info.root, 'user.db')}</span>, which a rebuild
+          never touches. Back it up with the library.
+        </p>
+        <div class="stats">
+          <a class="stat link" href={libHref(lib, '', { rating: 1 })}><span class="v">{formatCount(u?.ratings ?? 0)}</span><span class="k">Rated</span></a>
+          <div class="stat"><span class="v">{formatCount(u?.tags ?? 0)}</span><span class="k">Tags</span></div>
+          <a class="stat link" href={libHref(lib, 'albums')}><span class="v">{formatCount(u?.albums ?? 0)}</span><span class="k">Albums</span></a>
+          <a class="stat link" href={libHref(lib, 'trash')}><span class="v">{formatCount(u?.trashed ?? s.deleted)}</span><span class="k">In the trash</span></a>
+          <a class="stat link" href={libHref(lib, 'similar')}
+            ><span class="v">{sim && sim.pairs !== null ? formatCount(sim.pairs) : '–'}</span><span class="k">Similar pairs</span></a
+          >
+        </div>
       </section>
 
       <section class="card">
@@ -146,7 +171,7 @@
               <tbody>
                 {#each info.cameras as c (c.make + '\u0000' + c.model)}
                   <tr>
-                    <td><a href={href('/', { camera: c.model })}>{c.model}</a></td>
+                    <td><a href={libHref(lib, '', { camera: c.model })}>{c.model}</a></td>
                     <td class="muted">{c.make}</td>
                     <td class="num">{formatCount(c.count)}</td>
                   </tr>
@@ -159,7 +184,7 @@
 
       <section class="card">
         <h2>Jobs</h2>
-        {#if jobs.jobs.length === 0}
+        {#if libJobs.length === 0}
           <p class="muted">No jobs since the server started.</p>
         {:else}
           <div class="table-wrap">
@@ -168,7 +193,7 @@
                 <tr><th>#</th><th>Job</th><th>Started</th><th>Duration</th><th>Result</th><th>Outcome</th></tr>
               </thead>
               <tbody>
-                {#each jobs.jobs as j (j.id)}
+                {#each libJobs as j (j.id)}
                   {@const o = outcome(j)}
                   <tr>
                     <td class="num">{j.id}</td>
@@ -181,7 +206,7 @@
                     <td>
                       {jobSummary(j)}
                       {#if j.kind === 'import' && j.sessionId && !isActive(j)}
-                        <div><a class="small" href={href('/', { session: j.sessionId })}>Show imported</a></div>
+                        <div><a class="small" href={libHref(lib, '', { session: j.sessionId })}>Show imported</a></div>
                       {/if}
                     </td>
                     <td class="tone-{o.tone}">{isActive(j) ? j.state : o.text}</td>

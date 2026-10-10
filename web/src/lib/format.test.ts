@@ -102,3 +102,29 @@ describe('month names and labels', () => {
     expect(formatCount(0)).toBe('0');
   });
 });
+
+describe('relative times', () => {
+  it('formats ages', async () => {
+    const { formatAgo } = await import('./format');
+    const now = Date.UTC(2026, 9, 10, 12, 0, 0);
+    expect(formatAgo(new Date(now - 20_000), now, 'en')).toBe('just now');
+    expect(formatAgo(new Date(now - 5 * 60_000), now, 'en')).toBe('5 minutes ago');
+    expect(formatAgo(new Date(now - 26 * 3600_000), now, 'en')).toBe('yesterday');
+    expect(formatAgo(new Date(now - 3 * 86400_000), now, 'en')).toBe('3 days ago');
+    expect(formatAgo(new Date(now - 400 * 86400_000), now, 'en')).toBe('last year');
+    expect(formatAgo(null, now)).toBe('');
+  });
+  it('reads server times in every shape', async () => {
+    const { parseWhen, parseLocalWallClock } = await import('./format');
+    expect(parseWhen(1760090000)?.getTime()).toBe(1760090000_000);
+    expect(parseWhen('2026-10-10T12:00:00Z')?.toISOString()).toBe('2026-10-10T12:00:00.000Z');
+    expect(parseWhen('2026-10-10T12:00:00+03:00')?.toISOString()).toBe('2026-10-10T09:00:00.000Z');
+    const local = parseWhen('2026-10-10T12:00:00');
+    expect(local?.getHours()).toBe(12);
+    expect(local?.getDate()).toBe(10);
+    expect(parseLocalWallClock('0050-01-02T03:04:05')?.getFullYear()).toBe(50);
+    expect(parseWhen(null)).toBeNull();
+    expect(parseWhen(0)).toBeNull();
+    expect(parseWhen('nonsense')).toBeNull();
+  });
+});

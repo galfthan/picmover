@@ -1,25 +1,43 @@
 <script lang="ts">
-  import { tick, untrack } from 'svelte';
+  import { tick, untrack, type Snippet } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
-  import { errorMessage, getBucket, getTimeline, type Filters, type MediaDetail, type MediaItem, type TimelineBucket } from '../lib/api';
+  import { errorMessage, type Filters, type LibApi, type MediaDetail, type MediaItem, type TimelineBucket } from '../lib/api';
   import { layoutTimeline, type BucketLayout } from '../lib/timeline';
   import { bucketLabel, formatCount, parseWallClock } from '../lib/format';
   import { filtersKey, filtersToQuery, hasFilters } from '../lib/filters';
   import { href, navigate } from '../lib/router';
+  import { libHref } from '../lib/routes';
   import { library } from '../lib/library.svelte';
   import { jobs } from '../lib/jobs.svelte';
+  import { selection, type OrderSegment } from '../lib/selection.svelte';
+  import { onChange, type Change } from '../lib/changes';
   import { setSequenceProvider, type Neighbours } from '../lib/viewer';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import Tile from '../components/Tile.svelte';
   import Scrubber from '../components/Scrubber.svelte';
   import FiltersBar from '../components/Filters.svelte';
+  import SelectionBar from '../components/SelectionBar.svelte';
 
   interface Props {
+    api: LibApi;
+    /** Filters from the URL query. */
     filters: Filters;
     /** Item open in the lightbox, null when closed. */
     viewId: number | null;
+    /** grid: all photos; album: one album (albumId); trash: trashed items. */
+    mode?: 'grid' | 'album' | 'trash';
+    albumId?: number | null;
+    /** Router path of this page, for filter links ("/l/peter/albums/3"). */
+    basePath: string;
+    /** Page header above the toolbar (album name, Empty trash). */
+    header?: Snippet;
   }
-  let { filters, viewId }: Props = $props();
+  let { api, filters, viewId, mode = 'grid', albumId = null, basePath, header }: Props = $props();
+
+  /** The filters sent to the server: the URL's plus what the page implies. */
+  const effective = $derived<Filters>(
+    mode === 'trash' ? { ...filters, trashed: true } : mode === 'album' && albumId !== null ? { ...filters, album: albumId } : filters,
+  );
 
   const GAP = 4;
   const HEADER = 44;
@@ -71,8 +89,8 @@
     const pending = inflight.get(k);
     if (pending) return pending;
     const g = gen;
-    const f = filters;
-    const p = getBucket(f, year, month)
+    const f = effective;
+    const p = api.getBucket(f, year, month)
       .then((list) => {
         if (g !== gen) return null;
         items.set(k, list);
@@ -121,7 +139,7 @@
     inflight.clear();
     tlStatus = buckets.length && !resetScroll ? tlStatus : 'loading';
     try {
-      const b = await getTimeline(filters);
+      const b = await api.getTimeline(effective);
       if (g !== gen) return;
       stale.clear();
       if (!resetScroll) for (const [k, v] of items) stale.set(k, v);
@@ -141,11 +159,127 @@
     }
   }
 
-  // Filters changed (or first mount): reload and go to the top.
-  const fkey = $derived(filtersKey(filters));
+  // Filters changed (or first mount): reload and go to the top, and start
+  // a new selection.
+  const fkey = $derived(`${api.id}|${mode}|${albumId ?? ''}|${filtersKey(effective)}`);
   $effect(() => {
-    void fkey;
-    untrack(() => void loadTimeline(true));
+    const k = fkey;
+    untrack(() => {
+      selection.setScope(k);
+      void loadTimeline(true);
+    });
+  });
+
+  // ---- In-place updates after actions (selection bar, lightbox) ----
+
+  /** Drops items from the loaded buckets and shrinks the layout to match. */
+  function removeHashes(hashes: readonly string[]) {
+    if (!hashes.length) return;
+    const gone = new Set(hashes);
+    for (const map of [items, stale]) {
+      for (const [k, list] of map) {
+        const next = list.filter((x) => !gone.has(x.hash));
+        if (next.length === list.length) continue;
+        map.set(k, next);
+        if (map === items) {
+          const [y, m] = k.split('-').map(Number) as [number, number];
+          fixCount(y, m, next.length);
+        }
+      }
+    }
+    selection.remove(hashes);
+  }
+
+  function patchRating(hashes: readonly string[], rating: number) {
+    const set = new Set(hashes);
+    for (const map of [items, stale]) {
+      for (const [k, list] of map) {
+        if (!list.some((x) => set.has(x.hash))) continue;
+        map.set(
+          k,
+          list.map((x) => {
+            if (!set.has(x.hash)) return x;
+            const { rating: _old, ...rest } = x;
+            return rating > 0 ? { ...rest, rating } : rest;
+          }),
+        );
+      }
+    }
+  }
+
+  function applyChange(c: Change) {
+    switch (c.kind) {
+      case 'rating':
+        patchRating(c.hashes, c.rating);
+        break;
+      case 'trashed':
+        if (mode === 'trash') void loadTimeline(false);
+        else removeHashes(c.hashes);
+        break;
+      case 'restored':
+        if (mode === 'trash') removeHashes(c.hashes);
+        else void loadTimeline(false);
+        break;
+      case 'deleted':
+        if (mode === 'trash' && c.hashes.length) removeHashes(c.hashes);
+        else if (mode === 'trash') void loadTimeline(false);
+        break;
+      case 'album':
+        if (mode !== 'album' || c.albumId !== albumId) break;
+        removeHashes(c.removed);
+        if (c.added.length) void loadTimeline(false);
+        break;
+      case 'tags':
+        if (effective.tags?.length) void loadTimeline(false);
+        break;
+    }
+  }
+  $effect(() => onChange((c) => untrack(() => applyChange(c))));
+
+  // ---- Selection ----
+
+  /** The loaded months in display order, for Shift-click ranges. */
+  function segments(): OrderSegment[] {
+    return buckets.map((b) => {
+      const list = items.get(bkey(b.year, b.month));
+      return { count: b.count, hashes: list ? list.map((x) => x.hash) : null };
+    });
+  }
+
+  function onSelect(item: MediaItem, range: boolean) {
+    if (range) selection.selectRange(segments(), item.hash);
+    else selection.toggle(item.hash);
+  }
+
+  /** The rating every selected loaded item shares, else 0. */
+  const commonRating = $derived.by(() => {
+    if (selection.size === 0) return 0;
+    let r: number | null = null;
+    for (const list of items.values()) {
+      for (const x of list) {
+        if (!selection.peek(x.hash)) continue;
+        const v = x.rating ?? 0;
+        if (r === null) r = v;
+        else if (r !== v) return 0;
+      }
+    }
+    return r ?? 0;
+  });
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key !== 'Escape' || viewId !== null || selection.size === 0 || e.defaultPrevented) return;
+    const t = e.target;
+    if (t instanceof HTMLElement && (t.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(t.tagName)) && !(t instanceof HTMLInputElement && t.type === 'checkbox')) return;
+    e.preventDefault();
+    selection.clear();
+  }
+
+  // The trash page says "deleted 3 minutes ago"; keep it current.
+  let now = $state(Date.now());
+  $effect(() => {
+    if (mode !== 'trash') return;
+    const t = setInterval(() => (now = Date.now()), 60_000);
+    return () => clearInterval(t);
   });
 
   // A job finished: counts changed; reload in place.
@@ -387,15 +521,19 @@
   });
 
   function applyFilters(f: Filters) {
-    navigate(href('/', filtersToQuery(f)));
+    navigate(href(basePath, filtersToQuery(f)));
   }
 
   const libraryEmpty = $derived(library.info !== null && library.info.summary.total === 0);
+  const filtered = $derived(hasFilters(filters, { album: mode === 'album' }));
 </script>
 
+<svelte:window onkeydown={onKeydown} />
+
 <div class="grid-page">
+  {@render header?.()}
   <div class="toolbar">
-    <FiltersBar {filters} onchange={applyFilters} />
+    <FiltersBar {filters} onchange={applyFilters} hideAlbum={mode === 'album'} />
     <div class="spacer"></div>
     {#if tlStatus === 'ready'}
       <span class="muted small count">{formatCount(totalCount)} items</span>
@@ -427,10 +565,17 @@
         <div class="empty">Loading…</div>
       {:else if tlStatus === 'ready' && buckets.length === 0}
         <div class="empty">
-          {#if libraryEmpty && !hasFilters(filters)}
+          {#if mode === 'trash' && !filtered}
+            <h2>The trash is empty</h2>
+            <p>Items you delete wait here until you empty the trash.</p>
+          {:else if mode === 'album' && !filtered}
+            <h2>This album is empty</h2>
+            <p>Select photos in Photos and add them with the Album button.</p>
+            <a class="btn" href={libHref(api.id, '')}>Go to Photos</a>
+          {:else if libraryEmpty && !filtered}
             <h2>Your library is empty</h2>
             <p>Import photos and videos from a camera card, phone backup or folder.</p>
-            <a class="btn primary" href="#/import">Import media</a>
+            <a class="btn primary" href={libHref(api.id, 'import')}>Import media</a>
           {:else}
             <h2>Nothing matches these filters</h2>
             <button onclick={() => applyFilters({})}>Clear filters</button>
@@ -458,7 +603,18 @@
               </h2>
               {#each v.tiles as t (t.key)}
                 {#if t.item}
-                  <Tile item={t.item} left={t.left} top={t.top} size={timeline.tile} />
+                  <Tile
+                    item={t.item}
+                    left={t.left}
+                    top={t.top}
+                    size={timeline.tile}
+                    {api}
+                    selected={selection.has(t.item.hash)}
+                    selecting={selection.size > 0}
+                    onselect={onSelect}
+                    trash={mode === 'trash'}
+                    {now}
+                  />
                 {:else}
                   <div
                     class="ph"
@@ -477,6 +633,7 @@
     {#if tlStatus === 'ready' && buckets.length > 0}
       <Scrubber {timeline} {scrollTop} viewportHeight={height} onjump={scrollToY} />
     {/if}
+    <SelectionBar {api} mode={mode} {albumId} currentRating={commonRating} />
   </div>
 </div>
 
