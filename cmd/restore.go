@@ -59,7 +59,7 @@ target or the library could not be used; 130 cancelled.`,
 			if err := backup.CheckSeparate(t.Root, args[2]); err != nil {
 				return unusable(err)
 			}
-			set, err := backup.OpenSet(ctx, t, args[1], false)
+			set, err := backup.OpenSetReadOnly(ctx, t, args[1]) // a restore also works from a write-protected target
 			if err != nil {
 				return unusable(err)
 			}

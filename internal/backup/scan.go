@@ -22,7 +22,7 @@ type Entry struct {
 	Hash      uint64
 	HashKnown bool // media (from the catalog), or a non-media file matched by size and mtime
 	Size      int64
-	MTime     int64 // Unix seconds; 0 for media (not stat'ed by the scan)
+	MTime     int64 // Unix nanoseconds; 0 for media (not stat'ed by the scan)
 	Media     bool
 	Trashed   bool
 }
@@ -159,7 +159,7 @@ func ScanLibrary(ctx context.Context, lib *library.Library, rows []catalog.PathR
 		if err != nil || !fi.Mode().IsRegular() {
 			return nil
 		}
-		other = append(other, Entry{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().Unix(), Trashed: inTrash})
+		other = append(other, Entry{Rel: rel, Size: fi.Size(), MTime: fi.ModTime().UnixNano(), Trashed: inTrash})
 		return nil
 	})
 	if err != nil {

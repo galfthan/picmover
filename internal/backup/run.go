@@ -89,11 +89,15 @@ type Stats struct {
 	Failures       []Failure `json:"failed"`
 	Truncated      bool      `json:"truncated,omitempty"`
 	// Snapshots.
-	UserSnapshot  bool   `json:"userSnapshot"`
-	MediaSnapshot bool   `json:"mediaSnapshot"`
-	SnapshotError string `json:"snapshotError,omitempty"`
-	Cancelled     bool   `json:"cancelled"`
-	Seconds       int64  `json:"seconds"`
+	UserSnapshot  bool `json:"userSnapshot"`
+	MediaSnapshot bool `json:"mediaSnapshot"`
+	// The snapshot's content had not changed since the last one: it was
+	// not written again.
+	UserSnapshotUnchanged  bool   `json:"userSnapshotUnchanged,omitempty"`
+	MediaSnapshotUnchanged bool   `json:"mediaSnapshotUnchanged,omitempty"`
+	SnapshotError          string `json:"snapshotError,omitempty"`
+	Cancelled              bool   `json:"cancelled"`
+	Seconds                int64  `json:"seconds"`
 }
 
 // ExitCode is the CLI exit status of a finished run: 0 when everything
@@ -135,11 +139,19 @@ func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error)
 		workers = DefaultWorkers
 	}
 	workers = min(workers, MaxWorkers)
+	unlock, held, err := set.Lock("backup")
+	if err != nil {
+		return st, err
+	}
+	defer unlock()
 	m := newMeter(opts.OnProgress)
 	stop := m.run()
 	defer stop()
 	log, closeLog := setLogger(set, "backup", opts.Logger)
 	defer closeLog()
+	if held {
+		set.closeInterrupted(ctx, log)
+	}
 
 	if err := set.checkSeparate(src.Lib); err != nil {
 		return st, err
@@ -285,6 +297,10 @@ type result struct {
 	op    *rowOp
 	also  *rowOp // a second change in the same batch (a moved file copied again drops the row at From)
 	bytes int64
+	// dirs are the folders a rename changed: they are synced once
+	// before the batch with this result's row is committed, so a row is
+	// only written for a durable file.
+	dirs []string
 }
 
 func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error {
@@ -327,6 +343,7 @@ func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error 
 
 	var (
 		batch   []rowOp
+		dirs    = map[string]bool{}
 		done    int
 		werr    error
 		crashed bool
@@ -336,6 +353,12 @@ func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error 
 			batch = batch[:0]
 			return
 		}
+		// Each folder written into is synced once per batch, not once
+		// per file; the rows follow.
+		for d := range dirs {
+			library.SyncDir(d)
+		}
+		clear(dirs)
 		// Rows are written even when ctx is cancelled: their files are done.
 		if err := r.set.apply(context.WithoutCancel(ctx), batch); err != nil {
 			werr = err
@@ -367,6 +390,9 @@ func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error 
 			}
 			if res.also != nil {
 				batch = append(batch, *res.also)
+			}
+			for _, d := range res.dirs {
+				dirs[d] = true
 			}
 			if crashAfter != nil && crashAfter(done) {
 				crashed = true
@@ -491,10 +517,10 @@ func (r *runner) move(ctx context.Context, it Item) (res result, ok, fallback bo
 	}
 	err := library.RenameNoReplace(src, dst)
 	if err == nil {
-		library.SyncDir(filepath.Dir(dst))
 		r.count(&r.st.Renamed, 0)
 		r.log.Debug("renamed", "from", it.From, "to", it.Rel)
-		return result{op: &rowOp{upsert: &FileRow{RelPath: it.Rel}, from: it.From}}, true, false
+		return result{op: &rowOp{upsert: &FileRow{RelPath: it.Rel}, from: it.From},
+			dirs: []string{filepath.Dir(dst), filepath.Dir(src)}}, true, false
 	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return result{}, false, true
@@ -545,7 +571,7 @@ func (r *runner) adopt(ctx context.Context, it Item, dst string) (result, bool) 
 	r.count(&r.st.Adopted, 0)
 	r.m.done(1, 0)
 	r.log.Info("already on the target; verified", "path", it.Rel)
-	return result{op: &rowOp{upsert: r.row(it, h, n, lfi.ModTime().Unix())}}, true
+	return result{op: &rowOp{upsert: r.row(it, h, n, lfi.ModTime().UnixNano())}}, true
 }
 
 // copy copies a new or changed file.
@@ -584,7 +610,7 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 			r.fail(it, errConflict, "copy")
 			return result{}, false
 		}
-		res, err := library.CopyReadBack(ctx, libAbs, dst, r.set.TmpDir(), want)
+		res, err := library.CopyReadBackDeferSync(ctx, libAbs, dst, r.set.TmpDir(), want)
 		if err != nil {
 			if ctx.Err() == nil {
 				r.fail(it, err, "copy")
@@ -593,12 +619,13 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 		}
 		r.count(&r.st.Copied, res.Size)
 		r.m.done(1, res.Size)
-		return result{op: &rowOp{upsert: r.row(it, res.Hash, res.Size, res.MTime.Unix())}, bytes: res.Size}, true
+		return result{op: &rowOp{upsert: r.row(it, res.Hash, res.Size, res.MTime.UnixNano())}, bytes: res.Size,
+			dirs: []string{filepath.Dir(dst)}}, true
 	}
 	// Changed: the new content is staged and verified first; only then
 	// does the old file move to previous/ and the new one take its place.
 	stage := filepath.Join(r.set.TmpDir(), "stage-"+randomSuffix())
-	res, err := library.CopyReadBack(ctx, libAbs, stage, r.set.TmpDir(), want)
+	res, err := library.CopyReadBackDeferSync(ctx, libAbs, stage, r.set.TmpDir(), want)
 	if err != nil {
 		if ctx.Err() == nil {
 			r.fail(it, err, "copy")
@@ -611,16 +638,28 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 		if fi, err := os.Lstat(dst); err == nil && fi.Mode().IsRegular() {
 			r.count(&r.st.Refreshed, 0)
 			r.m.done(1, 0)
-			row := r.row(it, res.Hash, res.Size, res.MTime.Unix())
+			row := r.row(it, res.Hash, res.Size, res.MTime.UnixNano())
 			row.BackedAt, row.VerifiedAt = it.Row.BackedAt, it.Row.VerifiedAt
 			return result{op: &rowOp{upsert: row}}, true
 		}
 		// The target lost the file: copy it after all.
-		if res, err = library.CopyReadBack(ctx, libAbs, stage, r.set.TmpDir(), want); err != nil {
+		if res, err = library.CopyReadBackDeferSync(ctx, libAbs, stage, r.set.TmpDir(), want); err != nil {
 			if ctx.Err() == nil {
 				r.fail(it, err, "copy")
 			}
 			return result{}, false
+		}
+	}
+	// A destination that already has the new content (a run killed after
+	// putting it in place, before its row was written) is adopted: a
+	// correct copy never goes to previous/.
+	if fi, err := os.Lstat(dst); err == nil && fi.Mode().IsRegular() && fi.Size() == res.Size {
+		if h, n, err := library.HashFileContext(ctx, dst); err == nil && h == res.Hash && n == res.Size {
+			os.Remove(stage)
+			r.count(&r.st.Adopted, 0)
+			r.m.done(1, 0)
+			r.log.Info("already on the target; verified", "path", it.Rel)
+			return result{op: &rowOp{upsert: r.row(it, res.Hash, res.Size, res.MTime.UnixNano())}}, true
 		}
 	}
 	// The file at dst is the one the row at this path recorded (changed
@@ -642,10 +681,10 @@ func (r *runner) copy(ctx context.Context, it Item) (result, bool) {
 		r.fail(it, err, "rename into place")
 		return result{}, false
 	}
-	library.SyncDir(filepath.Dir(dst))
 	r.count(&r.st.Copied, res.Size)
 	r.m.done(1, res.Size)
-	return result{op: &rowOp{upsert: r.row(it, res.Hash, res.Size, res.MTime.Unix())}, bytes: res.Size}, true
+	return result{op: &rowOp{upsert: r.row(it, res.Hash, res.Size, res.MTime.UnixNano())}, bytes: res.Size,
+		dirs: []string{filepath.Dir(dst)}}, true
 }
 
 func randomSuffix() string {
@@ -667,38 +706,99 @@ const metaUserSnapshotHash = "user_snapshot_hash"
 // meta for restore to verify.
 func snapshots(ctx context.Context, src Source, set *Set, st *Stats, log *slog.Logger) error {
 	if src.User != nil {
-		tmp := filepath.Join(set.TmpDir(), "snap-user-"+randomSuffix()+".db")
-		h, err := writeSnapshot(ctx, src.User.Snapshot, tmp)
+		// user.db changes on every backup (the target's last backup
+		// time), so it is compared by its content without that
+		// bookkeeping (userdata ContentHash); the snapshot on the target
+		// must still hash as recorded.
+		content, err := src.User.ContentHash(ctx)
 		if err != nil {
 			return err
 		}
-		if _, err := placeSnapshot(set, tmp, UserSnapshot); err != nil {
-			return fmt.Errorf("the user.db snapshot: %w", err)
+		cv, _ := set.Meta(ctx, metaUserContentHash)
+		if sv, _ := set.Meta(ctx, metaUserSnapshotHash); cv == fmt.Sprintf("%016x", content) && sv != "" &&
+			snapshotIntact(ctx, set, UserSnapshot, sv) {
+			st.UserSnapshot, st.UserSnapshotUnchanged = true, true
+			log.Info("user.db unchanged since the last snapshot")
+		} else {
+			tmp := filepath.Join(set.TmpDir(), "snap-user-"+randomSuffix()+".db")
+			h, err := writeSnapshot(ctx, src.User.Snapshot, tmp)
+			if err != nil {
+				return err
+			}
+			if _, err := placeSnapshot(set, tmp, UserSnapshot); err != nil {
+				return fmt.Errorf("the user.db snapshot: %w", err)
+			}
+			wctx := context.WithoutCancel(ctx)
+			if err := set.SetMeta(wctx, metaUserSnapshotHash, fmt.Sprintf("%016x", h)); err != nil {
+				return err
+			}
+			if err := set.SetMeta(wctx, metaUserContentHash, fmt.Sprintf("%016x", content)); err != nil {
+				return err
+			}
+			st.UserSnapshot = true
+			log.Info("user.db snapshot written")
 		}
-		if err := set.SetMeta(context.WithoutCancel(ctx), metaUserSnapshotHash, fmt.Sprintf("%016x", h)); err != nil {
-			return err
-		}
-		st.UserSnapshot = true
-		log.Info("user.db snapshot written")
 	}
 	if src.Catalog != nil {
 		tmp := filepath.Join(set.TmpDir(), "snap-media-"+randomSuffix()+".db")
-		if _, err := writeSnapshot(ctx, src.Catalog.Snapshot, tmp); err != nil {
+		h, err := writeSnapshot(ctx, src.Catalog.Snapshot, tmp)
+		if err != nil {
 			return err
 		}
-		old, err := placeSnapshot(set, tmp, MediaSnapshot)
-		if err != nil {
-			return fmt.Errorf("the media.db snapshot: %w", err)
+		if unchangedSnapshot(ctx, set, MediaSnapshot, metaMediaSnapshotHash, h) {
+			os.Remove(tmp)
+			st.MediaSnapshot, st.MediaSnapshotUnchanged = true, true
+			log.Info("media.db unchanged since the last snapshot")
+		} else {
+			old, err := placeSnapshot(set, tmp, MediaSnapshot)
+			if err != nil {
+				return fmt.Errorf("the media.db snapshot: %w", err)
+			}
+			if old != "" && set.inSet(old) {
+				os.Remove(old)
+			}
+			if err := set.SetMeta(context.WithoutCancel(ctx), metaMediaSnapshotHash, fmt.Sprintf("%016x", h)); err != nil {
+				return err
+			}
+			st.MediaSnapshot = true
+			log.Info("media.db snapshot written")
 		}
-		if old != "" && set.inSet(old) {
-			os.Remove(old)
-		}
-		st.MediaSnapshot = true
-		log.Info("media.db snapshot written")
 	}
 	library.SyncDir(set.Dir)
 	return nil
 }
+
+// metaMediaSnapshotHash is the set meta key holding the hash of the
+// media.db snapshot at the set root.
+const metaMediaSnapshotHash = "media_snapshot_hash"
+
+// unchangedSnapshot reports whether the hash recorded for the snapshot
+// name at the set root (meta key) is h and the file there, a regular
+// file, still hashes to it: then the new snapshot is the same content
+// and is not written again (reading it back is much cheaper than writing
+// and syncing it, and proves it is intact).
+func unchangedSnapshot(ctx context.Context, set *Set, name, key string, h uint64) bool {
+	v, err := set.Meta(ctx, key)
+	if err != nil || v != fmt.Sprintf("%016x", h) {
+		return false
+	}
+	return snapshotIntact(ctx, set, name, v)
+}
+
+// snapshotIntact reports whether the snapshot name at the set root is a
+// regular file hashing to want (16 hex digits).
+func snapshotIntact(ctx context.Context, set *Set, name, want string) bool {
+	p := set.Abs(name)
+	if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	got, _, err := library.HashFileContext(ctx, p)
+	return err == nil && fmt.Sprintf("%016x", got) == want
+}
+
+// metaUserContentHash is the set meta key holding the user data's
+// content hash (userdata ContentHash) at the last user.db snapshot.
+const metaUserContentHash = "user_content_hash"
 
 // writeSnapshot writes a snapshot to tmp with write, syncs it and
 // returns its hash; tmp is removed on failure.

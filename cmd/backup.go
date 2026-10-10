@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -80,13 +81,16 @@ func rangeArgs(min, max int) cobra.PositionalArgs {
 
 // backupLib is an opened library for the backup commands.
 type backupLib struct {
-	lib    *library.Library
-	dir    string // the library folder as given, absolute (the default set name comes from it)
-	db     *catalog.DB
-	user   *userdata.DB
-	libID  string
-	id     backup.Identity
-	unlock func()
+	lib   *library.Library
+	dir   string // the library folder as given, absolute (the default set name comes from it)
+	db    *catalog.DB
+	user  *userdata.DB
+	libID string
+	id    backup.Identity
+	// readOnly: opened for a dry run (openBackupLibReadOnly); nothing is
+	// written, user may be nil.
+	readOnly bool
+	unlock   func()
 }
 
 func (b *backupLib) close() {
@@ -128,6 +132,42 @@ func openBackupLib(ctx context.Context, dir, lockName string, out, errOut io.Wri
 			from, userdata.SchemaVersion, filepath.Base(bak))
 	}
 	if b.id, err = b.user.Identity(ctx); err != nil {
+		b.close()
+		return nil, err
+	}
+	b.libID = b.id.LibraryID
+	return b, nil
+}
+
+// openBackupLibReadOnly opens a library for a dry run, writing nothing:
+// no lock, user.db read-only (never created or migrated) and the
+// library's instance peeked at, not recorded. A user.db that is missing
+// or would first be upgraded is reported on out; b.user is then nil (the
+// library has no targets yet).
+func openBackupLibReadOnly(ctx context.Context, dir string, out, errOut io.Writer) (*backupLib, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	lib, db, unlock, err := openExistingLocked(ctx, dir, "", errOut)
+	if err != nil {
+		return nil, err
+	}
+	b := &backupLib{lib: lib, dir: filepath.Clean(abs), db: db, unlock: unlock, readOnly: true}
+	u, err := userdata.OpenReadOnly(ctx, filepath.Join(lib.Root(), userdata.FileName))
+	switch {
+	case errors.Is(err, userdata.ErrNeedsMigration):
+		fmt.Fprintf(out, "Note: %v; it has no backup targets yet.\n", err)
+		return b, nil
+	case errors.Is(err, fs.ErrNotExist):
+		fmt.Fprintln(out, "Note: the library has no user.db yet (a run without --dry-run creates it); it has no backup targets yet.")
+		return b, nil
+	case err != nil:
+		b.close()
+		return nil, err
+	}
+	b.user = u
+	if b.id, err = u.PeekIdentity(ctx); err != nil {
 		b.close()
 		return nil, err
 	}
@@ -229,6 +269,16 @@ func resolveTargets(ctx context.Context, b *backupLib, folder, id string, all bo
 		if err := backup.CheckSeparate(t.Root, b.lib.Root()); err != nil {
 			return nil, err
 		}
+		if b.readOnly {
+			// A dry run does not attach the target.
+			if b.user != nil {
+				if bt, err := b.user.BackupTarget(ctx, t.ID()); err == nil {
+					bt.LastPath = t.Root
+					return []userdata.BackupTarget{bt}, nil
+				}
+			}
+			return []userdata.BackupTarget{{ID: t.ID(), Label: targetLabel(t.Root), LastPath: t.Root}}, nil
+		}
 		bt, err := attachTarget(ctx, b, t, "", out)
 		if err != nil {
 			return nil, err
@@ -237,6 +287,9 @@ func resolveTargets(ctx context.Context, b *backupLib, folder, id string, all bo
 	case id != "":
 		if !backup.ValidID(id) {
 			return nil, fmt.Errorf("invalid target id %q: want 16 lower-case hex digits ('picmover targets %s' lists them)", id, library.QuoteArg(b.dir))
+		}
+		if b.user == nil {
+			return nil, fmt.Errorf("the library has no target %s", id)
 		}
 		bt, err := b.user.BackupTarget(ctx, id)
 		if errors.Is(err, userdata.ErrNotFound) {
@@ -247,9 +300,12 @@ func resolveTargets(ctx context.Context, b *backupLib, folder, id string, all bo
 		}
 		return []userdata.BackupTarget{bt}, nil
 	}
-	ts, err := b.user.BackupTargets(ctx)
-	if err != nil {
-		return nil, err
+	var ts []userdata.BackupTarget
+	if b.user != nil {
+		var err error
+		if ts, err = b.user.BackupTargets(ctx); err != nil {
+			return nil, err
+		}
 	}
 	switch {
 	case len(ts) == 0:
@@ -447,7 +503,13 @@ be used; 130 cancelled.`,
 			if dryRun {
 				lockName = ""
 			}
-			b, err := openBackupLib(ctx, args[0], lockName, out, cmd.ErrOrStderr())
+			var b *backupLib
+			var err error
+			if dryRun {
+				b, err = openBackupLibReadOnly(ctx, args[0], out, cmd.ErrOrStderr())
+			} else {
+				b, err = openBackupLib(ctx, args[0], lockName, out, cmd.ErrOrStderr())
+			}
 			if err != nil {
 				return unusable(err)
 			}
@@ -526,7 +588,7 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 		// reach checked the owner; a dry run writes nothing.
 		var set *backup.Set
 		if backup.SetExists(rt.t, rt.setName) {
-			if set, err = backup.OpenSet(ctx, rt.t, rt.setName, false); err != nil {
+			if set, err = backup.OpenSetReadOnly(ctx, rt.t, rt.setName); err != nil {
 				return exitUnusable, err
 			}
 			defer set.Close()

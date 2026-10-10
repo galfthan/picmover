@@ -193,7 +193,12 @@ func TestBackupKeepDaysZero(t *testing.T) {
 	f := newFixture(t)
 	tg := f.addTarget("drive")
 	f.startBackupJob(`{"kind":"backup","target":"` + tg.ID + `"}`)
-	f.startBackupJob(`{"kind":"backup","target":"` + tg.ID + `"}`) // the first user.db snapshot goes to previous/
+	// user data changes: the next backup moves the first user.db
+	// snapshot to previous/.
+	if _, err := f.userDB().SetRating(t.Context(), []uint64{f.hashes["a.jpg"]}, 4); err != nil {
+		t.Fatal(err)
+	}
+	f.startBackupJob(`{"kind":"backup","target":"` + tg.ID + `"}`)
 	p30 := decode[planJSON](t, f.get("/api/l/lib/backups/targets/"+tg.ID+"/plan"))
 	p0 := decode[planJSON](t, f.get("/api/l/lib/backups/targets/"+tg.ID+"/plan?keepDays=0"))
 	if p30.Extra.Count != 0 || p0.Extra.Count < 1 || p0.KeepDays != 0 {

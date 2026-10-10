@@ -99,18 +99,24 @@ func Restore(ctx context.Context, set *Set, lib *library.Library, opts RestoreOp
 		return st, fmt.Errorf("invalid restore mode %q: want %s or %s", opts.Mode, ModeMissing, ModeUserData)
 	}
 	if opts.Owner != nil {
-		var err error
-		if opts.TakeOver && !opts.DryRun {
-			err = set.Claim(ctx, *opts.Owner, true, true)
-		} else {
-			err = set.CheckOwner(ctx, *opts.Owner, true)
-		}
-		if err != nil {
+		// A restore only reads the set (it may be read-only): taking
+		// over lets another copy of the library restore from it, without
+		// recording anything.
+		if err := set.CheckOwner(ctx, *opts.Owner, true); err != nil && !(opts.TakeOver && errors.Is(err, ErrForeignInstance)) {
 			return st, err
 		}
 	}
 	if err := set.checkSeparate(lib); err != nil {
 		return st, err
+	}
+	held := false
+	if !opts.DryRun {
+		unlock, h, err := set.Lock("restore")
+		if err != nil {
+			return st, err
+		}
+		defer unlock()
+		held = h
 	}
 	m := newMeter(opts.OnProgress)
 	stop := m.run()
@@ -126,6 +132,19 @@ func Restore(ctx context.Context, set *Set, lib *library.Library, opts RestoreOp
 		log, closeLog = setLogger(set, "restore", opts.Logger)
 	}
 	defer closeLog()
+	// The run is recorded through a writable handle when the set can be
+	// written; a set opened read-only (as restores do) gets one here.
+	recorder := set
+	if set.readOnly && !opts.DryRun {
+		recorder = nil
+		if rw, err := OpenSet(ctx, set.Target, set.Name, false); err == nil {
+			defer rw.Close()
+			recorder = rw
+		}
+	}
+	if held && recorder != nil {
+		recorder.closeInterrupted(ctx, log)
+	}
 	var runID int64
 	finish := func() {
 		st.Seconds = int64(time.Since(started).Seconds())
@@ -133,15 +152,18 @@ func Restore(ctx context.Context, set *Set, lib *library.Library, opts RestoreOp
 			st.NeedsRebuild = true
 		}
 		if runID != 0 {
-			if err := set.finishRun(runID, &st); err != nil {
+			if err := recorder.finishRun(runID, &st); err != nil {
 				log.Error("record the run", "err", err)
 			}
 		}
 	}
-	if !opts.DryRun {
+	if !opts.DryRun && recorder != nil {
+		// Best effort: a restore also works from a write-protected
+		// target, where the runs row cannot be written.
 		var err error
-		if runID, err = set.beginRun(ctx, "restore", opts.Library); err != nil {
-			return st, err
+		if runID, err = recorder.beginRun(ctx, "restore", opts.Library); err != nil {
+			log.Warn("the run is not recorded in backup.db", "err", err)
+			runID = 0
 		}
 	}
 	if opts.Mode == ModeUserData {

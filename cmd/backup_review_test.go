@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -174,7 +175,9 @@ func TestPruneKeepZeroCLI(t *testing.T) {
 	os.Mkdir(drive, 0o755)
 	out, err := run(t, "targets", "add", lib, drive)
 	wantExit(t, err, out, 0, "")
-	for range 2 {
+	for i := range 2 {
+		// A changed file: its earlier content goes to previous/.
+		os.WriteFile(filepath.Join(lib, "notes.txt"), []byte(fmt.Sprintf("notes %d", i)), 0o644)
 		out, err = run(t, "backup", "--quiet", lib)
 		wantExit(t, err, out, 0, "")
 	}
@@ -182,7 +185,7 @@ func TestPruneKeepZeroCLI(t *testing.T) {
 	wantExit(t, err, out, 0, "Nothing to prune")
 	out, err = run(t, "prune", "--yes", "--keep", "0d", lib, drive)
 	wantExit(t, err, out, 0, "Removed 1 files")
-	if prev, _ := filepath.Glob(filepath.Join(drive, "photos", ".picmover", "previous", "user.db.*")); len(prev) != 0 {
+	if prev, _ := filepath.Glob(filepath.Join(drive, "photos", ".picmover", "previous", "*")); len(prev) != 0 {
 		t.Fatalf("previous/ kept %v", prev)
 	}
 }

@@ -176,9 +176,10 @@ type backupContext struct {
 // reachable, and its set, which must belong to this library (an
 // *backup.OtherLibraryError otherwise, also for a remembered set name)
 // and have been last written by this copy of it (a *backup.ForeignError
-// otherwise, unless takeOver). Nothing is written: the set name is
+// otherwise, unless takeOver). Nothing is written (unless write, for a
+// job: a new library instance is recorded in user.db); the set name is
 // stored by a backup job once the set is claimed.
-func (s *Server) openBackup(ctx context.Context, h *libHandles, id string, takeOver bool) (*backupContext, error) {
+func (s *Server) openBackup(ctx context.Context, h *libHandles, id string, takeOver, write bool) (*backupContext, error) {
 	if h.user == nil {
 		return nil, errors.New("user.db is not open")
 	}
@@ -190,7 +191,13 @@ func (s *Server) openBackup(ctx context.Context, h *libHandles, id string, takeO
 	if err != nil {
 		return &backupContext{h: h, bt: bt}, err
 	}
-	ident, err := h.user.Identity(ctx)
+	// Only a job writes the library's instance (userdata.Identity);
+	// the GET routes and the job checks peek at it.
+	identity := h.user.PeekIdentity
+	if write {
+		identity = h.user.Identity
+	}
+	ident, err := identity(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +231,8 @@ func (bc *backupContext) source() backup.Source {
 	return backup.Source{Lib: bc.h.lib, Catalog: bc.h.db, User: bc.h.user}
 }
 
-// openSet opens the set; nil (no error) when it does not exist yet.
+// openSet opens the set for writing; nil (no error) when it does not
+// exist yet (unless create).
 func (bc *backupContext) openSet(ctx context.Context, create bool) (*backup.Set, error) {
 	if !create && !backup.SetExists(bc.t, bc.setName) {
 		return nil, nil
@@ -232,9 +240,18 @@ func (bc *backupContext) openSet(ctx context.Context, create bool) (*backup.Set,
 	return backup.OpenSet(ctx, bc.t, bc.setName, create)
 }
 
+// openSetReadOnly opens the set read-only (the GET routes and restore:
+// they never take a write lock on backup.db); nil when there is none.
+func (bc *backupContext) openSetReadOnly(ctx context.Context) (*backup.Set, error) {
+	if !backup.SetExists(bc.t, bc.setName) {
+		return nil, nil
+	}
+	return backup.OpenSetReadOnly(ctx, bc.t, bc.setName)
+}
+
 // computePlan makes the plan of a target and caches it.
 func (s *Server) computePlan(ctx context.Context, bc *backupContext, keep time.Duration) (planJSON, error) {
-	set, err := bc.openSet(ctx, false)
+	set, err := bc.openSetReadOnly(ctx)
 	if err != nil {
 		return planJSON{}, err
 	}
@@ -327,7 +344,7 @@ func (e *libEntry) clearPlans() {
 func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.BackupTarget, maxAge time.Duration) targetJSON {
 	out := targetJSON{ID: bt.ID, Label: bt.Label, Path: bt.LastPath,
 		LastBackupAt: unixOrNull(bt.LastBackupAt), LastScrubAt: unixOrNull(bt.LastScrubAt)}
-	bc, err := s.openBackup(ctx, h, bt.ID, false)
+	bc, err := s.openBackup(ctx, h, bt.ID, false, false)
 	if errors.Is(err, errUnreachable) {
 		return out
 	}
@@ -346,7 +363,7 @@ func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.
 		return out
 	}
 	sj := &setJSON{Name: bc.setName}
-	if set, err := bc.openSet(ctx, false); err != nil {
+	if set, err := bc.openSetReadOnly(ctx); err != nil {
 		out.Error = s.backupError(err)
 		return out
 	} else if set != nil {
@@ -399,6 +416,7 @@ func (s *Server) backupError(err error) string {
 		ole *backup.OtherLibraryError
 		fe  *backup.ForeignError
 		ie  *backup.IncompleteScanError
+		le  *library.ErrLocked
 	)
 	switch {
 	case errors.As(err, &ole):
@@ -409,6 +427,8 @@ func (s *Server) backupError(err error) string {
 		return fe.Error()
 	case errors.As(err, &ie):
 		return ie.Error()
+	case errors.As(err, &le):
+		return le.Error() // the set is in use: pid, command, host, time; no path
 	case errors.Is(err, backup.ErrNotSetFolder), errors.Is(err, backup.ErrLibraryFolder), errors.Is(err, backup.ErrNotOwned),
 		errors.Is(err, backup.ErrBadUserSnapshot):
 		return rootSentinel(err, backup.ErrNotSetFolder, backup.ErrLibraryFolder, backup.ErrNotOwned, backup.ErrBadUserSnapshot).Error()
@@ -460,6 +480,10 @@ func rootError(err error) error {
 // another picmover version, a bad set name, no backup of this library
 // yet, an incomplete library scan (prune).
 func isBackupConflict(err error) bool {
+	var le *library.ErrLocked
+	if errors.As(err, &le) {
+		return true
+	}
 	for _, e := range []error{errUnreachable, backup.ErrOtherLibrary, backup.ErrForeignInstance, backup.ErrSetVersion,
 		backup.ErrInvalidSetName, backup.ErrNotSetFolder, backup.ErrLibraryFolder, backup.ErrNotOwned,
 		backup.ErrIncompleteScan, backup.ErrNotSeparate} {
@@ -808,7 +832,7 @@ func (s *Server) handleTargetPlan(w http.ResponseWriter, r *http.Request, l *lib
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	bc, err := s.openBackup(r.Context(), l, bt.ID, false)
+	bc, err := s.openBackup(r.Context(), l, bt.ID, false, false)
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -842,7 +866,7 @@ func (s *Server) handleTargetRuns(w http.ResponseWriter, r *http.Request, l *lib
 	if !ok {
 		return
 	}
-	bc, err := s.openBackup(r.Context(), l, bt.ID, true) // reading the runs of a foreign set is harmless
+	bc, err := s.openBackup(r.Context(), l, bt.ID, true, false) // reading the runs of a foreign set is harmless
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -850,7 +874,7 @@ func (s *Server) handleTargetRuns(w http.ResponseWriter, r *http.Request, l *lib
 	out := struct {
 		Runs []runJSON `json:"runs"`
 	}{Runs: []runJSON{}}
-	set, err := bc.openSet(r.Context(), false)
+	set, err := bc.openSetReadOnly(r.Context())
 	if err != nil {
 		s.backupStateError(w, r, err)
 		return
@@ -913,7 +937,7 @@ func (s *Server) checkBackupJob(ctx context.Context, e *libEntry, p *jobParams) 
 		return http.StatusConflict, "library is not open (" + state + ")"
 	}
 	defer e.release()
-	bc, err := s.openBackup(ctx, h, p.Target, p.TakeOver)
+	bc, err := s.openBackup(ctx, h, p.Target, p.TakeOver, false)
 	switch {
 	case errors.Is(err, userdata.ErrNotFound):
 		return http.StatusNotFound, "no such target"
@@ -928,6 +952,11 @@ func (s *Server) checkBackupJob(ctx context.Context, e *libEntry, p *jobParams) 
 	}
 	if err := backup.CheckSetFolder(bc.t, bc.setName); err != nil {
 		return http.StatusConflict, s.backupError(err)
+	}
+	// A set another process is backing up, scrubbing, pruning or
+	// restoring is refused now, naming that process.
+	if err := backup.SetBusy(bc.t, bc.setName); err != nil {
+		return http.StatusConflict, err.Error()
 	}
 	if p.Kind == kindScrub || p.Kind == kindRestore || p.Kind == kindPrune {
 		owner, err := backup.SetOwner(ctx, bc.t, bc.setName)
@@ -1001,14 +1030,19 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 		return stateFailed, 2, stats, 0, srv.backupError(err)
 	}
 	ctx := j.ctx
-	bc, err := srv.openBackup(ctx, h, j.params.Target, j.params.TakeOver)
+	bc, err := srv.openBackup(ctx, h, j.params.Target, j.params.TakeOver, true)
 	if err != nil {
 		return fail(err)
 	}
 	if err := backup.CheckSeparate(bc.t.Root, h.lib.Root()); err != nil {
 		return stateFailed, 2, stats, 0, err.Error()
 	}
-	set, err := bc.openSet(ctx, kind == kindBackup)
+	var set *backup.Set
+	if kind == kindRestore {
+		set, err = bc.openSetReadOnly(ctx) // works from a write-protected target
+	} else {
+		set, err = bc.openSet(ctx, kind == kindBackup)
+	}
 	if err == nil && set == nil {
 		err = backup.ErrNoSet
 	}

@@ -167,6 +167,11 @@ func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneS
 	if err := set.checkSeparate(src.Lib); err != nil {
 		return st, err
 	}
+	unlock, held, err := set.Lock("prune")
+	if err != nil {
+		return st, err
+	}
+	defer unlock()
 	if err := set.Claim(ctx, opts.Owner, true, opts.TakeOver); err != nil {
 		return st, err
 	}
@@ -175,6 +180,9 @@ func Prune(ctx context.Context, src Source, set *Set, opts PruneOptions) (PruneS
 	defer stop()
 	log, closeLog := setLogger(set, "prune", opts.Logger)
 	defer closeLog()
+	if held {
+		set.closeInterrupted(ctx, log)
+	}
 	m.phase(PhasePlan, 0, 0)
 	plan, err := PlanFor(ctx, src, set)
 	if err != nil {

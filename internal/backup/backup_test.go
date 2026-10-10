@@ -243,7 +243,7 @@ func TestMakePlanClasses(t *testing.T) {
 		{RelPath: "a.jpg2", Hash: 9, Size: 1},
 		{RelPath: "gone.jpg", Hash: 99, Size: 1000},       // extra
 		{RelPath: "trashed-elsewhere", Hash: 50, Size: 1}, // not extra: the catalog has the hash
-		{RelPath: "e-copy.xmp", Hash: 55, Size: 5},        // not extra: e.xmp has the hash
+		{RelPath: "e-copy.xmp", Hash: 55, Size: 5},        // extra: e.xmp's row already holds the content
 	}
 	p := MakePlan(sc, rows)
 	check := func(name string, c Count, files, bytes int64) {
@@ -255,11 +255,11 @@ func TestMakePlanClasses(t *testing.T) {
 	check("moved", p.Moved, 1, 20)
 	check("changed", p.Changed, 2, 36)
 	check("new", p.New, 4, 57)
-	check("extra", p.Extra, 1, 1000)
+	check("extra", p.Extra, 2, 1005)
 	if p.Items[0].Class != ClassMoved || p.Items[0].From != "old/b.jpg" || p.Items[0].Rel != "new/b.jpg" {
 		t.Errorf("first item %+v", p.Items[0])
 	}
-	if len(p.Extras) != 1 || p.Extras[0].RelPath != "gone.jpg" {
+	if len(p.Extras) != 2 || p.Extras[0].RelPath != "e-copy.xmp" || p.Extras[1].RelPath != "gone.jpg" {
 		t.Errorf("extras %+v", p.Extras)
 	}
 	var order []string
@@ -333,10 +333,22 @@ func TestBackupRunAndIncremental(t *testing.T) {
 		t.Fatalf("runs %+v", runs)
 	}
 
-	// Nothing changed: nothing copied; user.db snapshot kept in previous/.
+	// Nothing changed: nothing copied; the snapshots are unchanged and
+	// not written again (L3 of the resumability review).
 	st = f.run(Options{})
-	if st.Copied != 0 || st.Current != 6 || st.ExitCode() != 0 {
+	if st.Copied != 0 || st.Current != 6 || st.ExitCode() != 0 || !st.UserSnapshotUnchanged || !st.MediaSnapshotUnchanged {
 		t.Fatalf("second run %+v", st)
+	}
+	if ents, _ := os.ReadDir(set.PreviousDir()); len(ents) != 0 {
+		t.Fatalf("previous %v", ents)
+	}
+	// A changed user.db: the earlier snapshot is kept in previous/.
+	if _, err := f.user.SetRating(f.ctx, []uint64{f.hashes["image/2023/01/b.jpg"]}, 3); err != nil {
+		t.Fatal(err)
+	}
+	st = f.run(Options{})
+	if st.UserSnapshotUnchanged || !st.UserSnapshot {
+		t.Fatalf("third run %+v", st)
 	}
 	if ents, _ := os.ReadDir(set.PreviousDir()); len(ents) != 1 || !strings.HasPrefix(ents[0].Name(), "user.db.") {
 		t.Fatalf("previous %v", ents)

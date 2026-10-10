@@ -35,6 +35,19 @@ type CopyResult struct {
 // nothing is left at dst and the temp file is removed. Missing parent
 // directories of dst are created.
 func CopyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64) (CopyResult, error) {
+	return copyReadBack(ctx, src, dst, tmpDir, want, true)
+}
+
+// CopyReadBackDeferSync is CopyReadBack without the final sync of dst's
+// folder: the copy is fsynced, but its name is durable only after the
+// caller's SyncDir(filepath.Dir(dst)), which a caller copying many files
+// into few folders does once per folder (the backup does it before
+// committing the rows of a batch).
+func CopyReadBackDeferSync(ctx context.Context, src, dst, tmpDir string, want *uint64) (CopyResult, error) {
+	return copyReadBack(ctx, src, dst, tmpDir, want, false)
+}
+
+func copyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64, sync bool) (CopyResult, error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return CopyResult{}, err
@@ -104,7 +117,9 @@ func CopyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64) (C
 	if err := RenameNoReplace(tmpName, dst); err != nil {
 		return fail(err)
 	}
-	syncDir(filepath.Dir(dst))
+	if sync {
+		syncDir(filepath.Dir(dst))
+	}
 	return CopyResult{Hash: srcHash, Size: n, MTime: mtime}, nil
 }
 

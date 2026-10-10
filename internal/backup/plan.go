@@ -168,6 +168,12 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 		}
 	}
 	p.Items = append(moves, copies...)
+	heldAtLibPath := make(map[uint64]bool)
+	for i := range rows {
+		if _, ok := p.LibraryPaths[keyOf(rows[i].RelPath)]; ok {
+			heldAtLibPath[rows[i].Hash] = true
+		}
+	}
 	var restore []string
 	for i := range rows {
 		r := &rows[i]
@@ -183,7 +189,10 @@ func MakePlan(sc *Scan, rows []FileRow) *Plan {
 		if used[r] {
 			continue
 		}
-		if _, ok := p.LibraryHashes[r.Hash]; ok {
+		// The content is the library's: keep the row, unless another row
+		// at a path the library has already holds it (a leftover of an
+		// interrupted move: a redundant copy).
+		if _, ok := p.LibraryHashes[r.Hash]; ok && !heldAtLibPath[r.Hash] {
 			continue
 		}
 		p.Extra.add(r.Size)

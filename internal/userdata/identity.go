@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Identity is who a library is, as a backup set records it: the
@@ -105,6 +107,73 @@ func (d *DB) Identity(ctx context.Context) (Identity, error) {
 		return Identity{}, err
 	}
 	return id, nil
+}
+
+// PeekIdentity is Identity without writing: when this database has no
+// instance yet, or its stored root or host differ from where it is now,
+// Instance is "" (the instance a write would create is new, so no set
+// can have recorded it).
+func (d *DB) PeekIdentity(ctx context.Context) (Identity, error) {
+	var libID string
+	if err := d.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'library_id'`).Scan(&libID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Identity{}, errors.New("userdata: the library has no identity yet")
+		}
+		return Identity{}, fmt.Errorf("userdata: library id: %w", err)
+	}
+	id := Identity{LibraryID: libID, Root: d.canonicalRoot(), Host: hostName()}
+	inst, root, host, err := readInstance(ctx, d.db)
+	if err != nil {
+		return Identity{}, fmt.Errorf("userdata: identity: %w", err)
+	}
+	if inst != "" && sameRoot(root, id.Root) && strings.EqualFold(host, id.Host) {
+		id.Instance = inst
+	}
+	return id, nil
+}
+
+// ErrNeedsMigration: OpenReadOnly found a user.db of schema version 1,
+// which a command that writes would upgrade first.
+var ErrNeedsMigration = errors.New("user.db has schema version 1 and would be upgraded to version 2 first (a run without --dry-run does that)")
+
+// OpenReadOnly opens an existing user.db read-only (SQLite mode=ro; its
+// WAL is read, nothing is written, nothing is created or migrated). A
+// missing file is fs.ErrNotExist, version 1 ErrNeedsMigration, another
+// version a *VersionError.
+func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	if strings.Contains(path, "?") {
+		return nil, fmt.Errorf("userdata: database path %q contains '?', which is not supported", path)
+	}
+	p := filepath.ToSlash(path)
+	if runtime.GOOS == "windows" && !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	u := url.URL{Scheme: "file", Path: p}
+	sqldb, err := sql.Open("sqlite", u.String()+"?mode=ro&_pragma=busy_timeout(10000)")
+	if err != nil {
+		return nil, fmt.Errorf("userdata: open %s: %w", path, err)
+	}
+	d := &DB{db: sqldb, path: path, now: time.Now}
+	v, tables, err := d.version(ctx)
+	switch {
+	case err != nil:
+		err = fmt.Errorf("userdata: open %s: %w", path, err)
+	case v == SchemaVersion:
+		return d, nil
+	case v == 1:
+		err = ErrNeedsMigration
+	case v == 0 && tables == 0:
+		err = fmt.Errorf("userdata: %s is empty: %w", path, os.ErrNotExist)
+	case v == 0:
+		err = fmt.Errorf("userdata: %s: %w", path, ErrNotUserDB)
+	default:
+		err = fmt.Errorf("userdata: %s: %w", path, &VersionError{Version: v})
+	}
+	sqldb.Close()
+	return nil, err
 }
 
 // IntegrityCheck checks the user.db file at path read-only: PRAGMA

@@ -100,11 +100,9 @@ func (s *Set) checkOwner(owner, id Identity, owned, takeOver bool) error {
 // CheckOwner reports whether the library id may use the set without
 // writing anything: nil when the set belongs to it (and was last written
 // by its instance, or the instance is not recorded) or has no owner yet
-// (unless owned).
+// (unless owned). A library without an identity yet (id.LibraryID "",
+// a dry run before its user.db exists) owns no set.
 func (s *Set) CheckOwner(ctx context.Context, id Identity, owned bool) error {
-	if id.LibraryID == "" {
-		return errors.New("backup: the library's identity is unknown")
-	}
 	owner, err := s.Owner(ctx)
 	if err != nil {
 		return err
@@ -160,7 +158,7 @@ func CheckSetOwner(ctx context.Context, t *Target, name string, id Identity) err
 	if !SetExists(t, name) {
 		return nil
 	}
-	s, err := OpenSet(ctx, t, name, false)
+	s, err := OpenSetReadOnly(ctx, t, name)
 	if err != nil {
 		return err
 	}
