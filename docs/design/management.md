@@ -561,3 +561,228 @@ libraries state machine), no `any`, wall-clock date handling via
   is needed for it; it is a server feature plus UI.
 - Manual album ordering (`position` is already there), tag hierarchies,
   smart albums (saved filters), moving items between libraries.
+
+## As implemented (backend)
+
+Everything outside `web/`. Notes that matter to the client are marked
+**(frontend)**. Where this section is silent, the contract holds.
+
+### API shapes, exactly
+
+- **(frontend)** `GET /api/libraries` → `{root, mode, libraries: [lib],
+  folders: [{id, name, path, state: "folder"}]}`, both lists sorted by id
+  (byte order). `folders` gained `id` (= name) and `state`. A folder that
+  is being rebuilt is listed under `libraries` with `state: "rebuilding"`
+  and no summary; once it has a `media.db` it is a library.
+- **(frontend)** `lib` = `{id, name, path, state, summary?, cover?,
+  holder?, error?}`; `name` = `id`; `path` is the folder in the listing,
+  the resolved root once opened; `summary` is the `/library` summary
+  object; `cover` a hash. `holder` = `{pid, cmd, since}` with `since` a
+  wall-clock string in the server's zone (or `null`), `pid` 0 and `cmd`
+  `""` when unknown. A closed library whose catalog cannot be peeked is
+  listed as `error` with the reason. `busy` is known only after an open
+  attempt (the listing does not probe locks); it stays until the next
+  open succeeds.
+- **(frontend)** `GET /api/libraries/{lib}/cover` (added at the client's
+  request): the 256 px JPEG of the library's cover item for a library in
+  any readable state, closed included, read through the cached peek and
+  a read-only thumbnail store without the lock. `ETag:
+  "<hash>-<FormatVersion>-<thumbAt or 0>"`, `Cache-Control: private,
+  max-age=3600`, `If-None-Match` → 304. 404 when the id is unknown or
+  invalid, for a folder, an unreadable catalog, no cover or no thumbnail.
+- **(frontend)** `POST /api/libraries {name}` → 201 `lib` (state `open`).
+  400 in single mode, for malformed JSON and for an invalid name: the id
+  rules plus no `< > " | ? *`, control characters, trailing dot or space,
+  or Windows device name (`CON`, `nul.txt`, `Com1`, `LPT9.jpg`; `COM10`
+  and `console` are fine). 409 when a file or folder of that name exists.
+- **(frontend)** `POST /api/libraries/{lib}/open` → 200 `lib`; 409
+  `{error, state: "busy", holder}`; 409 `{error, state: "error"}`
+  (unreadable or needs-rebuild catalog; `error` says which); 409 `{error,
+  state: "folder"}` for a folder; 503 `{error, state: "rebuilding"}`.
+  Opening an open library is 200 again.
+- **(frontend)** Scoped routes `/api/l/{lib}/...`: 404 `{"error": "no such
+  library"}` for a malformed or unknown id; 409 `{"error": "library is not
+  open", "state": "closed"|"busy"|"error"|"folder"}`; 503 `{"error": "the
+  library is being rebuilt", "state": "rebuilding"}`. Only these library
+  state answers (and the open/jobs ones above) carry `state`; every other
+  409 (job running, tag name taken) is a plain `{error}`. After shutdown
+  every library route is 503 `{"error": "the server is shutting down"}`.
+  A literal `..` segment is cleaned by Go's mux (307 to the unprefixed
+  path, which is 404); `%2e%2e`, `%2F`, `%5C`, `:` and NUL reach the id
+  check and are 404.
+- **(frontend)** `/api/l/{lib}/library` adds `id`, `userdb: {ratings,
+  tags, albums, trashed, ignoredPairs}` and `similar: {at, distance,
+  items, pairs}`, all `null` before the first run; `at` is **Unix seconds**
+  (a number, as `thumbAt`), not a string.
+- **(frontend)** Items: `rating` (omitted when 0) and `deletedAt`
+  (wall-clock string in the server's zone, `2024-07-14T13:05:22`, only on
+  trashed rows). Detail: `rating` (0 when unrated), `tags: [{id, name}]`,
+  `albums: [{id, name}]` (both sorted by name), `deletedAt` (`null` when
+  live). **The detail and `/file` of a trashed row are now 200** (step 3
+  answered 404 for deleted rows): the file comes from the trash path.
+- **(frontend)** Filters: `recur` is `MM-DD` or `MM-DD..MM-DD`; `tag`
+  repeatable, at most 32; `rating` 1–5; `album` and `tag` positive ids;
+  `trashed` `1` (or `0`/empty). Each malformed value is 400 naming the
+  parameter (`invalid recur "13-01": ...`). An unknown tag or album id is
+  not an error: it matches nothing.
+- **(frontend)** `POST ratings {hashes, rating}`: `rating` is required
+  (0 clears); `updated` counts the hashes whose stored rating changed.
+- **(frontend)** Tags: `GET tags` → `{tags: [{id, name, count}]}` sorted
+  case-insensitively. `POST tags` → 201 or 200 `{id, name, count}`. Rename
+  → the tag; 404 unknown id; 409 `{error}` taken (a case-only rename of
+  the same tag is allowed). `POST tags/{tid}/delete` → `{removed}`.
+  `POST media/tags` → `{tags: [{id, name, count}]}`: every tag added, the
+  `add` ids first then the `create` names (created or found
+  case-insensitively), without duplicates, with their new counts; one
+  transaction; 404 when an `add`/`remove` id does not exist (nothing
+  changes). At most 100 ids per list and 100 names.
+- **(frontend)** Albums: `{id, name, count, cover, createdAt, updatedAt}`
+  with `cover` a hash or `null` (empty album) and the times RFC 3339 in
+  the server's zone. Without an explicit cover that is still a member,
+  `cover` is the newest live member by capture time, else the member
+  added last. `POST albums/{aid}` takes `name` and/or `cover` (absent:
+  unchanged, `null`: cleared, a hash: set; a non-member hash is stored but
+  only shown once it is a member); it bumps `updatedAt`, as do item
+  changes. `albums/{aid}/items`: `add` and `remove` together at most 2000;
+  adds first, members keep their position. 404 for an unknown album.
+- **(frontend)** Trash: `failed` entries are `{hash, error}` with texts
+  such as `not in the catalog`, `already in the trash`, `not in the
+  trash`, `the file is missing`, `the trash already holds a different file
+  at this path`, `the file is on another volume ...`. `trash/delete` needs
+  `confirm: true` and exactly one of a non-empty `hashes` or `all: true`
+  (400 otherwise); live rows are reported in `failed`.
+- **(frontend)** `GET similar` → `{groups: [{items, maxDistance}], total,
+  at, distance}` with `at` Unix seconds or `null`. Items are the item
+  object plus `size, width, height, relPath`, ordered by pixel count,
+  then file size (largest first), then hash, so the first is the natural
+  "keep". `offset` 0–2^30 and `limit` 1–200 (default 50); other values
+  400. Groups use only pairs whose rows both exist and are live, minus
+  ignored pairs; an offset past the end gives `groups: []` with the
+  `total`.
+- **(frontend)** `POST similar/ignore {hashes}` takes **2–200 hashes**
+  (every pair among them is stored, n(n-1)/2 rows; 2000 would be two
+  million) and returns `{ignored}` = new pairs.
+- **(frontend)** Jobs: the job object always has `library` (the id),
+  also in `GET /api/jobs` and SSE replays. `similar` jobs add `distance`
+  (the effective one, default 6) and `progress: {phase, items, bands,
+  pairs}` once running; their SSE `progress` events carry that object at
+  the top level (`{"phase":"compare","items":136000,"bands":3,"pairs":0}`;
+  all four fields always present). `rebuild` jobs show `noThumbs` and the
+  importer stats (`existing` = files recorded) and send `progress`/`result`
+  events like an import. Exit codes: 0, 2 (per-file errors or thumbnail
+  failures, as `import`), 130 cancelled, 1 failed. Logs:
+  `.picmover/logs/similar_<time>.log`, `rebuild_<time>.log`.
+  `GET /api/l/{lib}/jobs` lists that library's jobs; `GET /api/jobs` all.
+  Job kinds other than these four are 400.
+- `POST /api/libraries/{lib}/jobs`: an open library takes every kind; a
+  folder or an unreadable catalog (state `error`, or a `closed` one whose
+  peek fails) only `rebuild`, else 409 `{error, state}`; `closed`/`busy`
+  409 `{error, state}`; `rebuilding` 503.
+
+### Deviations and additions
+
+- **Restore into a taken path** uses `library.UniqueName`, the importer's
+  rule: `name_1.ext`, `name_2.ext`, ... (the contract said `name-2.ext`).
+  Taken means present on disk or recorded in the catalog.
+- **Open libraries are not re-listed per request**: a scoped request on
+  an open library uses the registry; the directory listing is read for
+  ids that are not open, for `/api/libraries*` and for opens.
+- **`server.Options`**: `Workspace` (folder of libraries; excludes
+  `Library/Catalog/Store`) and `UserData` (single mode; nil opens
+  `<library>/user.db`). In single mode the server now owns the handles:
+  `Shutdown` cancels the job and then closes every library (catalog,
+  store, user.db) and releases the locks it took; closing them again is
+  harmless. `(*Server).Mode()`.
+- **Rebuild job**: waits up to 10 s for in-flight requests on the library
+  before closing its catalog and store (a long file stream holds no
+  catalog handle, so it is not cut). On a failure before the new catalog
+  exists (backup refused, ...) the old catalog is reopened; when it cannot
+  be, the library becomes `error`. A folder or unreadable library is
+  attached and locked at the start and stays locked and open afterwards.
+  Times stored as instants use the server's zone (the CLI default).
+- **user.db API** refinements: `SetRating` returns the number changed;
+  `TagMedia(ctx, hashes, add, remove, create)` also creates names, in the
+  same transaction, and returns the tags added; `HashesWithTags` (AND)
+  next to `HashesWithTag`; `AlbumEdit(id, add, remove)` with
+  `AlbumAdd/AlbumRemove` as wrappers; `Album`, `UpdateAlbum(id,
+  AlbumUpdate{Name, Cover, ClearCover})`; `TrashedAt(nil)` returns every
+  row (rebuild); `Rating`, `Counts`, exported `CleanName`, `NewPair`,
+  errors `ErrNotFound`, `ErrNameTaken`, `ErrInvalidName`,
+  `ErrInvalidRating`. Tag and album names also refuse U+2028/2029 and
+  U+FFFD. `userdata.Album.Cover` falls back to the member added last; the
+  server applies the "newest by capture time" rule on top (the catalog
+  knows capture times).
+- **Catalog**: `Filter.Recur *Recur{From, To}` and `ValidMonthDay`;
+  `GetByHash`, `ByHashes`, `NewestOf`, `Cover`, `PHashItems`,
+  `SimilarPairs` (live rows only), `CountSimilarPairs`,
+  `ReplaceSimilarPairs(pairs, meta)` (one transaction), `Meta`, `SetMeta`,
+  `PeekFile` (read-only `mode=ro`, no lock, refuses another schema with
+  `ErrNeedsRebuild`). `ClearDeleted(hash, rel)` sets the restored path in
+  the same statement; `Remove` also drops the hash's similar pairs. The
+  derived tables are created by `Open` and `OpenExisting`.
+- **Library**: `MoveToTrashAs` (undoing a restore that renamed),
+  `IsCrossDevice`, `BackupCatalog`/`CatalogFileSuffixes` moved from `cmd`
+  (the rebuild job shares them), `UserDBName`; `user.db` and its
+  `-wal/-shm/-journal` are internal (`IsInternal`), like `media.db`.
+- **Importer**: `Options.TrashTimes`. The trash is walked as a second
+  pipeline after the library tree, so a trash file identical to a live
+  one is a duplicate (the live row wins) and a trash file whose path is
+  recorded live is an error result. Result message `in trash`.
+- **`serve`**: `Use` is `serve <library-or-workspace>`. `--workspace` on a
+  folder with `media.db` is a usage error; on an absent folder it creates
+  it. The banner counts the subfolders with a regular `media.db`
+  (`(1 library)`, `(N libraries)`). The refusal hint adds `picmover serve
+  --workspace <dir>`. `rebuild` reads trash times from an existing
+  `user.db` (it never creates one); `verify` checks trashed rows at their
+  trash path and counts a file left at a trashed row's library path as an
+  orphan.
+- Trash operations are serialised per library and never cancelled half
+  way by a client disconnect (a moved file is always recorded). If the
+  catalog update fails after a move, the move is undone.
+
+### Tests
+
+`internal/userdata` (schema, reopen, version 2 and foreign-file refusal
+naming the file; ratings incl. a negative int64 hash; tag NOCASE
+uniqueness, 64-rune limit, control characters, rename conflict and case
+rename, delete cascade; album positions, explicit/fallback cover, delete
+cascade, unknown ids; trash rows; ignored pairs normalised as int64;
+counts). `internal/catalog/manage_test.go` (`Hashes` nil/empty/one/
+trashed/50k via json_each, on buckets, items and geo; `recur` plain, one
+day, wrapping, 02-29, whole year, with `from`/`to` and with `Hashes`,
+bucket months, invalid bounds; trashed listing, set/clear/rel path,
+remove with pairs; similar pairs replace, live-only read, int64
+normalisation; meta; derived tables recreated by both opens without a
+version change; `PeekFile`, cover, `PHashItems`). `internal/library`
+(trash round trip, refuse overwrite, restore into a taken name, injected
+EXDEV returned verbatim; `IsInternal` cases for the trash and user.db).
+`internal/similar` (equality with brute force on 3000 clustered hashes for
+d = 1..7, symmetry and dedupe, order independence, phash 0, bucket cap
+with a pair still found through another band, groups and ignore, `Run`
+with meta, progress and cancellation; a 136k benchmark: 80 ms on random
+clustered data). `internal/importer` (`TestRecordInPlaceTrash`).
+`internal/server` (`management_test.go`, `management_review_test.go`,
+`workspace_test.go`: ratings/tags/albums incl. 400s, the 2000 cap, unknown
+fields, 409 without `state`, header and origin rules on every new POST;
+new filter parameters on all four endpoints; the trash flow incl. serving
+from the trash, restore into a taken name, `confirm`, `all`, renditions
+deleted and ratings kept; trash serving refuses symlinks and escaping
+paths, deletion removes a link not its target; the similar job, groups,
+pagination, trash and ignore; the rebuild job's 503 window and reopen
+with trash and ratings kept; workspace discovery with hidden, symlinked
+inside/outside entries and files; cover thumbnails; id validation on
+scoped, open and jobs routes; closed/open/busy (holder)/error/folder;
+locks released at shutdown; create with reserved names and 409; peek
+cache by size, mtime and TTL; rebuilding a folder and an unreadable
+catalog; job lists with `library`; single-mode listing and the removed
+step 3 paths; the similar progress event shape). Existing server tests
+moved to `/api/l/lib/...`. `cmd` (`serve_mode_test.go`: the four modes,
+`--workspace` cases, refusal hint, a served workspace with per-library
+locking; `trash_test.go`: rebuild records the trash with user.db times
+and keeps ratings, verify checks the trash path).
+
+Not measured: the step 4 performance targets other than the similarity
+search (no 136k-row benchmarks were added for the rating/tag/album
+filters, `recur` timelines or the groups page). The pre-existing
+`TestThumbsCancellationLeavesPending` in `internal/importer` is timing
+dependent and fails now and then on the base commit too.

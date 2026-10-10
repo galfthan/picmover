@@ -100,6 +100,13 @@ Flags:
 - `--no-open`: do not open the browser (it is also not opened when stdout is not a terminal).
 - `--cors-origin URL`: allow a development page at URL (for example `http://localhost:5173`) to call the API cross-origin; repeatable.
 - `--verbose`: log every request to stderr.
+- `--workspace`: serve the folder as a workspace (below) even when it holds no library yet; it is created when absent.
+
+**Workspaces.** `picmover serve /media`, where `/media` holds libraries as subfolders (`/media/peter`, `/media/penny`), serves all of them: the browser starts with a page listing the libraries (cover, counts, date span, state), opens any of them, creates new ones, and records a plain subfolder in place (the same as `picmover rebuild`) so it becomes a library. The folder is served as a workspace when it has no `media.db` itself and at least one subfolder has one, or with `--workspace`; it prints `Serving workspace /media (N libraries) at ...`. Each library is locked only once it is opened in the browser, so the others stay free for the CLI; a library in use by another picmover process is shown with that process. `picmover serve /media/peter` still serves one library.
+
+**Ratings, tags, albums, trash.** Select photos in the grid (checkbox, Ctrl/Cmd-click, Shift-click for a range) or use the lightbox to rate (0–5), tag, add to albums, or move to the trash. This user data lives in `<library>/user.db`, keyed by content hash; `rebuild` never touches it, so back it up with your photos. Deleting moves a file to `<library>/.picmover/trash/` (a rename on the same volume, never a copy) and hides it; restore puts it back (under `name_1.ext` when the original name is taken meanwhile). Emptying the trash, after an explicit confirmation, is the only way picmover deletes a file. The filters gain minimum rating, tags, album and "every year" date ranges (for example 24–26 December of every year).
+
+**Near-duplicates.** The Duplicates page runs a job that compares the perceptual hashes computed with the thumbnails (Hamming distance 1–7, default 6; 136k photos take well under 10 s) and shows groups of similar photos: keep one and trash the rest, or ignore the group.
 
 Frontend development: run `picmover serve /path/to/library --no-open --cors-origin http://localhost:5173` and, in `web/`, `npm run dev`; Vite serves the app on `http://localhost:5173` with hot reload and proxies `/api` to `127.0.0.1:7439` (the proxy rewrites the `Host` header, `changeOrigin: true`, so the server's host check passes). The `--cors-origin` flag accepts the dev page's `Origin` header, which browsers send on every POST even through the proxy, and also lets the page call `http://127.0.0.1:7439/api/...` directly, bypassing the proxy. `make check` runs the Go vet and tests plus the frontend checks and tests.
 
@@ -136,7 +143,7 @@ To recreate the catalog from the files in the library:
 
 The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet`, `--no-thumbs` as for `import`.
 
-A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
+Files in the trash (`.picmover/trash/`) are recorded as trashed, with the time they were trashed from `user.db` (else their modification time); `user.db` itself is never changed. A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
 
 To undo a rebuild, delete the new `media.db` (and its `-wal`/`-shm`) and rename the newest `media.db.bak-<timestamp>` files back to `media.db`. If `media.db` is missing but backups exist, `rebuild` names the newest one before recording the files, so a backup that should have been restored is noticed. To move stray files into the layout instead, use `picmover import <library> <library>`.
 
@@ -181,7 +188,7 @@ To check the catalog against the files in the library:
 ./picmover verify /path/to/library
 ```
 
-Every catalog row must point to an existing file with the recorded size. The command also lists files under `image/`, `image_raw/` and `video/` that are not in the catalog, files whose name matches a catalog row only when case is ignored (they would collide when the library is copied to Windows or macOS), and catalog rows whose paths differ only in case. It exits with status 1 when any problem is found.
+Every catalog row must point to an existing file with the recorded size (a trashed row: its file in `.picmover/trash/`). The command also lists files under `image/`, `image_raw/` and `video/` that are not in the catalog, files whose name matches a catalog row only when case is ignored (they would collide when the library is copied to Windows or macOS), and catalog rows whose paths differ only in case. It exits with status 1 when any problem is found.
 
 Flags:
 
@@ -197,7 +204,9 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
   image/YYYY/MM/<name>
   image_raw/YYYY/MM/<name>
   video/YYYY/MM/<name>
-  media.db              catalog
+  media.db              catalog (derived from the files; rebuild recreates it)
+  user.db               ratings, tags, albums, trash times (never rebuilt; back it up)
+  .picmover/trash/      trashed files, under their library path
   .picmover/thumbs.db   thumbnail cache (256 px JPEGs, keyed by content hash)
   .picmover/previews/   preview cache (1600 px JPEGs, <hh>/<hash>.jpg)
   .picmover/logs/       import, thumbs and rebuild logs
