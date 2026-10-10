@@ -768,3 +768,89 @@ in 18 files (32 new), plus `npm run build` without warnings.
   Library page line (recent, older than 30 days, no target); the Libraries
   page lines (recent, stale, absent).
 - `App.test.ts`: the nav gained Backups.
+
+### Review fixes (frontend)
+
+After the first run against the real server (findings H1-H2, M1-M8,
+L1-L10). Where this list and the sections above disagree, this list holds.
+
+- **Run stats come from `result` (H1).** `Job.result` (the run's stats once
+  finished) is typed; every backup-kind outcome line, the Library page job
+  table (M7: no more "0 imported" for backup kinds) and the summaries read
+  it; `stats` (the importer's zero counters) is ignored for these kinds.
+  Exit 1 shows the server's `error` ("The scrub found 1 damaged and 1
+  missing files (2 repaired); see the job log (<logPath>)"). A cancelled
+  job with a `result` says what it did before stopping.
+- **Jobs belong to a library (H2).** A card shows a job (progress, Cancel,
+  last outcome) only when `job.library` is the page's library and the job's
+  target is the card's (`backups.isFor`): marker ids are shared by every
+  library backed up to the same drive.
+- **Target `error` (M1)** is read (`BackupTarget.error`, and `set.name`)
+  and shown as the headline in the warning tone; Back up now, Scrub, Prune
+  and Restore are disabled, Edit and Forget stay. **`foreign: true`** (with
+  `error` and `set: null`: the set was last written by another copy of
+  this library, e.g. the folder was copied to another machine) adds **Take
+  over…**: a dialog says this library becomes the set's writer and the
+  other copy's backups there are treated as this library's, then starts
+  `{kind: "backup", target, takeOver: true}`. Without `foreign` an error
+  target has no Take over.
+- **Capped lists (M2).** `failedCount`, `damagedCount`, `missingCount` and
+  `unknownCount` are preferred over list lengths in the problems panel and
+  in run summaries; with `truncated: true` the panel says "The run's list
+  truncated to 500; the run log has every file" and summaries end with
+  "; list truncated to 500".
+- **Repaired missing files (M3).** The scrub's `repaired` counts damaged
+  and missing files copied again; when it covers the repaired damaged
+  files plus `missingCount`, the missing files are tagged "repaired". The
+  "Problems N" badge counts only open items (repaired damaged and missing
+  files excluded); list headings say "(2, 1 repaired)"; with nothing open
+  the summary reads "No open problems in the last runs".
+- **Restore preview (M4)** uses the plan's `restore` class (`{count, bytes,
+  paths}`, set rows missing from the library). Without it the dialog
+  explains what a restore does with no count and the button says "Restore
+  missing files"; `extra` (which includes `.picmover/previous/` versions)
+  is no longer used for it.
+- **Budgeted scrubs (M5).** The store remembers the budget of a scrub it
+  started (`jobBudgets`); its progress bar is the time used of the budget,
+  the numbers are "N files checked" and "stops after 15 min", no ETA; the
+  pill says "Scrubbing: N files checked…" without a percentage. Without a
+  known budget (another tab, a reload) the file/bytes bar stays.
+- **Live region (M6).** Only a visually hidden status line is
+  `aria-live="polite"`: "Backup: copying" (changes with the phase), then
+  the outcome. In a card it is part of the card so it outlives the
+  progress block; the counters are in the progress bar's
+  `aria-valuenow`/`aria-valuetext`.
+- **Fake server (M8)** answers as the real one: job objects with `target`,
+  `mode` (restore), zero `stats`, `result` and the last `progress` when
+  finished (`finish(id, …)` updates `GET /api/jobs` and sends `done`); run
+  stats in the real shapes (lists plus `*Count`, `truncated`); a new target
+  with a zero set and a plan; the plain GET with `behind` (`planOnGet`);
+  progress with `rate`/`eta`; target `error`/`foreign`; the real 409 texts.
+- **L1** server `rate`/`eta` are used when sent (`eta: -1` unknown, rate 0
+  hidden); the 20 s meter only when absent. **L2** a prune 409 keeps the
+  server's message, loads a fresh plan into the dialog and clears the typed
+  count. **L3** the prompt shows "Type 1,204", and digits with or without
+  grouping are accepted. **L4** labels `maxlength="64"`. **L5** a library
+  without `backup` in the listing (not in state error) shows "⚠ No backup
+  target yet"; that line is a muted warning (tone `muted`) everywhere.
+  **L6** focus goes to the job's Cancel after Back up now, Scrub, Prune and
+  Restore, back to Back up now when the job ends, to the label field on
+  Edit and back to Edit afterwards, and to the typed-count field when the
+  prune plan arrives. **L7** the snapshot phase shows "Saving catalog
+  snapshots…" (pill and card) without counters or bar. **L8** moves are not
+  "not backed up": "1 file to move", or "2 files, 2.0 KiB not backed up
+  yet; 1 to move". **L9** Edit's Browse starts the picker at the roots for
+  a UNC path. **L10** the Import page's "Show progress" for a backup-kind
+  job opens Backups.
+
+Tests: `make web-check`: svelte-check 0 errors, 0 warnings; 192 vitest
+tests in 18 files (21 more than before). New or changed: `Backups.test.ts`
+(H1 outcomes from `result` for backup, scrub exit 1, prune and restore; H2
+a penny job on the shared target; M1 error target; Take over with and
+without `foreign`; M2 truncated list; M3 problems count and repaired tag;
+M4 restore class and its absence; M5 budgeted scrub; M6 live region; M7
+Library job table; L1, L2, L3, L4, L5, L6, L7, L9, L10; plain GET with and
+without `behind`), `lib/backupinfo.test.ts` (real result shapes, counts,
+truncation, missing repair rules, server rate/ETA, move headlines,
+`summaryFromLib`, error headline), `lib/api.test.ts` (`error`, `foreign`,
+`set.name`, `plan.restore`, `takeOver` body).
