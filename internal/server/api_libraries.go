@@ -1,10 +1,13 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"net/http"
 	"path/filepath"
+	"slices"
+	"sync"
 
 	"picmover/internal/catalog"
 	"picmover/internal/library"
@@ -82,7 +85,10 @@ func (s *Server) describe(ctx context.Context, l listed, e *libEntry) libJSON {
 	pk, err := s.ws.peek(ctx, filepath.Join(l.path, library.DBName))
 	switch {
 	case err != nil && out.State == libClosed:
-		out.State, out.Error = libError, describeErr(err)
+		if ctx.Err() == nil {
+			s.log.Info("cannot peek library", "id", l.id, "err", err)
+		}
+		out.State, out.Error = libError, publicLibError(err)
 	case err == nil:
 		out.Summary = newSummary(pk.Summary)
 		if pk.HasCover {
@@ -102,6 +108,11 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := librariesJSON{Root: s.ws.root, Mode: s.Mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
+	// The peeks a listing needs run concurrently, at most peekWorkers at
+	// a time; unchanged catalogs come from the cache.
+	var described []*libJSON
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, peekWorkers)
 	for _, l := range all {
 		e := s.ws.entry(l.id)
 		if !l.library {
@@ -114,8 +125,19 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 			out.Folders = append(out.Folders, folderJSON{ID: l.id, Name: l.id, Path: l.path, State: libFolder})
 			continue
 		}
-		out.Libraries = append(out.Libraries, s.describe(r.Context(), l, e))
+		d := new(libJSON)
+		described = append(described, d)
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			*d = s.describe(r.Context(), l, e)
+		})
 	}
+	wg.Wait()
+	for _, d := range described {
+		out.Libraries = append(out.Libraries, *d)
+	}
+	slices.SortFunc(out.Libraries, func(a, b libJSON) int { return cmp.Compare(a.ID, b.ID) })
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -140,6 +162,12 @@ func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid name: one folder name, not starting with a dot, without / \\ : < > \" | ? * or control characters, not a Windows device name (CON, NUL, COM1, ...), at most 255 bytes")
 		return
 	}
+	if old := s.ws.entry(name); old != nil {
+		if st, _ := old.snapshot(); st == libRebuilding {
+			writeError(w, http.StatusConflict, "a library of this name is being rebuilt")
+			return
+		}
+	}
 	l, err := s.ws.createLibrary(r.Context(), name)
 	if errors.Is(err, errExists) {
 		writeError(w, http.StatusConflict, err.Error())
@@ -149,7 +177,9 @@ func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
-	e := s.ws.entryFor(l)
+	// The folder is new: an entry left from a deleted folder of the same
+	// name (open, holding its lock) is retired, never reused.
+	e := s.ws.freshEntry(l)
 	if err := s.ws.open(r.Context(), e); err != nil {
 		s.openFailed(w, r, l, e, err)
 		return
@@ -246,5 +276,5 @@ func (s *Server) openFailed(w http.ResponseWriter, r *http.Request, l listed, e 
 		return
 	}
 	s.log.Info("cannot open library", "id", l.id, "err", err)
-	writeJSON(w, http.StatusConflict, stateError{Error: describeErr(err), State: libError})
+	writeJSON(w, http.StatusConflict, stateError{Error: publicLibError(err), State: libError})
 }

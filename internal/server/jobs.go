@@ -581,11 +581,13 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 	}
 	lib, err := library.Open(h.lib.Root())
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	logFile, logPath, err := lib.OpenLog(j.params.Kind)
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	defer logFile.Close()
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -607,6 +609,15 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		opts.MinDimension = j.params.MinDimension
 		opts.Extractor = metadata.Default{DefaultZone: j.zone}
 		opts.NoThumbs = j.params.NoThumbs
+		// Content found in the trash is restored under the library's
+		// trash lock, and its user.db trash row removed.
+		opts.TrashLock = &j.entry.trashMu
+		opts.OnRestored = func(ctx context.Context, hash uint64) error {
+			if h.user == nil {
+				return nil
+			}
+			return h.user.Untrash(ctx, []uint64{hash})
+		}
 	} else {
 		opts.ThumbLimit = j.params.Limit
 	}
@@ -636,25 +647,31 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 
 // outcome maps a run's result to the job state, the CLI's exit code (0;
 // 2 for per-file or thumbnail failures; 130 cancelled; 1 otherwise) and
-// the CLI's error message.
+// the error message. Messages name no paths and carry no raw OS errors:
+// they point at the job log (the job object's logPath), and the detail
+// is in that log.
 func outcome(kind string, s importer.Stats, err error, logPath, root string) (state string, code int, msg string) {
+	_ = logPath
 	var stageErr *importer.ThumbStageError
 	switch {
 	case errors.Is(err, context.Canceled):
 		return stateCancelled, 130, ""
 	case errors.As(err, &stageErr):
-		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (%v); fix the cache and run 'picmover thumbs %s'",
-			stageErr.Err, library.QuoteArg(root))
+		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (see the job log); fix the cache and run 'picmover thumbs %s'",
+			library.QuoteArg(root))
 		if s.Errors > 0 {
-			msg = fmt.Sprintf("%d files could not be imported (see %s); %s", s.Errors, logPath, msg)
+			msg = fmt.Sprintf("%d files could not be imported (see the job log); %s", s.Errors, msg)
 		}
 		return stateDone, 2, msg
 	case err != nil:
-		return stateFailed, 1, err.Error()
+		if msg = publicLibError(err); msg == genericLibError {
+			msg = kind + " failed; see the job log"
+		}
+		return stateFailed, 1, msg
 	case (kind == kindImport || kind == kindRebuild) && s.Errors > 0:
-		return stateDone, 2, fmt.Sprintf("%d files could not be imported; see %s", s.Errors, logPath)
+		return stateDone, 2, fmt.Sprintf("%d files could not be imported; see the job log", s.Errors)
 	case s.ThumbsFailed > 0:
-		return stateDone, 2, fmt.Sprintf("thumbnails failed for %d files; see %s", s.ThumbsFailed, logPath)
+		return stateDone, 2, fmt.Sprintf("thumbnails failed for %d files; see the job log", s.ThumbsFailed)
 	}
 	return stateDone, 0, ""
 }
@@ -669,11 +686,13 @@ func (m *jobManager) runSimilar(j *job) (state string, code int, stats importer.
 	}
 	lib, err := library.Open(h.lib.Root())
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	logFile, logPath, err := lib.OpenLog(kindSimilar)
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Error("job not started", "id", j.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	defer logFile.Close()
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -690,7 +709,7 @@ func (m *jobManager) runSimilar(j *job) (state string, code int, stats importer.
 		state, code = stateCancelled, 130
 	case err != nil:
 		logger.Error("similar failed", "err", err)
-		state, code, msg = stateFailed, 1, err.Error()
+		state, code, msg = stateFailed, 1, "the search failed; see the job log"
 	default:
 		logger.Info("similar finished", "items", res.Items, "pairs", res.Pairs, "distance", res.Distance,
 			"skipped_buckets", len(res.Skipped))
@@ -701,62 +720,100 @@ func (m *jobManager) runSimilar(j *job) (state string, code int, stats importer.
 }
 
 // runRebuild runs "picmover rebuild" on the job's library: it closes the
-// catalog and the store (requests get 503 meanwhile; user.db stays open),
-// renames media.db to a backup when it exists, records the files and the
-// trash in place into a new catalog (trash times from user.db), runs the
-// thumbnail stage unless noThumbs, and reopens the library. A folder
-// without media.db, or one whose catalog is unreadable, is locked and
-// turned into a library. The library lock is held throughout.
+// catalog and the store (requests get 503 meanwhile; user.db stays open;
+// trash operations wait), reads the trash times from user.db, renames
+// media.db to a backup when it exists, records the files and the trash in
+// place into a new catalog, runs the thumbnail stage unless noThumbs, and
+// reopens the library. A folder without media.db, or one whose catalog is
+// unreadable, is locked and turned into a library. The library lock is
+// held throughout.
+//
+// The new catalog becomes live only when the record stage finished. A
+// failure or a cancellation before that removes the incomplete catalog
+// and renames the backup back (a folder without one becomes a folder
+// again), so the library is never left with a partial or no catalog.
 func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.Stats, sessionID int64, msg string) {
 	ctx := context.Background() // the backup and reopening are not cancelled
-	lib, user, _, err := m.ws.beginRebuild(ctx, j.entry)
+	lib, user, err := m.ws.beginRebuild(ctx, j.entry)
 	if err != nil {
-		return stateFailed, 1, stats, 0, err.Error()
+		m.log.Info("rebuild not started", "id", j.id, "library", j.entry.id, "err", err)
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
-	var db *catalog.DB
-	fail := func(err error) (string, int, importer.Stats, int64, string) {
-		// The catalog was not replaced: reopen the old one when it opens.
-		if old, oerr := catalog.OpenExisting(ctx, lib.DBPath(), m.log); oerr == nil {
+	dbPath := lib.DBPath()
+	// reopenOld ends the rebuild on the catalog that was there before (or
+	// none) after a failure that left it in place.
+	reopenOld := func(err error) (string, int, importer.Stats, int64, string) {
+		m.log.Error("rebuild failed", "id", j.id, "library", j.entry.id, "err", err)
+		if old, oerr := catalog.OpenExisting(ctx, dbPath, m.log); oerr == nil {
 			m.ws.endRebuild(ctx, j.entry, old, nil)
 		} else {
 			m.ws.endRebuild(ctx, j.entry, nil, err)
 		}
-		return stateFailed, 1, stats, 0, err.Error()
+		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
 	if _, err := library.Open(lib.Root()); err != nil { // the temp and log dirs
-		return fail(err)
+		return reopenOld(err)
 	}
 	logFile, logPath, err := lib.OpenLog(kindRebuild)
 	if err != nil {
-		return fail(err)
+		return reopenOld(err)
 	}
 	defer logFile.Close()
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	j.setState(stateRunning, logPath)
 	m.log.Info("job started", "id", j.id, "kind", kindRebuild, "library", j.entry.id, "log", logPath)
 
-	dbPath := lib.DBPath()
+	// Everything that can fail without touching the catalog comes first.
+	times, err := user.TrashedAt(ctx, nil)
+	if err != nil {
+		logger.Error("read trash times", "err", err)
+		return reopenOld(err)
+	}
+	backup := ""
 	switch fi, err := os.Stat(dbPath); {
 	case err == nil && !fi.Mode().IsRegular():
-		return fail(fmt.Errorf("%s is not a regular file", dbPath))
+		logger.Error("rebuild refused", "err", errNotRegularCatalog)
+		return reopenOld(errNotRegularCatalog)
 	case err == nil:
-		backup, err := library.BackupCatalog(dbPath, time.Now())
-		if err != nil {
-			return fail(err)
+		if backup, err = library.BackupCatalog(dbPath, time.Now()); err != nil {
+			logger.Error("back up catalog", "err", err)
+			return reopenOld(err)
 		}
 		logger.Info("old catalog saved", "backup", backup)
 	case !errors.Is(err, fs.ErrNotExist):
-		return fail(err)
+		return reopenOld(err)
 	}
-	db, err = catalog.Open(ctx, dbPath, logger)
-	if err != nil {
-		m.ws.endRebuild(ctx, j.entry, nil, err)
-		return stateFailed, 1, stats, 0, err.Error()
+	// rollback undoes the backup after a failure or cancellation before
+	// the new catalog was complete.
+	rollback := func(db *catalog.DB, cause error) string {
+		if db != nil {
+			db.Close()
+		}
+		if err := library.RestoreCatalogBackup(dbPath, backup); err != nil {
+			logger.Error("restore the previous catalog", "err", err)
+			m.log.Error("rebuild: restore the previous catalog", "id", j.id, "library", j.entry.id, "err", err)
+			m.ws.endRebuild(ctx, j.entry, nil, err)
+			return "the rebuild did not finish and the previous catalog could not be restored; see the job log"
+		}
+		what := "the previous catalog was restored"
+		if backup == "" {
+			what = "the incomplete catalog was removed"
+		}
+		logger.Info("rebuild rolled back", "cause", cause, "backup", backup)
+		if backup == "" {
+			m.ws.endRebuild(ctx, j.entry, nil, cause)
+		} else if old, err := catalog.OpenExisting(ctx, dbPath, m.log); err == nil {
+			m.ws.endRebuild(ctx, j.entry, old, nil)
+		} else {
+			m.ws.endRebuild(ctx, j.entry, nil, err)
+		}
+		return what
 	}
-	times, err := user.TrashedAt(ctx, nil)
+	db, err := catalog.Open(ctx, dbPath, logger)
 	if err != nil {
-		m.ws.endRebuild(ctx, j.entry, db, nil)
-		return stateFailed, 1, stats, 0, err.Error()
+		logger.Error("create catalog", "err", err)
+		what := rollback(nil, err)
+		return stateFailed, 1, stats, 0, publicLibError(err) + "; " + what
 	}
 	var im *importer.Importer
 	opts := importer.Options{
@@ -779,11 +836,25 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 	im = importer.New(lib, db, opts)
 	stats, runErr := im.Run(j.ctx)
 	sessionID = im.SessionID()
+	if !im.RecordStageDone() {
+		if runErr == nil {
+			runErr = errors.New("the record stage did not finish")
+		}
+		what := rollback(db, runErr)
+		if errors.Is(runErr, context.Canceled) {
+			logger.Info("rebuild cancelled")
+			m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", stateCancelled, "exit_code", 130)
+			return stateCancelled, 130, stats, sessionID, "rebuild cancelled; " + what
+		}
+		logger.Error("rebuild failed", "err", runErr)
+		m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", stateFailed, "exit_code", 1)
+		return stateFailed, 1, stats, sessionID, publicLibError(runErr) + "; " + what
+	}
 	m.ws.endRebuild(ctx, j.entry, db, nil)
 	state, code, msg = outcome(kindRebuild, stats, runErr, logPath, lib.Root())
 	switch {
 	case state == stateCancelled:
-		logger.Info("rebuild cancelled")
+		logger.Info("rebuild cancelled during the thumbnail stage; the catalog is complete")
 	case runErr != nil:
 		logger.Error("rebuild failed", "err", runErr)
 	}

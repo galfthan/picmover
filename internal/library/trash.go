@@ -245,3 +245,29 @@ func (l *Library) RemoveTrashFile(rel string) error {
 	syncDir(filepath.Dir(p))
 	return nil
 }
+
+// TrashFiles returns the catalog paths (slash form, relative to TrashDir)
+// of the regular files in the trash, in walk order. Links are not
+// followed and not listed. A missing trash is empty.
+func (l *Library) TrashFiles() ([]string, error) {
+	dir := l.TrashDir()
+	var out []string
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if p == dir && errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	return out, err
+}

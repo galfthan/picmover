@@ -50,7 +50,10 @@ func newCatalog(t *testing.T, dir string, rows ...catalog.Media) *library.Librar
 //	ext   -> a library outside the root (skipped)
 //	.hidden/ a library (skipped)
 //	notes.txt (skipped)
-func newWorkspace(t *testing.T) (*fixture, string) {
+func newWorkspace(t *testing.T) (*fixture, string) { return newWorkspaceWith(t, nil) }
+
+// newWorkspaceWith is newWorkspace with adjusted server options.
+func newWorkspaceWith(t *testing.T, adjust func(*Options)) (*fixture, string) {
 	t.Helper()
 	base := t.TempDir()
 	root := filepath.Join(base, "media")
@@ -79,7 +82,11 @@ func newWorkspace(t *testing.T) (*fixture, string) {
 	if err := os.Symlink(filepath.Join(base, "outside"), filepath.Join(root, "ext")); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Workspace: root, Addr: testAddr, Static: fstest.MapFS{}})
+	opts := Options{Workspace: root, Addr: testAddr, Static: fstest.MapFS{}}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	srv, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,10 +285,6 @@ func TestWorkspaceCreate(t *testing.T) {
 
 func TestWorkspacePeekCache(t *testing.T) {
 	f, root := newWorkspace(t)
-	now := time.Unix(2000000000, 0)
-	f.srv.ws.mu.Lock()
-	f.srv.ws.now = func() time.Time { return now }
-	f.srv.ws.mu.Unlock()
 	dbPath := filepath.Join(root, "penny", "media.db")
 	if l, _ := libByID(f.libraries(), "penny"); l.Summary.Total != 0 {
 		t.Fatalf("penny %+v", l)
@@ -297,12 +300,11 @@ func TestWorkspacePeekCache(t *testing.T) {
 		t.Skip("the insert changed the file size")
 	}
 	os.Chtimes(dbPath, fi.ModTime(), fi.ModTime())
-	if l, _ := libByID(f.libraries(), "penny"); l.Summary.Total != 0 {
-		t.Fatalf("not cached: %+v", l.Summary)
-	}
-	now = now.Add(peekTTL + time.Second)
-	if l, _ := libByID(f.libraries(), "penny"); l.Summary.Total != 1 {
-		t.Fatalf("cache not expired: %+v", l.Summary)
+	// Unchanged size and mtime: the cached peek, with no expiry.
+	for range 2 {
+		if l, _ := libByID(f.libraries(), "penny"); l.Summary.Total != 0 {
+			t.Fatalf("not cached: %+v", l.Summary)
+		}
 	}
 	// A changed mtime refreshes at once.
 	db, _ = catalog.OpenExisting(context.Background(), dbPath, nil)
