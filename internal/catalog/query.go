@@ -32,6 +32,10 @@ type Filter struct {
 	// Recur restricts dated rows to a day range every year; nil = none.
 	// Undated rows never match.
 	Recur *Recur
+	// MinSide and MaxSide bound the longer edge, MAX(width, height), in
+	// pixels (inclusive); 0 = no bound. Rows with unknown dimensions
+	// (width or height NULL or 0) never match when either bound is set.
+	MinSide, MaxSide int
 }
 
 // Recur is an inclusive day-of-year range repeated every year, as
@@ -116,6 +120,20 @@ func (f Filter) where() ([]string, []any, error) {
 		}
 		conds = append(conds, "file_type = ?")
 		args = append(args, f.FileType)
+	}
+	if f.MinSide < 0 || f.MaxSide < 0 || (f.MinSide > 0 && f.MaxSide > 0 && f.MinSide > f.MaxSide) {
+		return nil, nil, fmt.Errorf("catalog: invalid size range %d..%d", f.MinSide, f.MaxSide)
+	}
+	if f.MinSide > 0 || f.MaxSide > 0 {
+		conds = append(conds, "width > 0 AND height > 0")
+		if f.MinSide > 0 {
+			conds = append(conds, "MAX(width, height) >= ?")
+			args = append(args, f.MinSide)
+		}
+		if f.MaxSide > 0 {
+			conds = append(conds, "MAX(width, height) <= ?")
+			args = append(args, f.MaxSide)
+		}
 	}
 	if f.HasGPS {
 		conds = append(conds, "lat IS NOT NULL AND lon IS NOT NULL")
