@@ -15,7 +15,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -350,8 +349,14 @@ func HashFile(p string) (uint64, int64, error) {
 		return 0, 0, err
 	}
 	defer f.Close()
+	return HashReader(f)
+}
+
+// HashReader returns the xxhash64 digest of everything r yields and its
+// length, reading with the pooled 1 MiB buffer.
+func HashReader(r io.Reader) (uint64, int64, error) {
 	h := xxhash.New()
-	n, err := copyBuffered(context.Background(), h, f)
+	n, err := copyBuffered(context.Background(), h, r)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -360,8 +365,9 @@ func HashFile(p string) (uint64, int64, error) {
 
 // CopyVerified copies src to dst, an absolute path inside the library, via a
 // temp file on the same volume. The bytes written are hashed and must equal
-// want; the temp file is fsynced, closed, and only then renamed into place.
-// The source mtime is preserved. On failure nothing is left at dst.
+// want; the temp file is then placed with Commit (fsynced, closed, renamed
+// into place). The source mtime is preserved. On failure nothing is left at
+// dst.
 func (l *Library) CopyVerified(ctx context.Context, src, dst string, want uint64) (int64, error) {
 	in, err := os.Open(src)
 	if err != nil {
@@ -370,9 +376,6 @@ func (l *Library) CopyVerified(ctx context.Context, src, dst string, want uint64
 	defer in.Close()
 	info, err := in.Stat()
 	if err != nil {
-		return 0, err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return 0, err
 	}
 	tmp, err := os.CreateTemp(l.TempDir(), "copy-*.part")
@@ -396,27 +399,9 @@ func (l *Library) CopyVerified(ctx context.Context, src, dst string, want uint64
 	if got := h.Sum64(); got != want {
 		return fail(fmt.Errorf("%w: %s (want %016x, got %016x)", ErrHashMismatch, src, want, got))
 	}
-	// CreateTemp makes the file 0600; imported files should be readable
-	// like the rest of the library. Chmod is a no-op on Windows.
-	if err := tmp.Chmod(0o644); err != nil && runtime.GOOS != "windows" {
-		return fail(err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+	if err := commitFile(tmp, dst, info.ModTime()); err != nil {
 		return 0, err
 	}
-	if err := RenameNoReplace(tmpName, dst); err != nil {
-		os.Remove(tmpName)
-		if errors.Is(err, fs.ErrExist) {
-			return 0, fmt.Errorf("destination already exists: %s", dst)
-		}
-		return 0, err
-	}
-	_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
-	syncDir(filepath.Dir(dst))
 	return n, nil
 }
 
