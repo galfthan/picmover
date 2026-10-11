@@ -33,7 +33,7 @@ func newImportCmd() *cobra.Command {
 		Short: "Import photos and videos into a library",
 		Long: `Import media from a source directory (zip archives included) into the
 library, laid out as <type>/YYYY/MM/<name> by capture date. Each file is
-copied through a temp file, verified by hash and recorded in the catalog.
+copied through a temp file and recorded in the catalog with its hash.
 Files whose content is already in the catalog are skipped as duplicates.
 With --move the sources are deleted once they are safely recorded.
 
@@ -44,8 +44,8 @@ imported file are generated into <library>/.picmover (skip with
 A detailed log is written to <library>/.picmover/logs/.`,
 		Args: exactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if p.minDimension < 0 || p.workers < 0 {
-				return fmt.Errorf("--min-dimension and --workers must be >= 0")
+			if p.minDimension < 0 || p.workers < 0 || p.sourceReaders < 0 {
+				return fmt.Errorf("--min-dimension, --workers and --source-readers must be >= 0")
 			}
 			zone, err := resolveZone(zoneName)
 			if err != nil {
@@ -76,6 +76,7 @@ A detailed log is written to <library>/.picmover/logs/.`,
 	f.BoolVar(&p.move, "move", false, "move files instead of copying (sources are deleted after they are recorded)")
 	f.IntVar(&p.minDimension, "min-dimension", 0, "skip images whose width and height are both below N pixels (0 = no limit)")
 	f.IntVar(&p.workers, "workers", 0, "number of parallel workers (0 = auto)")
+	f.IntVar(&p.sourceReaders, "source-readers", 0, "workers reading the source at once (0 = auto: 1 on FUSE mounts such as phones, else --workers)")
 	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime); default the system zone")
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.noThumbs, "no-thumbs", false, "do not generate thumbnails and previews (run 'picmover thumbs' later)")
@@ -88,6 +89,7 @@ type importParams struct {
 	move            bool
 	minDimension    int
 	workers         int
+	sourceReaders   int
 	zone            *time.Location
 	quiet           bool
 	noThumbs        bool
@@ -179,6 +181,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 			Move:          p.move,
 			MinDimension:  p.minDimension,
 			Workers:       p.workers,
+			SourceReaders: p.sourceReaders,
 			Extractor:     metadata.Default{DefaultZone: p.zone},
 			Logger:        logger,
 			NoThumbs:      p.noThumbs,
@@ -190,7 +193,14 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 			status = newStatusLine(out)
 		}
 		if status != nil {
-			opts.OnProgress = func(s importer.Stats) { status.show(formatStatus(s)) }
+			// The transfer rate is measured between two ticks.
+			prevBytes, prevAt := int64(0), time.Now()
+			opts.OnProgress = func(s importer.Stats) {
+				now := time.Now()
+				rate := transferRate(s.BytesCopied-prevBytes, now.Sub(prevAt))
+				prevBytes, prevAt = s.BytesCopied, now
+				status.show(formatStatus(s, rate))
+			}
 		}
 		if !p.recordInPlace {
 			// Content found in the trash is restored; its user.db trash
@@ -308,13 +318,27 @@ func redrawLine(line string, width int, vt bool) string {
 	return "\r" + strings.Repeat(" ", width) + "\r" + line
 }
 
-func formatStatus(s importer.Stats) string {
+// formatStatus is the live status line of an import; rate is the current
+// transfer rate in bytes per second, shown only while bytes are moving.
+func formatStatus(s importer.Stats, rate int64) string {
 	line := fmt.Sprintf("Scanned %d | Imported %d | Existing %d | Duplicates %d | Small %d | Non-media %d | Errors %d | Copied %s",
 		s.Scanned, s.Imported, s.Existing, s.Duplicates, s.SkippedSmall, s.NonMedia, s.Errors, humanSize(s.BytesCopied))
+	if rate > 0 {
+		line += " (" + humanSize(rate) + "/s)"
+	}
 	if n := thumbsProcessed(s); n > 0 {
 		line += fmt.Sprintf(" | Thumbs %d", n)
 	}
 	return line
+}
+
+// transferRate returns delta bytes over elapsed in bytes per second; 0
+// when nothing was copied (or a discarded copy was taken back).
+func transferRate(delta int64, elapsed time.Duration) int64 {
+	if delta <= 0 || elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(delta) / elapsed.Seconds())
 }
 
 // thumbsProcessed is the number of rows the thumbnail stage has finished.

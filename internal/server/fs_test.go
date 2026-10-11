@@ -27,6 +27,33 @@ func TestFSRoots(t *testing.T) {
 	}
 }
 
+// The gvfs directory (phone mounts) is a root only when it exists.
+func TestFSRootsGvfs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no gvfs on Windows")
+	}
+	run := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", run)
+	gvfs := filepath.Join(run, "gvfs")
+	has := func() bool {
+		for _, d := range roots() {
+			if d.Path == gvfs {
+				return true
+			}
+		}
+		return false
+	}
+	if has() {
+		t.Fatal("missing gvfs directory listed")
+	}
+	if err := os.Mkdir(gvfs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !has() {
+		t.Errorf("gvfs directory %s not listed in %+v", gvfs, roots())
+	}
+}
+
 func TestFSList(t *testing.T) {
 	f := newEmptyServer(t)
 	dir := t.TempDir()
