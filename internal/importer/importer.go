@@ -30,7 +30,12 @@
 //
 // Every read of a source file outside the library (staging, the move
 // verification, hashing, CopyVerified, zip archives) holds one of the
-// SourceReaders slots for the read only. Every staged temp file not placed
+// SourceReaders slots for the read only. On Linux a file on a phone mount
+// (gvfs mtp or gphoto2, internal/gvfs) is not read through FUSE for staging
+// or hashing: the gvfs daemon pulls it into a library temp file with
+// `gio copy` (library.StagePulled, library.HashPulled), which runs at USB
+// speed. If gio is missing, or a pull fails (one warning), the rest of the
+// run reads through FUSE. Every staged temp file not placed
 // is removed. A single writer batches the finished files into catalog
 // transactions. Only after a transaction has committed are move sources
 // deleted; if an insert loses a hash race or the commit fails, the file
@@ -59,6 +64,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/gvfs"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 )
@@ -180,10 +186,19 @@ type Importer struct {
 
 	readers chan struct{} // semaphore of the staging reads, cap SourceReaders
 
+	// usePull: files on a phone mount (gvfs mtp or gphoto2) are read by
+	// pulling them through the gvfs daemon (gio copy) rather than through
+	// FUSE. Set in Run when gio is available; cleared for the rest of the
+	// run when a pull fails.
+	usePull atomic.Bool
+
 	// Test hooks; New sets the real functions.
-	openSource func(string) (*os.File, error)  // opens a source file for reading
-	sameDev    func(src, dir string) bool      // sameDevice
-	place      func(tmpPath, dst string) error // library.Commit
+	openSource func(string) (*os.File, error)                                           // opens a source file for reading
+	sameDev    func(src, dir string) bool                                               // sameDevice
+	place      func(tmpPath, dst string) error                                          // library.Commit
+	pull       func(ctx context.Context, src, dst string, onProgress func(int64)) error // gvfs.Pull
+	isDevice   func(string) bool                                                        // gvfs.IsDevice
+	gioOK      func() bool                                                              // gvfs.Available
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
@@ -228,6 +243,9 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		openSource: os.Open,
 		sameDev:    sameDevice,
 		place:      library.Commit,
+		pull:       gvfs.Pull,
+		isDevice:   gvfs.IsDevice,
+		gioOK:      gvfs.Available,
 	}
 }
 
@@ -284,8 +302,10 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	im.session.Store(im.sessionID)
 	im.opts.SourceReaders = sourceReaders(im.opts.SourceReaders, im.opts.Workers, src)
 	im.readers = make(chan struct{}, im.opts.SourceReaders)
+	im.usePull.Store(!im.opts.RecordInPlace && im.gioOK())
 	im.log.Info("import started", "source", src, "library", im.lib.Root(), "mode", mode,
-		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders, "session", im.sessionID)
+		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders,
+		"gio", im.usePull.Load() && im.isDevice(src), "session", im.sessionID)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -791,21 +811,73 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 // stage copies the source file src into a library temp file
 // (library.StageFile), holding one of the SourceReaders slots while it
 // reads. Every buffer written is added to bytesCopied and to *counted.
+// A file on a phone mount is pulled through the gvfs daemon instead
+// (library.StagePulled with gvfs.Pull) while that works; see pullFailed.
 func (im *Importer) stage(ctx context.Context, src string, counted *int64) (library.Staged, error) {
 	release, err := im.sourceSlot(ctx, src)
 	if err != nil {
 		return library.Staged{}, err
 	}
 	defer release()
+	onWrite := func(n int64) {
+		*counted += n
+		im.bytesCopied.Add(n)
+	}
+	if im.devicePull(src) {
+		before := *counted
+		pull, pullErr := im.pullFunc(src)
+		st, err := library.StagePulled(ctx, src, im.lib.TempDir(), pull, onWrite)
+		if err == nil {
+			im.log.Debug("pulled through gvfs", "file", src, "bytes", st.Size)
+			return st, nil
+		}
+		if ctx.Err() != nil {
+			return library.Staged{}, err
+		}
+		// Read it again through FUSE: take back what the pull counted.
+		im.bytesCopied.Add(before - *counted)
+		*counted = before
+		im.pullFailed(src, *pullErr, err)
+	}
 	in, err := im.openSource(src)
 	if err != nil {
 		return library.Staged{}, err
 	}
 	defer in.Close()
-	return library.StageFile(ctx, in, im.lib.TempDir(), func(n int64) {
-		*counted += n
-		im.bytesCopied.Add(n)
-	})
+	return library.StageFile(ctx, in, im.lib.TempDir(), onWrite)
+}
+
+// devicePull reports whether the source file p is read by pulling it
+// through the gvfs daemon (gio copy) instead of through its FUSE mount.
+func (im *Importer) devicePull(p string) bool {
+	return im.usePull.Load() && im.isDevice(p)
+}
+
+// pullFunc returns im.pull for src as a library.PullFunc, and where the
+// pull's own error is kept (nil when the pull succeeded or did not run).
+func (im *Importer) pullFunc(src string) (library.PullFunc, *error) {
+	var pullErr error
+	return func(ctx context.Context, dst string, onProgress func(int64)) error {
+		pullErr = im.pull(ctx, src, dst, onProgress)
+		return pullErr
+	}, &pullErr
+}
+
+// pullFailed handles a failed pull of src, before the file is read through
+// FUSE instead. pullErr is the pull's own error: gio missing
+// (gvfs.ErrUnavailable) turns pulling off silently, any other pull error
+// turns it off for the rest of the run with one warning. Without a pull
+// error (the pulled copy had the wrong size or could not be hashed) only
+// this file is read through FUSE.
+func (im *Importer) pullFailed(src string, pullErr, err error) {
+	switch {
+	case pullErr == nil:
+		im.log.Debug("pulled copy not used, reading through FUSE", "file", src, "err", err)
+	case errors.Is(pullErr, gvfs.ErrUnavailable):
+		im.usePull.Store(false)
+	case im.usePull.Swap(false):
+		im.log.Warn("gio copy failed, reading through FUSE", "file", src, "err", pullErr)
+	}
 }
 
 // sourceSlot takes one of the SourceReaders slots for a read of p, a
@@ -848,13 +920,27 @@ func (im *Importer) verifySource(ctx context.Context, src string, want uint64) e
 
 // hashSource hashes the file at p (the hash-first path, and the second read
 // of a copy-first move), holding a SourceReaders slot when p is outside the
-// library.
+// library. A file on a phone mount is pulled through the gvfs daemon into
+// a second temp file, hashed and removed (library.HashPulled), while that
+// works; see pullFailed.
 func (im *Importer) hashSource(ctx context.Context, p string) (uint64, int64, error) {
 	release, err := im.sourceSlot(ctx, p)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer release()
+	if im.devicePull(p) {
+		pull, pullErr := im.pullFunc(p)
+		h, n, err := library.HashPulled(ctx, im.lib.TempDir(), pull)
+		if err == nil {
+			im.log.Debug("hashed a pull through gvfs", "file", p, "bytes", n)
+			return h, n, nil
+		}
+		if ctx.Err() != nil {
+			return 0, 0, err
+		}
+		im.pullFailed(p, *pullErr, err)
+	}
 	f, err := im.openSource(p)
 	if err != nil {
 		return 0, 0, err

@@ -324,3 +324,132 @@ Not changed in code:
 - Duplicates are staged before the duplicate check, so an import needs
   temp space in the library for up to `Workers` files at a time,
   duplicates included (noted in the README).
+
+## Phone mounts: pulling through the gvfs daemon
+
+Branch `fix/import-gio` (from `fix/import-copy-first` 27da386).
+
+### What and why
+
+With one read per file, a phone import is still about 1 MB/s through
+the gvfs FUSE mount: the gvfs MTP backend turns every FUSE read chunk
+into a separate MTP partial-object request, one USB round trip each.
+The gvfs daemon can pull a whole object at USB speed (the backend's pull
+operation, `LIBMTP_Get_File_To_File` for MTP); that is what Nautilus and
+`gio copy` use. `gio cat` is not fast: it reads through the same
+per-request path. So on Linux a source file on a phone mount is staged by
+running
+
+    gio copy -- <uri> <library>/.picmover/tmp/copy-XXXX.part
+
+and hashing the local temp file.
+
+### Mapping (`internal/gvfs`)
+
+- `Dir()`: `$XDG_RUNTIME_DIR/gvfs`, else `/run/user/<uid>/gvfs` (the
+  server's folder browser lists it as a root, as before, now through
+  `gvfs.Dir`).
+- `Mount(p)`: for an absolute clean path below `Dir()`, the mount
+  directory name is `<scheme>:host=<host>` possibly followed by
+  `,key=value` parts; it returns the scheme, the host as written there,
+  and the slash path below the mount directory. Linux only; elsewhere
+  false.
+- `IsDevice(p)`: scheme `mtp` (Android) or `gphoto2` (PTP cameras,
+  iPhones). Other gvfs mounts (sftp, smb) keep the FUSE read.
+- `URI(p)`: `<scheme>://<host>/<rel>`, each segment of `rel`
+  percent-encoded with `url.PathEscape` (`/` kept). The host is copied
+  as it is in the directory name: gvfs already escapes reserved
+  characters there as in its URIs (older gvfs: `mtp:host=%5Busb%3A002%2C005%5D`).
+  Example: `.../gvfs/mtp:host=Google_Pixel_7_1A2B3C4D/Internal shared
+  storage/DCIM/Camera/PXL_2025 (1).jpg` is
+  `mtp://Google_Pixel_7_1A2B3C4D/Internal%20shared%20storage/DCIM/Camera/PXL_2025%20%281%29.jpg`.
+- `Pull(ctx, src, dst, onProgress)`: `gio` is found with
+  `exec.LookPath` once (`ErrUnavailable` when missing) and run with
+  `exec.CommandContext` as `gio copy -- <uri> <dst>`; stdout and stderr
+  are kept in one 4 KiB tail buffer. If that fails with a message saying
+  the location is not mounted, `gio copy -- <fuse path> <dst>` is tried
+  once; if that works, later pulls start with the plain path. While gio
+  runs, `dst`'s size is polled every 200 ms and growth reported through
+  `onProgress` (on the caller's goroutine). A non-zero exit returns an
+  error ending in gio's last output line; cancellation kills gio and
+  returns `ctx.Err()`; both remove `dst`.
+
+### Library (`internal/library/pull.go`)
+
+`StagePulled(ctx, src, tmpDir, pull, onWrite)` returns the same
+`Staged` as `Stage`: it stats `src` (never reads it), reserves a
+`copy-*.part` name with `CreateTemp`, runs `pull` onto it, passes the
+pull's progress to `onWrite` as increments (and the rest of the final
+size afterwards), hashes the temp file locally, requires its size to
+equal the source's `Stat` size (`ErrSizeChanged`), and sets the source
+mtime. `HashPulled(ctx, tmpDir, pull)` pulls into a temp file, hashes it
+and removes it. Every error, cancellation included, removes the temp.
+
+Deviation: the reserved empty file is removed again before `pull` runs,
+so gio creates the destination itself. `gio copy` would overwrite it,
+but GIO replaces an existing local file by writing a hidden
+`.goutputstream-XXXXXX` file in the same directory and renaming it at
+the end (the generic copy fallback; the gvfs pull path writes directly):
+the size polled would stay 0 until the end, and a killed gio would leave
+the hidden file behind. A name collision with the removed file is
+impossible in practice (random name, private directory); `CleanTemp`
+clears the directory at the start of every run anyway.
+
+### Importer
+
+- `Run` sets `usePull` when gio is available (not in record-in-place
+  mode) and logs `gio=true` on "import started" when it is set and the
+  source root is on a device mount.
+- `stage`: for a device path while `usePull` holds, `StagePulled` with
+  `gvfs.Pull`, holding the `readers` slot for the whole pull; progress
+  goes to `bytesCopied` and `*counted` as with `StageFile`. Debug log
+  "pulled through gvfs" per file.
+- `hashSource` (the move verification `verifySource` and the hash-first
+  path): for a device path, `HashPulled` into a second temp file. A move
+  therefore still reads the source twice, as two independent pulls.
+- Fallback: the pull error `gvfs.ErrUnavailable` turns pulling off for
+  the run silently; any other pull error turns it off for the rest of the
+  run (an atomic flag) with one warning `gio copy failed, reading
+  through FUSE` (`file`, `err`), and that file is read through FUSE.
+  The bytes the failed pull counted are taken back first. A pull that
+  worked but whose copy has the wrong size, or cannot be hashed, reads
+  only that file through FUSE (debug log "pulled copy not used"); the
+  FUSE read then applies its own size check. Cancellation returns the
+  error without a fallback.
+- Zip archives on a phone keep the FUSE read. `Stats` are unchanged.
+
+### Tests
+
+- `internal/gvfs/gvfs_test.go`: `TestParseMountAndURI` (Pixel, iPhone,
+  Samsung names with spaces, `%`, `#`, `?`, parentheses; old escaped USB
+  host; extra key=value parts; the mount directory; non-device and
+  malformed paths), `TestDir`.
+- `internal/gvfs/gvfs_linux_test.go`, with a shell script standing in for
+  gio: `TestPull` (the exact argv, overwrite of a pre-created
+  destination, monotonic progress), `TestPullFailure` (last stderr line,
+  `dst` removed, no retry), `TestPullFallsBackToPlainPath`,
+  `TestPullCancelled` (killed, `dst` removed), `TestPullNotOnMount`.
+- `internal/library/pull_test.go`: `TestStagePulled` (hash, size,
+  progress increments, mtime, `Commit`, `HashPulled`),
+  `TestStagePulledFailures` (size mismatch, pull error, cancellation
+  during and right after the pull, missing source; no temp left).
+- `internal/importer/gio_test.go` (hooks `pull`, `isDevice`, `gioOK`):
+  `TestDevicePullStages` (device files pulled once, never opened through
+  FUSE; a local file in the same import is), `TestDevicePullLogsGio`,
+  `TestDevicePullFallsBack` (failing gio: one pull, one warning, all files
+  through FUSE, `BytesCopied` exact; no gio: no warning),
+  `TestDevicePullSizeMismatch`, `TestDevicePullMoveVerifies` (second
+  pull; a differing second pull keeps the source),
+  `TestDevicePullMoveVerifyFallsBack`.
+
+### Not verified
+
+The development container has neither gvfs nor gio: the real
+`gio copy` from an MTP or gphoto2 mount, its speed, its exact error
+messages (the "not mounted" retry matches `not mounted`, `no such
+mount`, `mount does not exist`, `mount not found`), whether the gphoto2
+backend pulls whole files, and what the daemon does with a pull whose gio
+client was killed (it may keep writing the unlinked temp file until the
+transfer ends) are untested. gio needs the session's D-Bus; run outside
+the desktop session it fails and the import falls back to FUSE with the
+warning.
