@@ -143,3 +143,87 @@ In `internal/importer` (new `copyfirst_test.go` plus adjustments):
   "Verified Copies" bullet and the import section say what is true now.
 - Commits on `fix/import-copy-first` with explicit paths (`git add <files>`),
   never `git add -A`; no push.
+
+## As implemented
+
+Built as specified, in three code commits on `fix/import-copy-first`
+(library, importer, CLI) plus this documentation commit.
+
+- `internal/library/stage.go`: `Stage(ctx, src, tmpDir, onWrite)`, its
+  core `StageFile(ctx, *os.File, tmpDir, onWrite)` (reads an already
+  opened source, so the importer's test hook sees every source open),
+  the `Staged{Path, Hash, Size}` result, `ErrSourceChanged` (the message
+  is `"<path>: changed while it was read"`), and `Commit(tmpPath, dst)`.
+  `CopyVerified` now places its temp file through the same `commitFile`
+  (chmod 0644, fsync, close, `MkdirAll`, `RenameNoReplace`, mtime, dir
+  sync). `HashReader` was added next to `HashFile` for the importer's
+  hash-first path.
+- `internal/importer/importer.go`: `process` decides `copyFirst`
+  (`!RecordInPlace && !trash && !fromZip && !isLink &&
+  !lib.Contains(src) && (!Move || ForceCopy || !sameDevice(src,
+  lib.TempDir()))`); the copy-first branch stages, checks duplicates
+  (catalog, trashed restore, in-flight) on the staged hash, extracts
+  metadata from the temp file, skips the in-place checks, reserves the
+  destination and `Commit`s. One deferred cleanup removes the temp unless
+  it was placed. `Options.SourceReaders` is resolved in `Run`
+  (`sourceReaders`) and logged as `source_readers` on "import started";
+  a channel semaphore wraps the open and staging read.
+- `xdev_unix.go` / `xdev_windows.go`: `sameDevice` (`Stat_t.Dev`; volume
+  serial via `CreateFile(FILE_READ_ATTRIBUTES,
+  FILE_FLAG_BACKUP_SEMANTICS)` + `GetFileInformationByHandle`, falling
+  back to case-insensitive `filepath.VolumeName`, and to "same" when a
+  volume name is empty). `fuse_linux.go` / `fuse_other.go`: `isFUSE`
+  (`statfs` type `0x65735546`; false elsewhere).
+- `cmd/import.go`: `--source-readers`; the status line appends
+  `(<humanSize>/s)` after `Copied` when the `BytesCopied` delta between
+  two ticks is positive. The server job progress
+  (`internal/server/jobs.go`) already maps `bytesCopied` field by field;
+  nothing changed there.
+- Test hooks on `Importer`: `openSource` (wraps `os.Open` of source
+  files), `sameDev` and `place` (`library.Commit`).
+
+Deviations and clarifications:
+
+- `Stage` takes a fourth argument, `onWrite func(n int64)`, called per
+  buffer written: that is how the importer adds to `Stats.BytesCopied`
+  while a large file is read, and the library has no access to the
+  importer's counters.
+- `BytesCopied` counts bytes placed in the library. Bytes counted while
+  staging a file that is then discarded (duplicate, trashed restore,
+  identical file at the destination, below `MinDimension`, error,
+  cancellation) are subtracted again. Without this the existing
+  `TestIdenticalAtDestination` (copy, `BytesCopied == 0`) would fail, and
+  the summary's "Copied" would include files that were not imported. The
+  status line therefore shows no rate when the delta is zero or negative.
+- `--source-readers` larger than `--workers` is clamped to the worker
+  count.
+- The cleanup of a foreign file in the trashed-restore case: the staged
+  copy is discarded and the trashed copy restored as before
+  (`restoreTrashed`); with `--move` the source is then deleted by
+  `restoreTrashed` as today, without opening it again.
+
+Tests (`go test -tags nodynamic`):
+
+- `internal/library/stage_test.go`: `TestStageAndCommit` (hash and size
+  equal `HashFile`, `onWrite` per buffer, mtime and 0644 kept, temp
+  gone), `TestCommitFailureLeavesNothing` (existing destination kept,
+  uncreatable directory; temp removed, nothing at `dst`),
+  `TestStageCancelledAndChanged` (cancellation; a source growing during
+  the read gives `ErrSourceChanged`; temp removed).
+- `internal/importer/copyfirst_test.go`: `TestCopyFirstReadsSourceOnce`
+  (new files, an in-flight duplicate and a catalogued duplicate are each
+  opened once; metadata is only extracted from staged temp files; row
+  hash, size and mtime equal the source's; `BytesCopied` excludes the
+  duplicate), `TestSameDeviceMoveDoesNotStage`,
+  `TestCrossDeviceMoveStagesOnce` (`sameDev` forced false: one open,
+  source deleted after commit, row hash/size/mtime equal the source's),
+  `TestForceCopyTakesCopyFirst`, `TestCopyFirstCleanup` (catalog
+  duplicate, below `MinDimension`, extraction error stub, cancellation
+  during staging, failing `Commit`: no `copy-*.part`, nothing at the
+  destination, `BytesCopied` 0), `TestSourceReadersSerialisesStaging`
+  (at most one concurrent staging open with `SourceReaders: 1`; more
+  than one with 4, so the test can fail), `TestSourceReadersAuto`.
+- `cmd/cmd_test.go`: `TestStatusTransferRate`.
+- All existing tests pass unchanged; the importer and library packages
+  also under `-race`. Vet passes for linux, windows and darwin/arm64.
+  The Windows volume-serial code is vetted, not run.

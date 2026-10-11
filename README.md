@@ -13,7 +13,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 - **Thumbnails and Previews**: Every imported file gets a 256 px thumbnail, a 1600 px preview and a perceptual hash (for finding near-duplicates later), cached by content hash in `.picmover/`.
 - **Database Management**: Uses SQLite to maintain a catalog (`media.db`) of all imported files for quick access and management. SQLite is built in (pure Go, no cgo).
 - **Portable Libraries**: Paths in the catalog are relative to the library root, so one library works from Linux, Windows and macOS.
-- **Verified Copies**: Each copy goes through a temp file, is hash-checked, fsynced and renamed into place before it is recorded in the catalog.
+- **Safe Copies**: Each source file is read once, into a temp file inside the library, hashing the bytes as they are written; duplicates are dropped and metadata is read from that copy, which is then fsynced and renamed into place before it is recorded in the catalog. The hash recorded is the hash of the bytes written (there is no second read-back); the thumbnail stage then decodes every imported file. A file that changes size while it is read is an error and is not imported.
 - **Safe Moves**: With `--move`, source files are deleted only after the catalog transaction that records them has committed.
 - **Parallel Import**: Hashing and copying run in a worker pool, and catalog writes are batched in transactions.
 - **Verification**: A `verify` command checks the catalog against the files in the library, with optional re-hashing.
@@ -63,7 +63,9 @@ To import media from a source into a library:
 ./picmover import /path/to/source /path/to/library
 ```
 
-The source may be a folder, a single file or a `.zip` archive. Files whose content is already in the catalog are skipped as duplicates. If the library has no `media.db` yet, a new library is created there (`Creating new library at <path>` is printed first, and the summary marks the library as new).
+The source may be a folder, a single file or a `.zip` archive. Files whose content is already in the catalog are skipped as duplicates.
+
+Each source file is read once: it is copied into `<library>/.picmover/tmp`, hashed while it is copied, and the duplicate check and the metadata use that copy. This keeps imports from slow sources fast, such as a phone mounted over MTP or PTP (gvfs FUSE mounts on Linux), where every extra open of a file is a new USB transfer. On a FUSE source only one worker reads from the source at a time (`--source-readers`); the others extract metadata and place files meanwhile. The status line shows the transfer rate while bytes are being copied. A duplicate is still read once in full, to hash it. With `--move` on the same volume the file is hashed in place and renamed, without a copy. If the library has no `media.db` yet, a new library is created there (`Creating new library at <path>` is printed first, and the summary marks the library as new).
 
 Press Ctrl+C to stop cleanly: files already copied are recorded, the partial summary is printed and the command exits with status 130. Press Ctrl+C a second time to terminate at once.
 
@@ -76,6 +78,7 @@ Flags:
 - `--move`: move files instead of copying. Sources are deleted only after they are recorded.
 - `--min-dimension N`: skip images whose width and height are both below N pixels (0 = no limit).
 - `--workers N`: number of parallel workers (0 = auto).
+- `--source-readers N`: how many workers read from the source at once (0 = auto: 1 when the source is a FUSE mount such as a phone, otherwise `--workers`).
 - `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time). Defaults to the system zone.
 - `--quiet`: do not show the live status line.
 - `--no-thumbs`: skip the thumbnail stage; the files are marked pending for `picmover thumbs`.

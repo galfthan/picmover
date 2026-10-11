@@ -4,9 +4,26 @@
 //	scanner ──jobs──▶ N workers ──pending──▶ writer (1) ──▶ results
 //
 // The scanner walks the source and dispatches media files and zip archives.
-// Workers hash each file, drop duplicates (catalog or in-flight in this
-// import), extract metadata, reserve a unique destination and copy (through a
-// verified temp file) or rename the file into place. A single writer batches
+// A worker handles each media file in one of two orders:
+//
+//   - Copy-first, for a foreign file (outside the library, a regular file
+//     reached directly, not a zip entry) that is copied: a copy, a
+//     ForceCopy move, or a move to another device (sameDevice). The file
+//     is staged into <library>/.picmover/tmp/copy-*.part in one
+//     sequential read, hashed as it is written (library.StageFile, at most
+//     SourceReaders at a time); the source is not opened again. Duplicates
+//     (catalog or in-flight in this import) are dropped, trashed content is
+//     restored from the trash instead, metadata is extracted from the staged
+//     copy, a unique destination is reserved and the copy is committed
+//     into place (library.Commit: fsync, rename). The recorded hash is
+//     that of the bytes written; there is no read-back.
+//   - Hash-first, for everything else (record in place, zip entries,
+//     symlinks, files inside the library, same-device moves): the file is
+//     hashed, duplicates are dropped, metadata is extracted from the file,
+//     and it is kept in place, renamed, or copied through a verified temp
+//     file (library.CopyVerified).
+//
+// Every staged temp file not placed is removed. A single writer batches
 // the finished files into catalog transactions. Only after a transaction has
 // committed are move sources deleted; if an insert loses a hash race or the
 // commit fails, the file operations of the affected items are undone.
