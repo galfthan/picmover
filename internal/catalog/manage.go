@@ -444,6 +444,44 @@ func peekFile(ctx context.Context, path string, immutable bool) (Peek, error) {
 	return p, nil
 }
 
+// SessionsFile is Sessions on the catalog at path opened read-only like
+// PeekFile (nothing is written, created, checkpointed or converted; an
+// error wrapping ErrNeedsRebuild for another schema version). A rebuild
+// reads the old catalog's sessions with it before renaming it away.
+func SessionsFile(ctx context.Context, path string) ([]Session, error) {
+	if err := checkPath(path); err != nil {
+		return nil, err
+	}
+	s, err := sessionsFile(ctx, path, false)
+	if err != nil && ctx.Err() == nil && cannotOpenReadOnly(err) && !walHasData(path) {
+		if s2, err2 := sessionsFile(ctx, path, true); err2 == nil {
+			return s2, nil
+		}
+	}
+	return s, err
+}
+
+func sessionsFile(ctx context.Context, path string, immutable bool) ([]Session, error) {
+	dsn := readOnlyDSN(path)
+	if immutable {
+		dsn += "&immutable=1"
+	}
+	sqldb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: open %s: %w", path, err)
+	}
+	defer sqldb.Close()
+	sqldb.SetMaxOpenConns(1)
+	v, hasMedia, err := schemaState(ctx, sqldb)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: open %s: %w", path, err)
+	}
+	if err := checkSchema(path, v, hasMedia, false); err != nil {
+		return nil, err
+	}
+	return (&DB{DB: sqldb, path: path}).Sessions(ctx)
+}
+
 // readOnlyDSN returns a SQLite URI that opens path read-only.
 func readOnlyDSN(path string) string {
 	p := filepath.ToSlash(path)

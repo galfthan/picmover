@@ -173,11 +173,24 @@ func (r *Recorder) Finish(ctx context.Context, outcome string, stats importer.St
 // history the first time (userdata.BackfillImports); it does nothing when
 // that has happened. It returns the number of records written.
 func Backfill(ctx context.Context, cat *catalog.DB, user *userdata.DB) (int, error) {
+	return backfill(ctx, user, cat.Sessions)
+}
+
+// BackfillFile is Backfill from the catalog file at path, read without
+// writing anything to it (catalog.SessionsFile): a rebuild runs it on
+// the old catalog before renaming it away.
+func BackfillFile(ctx context.Context, path string, user *userdata.DB) (int, error) {
+	return backfill(ctx, user, func(ctx context.Context) ([]catalog.Session, error) {
+		return catalog.SessionsFile(ctx, path)
+	})
+}
+
+func backfill(ctx context.Context, user *userdata.DB, list func(context.Context) ([]catalog.Session, error)) (int, error) {
 	done, err := user.ImportsBackfilled(ctx)
 	if err != nil || done {
 		return 0, err
 	}
-	sessions, err := cat.Sessions(ctx)
+	sessions, err := list(ctx)
 	if err != nil {
 		return 0, err
 	}

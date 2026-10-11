@@ -2,7 +2,10 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -43,5 +46,26 @@ func TestSessionsWithHashes(t *testing.T) {
 	}
 	if c.ID != s3 || fmt.Sprint(c.Hashes) != "[2]" {
 		t.Errorf("session 3 %+v", c)
+	}
+
+	// SessionsFile reads the same while the catalog is open (data in its
+	// WAL) and writes nothing: the -wal file is left as it is.
+	before, err := os.Stat(d.path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := SessionsFile(ctx, d.path)
+	if err != nil || !reflect.DeepEqual(fromFile, got) {
+		t.Fatalf("SessionsFile %+v %v", fromFile, err)
+	}
+	if after, err := os.Stat(d.path + "-wal"); err != nil || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("wal changed: %v", err)
+	}
+	// Another schema version is refused.
+	if _, err := d.Exec("PRAGMA user_version = 99"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SessionsFile(ctx, d.path); !errors.Is(err, ErrNeedsRebuild) {
+		t.Fatalf("SessionsFile on version 99: %v", err)
 	}
 }
