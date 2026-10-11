@@ -113,6 +113,9 @@
       <div class="stat"><span class="v">{formatCount(s.thumbsDone)}</span><span class="k">Done</span></div>
       <div class="stat"><span class="v">{formatCount(s.thumbsUnsupported)}</span><span class="k">Unsupported</span></div>
       <div class="stat" class:bad={s.thumbsFailed > 0}><span class="v">{formatCount(s.thumbsFailed)}</span><span class="k">Failed</span></div>
+      {#if s.largeDone > 0}
+        <div class="stat"><span class="v">{formatCount(s.largeDone)}</span><span class="k">Large filled</span></div>
+      {/if}
     </div>
   {/if}
 </div>

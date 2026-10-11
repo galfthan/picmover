@@ -44,7 +44,7 @@ func TestStorePutReplaceFailureKeepsPrevious(t *testing.T) {
 	const hash = 0x7700000000000007
 	oldThumb := testimg.BareJPEG()
 	oldPreview := testimg.JPEG(testimg.Options{Width: 40, Height: 30, NoExif: true, Seed: 1})
-	if err := s.Put(ctx, hash, oldThumb, 4, 3, oldPreview); err != nil {
+	if err := s.Put(ctx, hash, oldThumb, 4, 3, nil, oldPreview); err != nil {
 		t.Fatal(err)
 	}
 	newPreview := testimg.JPEG(testimg.Options{Width: 40, Height: 30, NoExif: true, Seed: 2})
@@ -57,7 +57,7 @@ func TestStorePutReplaceFailureKeepsPrevious(t *testing.T) {
 		if _, w, _, ok, err := s.Thumb(ctx, hash); err != nil || !ok || w != wantW {
 			t.Errorf("%s: Thumb w=%d ok=%v err=%v, want w=%d", what, w, ok, err, wantW)
 		}
-		if th, pv, err := s.Has(ctx, hash); !th || !pv || err != nil {
+		if th, _, pv, err := s.Has(ctx, hash); !th || !pv || err != nil {
 			t.Errorf("%s: Has = %v %v %v", what, th, pv, err)
 		}
 		if _, err := os.Lstat(s.PreviewPath(hash) + oldSuffix); !errors.Is(err, os.ErrNotExist) {
@@ -66,7 +66,7 @@ func TestStorePutReplaceFailureKeepsPrevious(t *testing.T) {
 	}
 
 	// Cancelled between the ctx check and the insert.
-	if err := s.Put(newLateCancel(), hash, oldThumb, 8, 6, newPreview); err == nil {
+	if err := s.Put(newLateCancel(), hash, oldThumb, 8, 6, nil, newPreview); err == nil {
 		t.Fatal("Put with a context cancelled before the insert succeeded")
 	}
 	check("cancelled replace", oldPreview, 4)
@@ -80,7 +80,7 @@ func TestStorePutReplaceFailureKeepsPrevious(t *testing.T) {
 	if _, err := db.Exec(`CREATE TRIGGER boom BEFORE INSERT ON thumbs BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(ctx, hash, oldThumb, 8, 6, newPreview); err == nil {
+	if err := s.Put(ctx, hash, oldThumb, 8, 6, nil, newPreview); err == nil {
 		t.Fatal("Put succeeded despite the failing insert")
 	}
 	check("failed insert", oldPreview, 4)
@@ -89,7 +89,7 @@ func TestStorePutReplaceFailureKeepsPrevious(t *testing.T) {
 	}
 
 	// A successful replace.
-	if err := s.Put(ctx, hash, oldThumb, 8, 6, newPreview); err != nil {
+	if err := s.Put(ctx, hash, oldThumb, 8, 6, nil, newPreview); err != nil {
 		t.Fatal(err)
 	}
 	check("replace", newPreview, 8)
@@ -104,7 +104,7 @@ func TestOpenStoreCleansOldPreviews(t *testing.T) {
 	preview := testimg.JPEG(testimg.Options{Width: 40, Height: 30, NoExif: true})
 	const kept, orphan = 0x1100000000000001, 0x2200000000000002
 	for _, h := range []uint64{kept, orphan} {
-		if err := s.Put(ctx, h, thumb, 4, 3, preview); err != nil {
+		if err := s.Put(ctx, h, thumb, 4, 3, nil, preview); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -120,7 +120,7 @@ func TestOpenStoreCleansOldPreviews(t *testing.T) {
 	if err := os.Rename(s.PreviewPath(orphan), s.PreviewPath(orphan)+oldSuffix); err != nil {
 		t.Fatal(err)
 	}
-	if _, pv, err := s.Has(ctx, orphan); pv || err != nil {
+	if _, _, pv, err := s.Has(ctx, orphan); pv || err != nil {
 		t.Errorf("Has counted a .old file as the preview (%v)", err)
 	}
 	if _, b, err := s.Stats(ctx); err != nil || b != bytesBefore-int64(len(preview)) {
@@ -161,7 +161,7 @@ func TestOpenStoreReadOnly(t *testing.T) {
 	ctx := context.Background()
 	thumb := testimg.BareJPEG()
 	preview := testimg.JPEG(testimg.Options{Width: 40, Height: 30, NoExif: true})
-	if err := s.Put(ctx, 1, thumb, 4, 3, preview); err != nil {
+	if err := s.Put(ctx, 1, thumb, 4, 3, nil, preview); err != nil {
 		t.Fatal(err)
 	}
 	for _, writerOpen := range []bool{true, false} {
@@ -178,7 +178,7 @@ func TestOpenStoreReadOnly(t *testing.T) {
 		if _, _, _, ok, err := ro.Thumb(ctx, 1); !ok || err != nil {
 			t.Errorf("writer open %v: Thumb ok=%v err=%v", writerOpen, ok, err)
 		}
-		if err := ro.Put(ctx, 2, thumb, 4, 3, preview); err == nil {
+		if err := ro.Put(ctx, 2, thumb, 4, 3, nil, preview); err == nil {
 			t.Errorf("writer open %v: Put on a read-only store succeeded", writerOpen)
 		}
 		if _, err := ro.db.Exec("DELETE FROM thumbs"); err == nil {

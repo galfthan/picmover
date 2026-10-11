@@ -261,6 +261,8 @@ All endpoints that accept filters (timeline, media, geo, geo/items) accept:
 | `tag` | tag id; repeatable; all must match (AND) |
 | `album` | album id |
 | `trashed=1` | list trashed rows instead of live ones (other filters still apply) |
+| `minpx` | longer edge `MAX(width, height)` ≥ this many pixels, 1–1 000 000; unknown dimensions never match (see `renditions.md`, "Dimension filter") |
+| `maxpx` | longer edge ≤ this many pixels, 1–1 000 000; `minpx > maxpx` is 400 |
 
 `recur` is evaluated as `strftime('%m-%d', taken_at, 'unixepoch')`
 compared with the bounds (`BETWEEN` or `OR` of two ranges when wrapping),

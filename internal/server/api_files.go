@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"picmover/internal/imaging"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
 )
@@ -68,11 +70,39 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request, l *libHandl
 		writeError(w, http.StatusNotFound, "no thumbnail")
 		return
 	}
+	serveRenditionBytes(w, r, hash, data)
+}
+
+// serveRenditionBytes answers with an in-memory rendition (a thumbnail):
+// the sniffed content type, the versioned ETag and the long cache.
+func serveRenditionBytes(w http.ResponseWriter, r *http.Request, hash uint64, data []byte) {
 	h := w.Header()
-	h.Set("Content-Type", "image/jpeg")
+	h.Set("Content-Type", renditionType(bytes.NewReader(data)))
 	h.Set("ETag", renditionETag(hash, renditionVersion(r)))
 	h.Set("Cache-Control", renditionCache)
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+}
+
+// serveRenditionFile answers with an opened rendition file (preview,
+// large thumbnail) like serveRenditionBytes.
+func serveRenditionFile(w http.ResponseWriter, r *http.Request, hash uint64, f *os.File) {
+	h := w.Header()
+	h.Set("Content-Type", renditionType(f))
+	h.Set("ETag", renditionETag(hash, renditionVersion(r)))
+	h.Set("Cache-Control", renditionCache)
+	http.ServeContent(w, r, "", time.Time{}, f)
+}
+
+// renditionType is the content type of stored rendition bytes, from
+// sniffing them: new renditions are WebP, older ones JPEG.
+func renditionType(r io.ReaderAt) string {
+	switch imaging.Sniff(r) {
+	case imaging.FormatWebP:
+		return "image/webp"
+	case imaging.FormatJPEG:
+		return "image/jpeg"
+	}
+	return "application/octet-stream"
 }
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, l *libHandles) {
@@ -90,11 +120,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request, l *libHan
 		return
 	}
 	defer f.Close()
-	h := w.Header()
-	h.Set("Content-Type", "image/jpeg")
-	h.Set("ETag", renditionETag(hash, renditionVersion(r)))
-	h.Set("Cache-Control", renditionCache)
-	http.ServeContent(w, r, "", time.Time{}, f)
+	serveRenditionFile(w, r, hash, f)
 }
 
 // openRegular opens p only when it is a regular file and not a symbolic

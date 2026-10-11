@@ -71,8 +71,8 @@ func (u userFilter) empty() bool {
 }
 
 // parseFilter reads the filters shared by timeline, media, geo and
-// geo/items: type, gps, camera, session, from, to, recur, rating, tag
-// (repeatable), album, import and trashed. A malformed or unknown value
+// geo/items: type, gps, camera, session, from, to, recur, minpx, maxpx,
+// rating, tag (repeatable), album, import and trashed. A malformed or unknown value
 // is an error (400) naming the parameter.
 func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 	var (
@@ -121,6 +121,23 @@ func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 		}
 		f.Recur = r
 	}
+	for _, b := range []struct {
+		name string
+		dst  *int
+	}{{"minpx", &f.MinSide}, {"maxpx", &f.MaxSide}} {
+		v := q.Get(b.name)
+		if v == "" {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxFilterPixels {
+			return f, uf, fmt.Errorf("invalid %s %q: want a size in pixels 1-%d", b.name, v, maxFilterPixels)
+		}
+		*b.dst = n
+	}
+	if f.MinSide > 0 && f.MaxSide > 0 && f.MinSide > f.MaxSide {
+		return f, uf, fmt.Errorf("invalid minpx %d: greater than maxpx %d", f.MinSide, f.MaxSide)
+	}
 	switch v := q.Get("trashed"); v {
 	case "", "0":
 	case "1":
@@ -164,6 +181,9 @@ func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 
 // maxFilterTags bounds the tag parameters of one request.
 const maxFilterTags = 32
+
+// maxFilterPixels bounds minpx and maxpx.
+const maxFilterPixels = 1_000_000
 
 // parseRecur parses "MM-DD" or "MM-DD..MM-DD" (inclusive, may wrap the
 // year end).

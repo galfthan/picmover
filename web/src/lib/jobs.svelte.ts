@@ -49,6 +49,7 @@ export function emptyStats(): JobStats {
     thumbsDone: 0,
     thumbsUnsupported: 0,
     thumbsFailed: 0,
+    largeDone: 0,
   };
 }
 

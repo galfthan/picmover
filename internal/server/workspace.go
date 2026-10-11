@@ -91,6 +91,14 @@ type libEntry struct {
 	// planMu guards plans, the cached backup plans by target id.
 	planMu sync.Mutex
 	plans  map[string]cachedPlan
+
+	// largeMu guards the cached largeMissing count (Server.largeMissing);
+	// largeAt is when it was computed, zero when it was never computed;
+	// largeBusy is set while a background recount runs.
+	largeMu      sync.Mutex
+	largeMissing int64
+	largeAt      time.Time
+	largeBusy    bool
 }
 
 // libHandles are the open handles of a library for one request.

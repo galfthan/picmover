@@ -33,7 +33,7 @@ const (
 
 // Limits on bytes read into memory whole.
 const (
-	maxPreviewBytes = 64 << 20 // one embedded RAW preview
+	maxPreviewBytes = 64 << 20 // one embedded RAW preview, or one stored preview (EncodeLarge)
 	maxFrameBytes   = 32 << 20 // ffmpeg's JPEG on stdout
 	maxStderrTail   = 4 << 10  // stderr kept for error messages
 	ffmpegTimeout   = 60 * time.Second
@@ -68,6 +68,13 @@ type Result struct {
 	Width, Height  int    // of the oriented full image when known
 	PHash          uint64 // perceptual hash of the stored preview; set for every ok result
 	ThumbW, ThumbH int
+	// LargeFilled is set when Generate reused cached renditions and
+	// derived the missing large thumbnail from the stored preview.
+	// LargeError is the reason that derivation failed (the result is
+	// still ok: the large thumbnail is filled by a later pass or on
+	// demand).
+	LargeFilled bool
+	LargeError  string
 }
 
 // Default concurrency limits used when a Generator leaves them nil.
@@ -118,7 +125,8 @@ func unsupportedf(format string, args ...any) error {
 	return errUnsupported{fmt.Sprintf(format, args...)}
 }
 
-// Generate decodes, orients, scales and stores both sizes for one file.
+// Generate decodes, orients, scales and stores the three renditions of one
+// file (WebP; see Generator.store).
 // Images: decode via imaging; RAW: the largest embedded preview that
 // decodes; video: one frame via ffmpeg at min(1s, 10% of duration).
 // Never panics; errors become Result.State "error" (a cancelled ctx gives
@@ -126,9 +134,11 @@ func unsupportedf(format string, args ...any) error {
 //
 // When src carries Size/MTime, a file that no longer matches them is
 // refused ("error") before anything else, without touching the cache.
-// When the store already has both sizes (and not force), the stored
-// preview is decoded (at thumbnail scale) to verify it and to compute the
-// pHash; a preview that does not decode is regenerated. Every ok Result
+// When the store already has the thumbnail and the preview (and not
+// force), the stored preview is decoded (at thumbnail scale) to verify it
+// and to compute the pHash; a preview that does not decode is
+// regenerated. A missing large thumbnail is then derived from the stored
+// preview (Result.LargeFilled), never from the original. Every ok Result
 // therefore carries the pHash of the stored preview (computed the same
 // way for fresh and cached renditions, so it is stable across rebuilds);
 // a cached result has no Width/Height.
@@ -215,7 +225,7 @@ const phashFit = ThumbSize
 // missing, or a preview that does not decode. err is a store failure or a
 // context error.
 func (g *Generator) cached(ctx context.Context, hash uint64) (res Result, ok bool, err error) {
-	thumb, preview, err := g.Store.Has(ctx, hash)
+	thumb, large, preview, err := g.Store.Has(ctx, hash)
 	if err != nil || !thumb || !preview {
 		return Result{}, false, err
 	}
@@ -230,7 +240,151 @@ func (g *Generator) cached(ctx context.Context, hash uint64) (res Result, ok boo
 	if err != nil || !ok {
 		return Result{}, false, err
 	}
-	return Result{State: StateOK, PHash: ph, ThumbW: w, ThumbH: h}, true, nil
+	res = Result{State: StateOK, PHash: ph, ThumbW: w, ThumbH: h}
+	if !large {
+		filled, err := g.FillLarge(ctx, hash)
+		if ctx.Err() != nil {
+			return Result{}, false, ctx.Err()
+		}
+		res.LargeFilled = filled
+		// A derivation that already failed in this Store was reported
+		// then.
+		if err != nil && !errors.Is(err, ErrLargeFailed) {
+			res.LargeError = err.Error()
+		}
+	}
+	return res, true, nil
+}
+
+// FillLarge derives the large thumbnail of hash from its stored preview
+// unless it exists (see DeriveLarge), within the Generator's memory
+// budget. filled reports whether it wrote one.
+func (g *Generator) FillLarge(ctx context.Context, hash uint64) (filled bool, err error) {
+	return DeriveLarge(ctx, g.Store, hash, g.opts(nil))
+}
+
+// ErrNoPreview is returned (wrapped) by DeriveLarge and EncodeLarge when
+// hash has no stored preview.
+var ErrNoPreview = errors.New("no preview")
+
+// DeriveLarge writes the large thumbnail of hash from its stored preview
+// (see EncodeLarge) with Store.PutLarge, which never replaces an existing
+// file; the original is never read. filled reports whether this call
+// wrote it (false, nil: it already existed). A missing preview is an
+// error wrapping ErrNoPreview. A derivation that fails for another reason
+// than the context is remembered by the Store (MarkLargeFailed), and
+// later calls for that hash fail at once with an error wrapping
+// ErrLargeFailed. opts bounds the decode (memory budget, pixels).
+func DeriveLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) (filled bool, err error) {
+	data, err := deriveLarge(ctx, s, hash, opts)
+	if err != nil || data == nil {
+		return false, err
+	}
+	return s.PutLarge(hash, data)
+}
+
+// DerivedLarge is the outcome of DeriveLargeData.
+type DerivedLarge struct {
+	// Data is the derived large thumbnail (WebP); nil when one already
+	// existed.
+	Data []byte
+	// Written reports whether Data was stored.
+	Written bool
+	// WriteErr is why Data was not stored: the write failed, or it was
+	// skipped (ErrLargeUnwritable) because a recent write failed. Nil
+	// when it was written or another writer stored one first.
+	WriteErr error
+}
+
+// DeriveLargeData is DeriveLarge for a server: the derived bytes are
+// returned whether or not they could be stored, and a write is not
+// attempted while the Store's large directory is known to be unwritable
+// (Store.LargeUnwritable), so a read-only library folder still gets its
+// large thumbnails (served uncached by the caller). err is a derivation
+// failure only.
+func DeriveLargeData(ctx context.Context, s *Store, hash uint64, opts imaging.Options) (DerivedLarge, error) {
+	data, err := deriveLarge(ctx, s, hash, opts)
+	if err != nil || data == nil {
+		return DerivedLarge{}, err
+	}
+	if s.LargeUnwritable() {
+		return DerivedLarge{Data: data, WriteErr: ErrLargeUnwritable}, nil
+	}
+	written, werr := s.PutLarge(hash, data)
+	return DerivedLarge{Data: data, Written: written, WriteErr: werr}, nil
+}
+
+// deriveLarge returns the encoded large thumbnail of hash, or nil when a
+// non-empty one exists. See DeriveLarge for the errors.
+func deriveLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) ([]byte, error) {
+	if nonEmptyFile(s.LargePath(hash)) {
+		return nil, nil
+	}
+	if s.LargeFailed(hash) {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, ErrLargeFailed)
+	}
+	data, err := EncodeLarge(ctx, s, hash, opts)
+	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, ErrNoPreview) {
+			s.MarkLargeFailed(hash)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// EncodeLarge decodes the stored preview of hash (WebP or JPEG, by
+// sniffing) at LargeSize and returns the large thumbnail as WebP bytes at
+// LargeQuality, without storing it. The preview is read into memory and
+// closed before decoding, so the file is not held open (on Windows an
+// open file blocks a concurrent Put from renaming it).
+func EncodeLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) ([]byte, error) {
+	src, err := readPreview(s.PreviewPath(hash))
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotRegular) {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, ErrNoPreview)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
+	}
+	r := bytes.NewReader(src)
+	if f := imaging.Sniff(r); f != imaging.FormatJPEG && f != imaging.FormatWebP {
+		return nil, fmt.Errorf("thumbs: large %016x: stored preview is neither WebP nor JPEG", hash)
+	}
+	img, _, err := imaging.DecodeFit(ctx, r, int64(len(src)), LargeSize, opts)
+	if err != nil {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
+	}
+	var buf bytes.Buffer
+	if err := imaging.EncodeWebP(&buf, flatten(imaging.Fit(img, LargeSize)), LargeQuality); err != nil {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
+	}
+	return buf.Bytes(), nil
+}
+
+var errNotRegular = errors.New("not a regular file")
+
+// readPreview reads the regular file p (at most maxPreviewBytes) and
+// closes it.
+func readPreview(p string) ([]byte, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
+	if st.Size() > maxPreviewBytes {
+		return nil, fmt.Errorf("stored preview is larger than %d bytes", maxPreviewBytes)
+	}
+	return io.ReadAll(io.LimitReader(f, maxPreviewBytes))
 }
 
 // previewPHash decodes the stored preview of hash at thumbnail scale and
@@ -245,8 +399,8 @@ func (g *Generator) previewPHash(ctx context.Context, hash uint64) (uint64, erro
 	if err != nil {
 		return 0, err
 	}
-	if imaging.Sniff(f) != imaging.FormatJPEG {
-		return 0, errors.New("stored preview is not a JPEG")
+	if f := imaging.Sniff(f); f != imaging.FormatJPEG && f != imaging.FormatWebP {
+		return 0, errors.New("stored preview is neither WebP nor JPEG")
 	}
 	img, _, err := imaging.DecodeFit(ctx, f, st.Size(), phashFit, g.opts(nil))
 	if err != nil {
@@ -269,12 +423,15 @@ func failed(err error) Result {
 	return Result{State: StateError, Message: err.Error()}
 }
 
-// store scales an upright image to both sizes, hashes and stores them.
+// store scales an upright image to the three sizes (the large thumbnail
+// and the thumbnail from the scaled preview), encodes them as WebP,
+// hashes the preview and stores them in one Put.
 func (g *Generator) store(ctx context.Context, hash uint64, img image.Image) (Result, error) {
 	preview := flatten(imaging.Fit(img, PreviewSize))
+	large := imaging.Fit(preview, LargeSize)
 	thumb := imaging.Fit(preview, ThumbSize)
-	var pbuf, tbuf bytes.Buffer
-	if err := imaging.EncodeJPEG(&pbuf, preview, PreviewQuality); err != nil {
+	var pbuf, lbuf, tbuf bytes.Buffer
+	if err := imaging.EncodeWebP(&pbuf, preview, PreviewQuality); err != nil {
 		return Result{}, err
 	}
 	// The pHash comes from the encoded preview decoded exactly as a cache
@@ -285,21 +442,25 @@ func (g *Generator) store(ctx context.Context, hash uint64, img image.Image) (Re
 	} else if ctx.Err() != nil {
 		return Result{}, ctx.Err()
 	}
-	if err := imaging.EncodeJPEG(&tbuf, thumb, ThumbQuality); err != nil {
+	if err := imaging.EncodeWebP(&lbuf, large, LargeQuality); err != nil {
+		return Result{}, err
+	}
+	if err := imaging.EncodeWebP(&tbuf, thumb, ThumbQuality); err != nil {
 		return Result{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 	tb := thumb.Bounds()
-	if err := g.Store.Put(ctx, hash, tbuf.Bytes(), tb.Dx(), tb.Dy(), pbuf.Bytes()); err != nil {
+	if err := g.Store.Put(ctx, hash, tbuf.Bytes(), tb.Dx(), tb.Dy(), lbuf.Bytes(), pbuf.Bytes()); err != nil {
 		return Result{}, err
 	}
 	return Result{State: StateOK, PHash: ph, ThumbW: tb.Dx(), ThumbH: tb.Dy()}, nil
 }
 
-// flatten composites an image with transparency onto white, since JPEG has
-// no alpha (transparent pixels would otherwise turn black).
+// flatten composites an image with transparency onto white: renditions are
+// opaque (JPEG ones have no alpha, and transparent pixels would otherwise
+// turn black).
 func flatten(img image.Image) image.Image {
 	if o, ok := img.(interface{ Opaque() bool }); ok && o.Opaque() {
 		return img

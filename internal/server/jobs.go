@@ -98,6 +98,7 @@ type statsJSON struct {
 	ThumbsDone        int64 `json:"thumbsDone"`
 	ThumbsUnsupported int64 `json:"thumbsUnsupported"`
 	ThumbsFailed      int64 `json:"thumbsFailed"`
+	LargeDone         int64 `json:"largeDone"` // large thumbnails filled from previews
 }
 
 func newStats(s importer.Stats) statsJSON {
@@ -106,6 +107,7 @@ func newStats(s importer.Stats) statsJSON {
 		SkippedSmall: s.SkippedSmall, NonMedia: s.NonMedia, Errors: s.Errors, BytesCopied: s.BytesCopied,
 		Rate:       s.Rate,
 		ThumbsDone: s.ThumbsDone, ThumbsUnsupported: s.ThumbsUnsupported, ThumbsFailed: s.ThumbsFailed,
+		LargeDone: s.LargeDone,
 	}
 }
 
@@ -757,6 +759,12 @@ func (m *jobManager) run(j *job) {
 	defer m.wg.Done()
 	defer j.cancel()
 	state, code, stats, sessionID, msg := m.execute(j)
+	// Any job may have changed which large thumbnails are missing:
+	// recount here, so the library JSON keeps serving the previous count
+	// meanwhile and has the new one when the job is reported done.
+	if j.entry != nil {
+		j.entry.recountLargeMissing()
+	}
 	m.mu.Lock()
 	if m.running == j {
 		m.running = nil
@@ -835,6 +843,11 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		}
 	} else {
 		opts.ThumbLimit = j.params.Limit
+	}
+	// Hashes whose large thumbnail cannot be derived are not counted as
+	// missing, nor derived on demand, while the library stays open.
+	if h.store != nil {
+		opts.OnLargeFailed = func(hash uint64) { h.store.MarkLargeFailed(hash) }
 	}
 	if m.adjust != nil {
 		m.adjust(&opts)

@@ -54,6 +54,10 @@ type thumbsJSON struct {
 	OK          int64 `json:"ok"`
 	Unsupported int64 `json:"unsupported"`
 	Error       int64 `json:"error"`
+	// LargeMissing is the number of rows with a thumbnail and a preview
+	// but no large thumbnail (the thumbs job fills them from the
+	// previews); cached for up to largeMissingTTL.
+	LargeMissing int64 `json:"largeMissing"`
 }
 
 type cameraJSON struct {
@@ -70,6 +74,11 @@ func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request, l *libHan
 		return
 	}
 	pending, ok, unsupported, failed, err := l.db.ThumbStats(ctx)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	largeMissing, err := s.largeMissing(ctx, l)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
@@ -98,7 +107,8 @@ func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request, l *libHan
 			WithGPS: sum.WithGPS, Deleted: sum.Deleted, Bytes: sum.TotalBytes,
 			Earliest: wallClock(sum.Earliest), Latest: wallClock(sum.Latest),
 		},
-		Thumbs:  thumbsJSON{Pending: pending, OK: ok, Unsupported: unsupported, Error: failed},
+		Thumbs: thumbsJSON{Pending: pending, OK: ok, Unsupported: unsupported, Error: failed,
+			LargeMissing: largeMissing},
 		Cameras: cameraList(cams),
 		FFmpeg:  s.ffmpeg != "",
 		UserDB: userDBJSON{Ratings: counts.Ratings, Tags: counts.Tags, Albums: counts.Albums,

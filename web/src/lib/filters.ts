@@ -9,6 +9,9 @@ import { formatRecur, isDay, parseRecur } from './dates';
 
 const TYPES: readonly FileType[] = ['image', 'image_raw', 'video'];
 
+/** The largest `minpx`/`maxpx` the server accepts. */
+export const MAX_PX = 1_000_000;
+
 function positiveInt(s: string | null): number | null {
   if (!s || !/^\d+$/.test(s)) return null;
   const n = Number(s);
@@ -30,6 +33,16 @@ export function filtersFromQuery(q: URLSearchParams): Filters {
   if (isDay(to)) f.to = to;
   const recur = parseRecur(q.get('recur'));
   if (recur) f.recur = formatRecur(recur);
+  const px = (k: string) => {
+    const n = positiveInt(q.get(k));
+    return n !== null && n <= MAX_PX ? n : null;
+  };
+  const minPx = px('minpx');
+  const maxPx = px('maxpx');
+  if (minPx === null || maxPx === null || minPx <= maxPx) {
+    if (minPx !== null) f.minPx = minPx;
+    if (maxPx !== null) f.maxPx = maxPx;
+  }
   const rating = positiveInt(q.get('rating'));
   if (rating !== null && rating <= 5) f.rating = rating;
   const tags = [...new Set(q.getAll('tag').map(positiveInt).filter((n): n is number => n !== null))].sort((a, b) => a - b);
@@ -51,6 +64,8 @@ export function filtersToQuery(f: Filters): URLSearchParams {
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
   if (f.recur) q.set('recur', f.recur);
+  if (f.minPx) q.set('minpx', String(f.minPx));
+  if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (f.rating) q.set('rating', String(f.rating));
   for (const t of [...(f.tags ?? [])].sort((a, b) => a - b)) q.append('tag', String(t));
   if (f.album) q.set('album', String(f.album));
@@ -71,4 +86,12 @@ export function hasFilters(f: Filters, implied: { album?: boolean; import?: bool
   if (implied.album) g.album = undefined;
   if (implied.import) g.import = undefined;
   return filtersKey(g) !== '';
+}
+
+/** The Size filter's summary: "Any size", "≥ 2000 px", "≤ 640 px" or "640–2000 px". */
+export function describeSize(minPx?: number, maxPx?: number): string {
+  if (minPx && maxPx) return `${minPx}–${maxPx} px`;
+  if (minPx) return `≥ ${minPx} px`;
+  if (maxPx) return `≤ ${maxPx} px`;
+  return 'Any size';
 }

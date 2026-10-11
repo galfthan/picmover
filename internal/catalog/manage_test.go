@@ -124,6 +124,50 @@ func TestFilterRecur(t *testing.T) {
 	}
 }
 
+func TestFilterSide(t *testing.T) {
+	d := newDB(t)
+	ctx := context.Background()
+	// hash: width x height; 0 = unknown.
+	dims := map[uint64][2]int{
+		1: {160, 120}, 2: {120, 640}, 3: {1600, 1200}, 4: {4000, 3000},
+		5: {1080, 1920}, 6: {0, 0}, 7: {2000, 0}, 8: {0, 3000},
+	}
+	for h, wh := range dims {
+		m := Media{Hash: h, Size: 1, FileType: "image", Ext: "jpg", RelPath: "image/" + string(rune('a'+h)) + ".jpg",
+			TakenAt: time.Date(2023, 1, int(h), 12, 0, 0, 0, time.UTC), Width: wh[0], Height: wh[1]}
+		if !insert(t, d, &m) {
+			t.Fatal("insert")
+		}
+	}
+	for _, c := range []struct {
+		name string
+		f    Filter
+		want []uint64
+	}{
+		{"none", Filter{}, []uint64{1, 2, 3, 4, 5, 6, 7, 8}},
+		{"min", Filter{MinSide: 2000}, []uint64{4}},
+		{"min portrait", Filter{MinSide: 1920}, []uint64{4, 5}},
+		{"max", Filter{MaxSide: 640}, []uint64{1, 2}},
+		{"both", Filter{MinSide: 640, MaxSide: 1920}, []uint64{2, 3, 5}},
+		{"equal", Filter{MinSide: 1600, MaxSide: 1600}, []uint64{3}},
+		{"huge max excludes unknown", Filter{MaxSide: 1000000}, []uint64{1, 2, 3, 4, 5}},
+		{"with type", Filter{MaxSide: 640, FileType: "video"}, nil},
+	} {
+		if got := bucketHashes(t, d, c.f); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+	bs, err := d.Buckets(ctx, Filter{MinSide: 1600})
+	if err != nil || !reflect.DeepEqual(bs, []Bucket{{2023, 1, 3}}) {
+		t.Fatalf("buckets %v %v", bs, err)
+	}
+	for _, bad := range []Filter{{MinSide: 2000, MaxSide: 100}, {MinSide: -1}, {MaxSide: -5}} {
+		if _, err := d.Buckets(ctx, bad); err == nil {
+			t.Errorf("%+v accepted", bad)
+		}
+	}
+}
+
 func TestTrashRows(t *testing.T) {
 	d := newDB(t)
 	ids := seedQuery(t, d)

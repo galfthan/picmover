@@ -282,6 +282,90 @@ describe('grid', () => {
     expect(Number(slider.value)).toBeLessThan(160);
   });
 
+  it('swaps tiles between thumb, large and preview across the thresholds, keeping the loaded image underneath', async () => {
+    await start();
+    const tile = (id: number) => document.querySelector<HTMLAnchorElement>(`a.tile[href="#/l/Photos/view/${id}"]`)!;
+    const main = (id = 3) => tile(id).querySelector<HTMLImageElement>('img:not(.under)')!;
+    const under = (id = 3) => tile(id).querySelector<HTMLImageElement>('img.under');
+    const slider = document.querySelector<HTMLInputElement>('.size input')!;
+    const zoom = async (v: number) => {
+      slider.value = String(v);
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+      await settle();
+    };
+    const load = async (id = 3) => {
+      main(id).dispatchEvent(new Event('load'));
+      await settle();
+    };
+    expect(slider.max).toBe('480');
+    // 160 requested, ~182 CSS px laid out at ratio 1; a 4:3 thumb's short side is 192 px: the thumb.
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(under()).toBeNull();
+    await load();
+    expect(under()).toBeNull();
+
+    // Past the thumb's short side: the large, the loaded thumb underneath until it loads.
+    await zoom(300);
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/large/0000000000000003');
+    expect(under()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(tile(3).querySelectorAll('img')).toHaveLength(2);
+    await load();
+    expect(under()).toBeNull();
+    expect(tile(3).querySelectorAll('img')).toHaveLength(1);
+    // A tile that never loaded anything shows the thumb underneath the large from the start.
+    expect(main(2).getAttribute('src')).toBe('/api/l/Photos/large/0000000000000002');
+    expect(under(2)?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000002');
+    // A large that fails (no preview) falls back to the thumb, with nothing underneath.
+    main(2).dispatchEvent(new Event('error'));
+    await settle();
+    expect(main(2).getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000002');
+    expect(under(2)).toBeNull();
+
+    // One column (~950 px): past the large's short side (480 px), the preview over the loaded large.
+    await zoom(480);
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/preview/0000000000000003');
+    expect(under()?.getAttribute('src')).toBe('/api/l/Photos/large/0000000000000003');
+    await load();
+    expect(under()).toBeNull();
+
+    // Back below the threshold: the thumb again, the preview shown underneath meanwhile.
+    await zoom(100);
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(under()?.getAttribute('src')).toBe('/api/l/Photos/preview/0000000000000003');
+    expect(requests.some((r) => r.includes('/large/') || r.includes('/thumb/') || r.includes('/preview/'))).toBe(false); // images are not fetched
+  });
+
+  it('picks the rendition by aspect ratio: a 16:9 tile needs the large where a 4:3 one keeps the thumb', async () => {
+    const id = 2;
+    media.forEach((list) => list.forEach((x) => x.id === id && Object.assign(x, { w: 1920, h: 1080 })));
+    await start();
+    // ~182 CSS px: above a 16:9 thumb's short side (144), below a 4:3 one's (192).
+    expect(document.querySelector(`a.tile[href="#/l/Photos/view/${id}"] img:not(.under)`)?.getAttribute('src')).toMatch(/\/large\//);
+    expect(document.querySelector('a.tile[href="#/l/Photos/view/3"] img:not(.under)')?.getAttribute('src')).toMatch(/\/thumb\//);
+  });
+
+  it('picks the preview at a high pixel ratio and clamps the stored zoom to 480', async () => {
+    vi.stubGlobal('devicePixelRatio', 2);
+    localStorage.setItem('picmover.grid.tileSize', '1000');
+    await start();
+    const slider = document.querySelector<HTMLInputElement>('.size input')!;
+    expect(slider.value).toBe('480');
+    expect(document.querySelector('a.tile img:not(.under)')?.getAttribute('src')).toMatch(/^\/api\/l\/Photos\/preview\//);
+    // Wheel zoom stops at the maximum too.
+    const scroller = document.querySelector<HTMLElement>('.scroller')!;
+    for (let i = 0; i < 20; i++) scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, ctrlKey: true, cancelable: true }));
+    await settle();
+    expect(slider.value).toBe('480');
+    expect(localStorage.getItem('picmover.grid.tileSize')).toBe('1000'); // unchanged: no size change was applied
+  });
+
+  it('keeps a stored zoom between the old and the new maximum', async () => {
+    localStorage.setItem('picmover.grid.tileSize', '400');
+    await start();
+    expect(document.querySelector<HTMLInputElement>('.size input')!.value).toBe('400');
+    expect(document.querySelector('a.tile img:not(.under)')?.getAttribute('src')).toMatch(/^\/api\/l\/Photos\/large\//);
+  });
+
   it('moves a year with the keyboard on the scrubber and keeps the place on resize', async () => {
     timeline = [
       { year: 2024, month: 7, count: 100 },

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"picmover/internal/library"
@@ -31,9 +32,14 @@ func TestStoreRoundTrip(t *testing.T) {
 	s, lib := openTestStore(t)
 	ctx := context.Background()
 	const hash = 0xabcdef0123456789
-	want := filepath.Join(lib.Root(), library.MetaDir, PreviewDir, "ab", "abcdef0123456789.jpg")
+	// Without a preview, PreviewPath names the WebP file a new one gets.
+	want := filepath.Join(lib.Root(), library.MetaDir, PreviewDir, "ab", "abcdef0123456789.webp")
 	if got := s.PreviewPath(hash); got != want {
 		t.Errorf("PreviewPath = %q, want %q", got, want)
+	}
+	wantLarge := filepath.Join(lib.Root(), library.MetaDir, LargeDir, "ab", "abcdef0123456789.webp")
+	if got := s.LargePath(hash); got != wantLarge {
+		t.Errorf("LargePath = %q, want %q", got, wantLarge)
 	}
 	if _, err := os.Stat(filepath.Join(lib.Root(), library.MetaDir, DBName)); err != nil {
 		t.Errorf("thumbs.db: %v", err)
@@ -42,23 +48,27 @@ func TestStoreRoundTrip(t *testing.T) {
 	if _, _, _, ok, err := s.Thumb(ctx, hash); ok || err != nil {
 		t.Fatalf("Thumb before Put: ok=%v err=%v", ok, err)
 	}
-	if th, pv, err := s.Has(ctx, hash); th || pv || err != nil {
+	if th, _, pv, err := s.Has(ctx, hash); th || pv || err != nil {
 		t.Fatalf("Has before Put = %v %v %v", th, pv, err)
 	}
 
 	thumb := testimg.BareJPEG()
 	preview := testimg.JPEG(testimg.Options{Width: 40, Height: 30, NoExif: true})
-	if err := s.Put(ctx, hash, thumb, 16, 12, preview); err != nil {
+	if err := s.Put(ctx, hash, thumb, 16, 12, nil, preview); err != nil {
 		t.Fatal(err)
 	}
 	got, w, h, ok, err := s.Thumb(ctx, hash)
 	if err != nil || !ok || w != 16 || h != 12 || !bytes.Equal(got, thumb) {
 		t.Fatalf("Thumb = %d bytes %dx%d ok=%v err=%v", len(got), w, h, ok, err)
 	}
+	// JPEG preview bytes (as older versions wrote) keep the .jpg name.
+	if got := s.PreviewPath(hash); got != strings.TrimSuffix(want, ".webp")+".jpg" {
+		t.Errorf("PreviewPath of a JPEG preview = %q", got)
+	}
 	if pb, err := os.ReadFile(s.PreviewPath(hash)); err != nil || !bytes.Equal(pb, preview) {
 		t.Fatalf("preview file: %v", err)
 	}
-	if th, pv, err := s.Has(ctx, hash); !th || !pv || err != nil {
+	if th, _, pv, err := s.Has(ctx, hash); !th || !pv || err != nil {
 		t.Fatalf("Has = %v %v %v", th, pv, err)
 	}
 	// The temp dir holds no leftovers.
@@ -67,7 +77,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	// Replace.
-	if err := s.Put(ctx, hash, preview, 40, 30, thumb); err != nil {
+	if err := s.Put(ctx, hash, preview, 40, 30, nil, thumb); err != nil {
 		t.Fatal(err)
 	}
 	if _, w, h, _, _ := s.Thumb(ctx, hash); w != 40 || h != 30 {
@@ -76,7 +86,7 @@ func TestStoreRoundTrip(t *testing.T) {
 
 	// The hash with the top bit set survives the signed INTEGER mapping.
 	const high = 0xffffffffffffffff
-	if err := s.Put(ctx, high, thumb, 1, 1, preview); err != nil {
+	if err := s.Put(ctx, high, thumb, 1, 1, nil, preview); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, _, ok, _ := s.Thumb(ctx, high); !ok {
@@ -95,7 +105,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err := s.Delete(ctx, hash); err != nil {
 		t.Fatal(err)
 	}
-	if th, pv, err := s.Has(ctx, hash); th || pv || err != nil {
+	if th, _, pv, err := s.Has(ctx, hash); th || pv || err != nil {
 		t.Errorf("Has after Delete = %v %v %v", th, pv, err)
 	}
 	if err := s.Delete(ctx, hash); err != nil {
@@ -104,7 +114,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	if n, _, _ := s.Stats(ctx); n != 1 {
 		t.Errorf("count after delete = %d", n)
 	}
-	if err := s.Put(ctx, 1, nil, 1, 1, preview); err == nil {
+	if err := s.Put(ctx, 1, nil, 1, 1, nil, preview); err == nil {
 		t.Error("Put with empty thumb succeeded")
 	}
 }
@@ -120,10 +130,10 @@ func TestStorePutFailureLeavesNothing(t *testing.T) {
 	if err := os.WriteFile(fan, []byte("in the way"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put(ctx, h1, thumb, 1, 1, preview); err == nil {
+	if err := s.Put(ctx, h1, thumb, 1, 1, nil, preview); err == nil {
 		t.Fatal("Put succeeded although the preview directory is a file")
 	}
-	if th, _, err := s.Has(ctx, h1); th || err != nil {
+	if th, _, _, err := s.Has(ctx, h1); th || err != nil {
 		t.Errorf("row exists after failed preview write (err %v)", err)
 	}
 
@@ -138,10 +148,10 @@ func TestStorePutFailureLeavesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	const h2 = 0x3400000000000002
-	if err := s.Put(ctx, h2, thumb, 1, 1, preview); err == nil {
+	if err := s.Put(ctx, h2, thumb, 1, 1, nil, preview); err == nil {
 		t.Fatal("Put succeeded despite the failing insert")
 	}
-	if th, pv, err := s.Has(ctx, h2); th || pv || err != nil {
+	if th, _, pv, err := s.Has(ctx, h2); th || pv || err != nil {
 		t.Errorf("after failed insert: thumb=%v preview=%v err=%v", th, pv, err)
 	}
 
@@ -149,7 +159,7 @@ func TestStorePutFailureLeavesNothing(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
 	const h3 = 0x5600000000000003
-	if err := s.Put(cctx, h3, thumb, 1, 1, preview); !errors.Is(err, context.Canceled) {
+	if err := s.Put(cctx, h3, thumb, 1, 1, nil, preview); !errors.Is(err, context.Canceled) {
 		t.Errorf("Put with cancelled ctx = %v", err)
 	}
 	if _, err := os.Stat(s.PreviewPath(h3)); !errors.Is(err, os.ErrNotExist) {

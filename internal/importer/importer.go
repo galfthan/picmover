@@ -112,6 +112,11 @@ type Stats struct {
 	// Thumbnail stage: rows that got renditions (ok), that cannot have
 	// any (unsupported), and that failed (error).
 	ThumbsDone, ThumbsUnsupported, ThumbsFailed int64
+	// LargeDone counts large thumbnails (640 px) the thumbnail stage
+	// filled from stored previews for rows whose thumbnail was already
+	// there (renditions generated before the large size existed). Large
+	// thumbnails written together with fresh renditions are not counted.
+	LargeDone int64
 }
 
 // Options configure an import.
@@ -161,6 +166,10 @@ type Options struct {
 	// OnRestored is called after such a restore (the server and the CLI
 	// remove the user.db trash row); an error is only logged.
 	OnRestored func(ctx context.Context, hash uint64) error
+	// OnLargeFailed, when set, is called once per hash whose large
+	// thumbnail could not be derived from its stored preview in this run
+	// (the server stops counting it as missing).
+	OnLargeFailed func(hash uint64)
 
 	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
 	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64
@@ -212,7 +221,7 @@ type Importer struct {
 	gioOK      func() bool                                                              // gvfs.Available
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
-	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
+	thumbsDone, thumbsUnsupported, thumbsFailed, largeDone                             atomic.Int64
 	rate                                                                               atomic.Int64 // last computed Stats.Rate
 }
 
@@ -508,6 +517,7 @@ func (im *Importer) Stats() Stats {
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),
 		ThumbsFailed:      im.thumbsFailed.Load(),
+		LargeDone:         im.largeDone.Load(),
 	}
 }
 

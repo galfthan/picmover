@@ -194,6 +194,12 @@ func TestNewFilterParams(t *testing.T) {
 		{"tag=0", "tag"},
 		{"album=-1", "album"},
 		{"trashed=2", "trashed"},
+		{"minpx=0", "minpx"},
+		{"minpx=abc", "minpx"},
+		{"minpx=-5", "minpx"},
+		{"maxpx=1000001", "maxpx"},
+		{"maxpx=1.5", "maxpx"},
+		{"minpx=5000&maxpx=100", "maxpx"},
 	} {
 		for _, ep := range []string{"timeline?", "media?year=2024&month=7&", "geo?bbox=-180,-90,180,90&zoom=1&", "geo/items?bbox=-180,-90,180,90&"} {
 			wantError(t, f.get(lp+ep+c.q), http.StatusBadRequest, c.msg)
@@ -215,6 +221,33 @@ func TestNewFilterParams(t *testing.T) {
 	w := f.get(lp + "geo?bbox=-180,-90,180,90&zoom=1&recur=07-14")
 	if cl := decode[clustersJSON](t, w).Clusters; len(cl) != 1 || cl[0].Count != 1 {
 		t.Fatalf("geo with recur %+v", cl)
+	}
+	// Dimensions: a, b, c, e are 64x48, d.png 32x32; the direct rows
+	// (undated, deleted, outside, internal) have unknown dimensions.
+	for q, want := range map[string]int64{
+		"minpx=64":                  4,
+		"minpx=65":                  0,
+		"maxpx=32":                  1,
+		"minpx=33&maxpx=64":         4,
+		"minpx=32&maxpx=32":         1,
+		"maxpx=1000000":             5, // unknown dimensions never match
+		"minpx=64&type=image&gps=1": 3,
+		"minpx=64&from=2024-07-15":  2,
+		"maxpx=1000000&trashed=1":   0, // the deleted row has no dimensions
+	} {
+		if n := f.countAll(q); n != want {
+			t.Errorf("%s: %d, want %d", q, n, want)
+		}
+	}
+	if items := decode[itemsJSON](t, f.get(lp+"media?year=2024&month=7&minpx=64")).Items; len(items) != 2 {
+		t.Errorf("media minpx=64: %d items, want 2", len(items))
+	}
+	if items := decode[itemsJSON](t, f.get(lp+"media?year=2024&month=7&maxpx=63")).Items; len(items) != 0 {
+		t.Errorf("media maxpx=63: %d items, want 0", len(items))
+	}
+	w = f.get(lp + "geo?bbox=-180,-90,180,90&zoom=1&maxpx=32")
+	if cl := decode[clustersJSON](t, w).Clusters; len(cl) != 0 {
+		t.Fatalf("geo with maxpx %+v", cl)
 	}
 }
 

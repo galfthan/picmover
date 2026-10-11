@@ -54,6 +54,12 @@ describe('thumbnail and preview URLs', () => {
     expect(api.thumbUrl({ hash })).toBe('/api/l/peter/thumb/00000000000000ab');
     expect(api.previewUrl({ hash })).toBe('/api/l/peter/preview/00000000000000ab');
   });
+  it('build the large rendition URL like the thumb and preview', () => {
+    expect(api.largeUrl({ hash, thumbAt: 1760090000 })).toBe('/api/l/peter/large/00000000000000ab?v=1760090000');
+    expect(api.largeUrl({ hash })).toBe('/api/l/peter/large/00000000000000ab');
+    expect(api.largeUrl({ hash, thumbAt: Number.POSITIVE_INFINITY })).toBe('/api/l/peter/large/00000000000000ab');
+    expect(libApi('my lib').largeUrl({ hash })).toBe('/api/l/my%20lib/large/00000000000000ab');
+  });
   it('ignore a thumbAt that is not a finite number', () => {
     const bad = JSON.parse('{"hash":"00000000000000ab","thumbAt":"\\"><img>"}') as { hash: string; thumbAt?: number };
     expect(api.thumbUrl(bad)).toBe('/api/l/peter/thumb/00000000000000ab');

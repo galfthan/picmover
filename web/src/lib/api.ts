@@ -103,6 +103,8 @@ export interface ThumbCounts {
   unsupported: number;
   error: number;
   stale?: number;
+  /** Rows with a preview but no large (640 px) rendition; absent from older servers. */
+  largeMissing?: number;
 }
 
 /** Counts from user.db. */
@@ -450,6 +452,8 @@ export interface JobStats {
   thumbsDone: number;
   thumbsUnsupported: number;
   thumbsFailed: number;
+  /** Large (640 px) renditions derived from stored previews by a thumbs job. */
+  largeDone: number;
 }
 
 /**
@@ -577,6 +581,10 @@ export interface Filters {
   to?: string;
   /** "MM-DD" or "MM-DD..MM-DD", every year (see dates.ts). */
   recur?: string;
+  /** Longer edge, MAX(width, height), at least this many pixels (1..1 000 000; `minpx`). Unknown dimensions never match. */
+  minPx?: number;
+  /** Longer edge at most this many pixels (1..1 000 000; `maxpx`). Unknown dimensions never match. */
+  maxPx?: number;
   /** Minimum rating 1..5. */
   rating?: number;
   /** Tag ids; all must match. */
@@ -699,6 +707,8 @@ export function filterParams(f: Filters, extra?: Record<string, string | number>
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
   if (f.recur) q.set('recur', f.recur);
+  if (f.minPx) q.set('minpx', String(f.minPx));
+  if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (f.rating) q.set('rating', String(f.rating));
   for (const t of f.tags ?? []) q.append('tag', String(t));
   if (f.album) q.set('album', String(f.album));
@@ -784,6 +794,8 @@ export interface LibApi {
   getMedia(id: number, signal?: AbortSignal): Promise<MediaDetail>;
   thumbUrl(ref: ThumbRef): string;
   previewUrl(ref: ThumbRef): string;
+  /** The 640 px rendition (derived on demand from the preview by the server). */
+  largeUrl(ref: ThumbRef): string;
   fileUrl(id: number, download?: boolean): string;
   getGeoClusters(f: Filters, bbox: BBox, zoom: number, signal?: AbortSignal): Promise<GeoCluster[]>;
   getGeoItems(f: Filters, bbox: BBox, limit: number, signal?: AbortSignal): Promise<{ items: MediaItem[]; total: number }>;
@@ -825,7 +837,7 @@ export interface LibApi {
   getRuns(id: string, signal?: AbortSignal): Promise<BackupRun[]>;
 }
 
-function versioned(base: string, kind: 'thumb' | 'preview', ref: ThumbRef): string {
+function versioned(base: string, kind: 'thumb' | 'large' | 'preview', ref: ThumbRef): string {
   const u = `${base}/${kind}/${enc(ref.hash)}`;
   const v = ref.thumbAt;
   return typeof v === 'number' && Number.isFinite(v) ? `${u}?v=${enc(String(Math.trunc(v)))}` : u;
@@ -881,6 +893,7 @@ function makeLibApi(id: string): LibApi {
     },
     thumbUrl: (ref) => versioned(base, 'thumb', ref),
     previewUrl: (ref) => versioned(base, 'preview', ref),
+    largeUrl: (ref) => versioned(base, 'large', ref),
     fileUrl: (mid, download = false) => `${base}/file/${enc(String(mid))}${download ? '?download=1' : ''}`,
     async getGeoClusters(f, bbox, zoom, signal) {
       const q = filterParams(f, { bbox: bboxParam(bbox), zoom: Math.max(0, Math.min(22, Math.round(zoom))) });

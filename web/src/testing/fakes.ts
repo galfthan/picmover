@@ -48,6 +48,10 @@ export async function go(hash: string) {
   await settle();
 }
 
+/** Tiny stand-ins for rendition bytes (signatures only). */
+const TINY_JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+const TINY_WEBP = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
+
 export const hashOf = (id: number) => id.toString(16).padStart(16, '0');
 
 export interface Item extends MediaItem {
@@ -83,7 +87,7 @@ interface FakeTarget {
 }
 
 /** The importer counters every job object carries; zero for the backup kinds (their stats are in `result`). */
-export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
+export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0, largeDone: 0 };
 
 /** Run stats (`result`, and `stats` in runs) exactly as the step 5 server writes them, per kind. */
 export function runResult(kind: string, p: Record<string, unknown> = {}): Record<string, unknown> {
@@ -235,6 +239,10 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   const openErrors = new Map<string, string>();
   /** user.db counts that differ from the catalog's (null: the same). */
   const userdb: { trashed: number | null } = { trashed: null };
+  /** The library JSON `thumbs` counts (tests set `largeMissing`). */
+  const thumbCounts: { pending: number; ok: number; unsupported: number; error: number; largeMissing?: number } = { pending: 0, ok: 9, unsupported: 0, error: 0, largeMissing: 0 };
+  /** Hashes whose large cannot be derived: the large route answers the thumb bytes with no-store. */
+  const largeFallback = new Set<string>();
 
   /**
    * Backups of "peter" (docs/design/backups.md "HTTP API"): targets as
@@ -547,6 +555,12 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     const rating = Number(q.get('rating'));
     if (rating) list = list.filter((x) => (x.rating ?? 0) >= rating);
     for (const t of q.getAll('tag')) list = list.filter((x) => x.tagIds.includes(Number(t)));
+    // The dimension filter on the longer edge; unknown dimensions never match.
+    const minPx = Number(q.get('minpx') ?? 0);
+    const maxPx = Number(q.get('maxpx') ?? 0);
+    if (minPx || maxPx) {
+      list = list.filter((x) => x.w > 0 && x.h > 0 && (!minPx || Math.max(x.w, x.h) >= minPx) && (!maxPx || Math.max(x.w, x.h) <= maxPx));
+    }
     return list;
   }
 
@@ -557,6 +571,27 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     if (imp) {
       if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
       if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
+    }
+    // The dimension filter as the server: 1..1 000 000, minpx <= maxpx.
+    for (const k of ['minpx', 'maxpx']) {
+      const v = q.get(k);
+      if (v && (!/^[+-]?\d+$/.test(v) || Number(v) < 1 || Number(v) > 1_000_000)) {
+        return json({ error: `invalid ${k} "${v}": want a size in pixels 1-1000000` }, 400);
+      }
+    }
+    const [lo, hi] = [Number(q.get('minpx') || 0), Number(q.get('maxpx') || 0)];
+    if (lo && hi && lo > hi) return json({ error: `invalid minpx ${lo}: greater than maxpx ${hi}` }, 400);
+    // Renditions (docs/design/renditions.md), as the server answers them:
+    // a known hash gets a tiny image (the thumb and preview JPEG, the
+    // large WebP); a hash in largeFallback has a large that could not be
+    // derived, answered with the thumb bytes and no-store.
+    const rm = /^(thumb|large|preview)\/([0-9a-f]+)$/.exec(path);
+    if (rm && method === 'GET') {
+      const [, kind, hash] = rm;
+      if (!items.some((x) => x.hash === hash)) return json({ error: `no ${kind === 'large' ? 'large thumbnail' : kind === 'thumb' ? 'thumbnail' : 'preview'}` }, 404);
+      if (kind === 'large' && largeFallback.has(hash!)) return new Response(TINY_JPEG, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' } });
+      const webp = kind === 'large';
+      return new Response(webp ? TINY_WEBP : TINY_JPEG, { headers: { 'Content-Type': webp ? 'image/webp' : 'image/jpeg', 'Cache-Control': 'private, max-age=604800' } });
     }
     if (path === 'imports' && method === 'GET') return json({ imports: imports.map((r) => importJSON(r, 'stored')) });
     const im = /^imports\/([^/]+)(\/delete)?$/.exec(path);
@@ -583,7 +618,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         root: '/media/peter',
         version: 'test',
         summary: { ...summary(live().length), deleted: items.length - live().length },
-        thumbs: { pending: 0, ok: 9, unsupported: 0, error: 0 },
+        thumbs: { ...thumbCounts },
         cameras: [],
         ffmpeg: true,
         userdb: { ratings: items.filter((x) => x.rating).length, tags: tags.length, albums: albums.length, trashed: userdb.trashed ?? items.length - live().length, ignoredPairs: ignoredPairs.size },
@@ -807,7 +842,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

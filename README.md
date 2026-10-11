@@ -10,7 +10,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 - **Duplicate Detection**: Uses hash-based comparison to prevent duplicate imports.
 - **Metadata Extraction**: Extracts and stores EXIF data for images, including camera information and GPS coordinates.
 - **Support for Various File Types**: Images (JPEG, PNG, TIFF, HEIC/HEIF, AVIF, WebP, GIF, BMP), RAW files (CR2, CR3, NEF, ARW, DNG, ORF, RW2, RAF, PEF, SRW, ...) and common video formats. See [Supported Formats](#supported-formats).
-- **Thumbnails and Previews**: Every imported file gets a 256 px thumbnail, a 1600 px preview and a perceptual hash (for finding near-duplicates later), cached by content hash in `.picmover/`.
+- **Thumbnails and Previews**: Every imported file gets a 256 px thumbnail, a 640 px large thumbnail (for big grid tiles, and medium ones on high-resolution screens; the grid shows each tile the smallest rendition that fills it, up to the preview at the largest zoom), a 1600 px preview and a perceptual hash (for finding near-duplicates), stored as WebP and cached by content hash in `.picmover/`.
 - **Database Management**: Uses SQLite to maintain a catalog (`media.db`) of all imported files for quick access and management. SQLite is built in (pure Go, no cgo).
 - **Portable Libraries**: Paths in the catalog are relative to the library root, so one library works from Linux, Windows and macOS.
 - **Safe Copies**: Each source file is read once, into a temp file inside the library, hashing the bytes as they are written; duplicates are dropped and metadata is read from that copy, which is then fsynced and renamed into place before it is recorded in the catalog. The hash recorded is the hash of the bytes written. A copy reads the source once; a move reads it twice: before the original is deleted it is read again, and nothing is placed or deleted unless that second read gives the same hash as the copy (otherwise the file is an error and the source is kept). A file that changes size while it is read is an error and is not imported.
@@ -72,7 +72,7 @@ Phones on Linux: a phone or camera mounted by gvfs (the file manager's MTP or PT
 
 Press Ctrl+C to stop cleanly: files already copied are recorded, the partial summary is printed and the command exits with status 130. Press Ctrl+C a second time to terminate at once.
 
-After the files are copied, the thumbnail stage generates a thumbnail and a preview for every file imported in this run (one worker per CPU, at most 16). The status line shows `Thumbs N` during that stage, and the summary lists the thumbnails done, unsupported (for example a video without `ffmpeg`, a RAW file without an embedded preview, or an image above 100 megapixels) and failed. Ctrl+C during the thumbnail stage keeps every imported file; the remaining thumbnails stay pending and `picmover thumbs` generates them later.
+After the files are copied, the thumbnail stage generates a thumbnail, a large thumbnail and a preview for every file imported in this run (one worker per CPU, at most 16). The status line shows `Thumbs N` during that stage, and the summary lists the thumbnails done, unsupported (for example a video without `ffmpeg`, a RAW file without an embedded preview, or an image above 100 megapixels) and failed. Ctrl+C during the thumbnail stage keeps every imported file; the remaining thumbnails stay pending and `picmover thumbs` generates them later.
 
 Exit status: 0 on success; 2 when some files could not be imported or thumbnails failed (they are counted under `Errors` and listed in the log; with `--move` they are left in the source), or when the thumbnail stage could not run at all (for example an incompatible thumbnail cache: the files are imported, the cache error is printed as a warning and the thumbnails stay pending); 130 when cancelled; 1 for any other error, never after the files were imported successfully. So `picmover import --move a lib && rm -rf a` only deletes `a` when everything was imported.
 
@@ -126,7 +126,7 @@ Frontend development: run `picmover serve /path/to/library --no-open --cors-orig
 
 ### Thumbnails
 
-To generate the thumbnails and previews that are still pending (after `import --no-thumbs` or a cancelled import), retry the files whose thumbnails failed before, and regenerate stale ones:
+To generate the thumbnails and previews that are still pending (after `import --no-thumbs` or a cancelled import), retry the files whose thumbnails failed before, regenerate stale ones, and fill in the 640 px large thumbnails that libraries made by earlier versions lack:
 
 ```
 ./picmover thumbs /path/to/library
@@ -135,11 +135,13 @@ To generate the thumbnails and previews that are still pending (after `import --
 Flags:
 
 - `--workers N`: number of parallel workers (0 = one per CPU, at most 16).
-- `--rebuild`: regenerate the thumbnails of every file, not only the pending, failed and stale ones.
+- `--rebuild`: regenerate the thumbnails of every file from the originals, not only the pending, failed and stale ones (this also converts JPEG renditions made by earlier versions to WebP).
 - `--limit N`: process at most N files (0 = no limit).
 - `--quiet`: do not show the live status line.
 
 Every run retries the files whose thumbnails failed, so a file that can never be decoded is reported as failed (exit status 2) each time. A file becomes `stale` when `update-metadata` changes its orientation; `thumbs` then regenerates its thumbnail and preview even though they are cached.
+
+Thumbnails, large thumbnails and previews are written as WebP (quality 80, 82 and 85). Thumbnails and previews made by earlier versions are JPEG; they stay valid and are used as they are. A file whose thumbnail and preview exist but whose large thumbnail does not gets one made from its stored preview, without reading the original (so it works even when the original is on a disconnected drive); the summary counts these as `Large filled`. The browser app also makes a missing large thumbnail on demand when it first shows one (showing the thumbnail until it is ready), so running `thumbs` for this is optional; the Library page shows how many are missing. A large thumbnail whose preview cannot be decoded is not retried until the library is opened again (or the next `thumbs` run). When the library folder cannot be written, the browser app still shows large thumbnails it makes on demand, without storing them.
 
 It exits with status 2 when thumbnails failed for some files (they are listed in the log in `.picmover/logs/`), and 130 when cancelled.
 
@@ -253,13 +255,14 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
   media.db              catalog (derived from the files; rebuild recreates it)
   user.db               ratings, tags, albums, trash times, import history (never rebuilt; back it up)
   .picmover/trash/      trashed files, under their library path
-  .picmover/thumbs.db   thumbnail cache (256 px JPEGs, keyed by content hash)
-  .picmover/previews/   preview cache (1600 px JPEGs, <hh>/<hash>.jpg)
+  .picmover/thumbs.db   thumbnail cache (256 px, WebP or older JPEG, keyed by content hash)
+  .picmover/large/      large thumbnail cache (640 px WebP, <hh>/<hash>.webp)
+  .picmover/previews/   preview cache (1600 px, <hh>/<hash>.webp, or .jpg from earlier versions)
   .picmover/logs/       import, thumbs and rebuild logs
   .picmover/tmp/        in-progress copies
 ```
 
-The thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them.
+The thumbnail, large thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them.
 
 Times are stored as the camera's wall-clock time, plus the UTC offset when it is known. `--timezone` only affects videos and files without an embedded timestamp.
 

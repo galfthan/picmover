@@ -127,12 +127,13 @@ func brandFormat(br string) Format {
 }
 
 // guard runs f and converts a panic into an error; the WebAssembly
-// decoders in particular may panic on hostile input.
+// decoders in particular may panic on hostile input, and the WebP
+// encoder is guarded the same way.
 func guard[T any](f func() (T, error)) (v T, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			var zero T
-			v, err = zero, fmt.Errorf("imaging: decoder panic: %v", p)
+			v, err = zero, fmt.Errorf("imaging: codec panic: %v", p)
 		}
 	}()
 	return f()

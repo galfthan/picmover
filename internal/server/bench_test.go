@@ -72,7 +72,7 @@ func benchServer(b *testing.B) (*Server, uint64) {
 	}
 	const hash = 0x0123456789abcdef
 	thumb := testimg.JPEG(testimg.Options{Width: 256, Height: 192, NoExif: true})
-	if err := w.Put(ctx, hash, thumb, 256, 192, testimg.JPEG(testimg.Options{Width: 64, Height: 48, NoExif: true})); err != nil {
+	if err := w.Put(ctx, hash, thumb, 256, 192, nil, testimg.JPEG(testimg.Options{Width: 64, Height: 48, NoExif: true})); err != nil {
 		b.Fatal(err)
 	}
 	w.Close()
