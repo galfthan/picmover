@@ -1,5 +1,6 @@
 /dist/
 /picmover
+/picmover-app
 *.exe
 *.db
 *.db-*
