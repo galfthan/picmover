@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/gen2brain/webp"
@@ -107,4 +109,16 @@ func BenchmarkEncodeWebP(b *testing.B) {
 		}
 		b.ReportMetric(float64(n), "bytes")
 	})
+}
+
+// A panic in the WebP encoder is returned as an error.
+func TestEncodeWebPPanicGuarded(t *testing.T) {
+	orig := webpEncode
+	t.Cleanup(func() { webpEncode = orig })
+	webpEncode = func(io.Writer, image.Image, ...webp.Options) error { panic("wasm trap") }
+	var buf bytes.Buffer
+	err := EncodeWebP(&buf, scene(16, 16, 0), 80)
+	if err == nil || !strings.Contains(err.Error(), "wasm trap") {
+		t.Fatalf("EncodeWebP = %v", err)
+	}
 }

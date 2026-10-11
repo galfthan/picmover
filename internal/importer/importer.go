@@ -166,6 +166,10 @@ type Options struct {
 	// OnRestored is called after such a restore (the server and the CLI
 	// remove the user.db trash row); an error is only logged.
 	OnRestored func(ctx context.Context, hash uint64) error
+	// OnLargeFailed, when set, is called once per hash whose large
+	// thumbnail could not be derived from its stored preview in this run
+	// (the server stops counting it as missing).
+	OnLargeFailed func(hash uint64)
 
 	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
 	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64

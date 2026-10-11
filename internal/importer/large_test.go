@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"picmover/internal/catalog"
@@ -92,5 +93,46 @@ func TestRunThumbsFillsMissingLarge(t *testing.T) {
 		if _, err := os.Stat(e.lib.Abs(rel)); !os.IsNotExist(err) {
 			t.Errorf("%s: original exists again (%v)", rel, err)
 		}
+	}
+}
+
+// A large thumbnail that cannot be derived (undecodable preview) does not
+// stop the pass: the other rows are filled, the hash is reported once
+// through OnLargeFailed, and the catalog row is untouched.
+func TestRunThumbsLargeFailureReported(t *testing.T) {
+	e := newEnv(t)
+	for i := range 3 {
+		writeFile(t, filepath.Join(e.src, "f"+string(rune('a'+i))+".jpg"),
+			testimg.JPEG(testimg.Options{Width: 1200, Height: 900, DateTime: date(2020, 3, 5), Seed: byte(i)}))
+	}
+	e.mustRun(e.opts())
+	store := openStore(t, e.lib)
+	rows := e.rows()
+	var bad catalog.Media
+	for _, m := range rows {
+		os.Remove(store.LargePath(m.Hash))
+		if bad.Hash == 0 {
+			bad = m
+			if err := os.WriteFile(store.PreviewPath(m.Hash), []byte("RIFF\x20\x00\x00\x00WEBPVP8 not a webp"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var mu sync.Mutex
+	var failed []uint64
+	opts := Options{OnLargeFailed: func(h uint64) {
+		mu.Lock()
+		failed = append(failed, h)
+		mu.Unlock()
+	}}
+	st, err := New(e.lib, e.db, opts).RunThumbs(context.Background(), 0, false)
+	if err != nil || st.LargeDone != 2 || st.ThumbsFailed != 0 {
+		t.Fatalf("RunThumbs = %+v, %v", st, err)
+	}
+	if len(failed) != 1 || failed[0] != bad.Hash {
+		t.Errorf("OnLargeFailed calls %x, want [%x]", failed, bad.Hash)
+	}
+	if m := e.rows()[bad.RelPath]; m.ThumbState != catalog.ThumbStateOK {
+		t.Errorf("row of the failed large: %+v", m)
 	}
 }

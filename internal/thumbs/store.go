@@ -77,6 +77,9 @@ type Store struct {
 	large    string
 	tmp      string
 	readOnly bool
+	// ls is what this Store remembers about large thumbnails it could
+	// not derive or write (largestate.go).
+	ls largeState
 }
 
 // File extensions. New previews are WebP; older ones (and any written from
@@ -494,8 +497,11 @@ func (s *Store) Put(ctx context.Context, hash uint64, thumb []byte, tw, th int, 
 // fan-out directory and renames it into place without replacing
 // (library.RenameNoReplace), so concurrent writers (a server deriving on
 // demand, a thumbs job) never clobber each other and readers never see a
-// partial file. It works on a read-only Store: the large directory is the
-// only thing a server writes.
+// partial file. A zero-length file in its place (left by external
+// corruption; never by this code) is removed first, so it is replaced
+// rather than served forever. It works on a read-only Store: the large
+// directory is the only thing a server writes. A failed write is
+// remembered (LargeUnwritable) until a write succeeds.
 func (s *Store) PutLarge(hash uint64, data []byte) (written bool, err error) {
 	if len(data) == 0 {
 		return false, fmt.Errorf("thumbs: put large %016x: empty rendition", hash)
@@ -504,12 +510,15 @@ func (s *Store) PutLarge(hash uint64, data []byte) (written bool, err error) {
 	if nonEmptyFile(dst) {
 		return false, nil
 	}
+	removeEmptyFile(dst)
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		s.setLargeWritable(false)
 		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
 	}
 	tmp, err := writeSynced(dir, fmt.Sprintf(".%016x-*%s", hash, tmpSuffix), data)
 	if err != nil {
+		s.setLargeWritable(false)
 		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
 	}
 	if err := library.RenameNoReplace(tmp, dst); err != nil {
@@ -517,10 +526,19 @@ func (s *Store) PutLarge(hash uint64, data []byte) (written bool, err error) {
 		if errors.Is(err, fs.ErrExist) {
 			return false, nil
 		}
+		s.setLargeWritable(false)
 		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
 	}
 	syncDir(dir)
+	s.setLargeWritable(true)
 	return true, nil
+}
+
+// removeEmptyFile removes p when it is a zero-length regular file.
+func removeEmptyFile(p string) {
+	if st, err := os.Lstat(p); err == nil && st.Mode().IsRegular() && st.Size() == 0 {
+		_ = os.Remove(p)
+	}
 }
 
 // writeTemp writes data to a fsynced temp file (named after pattern) in

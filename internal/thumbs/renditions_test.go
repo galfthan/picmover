@@ -7,6 +7,7 @@ import (
 	"image"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -380,4 +381,80 @@ func TestCleanOldAcrossFormats(t *testing.T) {
 		t.Error("0x21 has no preview")
 	}
 	_ = library.MetaDir
+}
+
+// Review fixes (docs/design/renditions.md, "Review fixes"): a zero-length
+// large is replaced, failed derivations are remembered per Store, and an
+// unwritable large directory still yields the derived bytes.
+func TestLargeEmptyFailedUnwritable(t *testing.T) {
+	ctx := context.Background()
+	s, lib := openTestStore(t)
+	putLegacy(t, s, 0x20, 800, 600)
+	putLegacy(t, s, 0x21, 800, 600)
+
+	// An empty large file is not "present" for writing: PutLarge replaces it.
+	if err := os.MkdirAll(filepath.Dir(s.LargePath(0x20)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.LargePath(0x20), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if filled, err := DeriveLarge(ctx, s, 0x20, imaging.Options{}); !filled || err != nil {
+		t.Fatalf("DeriveLarge over an empty file = %v, %v", filled, err)
+	}
+	if st, err := os.Stat(s.LargePath(0x20)); err != nil || st.Size() == 0 {
+		t.Fatalf("large after replacing the empty file: %v %v", st, err)
+	}
+
+	// An undecodable preview fails once, then is refused without decoding.
+	if err := os.WriteFile(s.PreviewPath(0x21), []byte("\xff\xd8\xff\xe0 not a jpeg at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveLarge(ctx, s, 0x21, imaging.Options{}); err == nil || errors.Is(err, ErrLargeFailed) || !s.LargeFailed(0x21) {
+		t.Fatalf("first DeriveLarge = %v, failed %v", err, s.LargeFailed(0x21))
+	}
+	if _, err := DeriveLargeData(ctx, s, 0x21, imaging.Options{}); !errors.Is(err, ErrLargeFailed) {
+		t.Fatalf("second derivation = %v, want ErrLargeFailed", err)
+	}
+	// A missing preview is not remembered (it may be generated later).
+	if _, err := DeriveLarge(ctx, s, 0x99, imaging.Options{}); !errors.Is(err, ErrNoPreview) || s.LargeFailed(0x99) {
+		t.Fatalf("no preview: %v, failed %v", err, s.LargeFailed(0x99))
+	}
+	if s.MarkLargeFailed(0x21) {
+		t.Error("MarkLargeFailed of a known hash reported new")
+	}
+	// A reopened Store starts afresh.
+	s2, err := OpenStoreReadOnly(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if s2.LargeFailed(0x21) {
+		t.Error("failed hash carried over to another Store")
+	}
+
+	// Unwritable large directory: the bytes are derived and returned, the
+	// write fails once and is then skipped; a later successful write
+	// clears the state.
+	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+		return
+	}
+	os.Remove(s.LargePath(0x20))
+	fan := filepath.Dir(s.LargePath(0x20))
+	if err := os.Chmod(fan, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(fan, 0o755) })
+	res, err := DeriveLargeData(ctx, s2, 0x20, imaging.Options{})
+	if err != nil || len(res.Data) == 0 || res.Written || res.WriteErr == nil || errors.Is(res.WriteErr, ErrLargeUnwritable) || !s2.LargeUnwritable() {
+		t.Fatalf("read-only: %d bytes, written %v, %v, %v", len(res.Data), res.Written, res.WriteErr, err)
+	}
+	res, err = DeriveLargeData(ctx, s2, 0x20, imaging.Options{})
+	if err != nil || len(res.Data) == 0 || !errors.Is(res.WriteErr, ErrLargeUnwritable) {
+		t.Fatalf("read-only again: %d bytes, %v, %v", len(res.Data), res.WriteErr, err)
+	}
+	os.Chmod(fan, 0o755)
+	if written, err := s2.PutLarge(0x20, res.Data); !written || err != nil || s2.LargeUnwritable() {
+		t.Fatalf("PutLarge after chmod = %v, %v, unwritable %v", written, err, s2.LargeUnwritable())
+	}
 }

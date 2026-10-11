@@ -102,7 +102,7 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 				// preview, also when it reuses cached renditions (and then
 				// derives a missing large thumbnail from that preview).
 				res := gen.Generate(runCtx, j.src, j.force)
-				im.countLarge(j, res.LargeFilled, res.LargeError)
+				im.countLarge(store, j, res.LargeFilled, res.LargeError)
 				done <- thumbDone{job: j, res: res}
 			}
 		})
@@ -132,28 +132,42 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 }
 
 // fillLarge derives the missing large thumbnail of a large job's row from
-// its stored preview and counts it.
+// its stored preview and counts it. A panic (the codecs are guarded, so
+// this is a bug) fails that row's fill only: it is logged, the hash is
+// remembered as failed and the stage continues.
 func (im *Importer) fillLarge(ctx context.Context, gen *thumbs.Generator, j thumbJob) {
+	defer func() {
+		if p := recover(); p != nil {
+			gen.Store.MarkLargeFailed(j.src.Hash)
+			im.countLarge(gen.Store, j, false, fmt.Sprintf("thumbs: panic: %v", p))
+		}
+	}()
 	filled, err := gen.FillLarge(ctx, j.src.Hash)
 	if ctx.Err() != nil {
 		return
 	}
 	msg := ""
-	if err != nil {
+	if err != nil && !errors.Is(err, thumbs.ErrLargeFailed) {
 		msg = err.Error()
 	}
-	im.countLarge(j, filled, msg)
+	im.countLarge(gen.Store, j, filled, msg)
 }
 
 // countLarge counts a large thumbnail filled from the stored preview and
 // logs a failed fill (not a failure of the stage: the server derives the
-// large thumbnail on demand, and the next pass retries).
-func (im *Importer) countLarge(j thumbJob, filled bool, errMsg string) {
+// large thumbnail on demand, and the next run retries). A hash whose
+// derivation failed is remembered by the run's Store (thumbs.ErrLargeFailed:
+// not tried, and not logged, again in this run) and reported through
+// Options.OnLargeFailed.
+func (im *Importer) countLarge(store *thumbs.Store, j thumbJob, filled bool, errMsg string) {
 	if filled {
 		im.largeDone.Add(1)
 	}
 	if errMsg != "" {
 		im.log.Warn("large thumbnail not filled", "file", j.rel, "message", errMsg)
+		if im.opts.OnLargeFailed != nil && store.LargeFailed(j.src.Hash) {
+			im.opts.OnLargeFailed(j.src.Hash)
+		}
 	}
 }
 
@@ -224,7 +238,9 @@ func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, session
 		}
 		for _, m := range rows {
 			afterID = m.ID
-			if !presence.Preview(m.Hash) || presence.Large(m.Hash) {
+			// A hash whose derivation already failed in this run (in the
+			// first pass) is not tried again.
+			if !presence.Preview(m.Hash) || presence.Large(m.Hash) || store.LargeFailed(m.Hash) {
 				continue
 			}
 			if page() == 0 {

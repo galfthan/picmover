@@ -33,7 +33,7 @@ const (
 
 // Limits on bytes read into memory whole.
 const (
-	maxPreviewBytes = 64 << 20 // one embedded RAW preview
+	maxPreviewBytes = 64 << 20 // one embedded RAW preview, or one stored preview (EncodeLarge)
 	maxFrameBytes   = 32 << 20 // ffmpeg's JPEG on stdout
 	maxStderrTail   = 4 << 10  // stderr kept for error messages
 	ffmpegTimeout   = 60 * time.Second
@@ -247,7 +247,9 @@ func (g *Generator) cached(ctx context.Context, hash uint64) (res Result, ok boo
 			return Result{}, false, ctx.Err()
 		}
 		res.LargeFilled = filled
-		if err != nil {
+		// A derivation that already failed in this Store was reported
+		// then.
+		if err != nil && !errors.Is(err, ErrLargeFailed) {
 			res.LargeError = err.Error()
 		}
 	}
@@ -269,45 +271,89 @@ var ErrNoPreview = errors.New("no preview")
 // (see EncodeLarge) with Store.PutLarge, which never replaces an existing
 // file; the original is never read. filled reports whether this call
 // wrote it (false, nil: it already existed). A missing preview is an
-// error wrapping ErrNoPreview. opts bounds the decode (memory budget,
-// pixels).
+// error wrapping ErrNoPreview. A derivation that fails for another reason
+// than the context is remembered by the Store (MarkLargeFailed), and
+// later calls for that hash fail at once with an error wrapping
+// ErrLargeFailed. opts bounds the decode (memory budget, pixels).
 func DeriveLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) (filled bool, err error) {
-	if nonEmptyFile(s.LargePath(hash)) {
-		return false, nil
-	}
-	data, err := EncodeLarge(ctx, s, hash, opts)
-	if err != nil {
-		return false, err
-	}
-	if err := ctx.Err(); err != nil {
+	data, err := deriveLarge(ctx, s, hash, opts)
+	if err != nil || data == nil {
 		return false, err
 	}
 	return s.PutLarge(hash, data)
 }
 
+// DerivedLarge is the outcome of DeriveLargeData.
+type DerivedLarge struct {
+	// Data is the derived large thumbnail (WebP); nil when one already
+	// existed.
+	Data []byte
+	// Written reports whether Data was stored.
+	Written bool
+	// WriteErr is why Data was not stored: the write failed, or it was
+	// skipped (ErrLargeUnwritable) because a recent write failed. Nil
+	// when it was written or another writer stored one first.
+	WriteErr error
+}
+
+// DeriveLargeData is DeriveLarge for a server: the derived bytes are
+// returned whether or not they could be stored, and a write is not
+// attempted while the Store's large directory is known to be unwritable
+// (Store.LargeUnwritable), so a read-only library folder still gets its
+// large thumbnails (served uncached by the caller). err is a derivation
+// failure only.
+func DeriveLargeData(ctx context.Context, s *Store, hash uint64, opts imaging.Options) (DerivedLarge, error) {
+	data, err := deriveLarge(ctx, s, hash, opts)
+	if err != nil || data == nil {
+		return DerivedLarge{}, err
+	}
+	if s.LargeUnwritable() {
+		return DerivedLarge{Data: data, WriteErr: ErrLargeUnwritable}, nil
+	}
+	written, werr := s.PutLarge(hash, data)
+	return DerivedLarge{Data: data, Written: written, WriteErr: werr}, nil
+}
+
+// deriveLarge returns the encoded large thumbnail of hash, or nil when a
+// non-empty one exists. See DeriveLarge for the errors.
+func deriveLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) ([]byte, error) {
+	if nonEmptyFile(s.LargePath(hash)) {
+		return nil, nil
+	}
+	if s.LargeFailed(hash) {
+		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, ErrLargeFailed)
+	}
+	data, err := EncodeLarge(ctx, s, hash, opts)
+	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, ErrNoPreview) {
+			s.MarkLargeFailed(hash)
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 // EncodeLarge decodes the stored preview of hash (WebP or JPEG, by
 // sniffing) at LargeSize and returns the large thumbnail as WebP bytes at
-// LargeQuality, without storing it.
+// LargeQuality, without storing it. The preview is read into memory and
+// closed before decoding, so the file is not held open (on Windows an
+// open file blocks a concurrent Put from renaming it).
 func EncodeLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Options) ([]byte, error) {
-	f, err := os.Open(s.PreviewPath(hash))
-	if errors.Is(err, fs.ErrNotExist) {
+	src, err := readPreview(s.PreviewPath(hash))
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotRegular) {
 		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, ErrNoPreview)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
 	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, ErrNoPreview)
-	}
-	if f := imaging.Sniff(f); f != imaging.FormatJPEG && f != imaging.FormatWebP {
+	r := bytes.NewReader(src)
+	if f := imaging.Sniff(r); f != imaging.FormatJPEG && f != imaging.FormatWebP {
 		return nil, fmt.Errorf("thumbs: large %016x: stored preview is neither WebP nor JPEG", hash)
 	}
-	img, _, err := imaging.DecodeFit(ctx, f, st.Size(), LargeSize, opts)
+	img, _, err := imaging.DecodeFit(ctx, r, int64(len(src)), LargeSize, opts)
 	if err != nil {
 		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
 	}
@@ -316,6 +362,29 @@ func EncodeLarge(ctx context.Context, s *Store, hash uint64, opts imaging.Option
 		return nil, fmt.Errorf("thumbs: large %016x: %w", hash, err)
 	}
 	return buf.Bytes(), nil
+}
+
+var errNotRegular = errors.New("not a regular file")
+
+// readPreview reads the regular file p (at most maxPreviewBytes) and
+// closes it.
+func readPreview(p string) ([]byte, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, errNotRegular
+	}
+	if st.Size() > maxPreviewBytes {
+		return nil, fmt.Errorf("stored preview is larger than %d bytes", maxPreviewBytes)
+	}
+	return io.ReadAll(io.LimitReader(f, maxPreviewBytes))
 }
 
 // previewPHash decodes the stored preview of hash at thumbnail scale and
