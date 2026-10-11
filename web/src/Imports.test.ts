@@ -76,8 +76,8 @@ describe('import history', () => {
     expect(a!.textContent).toContain('3 new, 1 already there, 2 duplicates, 1 error');
     expect(a!.textContent).toContain('3.0 MiB');
     expect(a!.querySelector('time')?.textContent).toMatch(/ago$/); // under a week: relative
-    // The cover is the newest item with a thumbnail, through the usual thumb URL.
-    expect(a!.querySelector('img')?.getAttribute('src')).toBe(`/api/l/peter/thumb/${hashOf(4)}`);
+    // The cover is the newest item by capture time, through the usual thumb URL.
+    expect(a!.querySelector('img')?.getAttribute('src')).toBe(`/api/l/peter/thumb/${hashOf(1)}`);
 
     // Unnamed: the source name; an old one shows its date; a cancelled one says so.
     expect(b!.getAttribute('href')).toBe('#/l/peter/imports/2');
@@ -168,6 +168,72 @@ describe('import history', () => {
     expect(rows().map((r) => r.getAttribute('href'))).toEqual(['#/l/peter/imports/2']);
   });
 
+  it('shows the server refusing a name with control characters', async () => {
+    await start('#/l/peter/imports/5');
+    button(document.querySelector('.ihead')!, 'Rename')!.click();
+    await settle();
+    await typeName('a\u0007b');
+    expect(server.posts('l/peter/imports/5').map((c) => c.body)).toEqual([{ name: 'a\u0007b' }]);
+    expect(dialog()?.querySelector('[role="alert"]')?.textContent).toContain('control characters are not allowed');
+    expect(document.querySelector('.ihead h1')?.textContent).toBe('Import: Phone dump');
+  });
+
+  it('shows a rebuild record without a grid of its own', async () => {
+    server.imports.unshift({
+      id: 9,
+      name: '',
+      startedAt: '2026-10-11T08:00:00Z',
+      finishedAt: '2026-10-11T08:01:00Z',
+      source: '/media/peter',
+      sourceName: 'peter',
+      mode: 'record',
+      host: '',
+      outcome: 'done',
+      imported: 0,
+      existing: 8,
+      duplicates: 0,
+      skipped: 0,
+      errors: 0,
+      bytes: 0,
+      hashes: [],
+    });
+    await start('#/l/peter/imports');
+    const a = rows()[0]!;
+    expect(a.getAttribute('href')).toBe('#/l/peter/imports/9');
+    expect(a.querySelector('.mode')?.textContent).toBe('Rebuild');
+    expect(a.textContent).toContain('8 files recorded');
+    expect(a.querySelector('img')).toBeNull();
+
+    await go('#/l/peter/imports/9');
+    expect(document.querySelector('.ihead h1')?.textContent).toBe('Rebuild: peter');
+    expect(document.body.textContent).toContain('keeps no list of pictures of its own');
+    const whole = [...document.querySelectorAll<HTMLAnchorElement>('a')].find((x) => x.textContent === 'Show the whole library');
+    expect(whole?.getAttribute('href')).toBe('#/l/peter/');
+    expect(timelines().filter((p) => p.includes('import=9'))).toEqual([]);
+    expect(tiles()).toEqual([]);
+    button(document.querySelector('.ihead')!, 'Delete record')!.click();
+    await settle();
+    expect(dialog()!.textContent).toContain("The library's photos and videos stay as they are; no file is touched.");
+  });
+
+  it('answers like the server (the fake)', async () => {
+    await start('#/l/peter/imports');
+    const status = async (p: string) => (await fetch(p)).status;
+    expect(await status('/api/l/peter/timeline?import=abc')).toBe(400);
+    expect(await status('/api/l/peter/timeline?import=0')).toBe(400);
+    expect(await status('/api/l/peter/timeline?import=99')).toBe(404);
+    expect(await status('/api/l/peter/imports/abc')).toBe(404);
+    expect(await status('/api/l/peter/imports/99')).toBe(404);
+    // The list carries the stored summary; one record the live one.
+    server.items.find((x) => x.hash === hashOf(1))!.deletedAt = '2026-10-11T00:00:00';
+    const list = (await (await fetch('/api/l/peter/imports')).json()) as { imports: { id: number; items: number; cover: string }[] };
+    expect(list.imports[0]).toMatchObject({ id: 5, items: 4, cover: hashOf(1) });
+    const one = (await (await fetch('/api/l/peter/imports/5')).json()) as { items: number; cover: string };
+    expect(one).toMatchObject({ items: 3, cover: hashOf(2) });
+    const d = (await (await fetch('/api/l/peter/media/2')).json()) as { imports: unknown[] };
+    expect(d.imports).toEqual([{ id: 5, name: 'Phone dump', startedAt: '2026-10-10T09:00:00Z', mode: 'copy', sourceName: 'Camera' }]);
+  });
+
   it('shows a missing record as such', async () => {
     await start('#/l/peter/imports/99');
     expect(document.body.textContent).toContain('There is no such import record in this library.');
@@ -191,7 +257,7 @@ describe('import history', () => {
     const link = [...document.querySelectorAll<HTMLAnchorElement>('.imports a')];
     expect(link).toHaveLength(1);
     expect(link[0]!.getAttribute('href')).toBe('#/l/peter/imports/5');
-    expect(link[0]!.textContent).toMatch(/^Imported .+ · Phone dump$/);
+    expect(link[0]!.textContent).toMatch(/^Imported .+ from Camera · Phone dump$/);
   });
 
   it('points "Show imported" at the record when the job has one', async () => {

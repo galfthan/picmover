@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatRecent, importCounts, importLine, importTitle, modeLabel, outcomeLabel } from './imports';
+import { formatRecent, importCounts, importLine, importTitle, isRebuild, modeLabel, outcomeLabel } from './imports';
 
 describe('import record wording', () => {
   it('titles a record by name, else source name, else id', () => {
@@ -12,6 +12,10 @@ describe('import record wording', () => {
   it('labels modes and only the outcomes worth showing', () => {
     expect(modeLabel('copy')).toBe('Copy');
     expect(modeLabel('rebuild')).toBe('Rebuild');
+    expect(modeLabel('record')).toBe('Rebuild');
+    expect(isRebuild('rebuild')).toBe(true);
+    expect(isRebuild('record')).toBe(true);
+    expect(isRebuild('copy')).toBe(false);
     expect(modeLabel('other')).toBe('other');
     expect(modeLabel('')).toBe('Import');
     expect(outcomeLabel('done')).toBeNull();
@@ -23,6 +27,9 @@ describe('import record wording', () => {
     expect(importCounts({ imported: 12, existing: 3, duplicates: 0, skipped: 0, errors: 1 })).toBe('12 new, 3 already there, 1 error');
     expect(importCounts({ imported: 1200, existing: 0, duplicates: 1, skipped: 4, errors: 2 })).toBe('1,200 new, 1 duplicate, 4 skipped, 2 errors');
     expect(importCounts({ imported: 0, existing: 0, duplicates: 0, skipped: 0, errors: 0 })).toBe('Nothing imported');
+    expect(importCounts({ imported: 0, existing: 1234, duplicates: 2, skipped: 0, errors: 0, mode: 'record' })).toBe('1,234 files recorded, 2 duplicates');
+    expect(importCounts({ imported: 0, existing: 1, duplicates: 0, skipped: 0, errors: 0, mode: 'rebuild' })).toBe('1 file recorded');
+    expect(importCounts({ imported: 0, existing: 3, duplicates: 0, skipped: 0, errors: 0, mode: 'copy' })).toBe('3 already there');
   });
 
   it('dates relative under a week, else the local date', () => {
@@ -37,6 +44,8 @@ describe('import record wording', () => {
   it('writes the detail line', () => {
     expect(importLine({ id: 1, name: '', startedAt: null, mode: 'copy', sourceName: 'DCIM' }, '9 Oct 2026')).toBe('Imported 9 Oct 2026 from DCIM');
     expect(importLine({ id: 1, name: 'Trip', startedAt: null, mode: 'move' }, '9 Oct 2026')).toBe('Imported 9 Oct 2026 · Trip');
-    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'rebuild' }, '')).toBe('Recorded by a rebuild');
+    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'rebuild' }, '')).toBe('Recorded');
+    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'record', sourceName: 'peter' }, '9 Oct 2026')).toBe('Recorded 9 Oct 2026');
+    expect(importLine({ id: 1, name: 'Old', startedAt: null, mode: 'rebuild', sourceName: 'peter' }, '9 Oct 2026')).toBe('Recorded 9 Oct 2026 · Old');
   });
 });

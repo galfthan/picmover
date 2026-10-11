@@ -10,7 +10,17 @@ export function importTitle(r: Pick<ImportRecord, 'id' | 'name'> & { sourceName?
   return r.name.trim() || r.sourceName?.trim() || `Import #${r.id}`;
 }
 
-const MODES: Record<string, string> = { copy: 'Copy', move: 'Move', rebuild: 'Rebuild', record: 'Record' };
+// "record" is a rebuild session of an earlier version, backfilled from the catalog: a rebuild too.
+const MODES: Record<string, string> = { copy: 'Copy', move: 'Move', rebuild: 'Rebuild', record: 'Rebuild' };
+
+/**
+ * A rebuild (mode rebuild, or record: one backfilled from the catalog)
+ * records the whole library in place; its record keeps no items and has
+ * no picture grid of its own.
+ */
+export function isRebuild(mode: string): boolean {
+  return mode === 'rebuild' || mode === 'record';
+}
 
 export function modeLabel(mode: string): string {
   return MODES[mode] ?? (mode || 'Import');
@@ -26,15 +36,23 @@ export function outcomeLabel(outcome: string): string | null {
 
 const plural = (n: number, one: string, many: string) => `${formatCount(n)} ${n === 1 ? one : many}`;
 
-/** "12 new, 3 already there, 1 error"; zero counts are left out. */
-export function importCounts(r: Pick<ImportRecord, 'imported' | 'existing' | 'duplicates' | 'skipped' | 'errors'>): string {
+/**
+ * "12 new, 3 already there, 1 error"; zero counts are left out. A rebuild
+ * (isRebuild) found every file in place: "1,234 files recorded".
+ */
+export function importCounts(r: Pick<ImportRecord, 'imported' | 'existing' | 'duplicates' | 'skipped' | 'errors'> & { mode?: string }): string {
   const parts: string[] = [];
-  if (r.imported) parts.push(`${formatCount(r.imported)} new`);
-  if (r.existing) parts.push(`${formatCount(r.existing)} already there`);
+  if (r.mode !== undefined && isRebuild(r.mode)) {
+    const n = r.imported + r.existing;
+    if (n) parts.push(plural(n, 'file recorded', 'files recorded'));
+  } else {
+    if (r.imported) parts.push(`${formatCount(r.imported)} new`);
+    if (r.existing) parts.push(`${formatCount(r.existing)} already there`);
+  }
   if (r.duplicates) parts.push(plural(r.duplicates, 'duplicate', 'duplicates'));
   if (r.skipped) parts.push(`${formatCount(r.skipped)} skipped`);
   if (r.errors) parts.push(plural(r.errors, 'error', 'errors'));
-  return parts.length ? parts.join(', ') : 'Nothing imported';
+  return parts.length ? parts.join(', ') : r.mode !== undefined && isRebuild(r.mode) ? 'Nothing recorded' : 'Nothing imported';
 }
 
 const WEEK = 7 * 86400 * 1000;
@@ -56,12 +74,14 @@ export function formatRecent(rfc3339: string | null | undefined, now: number = D
 
 /**
  * The lightbox line: "Imported 10 Oct 2026, 12:00 from DCIM", plus
- * " · <name>" when the record is named; a rebuild says "Recorded by a
- * rebuild". The source name is left out when the server does not send it.
+ * " · <name>" when the record is named; a rebuild (isRebuild) says
+ * "Recorded 10 Oct 2026, 12:00" (nothing came from anywhere). The source
+ * name is left out when the server does not send it.
  */
 export function importLine(r: ImportRef, when: string): string {
-  const verb = r.mode === 'rebuild' ? 'Recorded by a rebuild' : 'Imported';
-  const from = r.sourceName ? ` from ${r.sourceName}` : '';
+  const rebuild = isRebuild(r.mode);
+  const verb = rebuild ? 'Recorded' : 'Imported';
+  const from = r.sourceName && !rebuild ? ` from ${r.sourceName}` : '';
   const name = r.name.trim() ? ` · ${r.name.trim()}` : '';
   return `${verb}${when ? ` ${when}` : ''}${from}${name}`;
 }

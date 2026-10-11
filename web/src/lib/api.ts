@@ -257,9 +257,14 @@ export interface ImportRecord {
   skipped: number;
   errors: number;
   bytes: number;
-  /** Item rows (imported, existing, restored). */
-  items: number;
-  /** Hash of the cover item (16 hex digits), null when none. */
+  /**
+   * Item rows (imported, existing, restored): in the list the number stored
+   * when the record was finished, for one record (getImport) those that are
+   * live rows now. null for a record that keeps no items (a rebuild: mode
+   * rebuild or record covers the whole library).
+   */
+  items: number | null;
+  /** Hash of the cover item (16 hex digits; stored in the list, live for one record), null when none. */
   cover: string | null;
 }
 
@@ -269,7 +274,7 @@ export interface ImportRef {
   name: string;
   startedAt: string | null;
   mode: ImportMode | string;
-  /** Not in the contract's detail shape; shown when the server sends it. */
+  /** The source's base name (the server sends it; older ones did not). */
   sourceName?: string;
 }
 
@@ -295,7 +300,7 @@ export function toImport(v: unknown): ImportRecord {
     skipped: num(r.skipped),
     errors: num(r.errors),
     bytes: num(r.bytes),
-    items: num(r.items),
+    items: typeof r.items === 'number' && Number.isFinite(r.items) ? r.items : null,
     cover: isHash(r.cover) ? r.cover : null,
   };
 }

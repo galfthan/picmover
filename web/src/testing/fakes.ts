@@ -150,8 +150,15 @@ export interface FakeImport {
   skipped: number;
   errors: number;
   bytes: number;
-  /** Item hashes (import_items). */
+  /** Item hashes (import_items); none for the modes that keep no items (rebuild, record). */
   hashes: string[];
+  /**
+   * The stored summary GET imports lists (user.db imports.items/cover,
+   * written when the record was finished): undefined computes it from the
+   * items when the fake starts; null for a record without items.
+   */
+  items?: number | null;
+  cover?: string | null;
 }
 
 interface FakeClass {
@@ -505,12 +512,31 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     return m ? [Number(m[1]), Number(m[2])] : [0, 0];
   };
 
-  /** As the server: the record without its hashes, plus `items` and `cover` (the newest item with a thumbnail). */
-  const importJSON = (r: FakeImport) => {
-    const { hashes, ...rest } = r;
-    const cover = [...hashes].reverse().find((h) => items.some((x) => x.hash === h && x.thumb === 'ok')) ?? null;
-    return { ...rest, items: hashes.length, cover };
+  /** As the server (docs/design/imports.md): rebuild and record runs keep no items. */
+  const keepsItems = (r: FakeImport) => r.mode !== 'rebuild' && r.mode !== 'record';
+  /** The live rows among hashes and the newest of them (taken_at DESC, id DESC, undated last), as catalog.LiveSummary. */
+  const liveSummary = (hashes: string[]) => {
+    const rows = live().filter((x) => hashes.includes(x.hash));
+    const newest = [...rows].sort((a, b) => {
+      if (!a.takenAt !== !b.takenAt) return a.takenAt ? -1 : 1;
+      if (a.takenAt && b.takenAt && a.takenAt !== b.takenAt) return a.takenAt < b.takenAt ? 1 : -1;
+      return b.id - a.id;
+    })[0];
+    return { items: rows.length, cover: newest?.hash ?? null };
   };
+  /** The record object: the stored summary (list) or the live one (one record), null for a record without items. */
+  const importJSON = (r: FakeImport, how: 'stored' | 'live') => {
+    const { hashes, items: _i, cover: _c, ...rest } = r;
+    if (!keepsItems(r)) return { ...rest, items: null, cover: null };
+    if (how === 'live') return { ...rest, ...liveSummary(hashes) };
+    return { ...rest, items: r.items ?? null, cover: r.cover ?? null };
+  };
+  // The stored summary, as FinishImport wrote it: the item count and the newest item.
+  for (const r of imports) {
+    if (r.items !== undefined) continue;
+    r.items = keepsItems(r) ? r.hashes.length : null;
+    r.cover = keepsItems(r) ? liveSummary(r.hashes).cover : null;
+  }
 
   function select(q: URLSearchParams): Item[] {
     let list = q.get('trashed') === '1' ? items.filter((x) => !!x.deletedAt) : live();
@@ -526,26 +552,31 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
 
   function lib(path: string, q: URLSearchParams, method: string, body: Record<string, unknown>): Response {
     const hs = (body.hashes as string[] | undefined) ?? [];
-    // An unknown import id in a listing's filter is a 404, as the server.
+    // The import filter as the server: a malformed id is 400, an unknown one 404, empty is no filter.
     const imp = q.get('import');
-    if (imp !== null && !imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
-    if (path === 'imports' && method === 'GET') return json({ imports: imports.map(importJSON) });
+    if (imp) {
+      if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
+      if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
+    }
+    if (path === 'imports' && method === 'GET') return json({ imports: imports.map((r) => importJSON(r, 'stored')) });
     const im = /^imports\/([^/]+)(\/delete)?$/.exec(path);
     if (im) {
-      if (!/^[1-9]\d*$/.test(im[1] ?? '')) return json({ error: 'invalid import id' }, 400);
+      // A malformed id is 404 like an unknown one (pathID, as for albums).
+      if (!/^[1-9]\d*$/.test(im[1] ?? '')) return json({ error: 'no such import' }, 404);
       const r = imports.find((x) => x.id === Number(im[1]));
-      if (!r) return json({ error: 'no such import' }, 404);
-      if (method === 'GET' && !im[2]) return json(importJSON(r));
+      if (!r) return json({ error: `not found: import ${im[1]}` }, 404);
+      if (method === 'GET' && !im[2]) return json(importJSON(r, 'live'));
       if (method !== 'POST') return json({ error: 'not found' }, 404);
       if (im[2]) {
         imports.splice(imports.indexOf(r), 1);
         return json({});
       }
-      if (typeof body.name !== 'string') return json({ error: 'name: expected a string' }, 400);
+      if (typeof body.name !== 'string') return json({ error: 'name is required' }, 400);
       const name = body.name.trim();
-      if ([...name].length > 200) return json({ error: 'name: at most 200 characters' }, 400);
+      if (/[\p{Cc}\u2028\u2029\uFFFD]/u.test(name)) return json({ error: 'invalid name: control characters are not allowed' }, 400);
+      if ([...name].length > 200) return json({ error: 'invalid name: want 1-200 characters' }, 400);
       r.name = name;
-      return json(importJSON(r));
+      return json(importJSON(r, 'live'));
     }
     if (method === 'GET' && path === 'library') {
       return json({
@@ -600,7 +631,9 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         displayable: true,
         tags: tags.filter((t) => x.tagIds.includes(t.id)),
         albums: albums.filter((a) => a.hashes.includes(x.hash)).map((a) => ({ id: a.id, name: a.name })),
-        imports: imports.filter((r) => r.hashes.includes(x.hash)).map((r) => ({ id: r.id, name: r.name, startedAt: r.startedAt, mode: r.mode })),
+        imports: imports
+          .filter((r) => r.hashes.includes(x.hash))
+          .map((r) => ({ id: r.id, name: r.name, startedAt: r.startedAt, mode: r.mode, sourceName: r.sourceName })),
         deletedAt: x.deletedAt ?? null,
       });
     }

@@ -359,12 +359,18 @@ describe('import records', () => {
       skipped: 0,
       errors: 0,
       bytes: 0,
-      items: 0,
+      items: null,
       cover: null,
     });
     expect(list).toHaveLength(2);
     reply = () => json({ imports: null });
     expect(await api.getImports()).toEqual([]);
+  });
+
+  it('keeps a rebuild record without items', () => {
+    expect(toImport({ ...rec, mode: 'rebuild', items: null, cover: null })).toMatchObject({ mode: 'rebuild', items: null, cover: null });
+    expect(toImport({ ...rec, items: 0 }).items).toBe(0);
+    expect(toImport({ ...rec, items: 'x' }).items).toBeNull();
   });
 
   it('reads a cover only as a hash', () => {

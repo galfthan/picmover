@@ -7,7 +7,7 @@
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
   import { formatBytes, formatCount, formatInstant } from '../lib/format';
-  import { importCounts, importTitle, modeLabel, outcomeLabel } from '../lib/imports';
+  import { importCounts, importTitle, isRebuild, modeLabel, outcomeLabel } from '../lib/imports';
   import { navigate } from '../lib/router';
   import { libHref, libPath } from '../lib/routes';
   import Dialog from '../components/Dialog.svelte';
@@ -48,6 +48,8 @@
   });
 
   const title = $derived(rec ? importTitle(rec) : `#${importId}`);
+  /** A rebuild keeps no items: it covers the whole library, so there is no grid of its own. */
+  const rebuild = $derived(rec ? isRebuild(rec.mode) : false);
   const outcome = $derived(rec ? outcomeLabel(rec.outcome) : null);
 
   type DialogState = 'rename' | 'delete' | null;
@@ -101,42 +103,68 @@
       <div class="error-box">{loadError}</div>
     </div>
   </div>
+{:else if !rec}
+  <!-- The grid waits for the record: a rebuild record has none. -->
+  <div class="page">
+    <div class="page-inner">
+      {@render head()}
+      {#if !loadError}<p class="muted rebuild">Loading…</p>{/if}
+    </div>
+  </div>
+{:else if rebuild}
+  <div class="page">
+    <div class="page-inner">
+      {@render head()}
+      <div class="rebuild">
+        <p>A rebuild records every file of the library where it is, so its record keeps no list of pictures of its own.</p>
+        <p><a href={libHref(api.id, '')}>Show the whole library</a></p>
+      </div>
+    </div>
+  </div>
 {:else}
   <Grid {api} {filters} {viewId} mode="import" {importId} basePath={libPath(api.id, `imports/${importId}`)}>
     {#snippet header()}
-      <div class="ihead">
-        <div class="line">
-          <a class="back" href={libHref(api.id, 'imports')}>← Imports</a>
-          <h1>Import: {title}</h1>
-          {#if rec}
-            <span class="chip">{modeLabel(rec.mode)}</span>
-            {#if outcome}<span class="chip">{outcome}</span>{/if}
-          {/if}
-          <span class="spacer"></span>
-          <button class="small" disabled={!rec} onclick={() => show('rename')}>Rename</button>
-          <button class="small" disabled={!rec} onclick={() => show('delete')}>Delete record</button>
-        </div>
-        {#if rec}
-          <p class="facts muted small">
-            {formatInstant(rec.startedAt)}
-            {#if rec.source}· from <span class="mono">{rec.source}</span>{/if}
-            {#if rec.host}· on {rec.host}{/if}
-            · {importCounts(rec)}{#if rec.bytes > 0}, {formatBytes(rec.bytes)}{/if}
-          </p>
-        {:else if loadError}
-          <div class="error-box small">{loadError} <button class="small" onclick={load}>Retry</button></div>
-        {/if}
-      </div>
+      {@render head()}
     {/snippet}
   </Grid>
 {/if}
+
+{#snippet head()}
+  <div class="ihead">
+    <div class="line">
+      <a class="back" href={libHref(api.id, 'imports')}>← Imports</a>
+      <h1>{rebuild ? 'Rebuild' : 'Import'}: {title}</h1>
+      {#if rec}
+        <span class="chip">{modeLabel(rec.mode)}</span>
+        {#if outcome}<span class="chip">{outcome}</span>{/if}
+      {/if}
+      <span class="spacer"></span>
+      <button class="small" disabled={!rec} onclick={() => show('rename')}>Rename</button>
+      <button class="small" disabled={!rec} onclick={() => show('delete')}>Delete record</button>
+    </div>
+    {#if rec}
+      <p class="facts muted small">
+        {formatInstant(rec.startedAt)}
+        {#if rec.source}· {rebuild ? 'of' : 'from'} <span class="mono">{rec.source}</span>{/if}
+        {#if rec.host}· on {rec.host}{/if}
+        · {importCounts(rec)}{#if rec.bytes > 0}, {formatBytes(rec.bytes)}{/if}
+      </p>
+    {:else if loadError}
+      <div class="error-box small">{loadError} <button class="small" onclick={load}>Retry</button></div>
+    {/if}
+  </div>
+{/snippet}
 
 {#if dialog}
   <Dialog title={dialog === 'rename' ? 'Rename import' : `Delete the record of “${title}”?`} onclose={() => (dialog = null)}>
     <form onsubmit={submit}>
       {#if dialog === 'delete'}
         <p>The import record is removed from the history.</p>
-        <p>The {formatCount(rec?.items ?? 0)} photos and videos it brought in stay in the library; no file is touched.</p>
+        {#if rebuild}
+          <p>The library's photos and videos stay as they are; no file is touched.</p>
+        {:else}
+          <p>The {formatCount(rec?.items ?? 0)} photos and videos it brought in stay in the library; no file is touched.</p>
+        {/if}
       {:else}
         <label class="field">
           <span>Name</span>
@@ -177,6 +205,9 @@
   }
   .back {
     font-size: 0.9em;
+  }
+  .rebuild {
+    padding: 8px 16px;
   }
   .chip {
     padding: 0 8px;
