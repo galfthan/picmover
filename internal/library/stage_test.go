@@ -110,10 +110,19 @@ func TestStageCancelledAndChanged(t *testing.T) {
 	l := open(t)
 	src, _ := randomFile(t, t.TempDir(), 3<<20)
 
+	// Cancelled from inside the copy, after the first buffer is written:
+	// the partly written temp file is removed.
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := Stage(ctx, src, l.TempDir(), nil); !errors.Is(err, context.Canceled) {
+	defer cancel()
+	var written int64
+	if _, err := Stage(ctx, src, l.TempDir(), func(n int64) {
+		written += n
+		cancel()
+	}); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want Canceled", err)
+	}
+	if written == 0 || written >= 3<<20 {
+		t.Errorf("%d bytes written before the cancellation; want a partial copy", written)
 	}
 	tempIsEmpty(t, l)
 
@@ -131,8 +140,8 @@ func TestStageCancelledAndChanged(t *testing.T) {
 		f.Write([]byte("more"))
 		f.Close()
 	})
-	if !errors.Is(err, ErrSourceChanged) || !strings.Contains(err.Error(), src+": changed while it was read") {
-		t.Errorf("err = %v, want %s: changed while it was read", err, src)
+	if !errors.Is(err, ErrSizeChanged) || !strings.Contains(err.Error(), src+": size changed while it was read") {
+		t.Errorf("err = %v, want %s: size changed while it was read", err, src)
 	}
 	tempIsEmpty(t, l)
 }

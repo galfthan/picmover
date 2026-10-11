@@ -14,9 +14,10 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// ErrSourceChanged is returned (wrapped) by Stage when the number of bytes
+// ErrSizeChanged is returned (wrapped) by Stage when the number of bytes
 // read differs from the source's size: the file changed while it was read.
-var ErrSourceChanged = errors.New("changed while it was read")
+// Unify with the backup copy's ErrSourceChanged once both branches are in master.
+var ErrSizeChanged = errors.New("size changed while it was read")
 
 // Staged is a source file copied into a library temp file by Stage.
 type Staged struct {
@@ -41,8 +42,8 @@ func Stage(ctx context.Context, src, tmpDir string, onWrite func(n int64)) (Stag
 // does not close it. The pooled 1 MiB buffer is used; onWrite, when not
 // nil, is called with the size of every buffer written, as it is written.
 // The number of bytes written must equal the size of in's Stat, otherwise
-// the error is "<name>: changed while it was read" (wrapping
-// ErrSourceChanged). The temp file gets the source's mtime and is closed
+// the error is "<name>: size changed while it was read" (wrapping
+// ErrSizeChanged). The temp file gets the source's mtime and is closed
 // but not fsynced; Commit does that. On any error, cancellation included,
 // the temp file is removed.
 func StageFile(ctx context.Context, in *os.File, tmpDir string, onWrite func(n int64)) (Staged, error) {
@@ -70,7 +71,7 @@ func StageFile(ctx context.Context, in *os.File, tmpDir string, onWrite func(n i
 		return fail(err)
 	}
 	if n != info.Size() {
-		return fail(fmt.Errorf("%s: %w", in.Name(), ErrSourceChanged))
+		return fail(fmt.Errorf("%s: %w", in.Name(), ErrSizeChanged))
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(name)
