@@ -81,7 +81,13 @@ type Options struct {
 	OnResult         func(Result)       // optional, called from pipeline goroutines
 	OnProgress       func(Stats)        // optional, called every ProgressInterval and once at the end
 	ProgressInterval time.Duration      // <=0: 200ms
-	ForceCopy        bool               // testing: never rename when moving; always copy+verify+delete
+	ForceCopy        bool               // testing: never rename when moving; always copy, then delete the source
+	// SourceReaders bounds how many workers read source files at once
+	// (only the staging copy of the copy-first path; see the package
+	// comment). <=0: auto, which is 1 when the source is on a FUSE mount
+	// (Linux: gvfs MTP, gphoto2 phone mounts) and Workers otherwise. At
+	// most Workers.
+	SourceReaders int
 
 	// RecordInPlace records the library's own files where they are (for
 	// "picmover rebuild"). Source must be the library root. Every regular,
@@ -144,6 +150,13 @@ type Importer struct {
 
 	recorded atomic.Bool // the copy (or record) stage finished; see RecordStageDone
 
+	readers chan struct{} // semaphore of the staging reads, cap SourceReaders
+
+	// Test hooks; New sets the real functions.
+	openSource func(string) (*os.File, error)  // opens a source file for reading
+	sameDev    func(src, dir string) bool      // sameDevice
+	place      func(tmpPath, dst string) error // library.Commit
+
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
 }
@@ -181,7 +194,24 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Importer{lib: lib, db: db, opts: opts, log: log, claimed: map[string]struct{}{},
-		dirNames: map[string]map[string]struct{}{}}
+		dirNames:   map[string]map[string]struct{}{},
+		readers:    make(chan struct{}, opts.Workers),
+		openSource: os.Open,
+		sameDev:    sameDevice,
+		place:      library.Commit,
+	}
+}
+
+// sourceReaders resolves Options.SourceReaders for the source root src.
+func sourceReaders(n, workers int, src string) int {
+	switch {
+	case n > 0:
+		return min(n, workers)
+	case isFUSE(src):
+		return 1
+	default:
+		return workers
+	}
 }
 
 // Run executes the import and then, unless Options.NoThumbs, the thumbnail
@@ -223,8 +253,10 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 		return im.Stats(), fmt.Errorf("importer: %w", err)
 	}
 	im.session.Store(im.sessionID)
+	im.opts.SourceReaders = sourceReaders(im.opts.SourceReaders, im.opts.Workers, src)
+	im.readers = make(chan struct{}, im.opts.SourceReaders)
 	im.log.Info("import started", "source", src, "library", im.lib.Root(), "mode", mode,
-		"workers", im.opts.Workers, "session", im.sessionID)
+		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders, "session", im.sessionID)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -432,6 +464,24 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	if !fi.Mode().IsRegular() {
 		return fail("not a regular file", fmt.Errorf("%s: not a regular file", srcPath))
 	}
+	// copyFirst: a foreign file that is copied is read once, into a library
+	// temp file; hashing and metadata use that copy (see the package
+	// comment).
+	copyFirst := !im.opts.RecordInPlace && !trash && !fromZip && !isLink && !im.lib.Contains(srcPath) &&
+		(!im.opts.Move || im.opts.ForceCopy || !im.sameDev(srcPath, im.lib.TempDir()))
+	staged := ""            // the staged temp file, removed unless placed
+	stagedBytes := int64(0) // bytes of this file added to bytesCopied by staging
+	placed := false
+	defer func() {
+		if placed {
+			return
+		}
+		if staged != "" {
+			os.Remove(staged)
+		}
+		im.bytesCopied.Add(-stagedBytes)
+	}()
+
 	// In record-in-place mode the file's own path is its catalog path.
 	ownRel := ""
 	switch {
@@ -444,8 +494,15 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			return fail("record in place", err)
 		}
 	}
-	hash, size, err := library.HashFile(srcPath)
-	if err != nil {
+	var hash uint64
+	var size int64
+	if copyFirst {
+		st, err := im.stage(ctx, srcPath, &stagedBytes)
+		if err != nil {
+			return fail("copy", err)
+		}
+		staged, hash, size = st.Path, st.Hash, st.Size
+	} else if hash, size, err = im.hashSource(srcPath); err != nil {
 		return fail("hash", err)
 	}
 
@@ -477,7 +534,11 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		}
 	}()
 
-	info, warnings, err := im.opts.Extractor.Extract(ctx, srcPath, kind)
+	extractPath := srcPath
+	if staged != "" {
+		extractPath = staged // never read the source a second time
+	}
+	info, warnings, err := im.opts.Extractor.Extract(ctx, extractPath, kind)
 	if ctx.Err() != nil {
 		// Ctrl+C also kills a child ffprobe; its fallback (mtime) metadata
 		// must not be used to place the file.
@@ -533,9 +594,10 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 
 	// In place only when the path is not already recorded for another file
 	// (its hash missed the catalog above), so two rows never share a path.
-	// A symlink at the destination is never in place.
+	// A symlink at the destination is never in place, and neither is a
+	// foreign (copy-first) file.
 	inPlace := false
-	if !fromZip {
+	if !fromZip && !copyFirst {
 		if dfi, err := os.Lstat(im.lib.Abs(rel)); err == nil && dfi.Mode().IsRegular() && os.SameFile(fi, dfi) {
 			taken, err := im.db.RelPathTaken(ctx, rel)
 			if err != nil {
@@ -566,7 +628,15 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	dst := im.lib.Abs(rel)
 
 	moved, copied, nbytes := false, false, int64(0)
-	if !inPlace && !identical {
+	switch {
+	case inPlace || identical:
+	case copyFirst:
+		if err := im.place(staged, dst); err != nil {
+			return fail("copy", err)
+		}
+		placed = true
+		copied, nbytes = true, size
+	default:
 		if im.opts.Move && !fromZip && !im.opts.ForceCopy && !isLink {
 			err := moveFile(srcPath, dst)
 			switch {
@@ -594,8 +664,8 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	}
 	// original_mtime is the mtime of the file as it lies in the library:
 	// the thumbnail stage checks it to detect a file changed since import.
-	// It equals the source's for moves and copies (CopyVerified preserves
-	// it), but an identical file found at the destination, or a copy whose
+	// It equals the source's for moves and copies (Stage and CopyVerified
+	// preserve it), but an identical file found at the destination, or a copy whose
 	// mtime could not be set, has its own.
 	mtime := fi.ModTime()
 	if dfi, err := os.Stat(dst); err == nil {
@@ -614,6 +684,37 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		bytes:     nbytes,
 		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
 	}, nil
+}
+
+// stage copies the source file src into a library temp file
+// (library.StageFile), holding one of the SourceReaders slots while it
+// reads. Every buffer written is added to bytesCopied and to *counted.
+func (im *Importer) stage(ctx context.Context, src string, counted *int64) (library.Staged, error) {
+	select {
+	case im.readers <- struct{}{}:
+	case <-ctx.Done():
+		return library.Staged{}, ctx.Err()
+	}
+	defer func() { <-im.readers }()
+	in, err := im.openSource(src)
+	if err != nil {
+		return library.Staged{}, err
+	}
+	defer in.Close()
+	return library.StageFile(ctx, in, im.lib.TempDir(), func(n int64) {
+		*counted += n
+		im.bytesCopied.Add(n)
+	})
+}
+
+// hashSource hashes the file at p (the hash-first path).
+func (im *Importer) hashSource(p string) (uint64, int64, error) {
+	f, err := im.openSource(p)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	return library.HashReader(f)
 }
 
 // trashRel returns the catalog path of a trash file: its path relative to

@@ -24,3 +24,14 @@ func syncDir(dir string) {
 	_ = f.Sync()
 	_ = f.Close()
 }
+
+// sameDevice reports whether the file src and the directory dir are on the
+// same file system (st_dev). On any error it reports true: the caller then
+// tries a rename and copies on EXDEV.
+func sameDevice(src, dir string) bool {
+	var a, b syscall.Stat_t
+	if syscall.Stat(src, &a) != nil || syscall.Stat(dir, &b) != nil {
+		return true
+	}
+	return a.Dev == b.Dev
+}
