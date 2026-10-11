@@ -4,6 +4,7 @@
   import { formatAgo, formatBytes, formatCoord, formatDuration, formatInstant, formatTakenAt, formatWallDate, parseLocalWallClock } from '../lib/format';
   import { closeViewer, sequenceProvider, showInViewer, viewerHref, type Neighbours } from '../lib/viewer';
   import { libHref } from '../lib/routes';
+  import { importLine } from '../lib/imports';
   import { isBoolean, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
@@ -550,9 +551,17 @@
 
           <dt>Imported</dt>
           <dd>
-            {formatInstant(d.importedAt)}
-            {#if d.sessionId}
-              <br /><a href={libHref(api.id, '', { session: d.sessionId })}>Session #{d.sessionId}</a>
+            {#if d.imports?.length}
+              <ul class="imports">
+                {#each d.imports as r (r.id)}
+                  <li><a href={libHref(api.id, `imports/${r.id}`)}>{importLine(r, formatInstant(r.startedAt))}</a></li>
+                {/each}
+              </ul>
+            {:else}
+              {formatInstant(d.importedAt)}
+              {#if d.sessionId}
+                <br /><a href={libHref(api.id, '', { session: d.sessionId })}>Session #{d.sessionId}</a>
+              {/if}
             {/if}
           </dd>
 
@@ -743,6 +752,11 @@
     display: block;
     color: var(--faint);
     font-size: 12px;
+  }
+  .imports {
+    margin: 0;
+    padding: 0;
+    list-style: none;
   }
   .path {
     display: flex;

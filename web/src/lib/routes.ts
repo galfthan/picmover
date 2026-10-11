@@ -4,14 +4,27 @@
 // mode). Pure; see routes.test.ts.
 
 import { href, type Route } from './router';
+import type { Job } from './api';
 
-export type LibPage = 'grid' | 'map' | 'import' | 'library' | 'albums' | 'album' | 'trash' | 'similar' | 'backups' | 'view';
+export type LibPage =
+  | 'grid'
+  | 'map'
+  | 'import'
+  | 'library'
+  | 'albums'
+  | 'album'
+  | 'imports'
+  | 'importrecord'
+  | 'trash'
+  | 'similar'
+  | 'backups'
+  | 'view';
 
 export type AppRoute =
   | { kind: 'libraries' }
   /** A step 3 path without the library prefix ("#/map", "#/view/3", "#/?session=4"). */
   | { kind: 'legacy'; rest: string }
-  | { kind: 'lib'; lib: string; page: LibPage; albumId: number | null; viewId: number | null }
+  | { kind: 'lib'; lib: string; page: LibPage; albumId: number | null; importId: number | null; viewId: number | null }
   | { kind: 'notfound' };
 
 const SIMPLE: Record<string, LibPage> = {
@@ -20,6 +33,7 @@ const SIMPLE: Record<string, LibPage> = {
   import: 'import',
   library: 'library',
   albums: 'albums',
+  imports: 'imports',
   trash: 'trash',
   similar: 'similar',
   backups: 'backups',
@@ -43,15 +57,19 @@ export function parseAppRoute(r: Route): AppRoute {
   const sub = s[2] ?? '';
   if (sub === 'view') {
     if (s.length > 4) return { kind: 'notfound' };
-    return { kind: 'lib', lib, page: 'view', albumId: null, viewId: positiveInt(s[3]) };
+    return { kind: 'lib', lib, page: 'view', albumId: null, importId: null, viewId: positiveInt(s[3]) };
   }
   if (sub === 'albums' && s.length === 4) {
     const albumId = positiveInt(s[3]);
-    return albumId === null ? { kind: 'notfound' } : { kind: 'lib', lib, page: 'album', albumId, viewId: null };
+    return albumId === null ? { kind: 'notfound' } : { kind: 'lib', lib, page: 'album', albumId, importId: null, viewId: null };
+  }
+  if (sub === 'imports' && s.length === 4) {
+    const importId = positiveInt(s[3]);
+    return importId === null ? { kind: 'notfound' } : { kind: 'lib', lib, page: 'importrecord', albumId: null, importId, viewId: null };
   }
   const page = SIMPLE[sub];
   if (page === undefined || s.length > 3) return { kind: 'notfound' };
-  return { kind: 'lib', lib, page, albumId: null, viewId: null };
+  return { kind: 'lib', lib, page, albumId: null, importId: null, viewId: null };
 }
 
 /** Router path of a library page: libPath('peter', 'albums/3') → "/l/peter/albums/3". */
@@ -62,6 +80,19 @@ export function libPath(lib: string, sub = ''): string {
 /** Hash href of a library page, with an optional query. */
 export function libHref(lib: string, sub = '', query?: Parameters<typeof href>[1]): string {
   return href(libPath(lib, sub), query);
+}
+
+/**
+ * "Show imported" of a finished import job: the grid filtered to its
+ * user.db record (`?import=`) when the job has one, else to its catalog
+ * session (`?session=`, servers without import records); null when neither.
+ */
+export function importedHref(lib: string, job: Pick<Job, 'importId' | 'sessionId'>): string | null {
+  const iid = job.importId;
+  if (typeof iid === 'number' && Number.isSafeInteger(iid) && iid > 0) return libHref(lib, '', { import: iid });
+  const sid = job.sessionId;
+  if (typeof sid === 'number' && Number.isSafeInteger(sid) && sid > 0) return libHref(lib, '', { session: sid });
+  return null;
 }
 
 export interface WorkspaceMode {

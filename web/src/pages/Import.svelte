@@ -3,7 +3,7 @@
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed } from '../lib/format';
   import { exitCodeOf, outcome } from '../lib/jobtext';
-  import { libHref } from '../lib/routes';
+  import { importedHref, libHref } from '../lib/routes';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
   import { isWithin, joinPath } from '../lib/paths';
@@ -113,6 +113,8 @@
   // ---- Done ----
 
   const summary = $derived(cur ? outcome(cur) : null);
+  /** "Show imported": the job's import record when it has one, else its catalog session. */
+  const shownHref = $derived(cur ? importedHref(lib, cur) : null);
   const summaryRows = $derived.by(() => {
     if (!cur) return [];
     const s = cur.stats;
@@ -229,8 +231,8 @@
           </div>
         {/if}
         <div class="row actions">
-          {#if cur.sessionId}
-            <a class="btn primary" href={libHref(lib, '', { session: cur.sessionId })}>Show imported</a>
+          {#if shownHref}
+            <a class="btn primary" href={shownHref}>Show imported</a>
           {/if}
           <button onclick={importAnother}>Import another</button>
         </div>

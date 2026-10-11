@@ -206,6 +206,7 @@ describe('App smoke test', () => {
       'Photos',
       'Map',
       'Albums',
+      'Imports',
       'Trash',
       'Duplicates',
       'Import',
@@ -290,10 +291,12 @@ describe('App smoke test', () => {
     expect(document.querySelector('.dest')?.textContent).toContain('Importing into');
     expect(document.querySelector('.dest')?.textContent).toContain('/home/me/Photos/media.db');
     // Job finishes
-    es.emit('done', { ...runningJob, state: 'done', exitCode: 2, finishedAt: '2026-10-10T12:05:00+03:00', stats: { ...runningJob.stats, errors: 12 } });
+    es.emit('done', { ...runningJob, state: 'done', exitCode: 2, finishedAt: '2026-10-10T12:05:00+03:00', stats: { ...runningJob.stats, errors: 12 }, importId: 31 });
     await settle();
     expect(document.body.textContent).toContain('12 files could not be imported; see /lib/.picmover/logs/import.log');
-    expect(document.body.textContent).toContain('Show imported');
+    // "Show imported" goes to the import record when the job has one (else ?session=, see routes.test.ts).
+    const shown = [...document.querySelectorAll('a')].find((a) => a.textContent === 'Show imported');
+    expect(shown?.getAttribute('href')).toBe('#/l/Photos/?import=31');
     expect(document.body.textContent).not.toContain('MiB/s');
     expect(document.querySelector('.dest')?.textContent).toContain('Imported into');
     const another = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Import another');

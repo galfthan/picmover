@@ -1,7 +1,8 @@
 // Filters live in the route query (#/l/peter/?type=video&gps=1) so they
 // survive reloads and links like "Show imported" (?session=17) work. `tag`
-// is repeatable. The trash page's `trashed` and the album page's `album`
-// come from the route, not from here, when the page implies them.
+// is repeatable. The trash page's `trashed`, the album page's `album` and
+// the import record page's `import` come from the route, not from here,
+// when the page implies them.
 
 import type { FileType, Filters } from './api';
 import { formatRecur, isDay, parseRecur } from './dates';
@@ -35,6 +36,8 @@ export function filtersFromQuery(q: URLSearchParams): Filters {
   if (tags.length) f.tags = tags;
   const album = positiveInt(q.get('album'));
   if (album !== null) f.album = album;
+  const imp = positiveInt(q.get('import'));
+  if (imp !== null) f.import = imp;
   return f;
 }
 
@@ -51,6 +54,7 @@ export function filtersToQuery(f: Filters): URLSearchParams {
   if (f.rating) q.set('rating', String(f.rating));
   for (const t of [...(f.tags ?? [])].sort((a, b) => a - b)) q.append('tag', String(t));
   if (f.album) q.set('album', String(f.album));
+  if (f.import) q.set('import', String(f.import));
   return q;
 }
 
@@ -61,9 +65,10 @@ export function filtersKey(f: Filters): string {
   return q.toString();
 }
 
-/** Whether the user has narrowed the view (the page's own `album`/`trashed` do not count). */
-export function hasFilters(f: Filters, implied: { album?: boolean } = {}): boolean {
+/** Whether the user has narrowed the view (the page's own `album`/`import`/`trashed` do not count). */
+export function hasFilters(f: Filters, implied: { album?: boolean; import?: boolean } = {}): boolean {
   const g: Filters = { ...f, trashed: undefined };
   if (implied.album) g.album = undefined;
+  if (implied.import) g.import = undefined;
   return filtersKey(g) !== '';
 }

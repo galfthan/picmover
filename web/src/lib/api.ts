@@ -72,6 +72,8 @@ export interface MediaDetail extends MediaItem {
   displayable: boolean;
   tags?: TagRef[] | null;
   albums?: AlbumRef[] | null;
+  /** The import records that brought the item in (user.db), oldest first as the server lists them. */
+  imports?: ImportRef[] | null;
   /** Wall-clock string while the item is in the trash, null when live. */
   deletedAt?: string | null;
 }
@@ -227,6 +229,87 @@ export interface Album {
   cover: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---- Import history (docs/design/imports.md) ----
+
+export type ImportMode = 'copy' | 'move' | 'rebuild' | 'record';
+export type ImportOutcome = 'running' | 'done' | 'cancelled' | 'failed';
+
+/** One import record of user.db, as GET imports and GET imports/<iid> answer. */
+export interface ImportRecord {
+  id: number;
+  /** User-given; "" when unnamed. */
+  name: string;
+  /** RFC 3339 instants; finishedAt null while running or if never finished. */
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** The path given to import. */
+  source: string;
+  /** Its base name, for lists. */
+  sourceName: string;
+  mode: ImportMode | string;
+  host: string;
+  outcome: ImportOutcome | string;
+  imported: number;
+  existing: number;
+  duplicates: number;
+  skipped: number;
+  errors: number;
+  bytes: number;
+  /** Item rows (imported, existing, restored). */
+  items: number;
+  /** Hash of the cover item (16 hex digits), null when none. */
+  cover: string | null;
+}
+
+/** An import record as the media detail lists it. */
+export interface ImportRef {
+  id: number;
+  name: string;
+  startedAt: string | null;
+  mode: ImportMode | string;
+  /** Not in the contract's detail shape; shown when the server sends it. */
+  sourceName?: string;
+}
+
+const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+const instant = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+
+/** An import record with every field present (missing ones defaulted); a 0, "" or malformed cover is null. */
+export function toImport(v: unknown): ImportRecord {
+  const r = isRecord(v) ? (isRecord(v.import) ? v.import : v) : {};
+  return {
+    id: num(r.id),
+    name: str(r.name),
+    startedAt: instant(r.startedAt),
+    finishedAt: instant(r.finishedAt),
+    source: str(r.source),
+    sourceName: str(r.sourceName),
+    mode: str(r.mode),
+    host: str(r.host),
+    outcome: str(r.outcome),
+    imported: num(r.imported),
+    existing: num(r.existing),
+    duplicates: num(r.duplicates),
+    skipped: num(r.skipped),
+    errors: num(r.errors),
+    bytes: num(r.bytes),
+    items: num(r.items),
+    cover: isHash(r.cover) ? r.cover : null,
+  };
+}
+
+/** The media detail's `imports`, dropping malformed entries. */
+export function toImportRefs(v: unknown): ImportRef[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(isRecord).flatMap((r) => {
+    const id = num(r.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return [];
+    const ref: ImportRef = { id, name: str(r.name), startedAt: instant(r.startedAt), mode: str(r.mode) };
+    if (typeof r.sourceName === 'string' && r.sourceName !== '') ref.sourceName = r.sourceName;
+    return [ref];
+  });
 }
 
 export interface Failure {
@@ -388,6 +471,8 @@ export interface Job {
   finishedAt: string | null;
   stats: JobStats;
   sessionId?: number | null;
+  /** user.db import record of an import job (docs/design/imports.md); absent or null when none was written. */
+  importId?: number | null;
   logPath?: string;
   error: string | null;
   exitCode?: number | null;
@@ -492,6 +577,8 @@ export interface Filters {
   /** Tag ids; all must match. */
   tags?: number[];
   album?: number;
+  /** An import record of user.db (`import=<iid>`). */
+  import?: number;
   /** List trashed rows instead of live ones (the trash page; not in the URL). */
   trashed?: boolean;
 }
@@ -610,6 +697,7 @@ export function filterParams(f: Filters, extra?: Record<string, string | number>
   if (f.rating) q.set('rating', String(f.rating));
   for (const t of f.tags ?? []) q.append('tag', String(t));
   if (f.album) q.set('album', String(f.album));
+  if (f.import) q.set('import', String(f.import));
   if (f.trashed) q.set('trashed', '1');
   if (extra) for (const [k, v] of Object.entries(extra)) q.set(k, String(v));
   return q;
@@ -706,6 +794,14 @@ export interface LibApi {
   deleteAlbum(id: number): Promise<void>;
   albumItems(id: number, change: { add?: readonly string[]; remove?: readonly string[] }, progress?: ChunkProgress): Promise<{ count: number }>;
 
+  /** Import records, newest first. */
+  getImports(signal?: AbortSignal): Promise<ImportRecord[]>;
+  getImport(id: number, signal?: AbortSignal): Promise<ImportRecord>;
+  /** Renames a record ("" clears the name). */
+  renameImport(id: number, name: string): Promise<void>;
+  /** Deletes the record only; the files stay. */
+  deleteImport(id: number): Promise<void>;
+
   trash(hashes: readonly string[], progress?: ChunkProgress): Promise<TrashResult>;
   restore(hashes: readonly string[], progress?: ChunkProgress): Promise<RestoreResult>;
   deleteForever(hashes: readonly string[], progress?: ChunkProgress): Promise<DeleteResult>;
@@ -735,6 +831,12 @@ function failures(v: unknown): Failure[] {
 }
 
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/** Record ids are positive integers; anything else never reaches a URL. */
+function encId(id: number): string {
+  if (!Number.isSafeInteger(id) || id <= 0) throw new ApiError(400, `invalid id ${JSON.stringify(id)}`);
+  return String(id);
+}
 
 function makeLibApi(id: string): LibApi {
   const base = libBase(id);
@@ -768,7 +870,10 @@ function makeLibApi(id: string): LibApi {
       const r = await get<{ items: MediaItem[] | null }>(withQuery('/media', filterParams(f, { year, month })), signal);
       return r.items ?? [];
     },
-    getMedia: (mid, signal) => get<MediaDetail>(`/media/${enc(String(mid))}`, signal),
+    async getMedia(mid, signal) {
+      const d = await get<MediaDetail>(`/media/${enc(String(mid))}`, signal);
+      return 'imports' in d ? { ...d, imports: toImportRefs(d.imports) } : d;
+    },
     thumbUrl: (ref) => versioned(base, 'thumb', ref),
     previewUrl: (ref) => versioned(base, 'preview', ref),
     fileUrl: (mid, download = false) => `${base}/file/${enc(String(mid))}${download ? '?download=1' : ''}`,
@@ -853,6 +958,20 @@ function makeLibApi(id: string): LibApi {
         progress?.(done, total);
       }
       return { count };
+    },
+
+    async getImports(signal) {
+      const r = await get<{ imports?: unknown }>('/imports', signal);
+      return Array.isArray(r.imports) ? r.imports.filter(isRecord).map(toImport) : [];
+    },
+    async getImport(iid, signal) {
+      return toImport(await get<unknown>(`/imports/${encId(iid)}`, signal));
+    },
+    async renameImport(iid, name) {
+      await post<unknown>(`/imports/${encId(iid)}`, { name });
+    },
+    async deleteImport(iid) {
+      await post<unknown>(`/imports/${encId(iid)}/delete`, {});
     },
 
     async trash(hashes, progress) {

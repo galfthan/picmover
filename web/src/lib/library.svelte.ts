@@ -3,7 +3,7 @@
 // albums), the grid's empty state and the Library page read it. The shell
 // selects the library from the route (`select`).
 
-import { errorMessage, libApi, type Album, type LibApi, type LibraryInfo, type Tag } from './api';
+import { errorMessage, libApi, type Album, type ImportRecord, type LibApi, type LibraryInfo, type Tag } from './api';
 import { baseName } from './paths';
 
 class LibraryStore {
@@ -16,9 +16,15 @@ class LibraryStore {
   loading = $state(false);
   tags = $state.raw<Tag[]>([]);
   albums = $state.raw<Album[]>([]);
+  /** Import records, newest first; loaded on demand (loadImports), not by load(). */
+  imports = $state.raw<ImportRecord[]>([]);
+  /** Whether loadImports() has answered for this library. */
+  importsLoaded = $state(false);
   /** Bumped by every load(); answers for an older library or generation are dropped. */
   #gen = 0;
   #inflight: Promise<void> | null = null;
+  /** Bumped by every loadImports() and library switch; older answers are dropped. */
+  #igen = 0;
   /** A load() arrived while one was in flight: that one may have read the old state, so load again after it. */
   #dirty = false;
 
@@ -52,6 +58,9 @@ class LibraryStore {
     this.error = null;
     this.tags = [];
     this.albums = [];
+    this.imports = [];
+    this.importsLoaded = false;
+    this.#igen++;
     this.#inflight = null;
     this.#dirty = false;
     this.#gen++;
@@ -118,6 +127,28 @@ class LibraryStore {
     if (tags) this.tags = [...tags].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
     if (albums) this.albums = albums;
     return err;
+  }
+
+  /**
+   * Reloads the import records (the Imports page, the import filter chip).
+   * Kept apart from load(): a server without import records answers 404,
+   * which must not mark the tag and album lists as failed. Resolves to an
+   * error message, or null.
+   */
+  async loadImports(): Promise<string | null> {
+    const id = this.id;
+    if (id === null) return null;
+    const g = ++this.#igen;
+    try {
+      const list = await libApi(id).getImports();
+      if (id !== this.id || g !== this.#igen) return null;
+      this.imports = list;
+      return null;
+    } catch (e) {
+      return errorMessage(e);
+    } finally {
+      if (id === this.id && g === this.#igen) this.importsLoaded = true;
+    }
   }
 
   /** Adds or replaces tags in the list (after a create). */

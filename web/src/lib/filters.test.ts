@@ -36,5 +36,15 @@ describe('filters in the URL', () => {
     expect(hasFilters({ album: 3 })).toBe(true);
     expect(hasFilters({ album: 3 }, { album: true })).toBe(false);
     expect(hasFilters({ album: 3, rating: 1 }, { album: true })).toBe(true);
+    expect(hasFilters({ import: 4 })).toBe(true);
+    expect(hasFilters({ import: 4 }, { import: true })).toBe(false);
+    expect(hasFilters({ import: 4, album: 3 }, { import: true })).toBe(true);
+  });
+  it('read and write the import record filter', () => {
+    expect(filtersFromQuery(q('import=12&album=3'))).toEqual({ import: 12, album: 3 });
+    expect(filtersFromQuery(q('import=0'))).toEqual({});
+    expect(filtersFromQuery(q('import=x'))).toEqual({});
+    expect(filtersToQuery({ import: 12, session: 4 }).toString()).toBe('session=4&import=12');
+    expect(filtersKey({ import: 1 })).not.toBe(filtersKey({ import: 2 }));
   });
 });

@@ -160,3 +160,110 @@ mode, source name, imported/existing/duplicates/errors, bytes, name).
 
 Cross-library import history, re-running an import, editing items, moving
 items between imports, and statistics over time.
+
+## As implemented (frontend)
+
+Routes (`web/src/lib/routes.ts`): `#/l/<id>/imports` is the page `imports`;
+`#/l/<id>/imports/<iid>` is `importrecord` with `importId` on the lib route
+(positive int, else not found; extra segments not found). `imports` is not
+a step 3 legacy path. `importedHref(lib, job)` picks "Show imported":
+`?import=<importId>` when the job has a positive `importId`, else
+`?session=<sessionId>`, else no link. Both the import wizard's finished
+panel (`pages/Import.svelte`) and the job list on the Library page use it.
+
+API client (`web/src/lib/api.ts`): `ImportRecord`, `ImportRef`;
+`getImports`, `getImport(iid)`, `renameImport(iid, name)`,
+`deleteImport(iid)` on `LibApi`. `toImport` defaults every missing field
+(strings `""`, counts 0, `startedAt`/`finishedAt` null when absent or
+empty) and accepts the record bare or wrapped as `{import: …}`. `cover` is
+used only when it is a 16-hex-digit hash string (as album covers);
+anything else (`0`, `""`, null) means no cover. `getMedia` normalises
+`imports` with `toImportRefs` (entries without a positive id are dropped).
+Ids are checked before they reach a URL. `Filters.import` is sent as
+`import=<iid>` by `filterParams` and lives in the route query
+(`lib/filters.ts`), next to `album` and `session`. `Job.importId` is
+optional (`number | null`).
+
+Components:
+
+- `pages/Imports.svelte`: the list, newest first as the server orders it.
+  Row: cover (`/thumb/<hash>`), title (name, else source name, else
+  `Import #<id>`), mode chip, outcome chip unless `done`, date (relative
+  under a week, else the local date; full instant in the tooltip), the
+  source (the source name when the record is named, else the full path),
+  counts (`12 new, 3 already there, 2 duplicates, 1 error`, zeros left
+  out, `Nothing imported` when all are zero) and bytes. Shows the library
+  root ("In /media/peter") like Albums, an empty state, and a link to the
+  import wizard.
+- `pages/ImportRecord.svelte`: `Grid` with the new `mode="import"` and
+  `importId` (the grid adds `import` to its effective filters, hides the
+  import chip and counts it as implied; the selection bar runs as on the
+  plain grid). Header: back link, `Import: <title>`, mode and outcome
+  chips, Rename and Delete record, and a facts line (started at, full
+  source path, host, counts, bytes). Rename uses a Dialog: trimmed, at most
+  200 characters (checked client-side too), empty allowed and clears the
+  name. Delete record confirms in a Dialog that the record goes and the N
+  photos and videos stay in the library with no file touched, then
+  returns to the list with a toast. A 404 shows "There is no such import
+  record in this library." instead of the grid.
+- `components/Filters.svelte`: chip `Import: <title>` with a remove button
+  (`aria-label="Remove import filter <title>"`); the title comes from
+  `library.imports`, loaded on demand when the id is not known
+  (`#<iid>` until then). The old session chip's remove label became
+  "Remove import session filter".
+- `components/Lightbox.svelte`: under "Imported", one link per record in
+  `imports` to `#/l/<id>/imports/<iid>`, text from `importLine`
+  ("Imported <instant> from <source name> · <name>", or "Recorded by a
+  rebuild …" for mode `rebuild`). Without `imports` (older server) it
+  shows `importedAt` and the session link as before.
+- `lib/library.svelte.ts`: `imports` and `loadImports()`, kept apart from
+  `load()`/`loadLists()` so a server without the endpoint does not mark
+  the tag and album lists as failed.
+- `lib/imports.ts`: wording helpers (`importTitle`, `modeLabel`,
+  `outcomeLabel`, `importCounts`, `formatRecent`, `importLine`).
+- Nav: "Imports" right after "Albums", active on both pages.
+
+Fake server (`web/src/testing/fakes.ts`): two records in "peter" (#5
+named, copy, items 1..4, one error; #2 unnamed, move, cancelled, items 7
+and 8), `GET imports`, `GET/POST imports/<iid>`, `POST
+imports/<iid>/delete` (404 when missing, 400 for a bad id or a name over
+200 characters), the `import=` filter on listings (404 for an unknown id)
+and `imports` in the media detail. `ZERO_STATS` gained `rate: 0` (it was
+missing since the transfer-rate commit and broke `svelte-check`; the same
+fix in `backupinfo.test.ts`).
+
+Tests:
+
+- `lib/routes.test.ts`: the two routes, malformed ids, `importedHref`
+  preferring `importId` and falling back to `sessionId`.
+- `lib/api.test.ts`: list parsing with defaults and junk entries, cover
+  only as a hash, wrapped answers, get/rename/delete URLs and bodies,
+  invalid ids never sent, `import=` in listings, `imports` in the detail.
+- `lib/filters.test.ts`: `import=` read, written, keyed and implied.
+- `lib/imports.test.ts`: titles, labels, counts, dates, the detail line.
+- `Imports.test.ts` (whole app on the fake server): the list rendering and
+  nav position; the empty state; the record grid (`timeline?import=5`, other
+  filters combine, rename incl. clearing and the length limit); delete
+  with the confirm text, no file request, back to the list; a missing
+  record; the `Import: <name>` chip on the plain grid and its removal; the
+  lightbox link; "Show imported" on the Library page choosing `?import=`
+  over `?session=`.
+- `App.test.ts`: the nav list, and the wizard's finished panel linking to
+  `?import=31` when the done job carries `importId`.
+
+Assumptions beyond the contract (the backend should match):
+
+- `POST imports/<iid>` and `POST imports/<iid>/delete` answers are not
+  read; the client reloads the record and the list afterwards. Any 2xx JSON
+  body works (the fake returns the updated record and `{}`).
+- `cover` is a 16-hex-digit hash string like album covers (a JSON number
+  cannot carry a uint64); "none" may be `null`, `""` or `0`.
+- `startedAt`/`finishedAt` are RFC 3339 with zone; `finishedAt` is `null`
+  when unset.
+- The detail's `imports` entries may also carry `sourceName`; the line
+  "Imported <date> from <source name>" needs it, and without it the line
+  reads "Imported <date>" plus the name. This is the one deviation from the
+  contract's `{id, name, startedAt, mode}`: adding `sourceName` there is
+  recommended.
+- `GET imports/<iid>` for an unknown id answers 404 (the page shows it as
+  missing; other errors are shown with Retry).
