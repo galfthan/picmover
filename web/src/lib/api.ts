@@ -581,6 +581,10 @@ export interface Filters {
   to?: string;
   /** "MM-DD" or "MM-DD..MM-DD", every year (see dates.ts). */
   recur?: string;
+  /** Longer edge, MAX(width, height), at least this many pixels (1..1 000 000; `minpx`). Unknown dimensions never match. */
+  minPx?: number;
+  /** Longer edge at most this many pixels (1..1 000 000; `maxpx`). Unknown dimensions never match. */
+  maxPx?: number;
   /** Minimum rating 1..5. */
   rating?: number;
   /** Tag ids; all must match. */
@@ -703,6 +707,8 @@ export function filterParams(f: Filters, extra?: Record<string, string | number>
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
   if (f.recur) q.set('recur', f.recur);
+  if (f.minPx) q.set('minpx', String(f.minPx));
+  if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (f.rating) q.set('rating', String(f.rating));
   for (const t of f.tags ?? []) q.append('tag', String(t));
   if (f.album) q.set('album', String(f.album));

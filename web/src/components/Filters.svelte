@@ -6,6 +6,7 @@
   import { importTitle } from '../lib/imports';
   import { parseWallClock } from '../lib/format';
   import DateFilter, { type DateValue } from './DateFilter.svelte';
+  import SizeFilter, { type SizeValue } from './SizeFilter.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
 
   interface Props {
@@ -73,6 +74,9 @@
   function onDates(v: DateValue) {
     set({ from: v.from, to: v.to, recur: v.recur });
   }
+  function onSize(v: SizeValue) {
+    set({ minPx: v.minPx, maxPx: v.maxPx });
+  }
   function addTag(p: Pick) {
     if ('create' in p) return;
     const cur = filters.tags ?? [];
@@ -121,6 +125,8 @@
   </select>
 
   <DateFilter from={filters.from} to={filters.to} recur={filters.recur} {years} onchange={onDates} />
+
+  <SizeFilter minPx={filters.minPx} maxPx={filters.maxPx} onchange={onSize} />
 
   <select aria-label="Minimum rating" value={String(filters.rating ?? 0)} onchange={onRating}>
     <option value="0">Any rating</option>

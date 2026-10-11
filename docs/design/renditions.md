@@ -554,3 +554,38 @@ if wanted, trashed.
   `onchange` with the pair and that Clear removes it.
 - **Not in scope.** Megapixel or aspect filters, a dimensions column in
   the grid, bulk trash shortcuts (selection + Trash already works).
+
+### As implemented
+
+- **Catalog.** `Filter.MinSide`, `Filter.MaxSide` (0 = none). When either
+  is set, `Filter.where` adds `width > 0 AND height > 0` once, then
+  `MAX(width, height) >= ?` and/or `MAX(width, height) <= ?`. A negative
+  bound or `MinSide > MaxSide` (both set) is an error. Applies to
+  Buckets, BucketItems, GeoPoints and GeoItems through the shared filter.
+- **HTTP.** `parseFilter` reads `minpx`/`maxpx` for timeline, media, geo
+  and geo/items (similar does not take browsing filters). Not a whole
+  number, < 1 or > 1 000 000 → 400 `invalid minpx "abc": want a size in
+  pixels 1-1000000`; both set with min > max → 400 `invalid minpx 5000:
+  greater than maxpx 100`.
+- **Web.** `Filters.minPx`/`maxPx`, sent as `minpx`/`maxpx`;
+  `filtersFromQuery` drops a malformed or out-of-range value, and both
+  when min > max; `describeSize` builds the summary. `SizeFilter.svelte`
+  sits after the Dates control. The button text is the summary itself
+  ("Any size", "≥ 2000 px", ...), with a "Size of the longer edge"
+  tooltip. A typed min above max is swapped rather than rejected; a
+  malformed typed value clears that bound. Moving focus from Min to Max
+  applies Min (blur), as the contract says. Unchanged values send nothing.
+- **Fake API.** `select` filters on `w`/`h` (both > 0); `lib` answers 400
+  for malformed or crossed bounds with the server's messages. The fixture
+  items are unchanged (4000×3000, the trashed one 10×10); the test that
+  needs a small item resizes one.
+- **Tests.** Go: `TestFilterSide` (catalog: min, max, both, equal,
+  portrait, unknown dimensions excluded, buckets, bounds validation);
+  `TestNewFilterParams` (server: `minpx=0`, `abc`, `-5`, `maxpx=1000001`,
+  `1.5`, `minpx=5000&maxpx=100` are 400 on all four endpoints; counts
+  with minpx/maxpx alone and combined with type/gps/from/trashed; media
+  and geo narrowed). Web: `lib/filters.test.ts` (round trip, malformed
+  and crossed bounds dropped, hasFilters, summary) and
+  `components/SizeFilter.test.ts` (presets through the filter bar, Clear,
+  labels, Enter/blur/close apply and no per-keystroke apply, fake server
+  filtering and 400s).

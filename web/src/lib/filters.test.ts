@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filtersFromQuery, filtersKey, filtersToQuery, hasFilters } from './filters';
+import { describeSize, filtersFromQuery, filtersKey, filtersToQuery, hasFilters } from './filters';
 
 const q = (s: string) => new URLSearchParams(s);
 
@@ -46,5 +46,33 @@ describe('filters in the URL', () => {
     expect(filtersFromQuery(q('import=x'))).toEqual({});
     expect(filtersToQuery({ import: 12, session: 4 }).toString()).toBe('session=4&import=12');
     expect(filtersKey({ import: 1 })).not.toBe(filtersKey({ import: 2 }));
+  });
+});
+
+describe('size filter in the URL', () => {
+  it('round-trips minpx and maxpx', () => {
+    const s = filtersToQuery({ minPx: 640, maxPx: 2000, type: 'image' }).toString();
+    expect(s).toBe('type=image&minpx=640&maxpx=2000');
+    expect(filtersFromQuery(q(s))).toEqual({ type: 'image', minPx: 640, maxPx: 2000 });
+    expect(filtersFromQuery(q('minpx=2000'))).toEqual({ minPx: 2000 });
+    expect(filtersFromQuery(q('maxpx=640'))).toEqual({ maxPx: 640 });
+    expect(filtersFromQuery(q('minpx=500&maxpx=500'))).toEqual({ minPx: 500, maxPx: 500 });
+  });
+  it('drops malformed bounds, and both when min > max', () => {
+    expect(filtersFromQuery(q('minpx=5000&maxpx=100'))).toEqual({});
+    expect(filtersFromQuery(q('minpx=0&maxpx=1000001'))).toEqual({});
+    expect(filtersFromQuery(q('minpx=abc&maxpx=-5'))).toEqual({});
+    expect(filtersFromQuery(q('minpx=1.5&maxpx=1000000'))).toEqual({ maxPx: 1000000 });
+  });
+  it('count as filters and key distinctly', () => {
+    expect(hasFilters({ minPx: 2000 })).toBe(true);
+    expect(hasFilters({ maxPx: 640 })).toBe(true);
+    expect(filtersKey({ minPx: 640 })).not.toBe(filtersKey({ maxPx: 640 }));
+  });
+  it('describe the bounds', () => {
+    expect(describeSize()).toBe('Any size');
+    expect(describeSize(2000)).toBe('≥ 2000 px');
+    expect(describeSize(undefined, 640)).toBe('≤ 640 px');
+    expect(describeSize(640, 2000)).toBe('640–2000 px');
   });
 });

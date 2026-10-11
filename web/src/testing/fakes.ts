@@ -555,6 +555,12 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     const rating = Number(q.get('rating'));
     if (rating) list = list.filter((x) => (x.rating ?? 0) >= rating);
     for (const t of q.getAll('tag')) list = list.filter((x) => x.tagIds.includes(Number(t)));
+    // The dimension filter on the longer edge; unknown dimensions never match.
+    const minPx = Number(q.get('minpx') ?? 0);
+    const maxPx = Number(q.get('maxpx') ?? 0);
+    if (minPx || maxPx) {
+      list = list.filter((x) => x.w > 0 && x.h > 0 && (!minPx || Math.max(x.w, x.h) >= minPx) && (!maxPx || Math.max(x.w, x.h) <= maxPx));
+    }
     return list;
   }
 
@@ -566,6 +572,15 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
       if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
     }
+    // The dimension filter as the server: 1..1 000 000, minpx <= maxpx.
+    for (const k of ['minpx', 'maxpx']) {
+      const v = q.get(k);
+      if (v && (!/^[+-]?\d+$/.test(v) || Number(v) < 1 || Number(v) > 1_000_000)) {
+        return json({ error: `invalid ${k} "${v}": want a size in pixels 1-1000000` }, 400);
+      }
+    }
+    const [lo, hi] = [Number(q.get('minpx') || 0), Number(q.get('maxpx') || 0)];
+    if (lo && hi && lo > hi) return json({ error: `invalid minpx ${lo}: greater than maxpx ${hi}` }, 400);
     // Renditions (docs/design/renditions.md), as the server answers them:
     // a known hash gets a tiny image (the thumb and preview JPEG, the
     // large WebP); a hash in largeFallback has a large that could not be
