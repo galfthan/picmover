@@ -502,7 +502,9 @@ What was built (all under `web/src/`):
 
 - `lib/api.ts`: `AppInfo` and `parseAppInfo` (tolerant: unknown platform
   reads as `linux`, a missing `window` as `false`, a missing `closeToTray`
-  as `true`); `getApp()` (null on 404, other errors throw);
+  as `true`; `windowReason: 'ok' | 'no-runtime' | 'browser-flag' |
+  'failed' | 'unsupported'`, when missing or unknown `ok` with the window,
+  else `no-runtime` on Windows and `unsupported` elsewhere); `getApp()` (null on 404, other errors throw);
   `setAppWorkspace(path)` (POST `/api/app/workspace`, returns the parsed
   `/api/libraries` body; 400/409 surface as `ApiError` with `status` and
   `body`); `appOpen()` (POST `/api/app/open {}`, not used by the UI: the
@@ -516,7 +518,9 @@ What was built (all under `web/src/`):
   and UNC; roots stay whole), `app.setWorkspace(path)` (posts, hands the
   answer to `libraries.apply`, refreshes `/api/app`; returns the inline
   message or null), the WebView2 notice flag and its dismissal
-  (localStorage `picmover.webview2notice` = `true` via `lib/storage.ts`).
+  (localStorage `picmover.webview2notice` = `true` via `lib/storage.ts`),
+  and the window-failed notice flag and its dismissal
+  (`picmover.windowfailed`).
 - `lib/libraries.svelte.ts`: `mode` may be `'unset'`; `apply(ws)` takes a
   listing from the workspace POST and drops the old workspace's per-library
   notes (opening, failures, rebuilding, reopen guard) and any listing
@@ -533,9 +537,10 @@ What was built (all under `web/src/`):
   workspace with a copy button when there is one, the existing
   `FolderPicker` whose choose button reads "Use this folder"). Errors stay
   inline under the picker (`role="alert"`): the server's 400 message as
-  sent; any 409 as "An import or backup is running; wait for it to
-  finish." Without app mode the button is disabled and the card says to
-  restart `picmover serve <folder>`. `FolderPicker` gained an optional
+  sent; a 409 with `jobs` as "An import or backup is running; wait for it
+  to finish.", any other 409 with its `error`. Without app mode the button
+  is disabled, and once `/api/app` answered 404 the card says to restart
+  `picmover serve <folder>`. `FolderPicker` gained an optional
   `disabled` prop for its choose button.
 - `pages/Libraries.svelte`: the WebView2 notice (app mode, `platform
   "windows"` and `window false`, until dismissed) above the heading; the
@@ -562,9 +567,9 @@ Deviations and assumptions the backend must honour:
   workspace needs no fragment (`#/` shows the card in mode `unset`).
 - `/api/libraries` in mode `unset` may send `root: ""` or leave it out;
   `libraries`/`folders` may be `[]` or `null`.
-- The 409 of `POST /api/app/workspace` is shown with a fixed text, whatever
-  its `error`; `jobs` is not read. A 400 shows `error` verbatim, so it
-  should be a sentence a user can act on.
+- The 409 of `POST /api/app/workspace` is shown with a fixed text when it
+  has a numeric `jobs`, else with its `error`. A 400 shows `error`
+  verbatim, so both should be sentences a user can act on.
 - `/api/libraries/<id>/open` (and the other workspace routes) in mode
   `unset` may answer 409 `{state:"unset"}` or 404; both reload the listing.
 - `GET /api/app` → `workspace` should be `""` while unset. After a switch
@@ -591,3 +596,41 @@ one), `server.ws` (mode and root), `GET /api/app`, `POST
 listing with the libraries under the new root and open libraries closed),
 `POST /api/app/open` → 204, and 409 `{error:"no workspace", state:"unset"}`
 for every `/api/libraries/...` and `/api/l/...` route while unset.
+
+## Review fixes (frontend)
+
+- Workspace switch errors by cause (finding 2): a 409 of `POST
+  /api/app/workspace` shows "An import or backup is running; wait for it
+  to finish." only when the body has a numeric `jobs`; any other 409 (the
+  library is in use by another process, cannot be opened) shows the
+  body's `error` as sent. The fake answers 409 `{error}` without `jobs`
+  for a busy or broken library folder; tested.
+- App-mode loading state and retry (finding 9): `app.loaded` now means
+  GET `/api/app` answered (the app's description, or 404 under `serve`);
+  it stays false while the request fails. The setup card's "restart
+  `picmover serve <folder>`" notice shows only when `app.loaded &&
+  !app.isApp`; while loading or failing the card shows its normal body
+  with the button disabled. A failure other than 404 is retried after 1 s,
+  2 s and 4 s, then once more on the next route change
+  (`app.navigated()`, called from `App.svelte`); a 404 is final. The fake
+  has `server.app.fail` (the next N GETs answer 500); tested.
+- `windowReason` from `/api/app`: the WebView2 notice shows only for
+  `platform === 'windows' && !window && windowReason === 'no-runtime'`; a
+  separate dismissible notice ("The native window could not be created,
+  so the app opened in your browser. Details are in the app log.",
+  localStorage `picmover.windowfailed`) for `windowReason === 'failed'`
+  with `!window` (any platform); nothing for `browser-flag` or
+  `unsupported`. A missing field defaults as described above, so older
+  servers keep the old behaviour.
+- The fake now matches the server for library folders: `POST
+  /api/app/workspace` with a path in `server.libraryFolders` (default
+  `/media/peter`, `/media/penny`, `/media/broken`) switches to mode
+  `single` on that library (or answers 409 `{error}` when it is busy or
+  broken) instead of 400. The fake's 400 is now the server's `.picmover`
+  sentence. Tested: after switching to `/media/peter` the route goes to
+  `#/l/peter/`, the header shows workspace "peter" and the library chip,
+  `#/` redirects to the library and `#/?setup=1` shows the card with the
+  one library and no New library.
+- The unset-409 test now opens the Trash page (four library requests at
+  once, all 409 `unset`) and asserts exactly one listing reload and no
+  toast, also after further time passes.

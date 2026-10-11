@@ -1204,6 +1204,16 @@ export async function startWorkspaceJob(id: string, req: RebuildJobRequest): Pro
 
 export type AppPlatform = 'windows' | 'linux' | 'darwin';
 
+/**
+ * Why the UI runs (or does not run) in the native window: `ok` it does;
+ * `no-runtime` the WebView2 runtime is missing (Windows); `browser-flag`
+ * the app was started with --browser; `failed` creating the window failed;
+ * `unsupported` the platform has no native window.
+ */
+export type WindowReason = 'ok' | 'no-runtime' | 'browser-flag' | 'failed' | 'unsupported';
+
+const WINDOW_REASONS: readonly WindowReason[] = ['ok', 'no-runtime', 'browser-flag', 'failed', 'unsupported'];
+
 /** GET /api/app: served only by picmover-app; 404 under `picmover serve`. */
 export interface AppInfo {
   app: true;
@@ -1214,6 +1224,8 @@ export interface AppInfo {
   platform: AppPlatform;
   /** Whether the UI runs in the native window (false: the browser fallback). */
   window: boolean;
+  /** Why `window` is what it is (older servers leave it out: see `parseAppInfo`). */
+  windowReason: WindowReason;
 }
 
 export function parseAppInfo(v: unknown): AppInfo | null {
@@ -1226,6 +1238,13 @@ export function parseAppInfo(v: unknown): AppInfo | null {
     closeToTray: v.closeToTray !== false,
     platform: p === 'windows' || p === 'darwin' ? p : 'linux',
     window: v.window === true,
+    windowReason: (WINDOW_REASONS as readonly unknown[]).includes(v.windowReason)
+      ? (v.windowReason as WindowReason)
+      : v.window === true
+        ? 'ok'
+        : p === 'windows'
+          ? 'no-runtime'
+          : 'unsupported',
   };
 }
 
@@ -1241,8 +1260,9 @@ export async function getApp(signal?: AbortSignal): Promise<AppInfo | null> {
 
 /**
  * Switches the app to another workspace folder: the new `/api/libraries`
- * body. ApiError 400 `{error}` for an invalid path, 409 `{error, jobs}`
- * while a job runs.
+ * body (mode "single" when the folder is a library). ApiError 400
+ * `{error}` for an invalid path, 409 `{error, jobs}` while a job runs, 409
+ * `{error}` when the library cannot be opened or is in use elsewhere.
  */
 export async function setAppWorkspace(path: string): Promise<Workspace> {
   return parseWorkspace(await postJSON<unknown>('/api/app/workspace', { path }));

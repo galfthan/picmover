@@ -2,7 +2,8 @@
   // The workspace's start page (#/): a card per library and per plain
   // folder, with New library, Record files in place, Rebuild and Retry.
   // In the desktop app also the workspace setup card (no workspace yet, or
-  // #/?setup=1 from the header's Change) and the WebView2-missing notice.
+  // #/?setup=1 from the header's Change) and the window notices (WebView2
+  // missing, window creation failed).
   import { untrack } from 'svelte';
   import { errorMessage, libraryCoverUrl, type FolderEntry, type Lib } from '../lib/api';
   import { libraries, holderText, libraryNameProblem } from '../lib/libraries.svelte';
@@ -140,7 +141,7 @@
 <div class="page">
   <div class="page-inner">
     {#if app.showWebView2Notice}
-      <div class="notice webview2" role="status">
+      <div class="notice appnotice webview2" role="status">
         <span>
           The app opened in your browser because the WebView2 runtime is missing. Install it from
           <a href="https://developer.microsoft.com/microsoft-edge/webview2/" target="_blank" rel="noopener noreferrer"
@@ -148,6 +149,12 @@
           > for a native window.
         </span>
         <button class="ghost small" aria-label="Dismiss" onclick={() => app.dismissWebView2Notice()}>×</button>
+      </div>
+    {/if}
+    {#if app.showWindowFailedNotice}
+      <div class="notice appnotice windowfailed" role="status">
+        <span>The native window could not be created, so the app opened in your browser. Details are in the app log.</span>
+        <button class="ghost small" aria-label="Dismiss" onclick={() => app.dismissWindowFailedNotice()}>×</button>
       </div>
     {/if}
     <div class="head">
@@ -287,13 +294,13 @@
 {/if}
 
 <style>
-  .webview2 {
+  .appnotice {
     display: flex;
     align-items: center;
     gap: 8px;
     margin-bottom: 12px;
   }
-  .webview2 span {
+  .appnotice span {
     flex: 1;
     word-break: break-word;
   }

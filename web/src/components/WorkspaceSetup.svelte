@@ -20,6 +20,10 @@
   let error = $state('');
   let busy = $state(false);
   const enabled = $derived(app.isApp);
+  // Only a server known not to be the app (GET /api/app answered 404) gets
+  // the restart notice; while /api/app is loading or failing the button
+  // just stays disabled.
+  const serveOnly = $derived(app.loaded && !app.isApp);
 
   async function choose(path: string) {
     if (!enabled || busy) return;
@@ -42,7 +46,7 @@
       <CopyButton text={current} />
     </div>
   {/if}
-  {#if !enabled}
+  {#if serveOnly}
     <div class="notice">
       This server has no workspace folder and cannot change it. Restart it with one: <span class="mono">picmover serve &lt;folder&gt;</span>.
     </div>

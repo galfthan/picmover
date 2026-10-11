@@ -5,7 +5,7 @@
 // with Change; the Libraries page shows the setup card while no workspace
 // is set (and after Change), posts /api/app/workspace and shows 400/409
 // inline; the WebView2-missing notice; and the unset mode's library 409s
-// send the route home once, without toasts.
+// send the route home with one listing reload, without toasts.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appInfo, backupJobJSON, fakeServer, go, settle, T1, type FakeServer } from './testing/fakes';
@@ -76,6 +76,10 @@ describe('desktop app mode', () => {
     expect(setupCard()).toBeNull();
     expect(document.querySelector('.webview2')).toBeNull();
     expect(cards()).toEqual(['peter', 'penny', 'broken', 'scans']);
+    // A 404 is final: no retry, not even on navigation.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await go('#/?setup=1');
+    expect(gets('app')).toHaveLength(1);
   });
 
   it('shows the setup card, disabled, when serve somehow has no workspace', async () => {
@@ -87,6 +91,39 @@ describe('desktop app mode', () => {
     await browse('/mnt');
     expect(button(setupCard()!, 'Use this folder')!.disabled).toBe(true);
     expect(server.posts('app/workspace')).toHaveLength(0);
+  });
+
+  it('keeps the setup card neutral and disabled while /api/app fails, retries it, then enables it', async () => {
+    server = fakeServer('unset');
+    server.app.info = appInfo({ workspace: '' });
+    server.app.fail = 4; // the first answer and the three timed retries fail
+    server.install();
+    await start(); // 1.5 s: the first request and the retry after 1 s
+    expect(gets('app')).toHaveLength(2);
+    const card = setupCard()!;
+    expect(card.textContent).toContain('Choose the folder that holds your libraries');
+    expect(card.textContent).not.toContain('picmover serve');
+    expect(card.querySelector('.notice')).toBeNull();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(gets('app')).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(gets('app')).toHaveLength(4);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(gets('app')).toHaveLength(4); // the timed retries are used up
+    await browse('/mnt');
+    expect(button(setupCard()!, 'Use this folder')!.disabled).toBe(true);
+    expect(setupCard()!.textContent).not.toContain('picmover serve');
+    expect(document.querySelector('.toast')).toBeNull();
+
+    // One more on the next navigation: it answers, and the card works.
+    await go('#/?setup=1');
+    expect(gets('app')).toHaveLength(5);
+    expect(header().querySelector('.workspace .ws-name')?.textContent).toBe('none');
+    await browse('/mnt');
+    expect(button(setupCard()!, 'Use this folder')!.disabled).toBe(false);
+    expect(setupCard()!.textContent).not.toContain('picmover serve');
+    await go('#/');
+    expect(gets('app')).toHaveLength(5);
   });
 
   it('sets the workspace from the setup card, then lists its libraries', async () => {
@@ -125,15 +162,59 @@ describe('desktop app mode', () => {
     server.app.info = appInfo({ workspace: '' });
     server.install();
     await start();
-    await browse('/media/peter');
+    await browse('/media/peter/.picmover');
     await useFolder();
-    expect(setupCard()!.querySelector('[role="alert"]')?.textContent).toBe('the folder is a library; choose the folder that holds it');
+    expect(setupCard()!.querySelector('[role="alert"]')?.textContent).toBe("That folder is inside a library's .picmover directory; choose the folder that holds your libraries.");
 
     server.backup.jobs.push(backupJobJSON({ id: 7, kind: 'backup', target: T1 }));
     await browse('/mnt');
     await useFolder();
     expect(setupCard()!.querySelector('[role="alert"]')?.textContent).toBe('An import or backup is running; wait for it to finish.');
     expect(server.ws.mode).toBe('unset');
+    expect(document.querySelector('.toast')).toBeNull();
+  });
+
+  it("shows a library's 409 (in use elsewhere, cannot be opened) with the server's sentence", async () => {
+    server = fakeServer('unset');
+    server.app.info = appInfo({ workspace: '' });
+    server.install();
+    await start();
+    await browse('/media/penny');
+    await useFolder();
+    expect(setupCard()!.querySelector('[role="alert"]')?.textContent).toBe('The library is in use by another picmover process (pid 812, import, since 2026-10-10T09:00:00).');
+    await browse('/media/broken');
+    await useFolder();
+    expect(setupCard()!.querySelector('[role="alert"]')?.textContent).toBe('The library cannot be opened: media.db needs a rebuild');
+    expect(document.body.textContent).not.toContain('An import or backup is running');
+    expect(server.ws.mode).toBe('unset');
+    expect(document.querySelector('.toast')).toBeNull();
+  });
+
+  it('switches to a library folder: single mode on that library', async () => {
+    server = fakeServer('workspace');
+    server.app.info = appInfo({ workspace: '/media' });
+    server.install();
+    await start('#/?setup=1');
+    await browse('/media/peter');
+    await useFolder();
+    expect(server.posts('app/workspace').map((c) => c.body)).toEqual([{ path: '/media/peter' }]);
+    expect(server.ws).toMatchObject({ mode: 'single', root: '/media/peter' });
+    // Single mode sends home to the library, which is open (no open request).
+    expect(location.hash).toBe('#/l/peter/');
+    expect(server.posts('libraries/peter/open')).toHaveLength(0);
+    expect(document.querySelectorAll('a.tile').length).toBe(8);
+    expect(header().querySelector('.libchip .name')?.textContent).toBe('peter');
+    expect(header().querySelector('.libchip .root')?.textContent).toBe('/media/peter');
+    const ws = header().querySelector<HTMLElement>('.workspace')!;
+    expect(ws.querySelector('.ws-name')?.textContent).toBe('peter');
+    expect(ws.getAttribute('title')).toBe('/media/peter');
+    // The Libraries page as in single mode: #/ goes to the library; Change shows the card and the one library.
+    await go('#/');
+    expect(location.hash).toBe('#/l/peter/');
+    await go('#/?setup=1');
+    expect(setupCard()!.querySelector('.current')?.textContent).toContain('/media/peter');
+    expect(cards()).toEqual(['peter']);
+    expect(button(document.body, 'New library')).toBeUndefined();
     expect(document.querySelector('.toast')).toBeNull();
   });
 
@@ -195,8 +276,35 @@ describe('desktop app mode', () => {
     expect(document.querySelector('.webview2')).toBeNull();
   });
 
-  it('hides the WebView2 notice with the window, and on other platforms', async () => {
-    for (const info of [appInfo({ platform: 'windows', window: true }), appInfo({ platform: 'linux', window: false }), appInfo({ platform: 'darwin', window: false })]) {
+  it('shows the window-failed notice instead when creating the window failed; dismissal is remembered apart', async () => {
+    server = fakeServer('workspace');
+    server.app.info = appInfo({ platform: 'windows', window: false, windowReason: 'failed' });
+    server.install();
+    await start();
+    expect(document.querySelector('.webview2')).toBeNull();
+    const notice = document.querySelector<HTMLElement>('.windowfailed')!;
+    expect(notice.textContent?.trim().replace(/\s+/g, ' ')).toContain('The native window could not be created, so the app opened in your browser. Details are in the app log.');
+    notice.querySelector<HTMLButtonElement>('button[aria-label="Dismiss"]')!.click();
+    await settle();
+    expect(document.querySelector('.windowfailed')).toBeNull();
+    expect(localStorage.getItem('picmover.windowfailed')).toBe('true');
+    expect(localStorage.getItem('picmover.webview2notice')).toBeNull();
+
+    stop();
+    vi.resetModules();
+    await start();
+    expect(document.querySelector('h1')?.textContent).toBe('Libraries');
+    expect(document.querySelector('.windowfailed')).toBeNull();
+  });
+
+  it('hides the window notices with the window, for --browser, and on other platforms', async () => {
+    for (const info of [
+      appInfo({ platform: 'windows', window: true }),
+      appInfo({ platform: 'windows', window: false, windowReason: 'browser-flag' }),
+      appInfo({ platform: 'windows', window: false, windowReason: 'unsupported' }),
+      appInfo({ platform: 'linux', window: false }),
+      appInfo({ platform: 'darwin', window: false }),
+    ]) {
       vi.resetModules();
       server = fakeServer('workspace');
       server.app.info = info;
@@ -204,6 +312,7 @@ describe('desktop app mode', () => {
       await start();
       expect(document.querySelector('h1')?.textContent).toBe('Libraries');
       expect(document.querySelector('.webview2')).toBeNull();
+      expect(document.querySelector('.windowfailed')).toBeNull();
       stop();
       vi.useRealTimers();
       vi.unstubAllGlobals();
@@ -222,14 +331,19 @@ describe('desktop app mode', () => {
     server.ws.mode = 'unset';
     server.ws.root = '';
     const before = server.calls.length;
-    await go('#/l/peter/albums');
-    expect(server.calls.slice(before).some((c) => c.path.startsWith('/api/l/peter/'))).toBe(true);
+    await go('#/l/peter/trash');
+    // The trash page asks several library routes at once; every one answers 409 unset.
+    const refused = server.calls.slice(before).filter((c) => c.path.startsWith('/api/l/peter/'));
+    expect(refused.length).toBeGreaterThanOrEqual(3);
     expect(location.hash).toBe('#/');
     expect(setupCard()).not.toBeNull();
     expect(document.querySelector('.toast')).toBeNull();
-    expect(gets('libraries').length - listings).toBeLessThanOrEqual(2);
+    // One listing reload for all of them.
+    expect(gets('libraries').length - listings).toBe(1);
     await settle();
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(location.hash).toBe('#/');
+    expect(gets('libraries').length - listings).toBe(1);
     expect(document.querySelector('.toast')).toBeNull();
   });
 });

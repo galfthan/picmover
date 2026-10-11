@@ -177,21 +177,28 @@ const summary = (n: number) => ({ total: n, images: n, raw: 0, videos: 0, withGp
 
 /** The desktop app's GET /api/app answer (docs/design/desktop-shell.md); tests override fields. */
 export function appInfo(p: Partial<AppInfo> = {}): AppInfo {
-  return { app: true, version: 'v0.6.0-test', workspace: '/media', closeToTray: true, platform: 'linux', window: true, ...p };
+  const window = p.window ?? true;
+  const windowReason = window ? 'ok' : (p.platform ?? 'linux') === 'windows' ? 'no-runtime' : 'unsupported';
+  return { app: true, version: 'v0.6.0-test', workspace: '/media', closeToTray: true, platform: 'linux', window, windowReason, ...p };
 }
 
 /**
  * A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver.
  * Mode "unset" is the desktop app without a workspace: the listing is empty,
  * every library route answers 409 state "unset", and POST /api/app/workspace
- * switches it to a workspace with the usual libraries. `app.info` set (see
+ * switches it to a workspace with the usual libraries, or (a folder in
+ * `libraryFolders`, as one with media.db) to single mode on that library;
+ * 409 without `jobs` when that library is busy or broken. `app.info` set (see
  * `appInfo`) makes it the desktop app; null (the default) answers the app
  * routes 404 as `picmover serve` does.
  */
 export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace') {
   /** The listing's mode and root; POST /api/app/workspace changes them. */
-  const ws = { mode, root: mode === 'single' ? '/media/peter' : mode === 'unset' ? '' : '/media' };
-  const app: { info: AppInfo | null } = { info: null };
+  const ws: { mode: 'workspace' | 'single' | 'unset'; root: string; single: Lib | null } = { mode, root: mode === 'single' ? '/media/peter' : mode === 'unset' ? '' : '/media', single: null };
+  /** Folders the workspace POST treats as libraries (they have media.db): it serves them in single mode. */
+  const libraryFolders = new Set(['/media/peter', '/media/penny', '/media/broken']);
+  /** `info` null: the app routes answer 404 (`picmover serve`); `fail`: the next that many GET /api/app answer 500. */
+  const app: { info: AppInfo | null; fail: number } = { info: null, fail: 0 };
   const calls: Call[] = [];
   const items: Item[] = [];
   // July: ids 1..6 (newest first), June: 7..8, one trashed (9).
@@ -791,13 +798,17 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   /** The /api/libraries body; libraries and folders live under the current root. */
   function listing() {
     if (ws.mode === 'unset') return { root: '', mode: 'unset', libraries: [], folders: [] };
-    if (ws.mode === 'single') return { root: ws.root, mode: 'single', libraries: libs, folders };
+    if (ws.mode === 'single') return { root: ws.root, mode: 'single', libraries: ws.single ? [ws.single] : libs, folders: ws.single ? [] : folders };
     const at = <T extends { id?: string; path: string }>(x: T): T => ({ ...x, path: `${ws.root === '/' ? '' : ws.root}/${x.id ?? ''}` });
     return { root: ws.root, mode: ws.mode, libraries: ws.root === '/media' ? libs : libs.map(at), folders: ws.root === '/media' ? folders : folders.map(at) };
   }
 
   /** The desktop app routes (404 unless `app.info` is set), checked as the server does. */
   function appRoute(p: string, method: string, body: Record<string, unknown>): Response {
+    if (p === '/api/app' && method === 'GET' && app.fail > 0) {
+      app.fail--;
+      return json({ error: 'internal error' }, 500);
+    }
     const info = app.info;
     if (!info) return json({ error: 'not found' }, 404);
     if (p === '/api/app' && method === 'GET') return json(info);
@@ -805,11 +816,25 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     if (p === '/api/app/workspace' && method === 'POST') {
       const path = body.path;
       if (typeof path !== 'string' || path === '' || !validTargetPath(path)) return json({ error: 'path: expected an absolute folder path' }, 400);
-      if (path === '/media/peter') return json({ error: 'the folder is a library; choose the folder that holds it' }, 400);
+      if (path.split('/').includes('.picmover')) return json({ error: "That folder is inside a library's .picmover directory; choose the folder that holds your libraries." }, 400);
       const running = backup.jobs.filter((j) => j.state === 'running' || j.state === 'queued').length;
       if (running) return json({ error: 'a job is running', jobs: running }, 409);
+      if (libraryFolders.has(path)) {
+        // As the server: a folder with media.db is served as one library (single mode), or refused 409 {error}.
+        const name = path.slice(path.lastIndexOf('/') + 1);
+        const known = libs.find((l) => l.path === path);
+        if (known?.state === 'busy') return json({ error: `The library is in use by another picmover process (pid ${known.holder?.pid ?? 0}, ${known.holder?.cmd ?? ''}, since ${known.holder?.since ?? ''}).` }, 409);
+        if (known?.state === 'error') return json({ error: `The library cannot be opened: ${known.error ?? 'unreadable'}` }, 409);
+        for (const l of libs) if (l.state === 'open') l.state = 'closed';
+        ws.mode = 'single';
+        ws.root = path;
+        ws.single = { ...(known ?? { id: name, name, path, summary: summary(0) }), state: 'open' };
+        app.info = { ...info, workspace: path };
+        return json(listing());
+      }
       ws.mode = 'workspace';
       ws.root = path;
+      ws.single = null;
       for (const l of libs) if (l.state === 'open') l.state = 'closed';
       app.info = { ...info, workspace: path };
       return json(listing());
@@ -891,7 +916,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, ws, app, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, ws, libraryFolders, app, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

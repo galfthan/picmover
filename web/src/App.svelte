@@ -41,6 +41,12 @@
   const current = $derived(route.current);
   const app = $derived(parseAppRoute(current));
 
+  // A GET /api/app whose automatic retries failed is tried once more on the next navigation.
+  $effect(() => {
+    void current;
+    untrack(() => desktop.navigated());
+  });
+
   // Single mode sends #/ to its library; old step 3 links get the prefix.
   $effect(() => {
     const target = redirectFor(app, current, { mode: libraries.mode, singleId: libraries.singleId });

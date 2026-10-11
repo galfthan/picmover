@@ -435,8 +435,8 @@ describe('desktop app endpoints', () => {
   const info = { app: true, version: 'v0.6.0', workspace: 'C:\\Users\\me\\Pictures', closeToTray: true, platform: 'windows', window: false };
 
   it('parse GET /api/app and answer null on 404 (picmover serve)', async () => {
-    reply = () => json(info);
-    expect(await getApp()).toEqual(info);
+    reply = () => json({ ...info, windowReason: 'failed' });
+    expect(await getApp()).toEqual({ ...info, windowReason: 'failed' });
     reply = () => json({ error: 'not found' }, 404);
     expect(await getApp()).toBeNull();
     reply = () => json({ error: 'boom' }, 500);
@@ -446,8 +446,16 @@ describe('desktop app endpoints', () => {
   it('normalise odd /api/app bodies', () => {
     expect(parseAppInfo({ app: false })).toBeNull();
     expect(parseAppInfo(null)).toBeNull();
-    expect(parseAppInfo({ app: true })).toEqual({ app: true, version: '', workspace: '', closeToTray: true, platform: 'linux', window: false });
-    expect(parseAppInfo({ ...info, platform: 'darwin', closeToTray: false, window: true })).toMatchObject({ platform: 'darwin', closeToTray: false, window: true });
+    expect(parseAppInfo({ app: true })).toEqual({ app: true, version: '', workspace: '', closeToTray: true, platform: 'linux', window: false, windowReason: 'unsupported' });
+    expect(parseAppInfo({ ...info, platform: 'darwin', closeToTray: false, window: true })).toMatchObject({ platform: 'darwin', closeToTray: false, window: true, windowReason: 'ok' });
+  });
+
+  it('default a missing or unknown windowReason from window and platform (older servers)', () => {
+    expect(parseAppInfo(info)?.windowReason).toBe('no-runtime');
+    expect(parseAppInfo({ ...info, windowReason: 'later' })?.windowReason).toBe('no-runtime');
+    expect(parseAppInfo({ ...info, window: true })?.windowReason).toBe('ok');
+    expect(parseAppInfo({ ...info, platform: 'linux' })?.windowReason).toBe('unsupported');
+    for (const r of ['ok', 'no-runtime', 'browser-flag', 'failed', 'unsupported']) expect(parseAppInfo({ ...info, windowReason: r })?.windowReason).toBe(r);
   });
 
   it('post the workspace and return the libraries body; errors keep status and body', async () => {
