@@ -31,6 +31,8 @@ migration:
 
 1. Fast grid and viewer later: a 256 px thumbnail and a 1600 px preview per
    file, generated at import and on demand, content-addressed by hash.
+   (Since `docs/design/renditions.md`: also a 640 px large thumbnail, and
+   new renditions are WebP; see "Renditions" at the end.)
 2. Modern formats imported and decoded in pure Go: HEIC/HEIF, AVIF, WebP,
    GIF, BMP, TIFF, plus RAW via the embedded JPEG previews every RAW
    carries. Video thumbnails via ffmpeg when it is present.
@@ -46,7 +48,7 @@ migration:
 ```
 internal/imaging   decode by sniffing magic bytes, bounded decode, EXIF orientation, resize, JPEG encode
 internal/exif      + HEIF/AVIF EXIF extraction, + embedded preview locator for RAW files
-internal/thumbs    thumbnail/preview generation and the cache store (thumbs.db + previews/ dir)
+internal/thumbs    thumbnail/preview generation and the cache store (thumbs.db + previews/ dir; + large/ dir since renditions.md)
 internal/catalog   schema v3 (strict), thumb state + phash columns, no migrations
 internal/metadata  extension lists extended; HEIC/AVIF/WebP/GIF/BMP dimensions and EXIF
 internal/importer  thumbnail stage after the copy stage; progress fields
@@ -258,6 +260,9 @@ As implemented (deviations and precisions):
 ## internal/thumbs
 
 ```go
+// As first designed; since renditions.md all three renditions are WebP
+// (thumb q80, large q82, preview q85) and LargeSize = 640 exists. See
+// "Renditions" at the end of this document.
 const ThumbSize = 256    // longer side, JPEG q80, stored in thumbs.db
 const PreviewSize = 1600 // longer side, JPEG q85, stored on disk
 
@@ -625,3 +630,25 @@ Deviations from, and precisions to, the notes above:
   explains how to restore it (rename it and its companions back) or to
   start over with `picmover import <lib> <lib>`.
 
+## Renditions (WebP, 640 px large thumbnail)
+
+`docs/design/renditions.md` changed the formats and sizes stated above:
+
+| name    | long side | where                                       | format (new writes) |
+|---------|-----------|---------------------------------------------|---------------------|
+| thumb   | 256 px    | `thumbs.db`, table `thumbs.data`             | WebP, quality 80    |
+| large   | 640 px    | `.picmover/large/<hh>/<hash>.webp`           | WebP, quality 82    |
+| preview | 1600 px   | `.picmover/previews/<hh>/<hash>.webp` (.jpg) | WebP, quality 85    |
+
+All three are encoded with `imaging.EncodeWebP` (gen2brain/webp: libwebp
+as WebAssembly translated to Go, method 0). JPEG renditions written before
+stay valid: `Store.PreviewPath` tries `.webp` then `.jpg`, readers sniff
+the bytes, and the server sends the sniffed content type. `Store.Has`
+reports thumb, large and preview; `Store.Put` takes the large thumbnail
+too and replaces a preview of either format. A missing large thumbnail is
+derived from the stored preview (never the original) by the thumbnail
+stage and on demand by the server. thumbs.db's schema and `FormatVersion`
+are unchanged. RAW embedded previews are decoded, oriented and re-encoded
+like any image (as they always were), so they are WebP now too. Details,
+timings and deviations: `docs/design/renditions.md`, "As implemented
+(backend)".
