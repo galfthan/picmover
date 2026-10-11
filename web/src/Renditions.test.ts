@@ -6,7 +6,7 @@
 // part of a thumbs job's line in the Jobs table.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { backupJobJSON, fakeServer, settle, ZERO_STATS, type FakeServer } from './testing/fakes';
+import { backupJobJSON, fakeServer, hashOf, settle, ZERO_STATS, type FakeServer } from './testing/fakes';
 
 let server: FakeServer;
 let unmountApp: (() => void) | null = null;
@@ -83,4 +83,50 @@ describe('renditions on the Library page', () => {
     expect(six).toBe('2 done, 0 unsupported, 0 failed');
     expect(six).not.toContain('large');
   });
+
+  // The browser's part, against the fake server: an <img> fires `load`
+  // when its URL answers 200 with an image, `error` otherwise.
+  async function loadImages(root: ParentNode) {
+    for (const img of root.querySelectorAll<HTMLImageElement>('img')) {
+      const res = await fetch(img.getAttribute('src')!);
+      const ok = res.ok && (res.headers.get('Content-Type') ?? '').startsWith('image/');
+      img.dispatchEvent(new Event(ok ? 'load' : 'error'));
+    }
+    await settle();
+  }
+
+  it('shows a large answered with the thumb bytes (no-store) as loaded, and falls back to the thumb on a 404', async () => {
+    vi.stubGlobal('devicePixelRatio', 2);
+    server.largeFallback.add(hashOf(3));
+    await start('#/l/peter');
+    const tile = (id: number) => document.querySelector<HTMLAnchorElement>(`a.tile[href="#/l/peter/view/${id}"]`)!;
+    const main = (id: number) => tile(id).querySelector<HTMLImageElement>('img:not(.under)')!;
+
+    // The fake answers like the server: WebP and cacheable for a large, the thumb's bytes uncached for a fallback.
+    const real = await fetch(main(2).getAttribute('src')!);
+    expect([real.status, real.headers.get('Content-Type'), real.headers.get('Cache-Control')]).toEqual([200, 'image/webp', 'private, max-age=604800']);
+    const fallback = await fetch(main(3).getAttribute('src')!);
+    expect([fallback.status, fallback.headers.get('Content-Type'), fallback.headers.get('Cache-Control')]).toEqual([200, 'image/jpeg', 'no-store']);
+    const thumb = await fetch(`/api/l/peter/thumb/${hashOf(3)}`);
+    expect(new Uint8Array(await fallback.arrayBuffer())).toEqual(new Uint8Array(await thumb.arrayBuffer()));
+
+    // Before anything loads, each large has the thumb underneath.
+    for (const id of [2, 3]) {
+      expect(main(id).getAttribute('src')).toMatch(/\/large\//);
+      expect(tile(id).querySelector('img.under')?.getAttribute('src')).toMatch(/\/thumb\//);
+    }
+    await loadImages(tile(3));
+    await loadImages(tile(2));
+    // The fallback is an image: the tile keeps the large URL (asked again later, as it is not cached) and drops the underlay.
+    for (const id of [2, 3]) {
+      expect(main(id).getAttribute('src')).toMatch(/\/large\//);
+      expect(tile(id).querySelector('img.under')).toBeNull();
+    }
+
+    // A large the server cannot answer (404: the item has no preview) falls back to the thumb.
+    server.items.splice(server.items.findIndex((x) => x.id === 4), 1);
+    await loadImages(tile(4));
+    expect(main(4).getAttribute('src')).toBe(`/api/l/peter/thumb/${hashOf(4)}`);
+  });
 });
+

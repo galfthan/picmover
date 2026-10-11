@@ -14,7 +14,7 @@
   import { setSequenceProvider, type Neighbours } from '../lib/viewer';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import Tile from '../components/Tile.svelte';
-  import { pixelRatio, renditionFor, watchPixelRatio } from '../lib/rendition';
+  import { aspectOf, pixelRatio, renditionFor, watchPixelRatio } from '../lib/rendition';
   import Scrubber from '../components/Scrubber.svelte';
   import FiltersBar from '../components/Filters.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
@@ -83,10 +83,10 @@
   const timeline = $derived(
     layoutTimeline(buckets, { width: contentWidth, tileSize, gap: GAP, headerHeight: HEADER, bucketPadding: BUCKET_PAD }),
   );
-  // Tiles at most 256 device px use the thumb, larger ones the 640 px large.
+  // Each tile shows the smallest rendition whose short side covers its
+  // device pixels (lib/rendition.ts): thumb, large or preview.
   let dpr = $state(pixelRatio());
   $effect(() => watchPixelRatio((r) => (dpr = r)));
-  const rendition = $derived(renditionFor(timeline.tile, dpr));
   /** Height of the selection bar while shown; the canvas grows by it (plus its margin) so the last row can scroll clear of it. */
   let barHeight = $state(0);
   const BAR_MARGIN = 24;
@@ -634,7 +634,7 @@
                     onselect={onSelect}
                     trash={mode === 'trash'}
                     {now}
-                    {rendition}
+                    rendition={renditionFor(timeline.tile, dpr, aspectOf(t.item.w, t.item.h))}
                   />
                 {:else}
                   <div

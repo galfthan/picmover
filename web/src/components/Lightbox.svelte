@@ -401,7 +401,7 @@
             </div>
           {:else}
             {#if thumbRequestable && !thumbFailed && !previewLoaded}
-              <img class="fit blur" src={api.largeUrl(item)} alt="" onerror={() => (thumbFailed = true)} />
+              <img class="fit blur" src={api.thumbUrl(item)} alt="" onerror={() => (thumbFailed = true)} />
             {/if}
             {#if !previewFailed}
               <img

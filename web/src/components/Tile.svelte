@@ -31,19 +31,26 @@
   // failure is remembered per URL: when the grid refetches the bucket after
   // a job (new thumbAt), the tile simply tries the new URL.
   const thumbSrc = $derived(api.thumbUrl(item));
-  const largeSrc = $derived(api.largeUrl(item));
-  // A large that fails (no preview to derive it from) falls back to the thumb.
-  let largeFailedSrc = $state<string | null>(null);
-  const src = $derived(rendition === 'large' && largeFailedSrc !== largeSrc ? largeSrc : thumbSrc);
+  const bigSrc = $derived(rendition === 'large' ? api.largeUrl(item) : rendition === 'preview' ? api.previewUrl(item) : null);
+  // A large or preview that fails (no preview to derive it from) falls back to the thumb.
+  let bigFailedSrc = $state<string | null>(null);
+  const src = $derived(bigSrc !== null && bigFailedSrc !== bigSrc ? bigSrc : thumbSrc);
   let failedSrc = $state<string | null>(null);
   const failed = $derived(failedSrc !== null && failedSrc === src);
   let loaded = $state(false);
   // The last URL that finished loading. While a new URL loads (zoom crossed
-  // the rendition threshold, or a job versioned the URL), that image stays
-  // underneath so the tile never goes blank; the extra <img> exists only
-  // during the swap.
+  // a rendition threshold, or a job versioned the URL), that image stays
+  // underneath so the tile never goes blank. A tile that has loaded nothing
+  // yet and shows the large or the preview gets the thumb underneath (the
+  // browser has usually cached it; it is small either way), so a large
+  // being derived on demand never leaves the tile empty. The extra <img>
+  // exists only until the shown URL has loaded.
   let loadedSrc = $state<string | null>(null);
-  const under = $derived(loadedSrc !== null && loadedSrc !== src && !failed ? loadedSrc : null);
+  const under = $derived.by(() => {
+    if (failed || loadedSrc === src) return null;
+    if (loadedSrc !== null) return loadedSrc;
+    return src !== thumbSrc ? thumbSrc : null;
+  });
 
   function onLoad(e: Event) {
     loaded = true;
@@ -51,7 +58,7 @@
   }
   function onError(e: Event) {
     const s = (e.currentTarget as HTMLImageElement).getAttribute('src');
-    if (s === largeSrc && s !== thumbSrc) largeFailedSrc = s;
+    if (s === bigSrc && s !== thumbSrc) bigFailedSrc = s;
     else failedSrc = s;
   }
   // One more try at an unchanged URL when a fresh copy of the item arrives

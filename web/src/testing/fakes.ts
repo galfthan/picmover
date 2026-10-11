@@ -48,6 +48,10 @@ export async function go(hash: string) {
   await settle();
 }
 
+/** Tiny stand-ins for rendition bytes (signatures only). */
+const TINY_JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+const TINY_WEBP = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]);
+
 export const hashOf = (id: number) => id.toString(16).padStart(16, '0');
 
 export interface Item extends MediaItem {
@@ -237,6 +241,8 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   const userdb: { trashed: number | null } = { trashed: null };
   /** The library JSON `thumbs` counts (tests set `largeMissing`). */
   const thumbCounts: { pending: number; ok: number; unsupported: number; error: number; largeMissing?: number } = { pending: 0, ok: 9, unsupported: 0, error: 0, largeMissing: 0 };
+  /** Hashes whose large cannot be derived: the large route answers the thumb bytes with no-store. */
+  const largeFallback = new Set<string>();
 
   /**
    * Backups of "peter" (docs/design/backups.md "HTTP API"): targets as
@@ -560,11 +566,17 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
       if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
     }
-    // Renditions (docs/design/renditions.md): any known hash answers with a tiny image.
+    // Renditions (docs/design/renditions.md), as the server answers them:
+    // a known hash gets a tiny image (the thumb and preview JPEG, the
+    // large WebP); a hash in largeFallback has a large that could not be
+    // derived, answered with the thumb bytes and no-store.
     const rm = /^(thumb|large|preview)\/([0-9a-f]+)$/.exec(path);
     if (rm && method === 'GET') {
-      if (!items.some((x) => x.hash === rm[2])) return json({ error: 'no such rendition' }, 404);
-      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=31536000, immutable' } });
+      const [, kind, hash] = rm;
+      if (!items.some((x) => x.hash === hash)) return json({ error: `no ${kind === 'large' ? 'large thumbnail' : kind === 'thumb' ? 'thumbnail' : 'preview'}` }, 404);
+      if (kind === 'large' && largeFallback.has(hash!)) return new Response(TINY_JPEG, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' } });
+      const webp = kind === 'large';
+      return new Response(webp ? TINY_WEBP : TINY_JPEG, { headers: { 'Content-Type': webp ? 'image/webp' : 'image/jpeg', 'Cache-Control': 'private, max-age=604800' } });
     }
     if (path === 'imports' && method === 'GET') return json({ imports: imports.map((r) => importJSON(r, 'stored')) });
     const im = /^imports\/([^/]+)(\/delete)?$/.exec(path);
@@ -815,7 +827,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;
