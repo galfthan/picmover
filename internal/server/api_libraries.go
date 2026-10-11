@@ -152,14 +152,25 @@ func (s *Server) libBackup(ctx context.Context, l listed, e *libEntry) *libBacku
 }
 
 // handleLibraries lists the workspace: libraries (a subfolder with a
-// regular media.db) and plain folders. In single mode the one library.
+// regular media.db) and plain folders. In single mode the one library;
+// in unset mode nothing.
 func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
-	all, err := s.ws.discover()
+	out, err := s.listLibraries(r.Context())
 	if err != nil {
 		s.internalError(w, r, err)
 		return
 	}
-	out := librariesJSON{Root: s.ws.root, Mode: s.Mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// listLibraries is the /api/libraries body.
+func (s *Server) listLibraries(ctx context.Context) (librariesJSON, error) {
+	c := s.ws.cfg()
+	all, err := s.ws.discover()
+	if err != nil {
+		return librariesJSON{}, err
+	}
+	out := librariesJSON{Root: c.root, Mode: c.mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
 	// The peeks a listing needs run concurrently, at most peekWorkers at
 	// a time; unchanged catalogs come from the cache.
 	var described []*libJSON
@@ -182,7 +193,7 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			*d = s.describe(r.Context(), l, e)
+			*d = s.describe(ctx, l, e)
 		})
 	}
 	wg.Wait()
@@ -190,7 +201,7 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 		out.Libraries = append(out.Libraries, *d)
 	}
 	slices.SortFunc(out.Libraries, func(a, b libJSON) int { return cmp.Compare(a.ID, b.ID) })
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 type createLibraryBody struct {
@@ -201,7 +212,7 @@ type createLibraryBody struct {
 // opens it: 201 lib. Workspace mode only (400 in single mode); 400 for an
 // invalid or reserved name, 409 when the folder exists.
 func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
-	if s.ws.single {
+	if s.ws.single() {
 		writeError(w, http.StatusBadRequest, "new libraries can only be created when serving a workspace")
 		return
 	}
