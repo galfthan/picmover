@@ -11,7 +11,6 @@ import (
 	"sync"
 	"testing"
 
-	"picmover/internal/gvfs"
 	"picmover/internal/library"
 )
 
@@ -172,57 +171,125 @@ func TestDevicePullLogsGio(t *testing.T) {
 	}
 }
 
+// A failed pull reads only that file through FUSE; pulling is turned off
+// for the rest of the run after maxPullFailures failures in a row, and a
+// pull that works resets the count.
 func TestDevicePullFallsBack(t *testing.T) {
+	e := newEnv(t)
+	names := []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "f.jpg", "g.jpg", "h.jpg"}
+	srcs := map[string]string{}
+	var all []string
+	for i, n := range names {
+		srcs[n] = writeFile(t, filepath.Join(e.src, n), jpegAt(date(2020, 3, 1+i), byte(i+1)))
+		all = append(all, srcs[n])
+	}
 	boom := errors.New("gio copy mtp://Pixel/a.jpg: exit status 1: Operation not supported")
-	for _, tc := range []struct {
-		name string
-		err  error
-		warn bool
-	}{
-		{"failing gio", boom, true},
-		{"no gio", gvfs.ErrUnavailable, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t)
-			var srcs []string
-			for i, n := range []string{"a.jpg", "b.jpg", "c.jpg"} {
-				srcs = append(srcs, writeFile(t, filepath.Join(e.src, n), jpegAt(date(2020, 3, 5+i), byte(i+1))))
-			}
-			fp := &fakePuller{fail: func(string, int) error { return tc.err }}
-			oc := &openCounter{}
-			o := e.opts()
-			o.Workers = 1
-			var buf *bytes.Buffer
-			o.Logger, buf = logBuffer()
-			st, c, err := e.runHooked(context.Background(), o, onDevice(fp, oc, srcs...))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if st.Imported != 3 || st.Errors != 0 {
-				t.Fatalf("stats = %+v, results %+v", st, c.results)
-			}
-			if n := fp.total(); n != 1 {
-				t.Errorf("%d pulls, want 1 (later files skip the pull)", n)
-			}
-			var want int64
-			for _, p := range srcs {
-				if n := oc.count(p); n != 1 {
-					t.Errorf("%s opened %d times through FUSE, want 1", filepath.Base(p), n)
-				}
-				want += sizeOf(t, p)
-			}
-			if st.BytesCopied != want {
-				t.Errorf("BytesCopied = %d, want %d (the failed pull's bytes taken back)", st.BytesCopied, want)
-			}
-			warns := strings.Count(buf.String(), "gio copy failed, reading through FUSE")
-			if tc.warn && (warns != 1 || !strings.Contains(buf.String(), "Operation not supported")) {
-				t.Errorf("%d warnings, want 1 with the error:\n%s", warns, buf.String())
-			}
-			if !tc.warn && warns != 0 {
-				t.Errorf("warning logged without gio:\n%s", buf.String())
-			}
-			e.assertTempEmpty()
-		})
+	fp := &fakePuller{fail: func(src string, _ int) error {
+		if src == srcs["c.jpg"] {
+			return nil
+		}
+		return boom
+	}}
+	oc := &openCounter{}
+	o := e.opts()
+	o.Workers = 1
+	var buf *bytes.Buffer
+	o.Logger, buf = logBuffer()
+	st, c, err := e.runHooked(context.Background(), o, onDevice(fp, oc, all...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Imported != int64(len(names)) || st.Errors != 0 {
+		t.Fatalf("stats = %+v, results %+v", st, c.results)
+	}
+	// a, b fail; c works (reset); d, e, f fail: pulling is off for g, h.
+	wantPulls := map[string]int{"a.jpg": 1, "b.jpg": 1, "c.jpg": 1, "d.jpg": 1, "e.jpg": 1, "f.jpg": 1}
+	var want int64
+	for _, n := range names {
+		p := srcs[n]
+		if got := fp.count(p); got != wantPulls[n] {
+			t.Errorf("%s pulled %d times, want %d", n, got, wantPulls[n])
+		}
+		wantOpens := 1
+		if n == "c.jpg" {
+			wantOpens = 0
+		}
+		if got := oc.count(p); got != wantOpens {
+			t.Errorf("%s opened %d times through FUSE, want %d", n, got, wantOpens)
+		}
+		want += sizeOf(t, p)
+	}
+	if st.BytesCopied != want {
+		t.Errorf("BytesCopied = %d, want %d (the failed pulls' bytes taken back)", st.BytesCopied, want)
+	}
+	log := buf.String()
+	if n := strings.Count(log, "gio copy failed repeatedly, reading the rest through FUSE"); n != 1 ||
+		!strings.Contains(log, "Operation not supported") || !strings.Contains(log, "in_a_row=3") {
+		t.Errorf("%d warnings, want 1 with the error:\n%s", n, log)
+	}
+	if n := strings.Count(log, "gio copy failed, reading this file through FUSE"); n != 5 {
+		t.Errorf("%d per-file debug lines, want 5:\n%s", n, log)
+	}
+	e.assertTempEmpty()
+}
+
+// Without gio from the start nothing is pulled and nothing is warned
+// about: every file is read through FUSE.
+func TestDevicePullNoGio(t *testing.T) {
+	e := newEnv(t)
+	var srcs []string
+	for i, n := range []string{"a.jpg", "b.jpg", "c.jpg"} {
+		srcs = append(srcs, writeFile(t, filepath.Join(e.src, n), jpegAt(date(2020, 3, 5+i), byte(i+1))))
+	}
+	fp, oc := &fakePuller{}, &openCounter{}
+	o := e.opts()
+	var buf *bytes.Buffer
+	o.Logger, buf = logBuffer()
+	st, c, err := e.runHooked(context.Background(), o, func(im *Importer) {
+		onDevice(fp, oc, srcs...)(im)
+		im.gioOK = func() bool { return false }
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Imported != 3 || st.Errors != 0 {
+		t.Fatalf("stats = %+v, results %+v", st, c.results)
+	}
+	if n := fp.total(); n != 0 {
+		t.Errorf("%d pulls without gio", n)
+	}
+	var want int64
+	for _, p := range srcs {
+		if n := oc.count(p); n != 1 {
+			t.Errorf("%s opened %d times through FUSE, want 1", filepath.Base(p), n)
+		}
+		want += sizeOf(t, p)
+	}
+	if st.BytesCopied != want {
+		t.Errorf("BytesCopied = %d, want %d", st.BytesCopied, want)
+	}
+	if strings.Contains(buf.String(), "gio copy failed") || strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("warning logged without gio:\n%s", buf.String())
+	}
+	e.assertTempEmpty()
+}
+
+// The source root is the gvfs directory itself: gio=true is logged, as
+// every file below it on a phone mount is pulled.
+func TestDevicePullLogsGioForGvfsDir(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	e := newEnvAt(t, filepath.Join(base, "run", "gvfs"), filepath.Join(base, "lib"))
+	writeFile(t, filepath.Join(e.src, "a.jpg"), jpegAt(date(2020, 3, 5), 1))
+	fp, oc := &fakePuller{}, &openCounter{}
+	o := e.opts()
+	var buf *bytes.Buffer
+	o.Logger, buf = logBuffer()
+	if _, _, err := e.runHooked(context.Background(), o, onDevice(fp, oc)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "gio=true") {
+		t.Errorf("log lacks gio=true for the gvfs directory:\n%s", buf.String())
 	}
 }
 
@@ -289,7 +356,13 @@ func TestDevicePullMoveVerifies(t *testing.T) {
 	// is kept.
 	e2 := newEnv(t)
 	a2 := writeFile(t, filepath.Join(e2.src, "a.jpg"), jpegAt(date(2020, 3, 5), 1))
-	other := writeFile(t, filepath.Join(t.TempDir(), "other.jpg"), jpegAt(date(2020, 3, 5), 2))
+	// Same size, other bytes (a different size would be read through FUSE).
+	changed, err := os.ReadFile(a2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed[len(changed)-3] ^= 0xff
+	other := writeFile(t, filepath.Join(t.TempDir(), "other.jpg"), changed)
 	fp2 := &fakePuller{from: func(src string, n int) string {
 		if n == 2 {
 			return other
@@ -351,6 +424,44 @@ func TestDevicePullMoveVerifyFallsBack(t *testing.T) {
 	}
 	if exists(a) {
 		t.Error("source not deleted")
+	}
+	e.assertTempEmpty()
+}
+
+// A device whose pulls always come back one byte short: staging and the
+// move verification both see the size mismatch and read the file through
+// FUSE, so the file is imported and moved.
+func TestDevicePullShortMove(t *testing.T) {
+	e := newEnv(t)
+	a := writeFile(t, filepath.Join(e.src, "a.jpg"), jpegAt(date(2020, 3, 5), 1))
+	data, err := os.ReadFile(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short := writeFile(t, filepath.Join(t.TempDir(), "short"), data[:len(data)-1])
+	fp := &fakePuller{from: func(string, int) string { return short }}
+	oc := &openCounter{}
+	o := e.opts()
+	o.Move = true
+	st, c, err := e.runHooked(context.Background(), o, func(im *Importer) {
+		onDevice(fp, oc, a)(im)
+		im.sameDev = func(string, string) bool { return false }
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Imported != 1 || st.Errors != 0 {
+		t.Fatalf("stats = %+v, results %+v", st, c.results)
+	}
+	if fp.count(a) != 2 || oc.count(a) != 2 {
+		t.Errorf("pulled %d, opened %d; want 2 pulls (stage, verify) and 2 FUSE opens", fp.count(a), oc.count(a))
+	}
+	if exists(a) {
+		t.Error("source not deleted after a verified move")
+	}
+	e.assertFiles("image/2020/03/a.jpg")
+	if got, _ := os.ReadFile(e.lib.Abs("image/2020/03/a.jpg")); !bytes.Equal(got, data) {
+		t.Error("placed file differs from the source")
 	}
 	e.assertTempEmpty()
 }

@@ -19,6 +19,12 @@ func fakePull(data []byte, after func(ctx context.Context, dst string) error) Pu
 		if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
 			return errors.New("destination exists before the pull")
 		}
+		if filepath.Base(dst) != "copy.part" || !strings.HasPrefix(filepath.Base(filepath.Dir(dst)), "pull-") {
+			return errors.New("destination not <tmp>/pull-*/copy.part: " + dst)
+		}
+		if entries, err := os.ReadDir(filepath.Dir(dst)); err != nil || len(entries) != 0 {
+			return errors.New("pull directory not empty before the pull")
+		}
 		f, err := os.Create(dst)
 		if err != nil {
 			return err
@@ -86,7 +92,7 @@ func TestStagePulled(t *testing.T) {
 	}
 	os.Remove(st.Path)
 
-	h, n, err := HashPulled(context.Background(), l.TempDir(), fakePull(data, nil))
+	h, n, err := HashPulled(context.Background(), src, l.TempDir(), fakePull(data, nil))
 	if err != nil || h != want || n != size {
 		t.Errorf("HashPulled = %016x, %d, %v; want %016x, %d", h, n, err, want, size)
 	}
@@ -112,9 +118,31 @@ func TestStagePulledFailures(t *testing.T) {
 		t.Errorf("failing pull: err = %v", err)
 	}
 	tempIsEmpty(t, l)
-	if _, _, err := HashPulled(context.Background(), l.TempDir(),
+	if _, _, err := HashPulled(context.Background(), src, l.TempDir(),
 		fakePull(data, func(context.Context, string) error { return boom })); !errors.Is(err, boom) {
 		t.Errorf("HashPulled with a failing pull: %v", err)
+	}
+	tempIsEmpty(t, l)
+
+	// HashPulled checks the size too, so the caller reads the source
+	// itself instead.
+	if _, _, err := HashPulled(context.Background(), src, l.TempDir(), fakePull(data[:len(data)-1], nil)); !errors.Is(err, ErrSizeChanged) {
+		t.Errorf("short HashPulled: err = %v, want ErrSizeChanged", err)
+	}
+	tempIsEmpty(t, l)
+
+	// A file the daemon would create after a killed gio finds its
+	// directory gone.
+	var late string
+	_, err = StagePulled(context.Background(), src, l.TempDir(), func(_ context.Context, dst string, _ func(int64)) error {
+		late = dst
+		return boom
+	}, nil)
+	if !errors.Is(err, boom) {
+		t.Errorf("failing pull: err = %v", err)
+	}
+	if err := os.WriteFile(late, data, 0o644); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("late write into the pull directory: %v, want ErrNotExist", err)
 	}
 	tempIsEmpty(t, l)
 
@@ -146,6 +174,22 @@ func TestStagePulledFailures(t *testing.T) {
 		func(context.Context, string, func(int64)) error { called = true; return nil }, nil)
 	if err == nil || called {
 		t.Errorf("missing source: err = %v, pull called %v", err, called)
+	}
+	tempIsEmpty(t, l)
+}
+
+// CleanTemp removes pull directories left by an earlier run.
+func TestCleanTempRemovesPullDirs(t *testing.T) {
+	l := open(t)
+	dir, err := os.MkdirTemp(l.TempDir(), "pull-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "copy.part"), []byte("orphan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.CleanTemp(); err != nil {
+		t.Fatal(err)
 	}
 	tempIsEmpty(t, l)
 }

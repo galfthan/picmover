@@ -304,8 +304,10 @@ func isBackupStamp(s string) bool {
 	return true
 }
 
-// CleanTemp removes everything in the temp directory. Only one importer may
-// use a library at a time.
+// CleanTemp removes everything in the temp directory: copy-*.part files
+// and the pull-* directories of pulls (see pullTemp), including any file a
+// gvfs daemon wrote there after its gio client was killed. Only one
+// importer may use a library at a time.
 func (l *Library) CleanTemp() error {
 	entries, err := os.ReadDir(l.TempDir())
 	if err != nil {

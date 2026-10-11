@@ -34,8 +34,10 @@
 // (gvfs mtp or gphoto2, internal/gvfs) is not read through FUSE for staging
 // or hashing: the gvfs daemon pulls it into a library temp file with
 // `gio copy` (library.StagePulled, library.HashPulled), which runs at USB
-// speed. If gio is missing, or a pull fails (one warning), the rest of the
-// run reads through FUSE. Every staged temp file not placed
+// speed. If gio is missing, the run reads through FUSE. A file whose pull
+// fails is read through FUSE; after maxPullFailures failed pulls in a row
+// (one warning) the rest of the run reads through FUSE. Every staged temp
+// file not placed
 // is removed. A single writer batches the finished files into catalog
 // transactions. Only after a transaction has committed are move sources
 // deleted; if an insert loses a hash race or the commit fails, the file
@@ -189,8 +191,10 @@ type Importer struct {
 	// usePull: files on a phone mount (gvfs mtp or gphoto2) are read by
 	// pulling them through the gvfs daemon (gio copy) rather than through
 	// FUSE. Set in Run when gio is available; cleared for the rest of the
-	// run when a pull fails.
+	// run after maxPullFailures failed pulls in a row (see pullFailed).
 	usePull atomic.Bool
+	// pullFails counts the failed pulls since the last one that worked.
+	pullFails atomic.Int32
 
 	// Test hooks; New sets the real functions.
 	openSource func(string) (*os.File, error)                                           // opens a source file for reading
@@ -303,9 +307,13 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	im.opts.SourceReaders = sourceReaders(im.opts.SourceReaders, im.opts.Workers, src)
 	im.readers = make(chan struct{}, im.opts.SourceReaders)
 	im.usePull.Store(!im.opts.RecordInPlace && im.gioOK())
+	im.pullFails.Store(0)
+	// gio=true: the files below src are pulled through the gvfs daemon
+	// (src is on a phone mount, or is the gvfs directory itself, whose
+	// mounts it then walks).
 	im.log.Info("import started", "source", src, "library", im.lib.Root(), "mode", mode,
 		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders,
-		"gio", im.usePull.Load() && im.isDevice(src), "session", im.sessionID)
+		"gio", im.usePull.Load() && (im.isDevice(src) || src == gvfs.Dir()), "session", im.sessionID)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -855,28 +863,46 @@ func (im *Importer) devicePull(p string) bool {
 
 // pullFunc returns im.pull for src as a library.PullFunc, and where the
 // pull's own error is kept (nil when the pull succeeded or did not run).
+// A pull that works resets the count of failed pulls in a row.
 func (im *Importer) pullFunc(src string) (library.PullFunc, *error) {
 	var pullErr error
 	return func(ctx context.Context, dst string, onProgress func(int64)) error {
 		pullErr = im.pull(ctx, src, dst, onProgress)
+		if pullErr == nil {
+			im.pullFails.Store(0)
+		}
 		return pullErr
 	}, &pullErr
 }
 
+// maxPullFailures is how many pulls in a row may fail before pulling is
+// turned off for the rest of the run. A single failure is often the
+// file's (deleted from the phone since the scan, refused by the phone,
+// the local disk full), and reading the rest of a large import through
+// FUSE is slow; failures in a row mean gio or the daemon is broken.
+const maxPullFailures = 3
+
 // pullFailed handles a failed pull of src, before the file is read through
 // FUSE instead. pullErr is the pull's own error: gio missing
-// (gvfs.ErrUnavailable) turns pulling off silently, any other pull error
-// turns it off for the rest of the run with one warning. Without a pull
-// error (the pulled copy had the wrong size or could not be hashed) only
-// this file is read through FUSE.
+// (gvfs.ErrUnavailable) turns pulling off silently. Any other pull error
+// reads only this file through FUSE (a debug line per file) and counts as
+// a failure; after maxPullFailures failures in a row (a pull that works
+// resets the count) pulling is turned off for the rest of the run with one
+// warning. Without a pull error (the pulled copy had the wrong size or
+// could not be hashed) only this file is read through FUSE and nothing is
+// counted.
 func (im *Importer) pullFailed(src string, pullErr, err error) {
 	switch {
 	case pullErr == nil:
 		im.log.Debug("pulled copy not used, reading through FUSE", "file", src, "err", err)
 	case errors.Is(pullErr, gvfs.ErrUnavailable):
 		im.usePull.Store(false)
-	case im.usePull.Swap(false):
-		im.log.Warn("gio copy failed, reading through FUSE", "file", src, "err", pullErr)
+	default:
+		im.log.Debug("gio copy failed, reading this file through FUSE", "file", src, "err", pullErr)
+		if im.pullFails.Add(1) >= maxPullFailures && im.usePull.Swap(false) {
+			im.log.Warn("gio copy failed repeatedly, reading the rest through FUSE",
+				"in_a_row", maxPullFailures, "file", src, "err", pullErr)
+		}
 	}
 }
 
@@ -922,7 +948,9 @@ func (im *Importer) verifySource(ctx context.Context, src string, want uint64) e
 // of a copy-first move), holding a SourceReaders slot when p is outside the
 // library. A file on a phone mount is pulled through the gvfs daemon into
 // a second temp file, hashed and removed (library.HashPulled), while that
-// works; see pullFailed.
+// works; see pullFailed. A pulled copy whose size differs from the
+// source's is not used: p is read through FUSE (as stage does), so a
+// device whose pulls come back short does not block a move.
 func (im *Importer) hashSource(ctx context.Context, p string) (uint64, int64, error) {
 	release, err := im.sourceSlot(ctx, p)
 	if err != nil {
@@ -931,7 +959,7 @@ func (im *Importer) hashSource(ctx context.Context, p string) (uint64, int64, er
 	defer release()
 	if im.devicePull(p) {
 		pull, pullErr := im.pullFunc(p)
-		h, n, err := library.HashPulled(ctx, im.lib.TempDir(), pull)
+		h, n, err := library.HashPulled(ctx, p, im.lib.TempDir(), pull)
 		if err == nil {
 			im.log.Debug("hashed a pull through gvfs", "file", p, "bytes", n)
 			return h, n, nil
