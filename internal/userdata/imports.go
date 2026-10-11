@@ -16,7 +16,7 @@ const (
 	ImportModeCopy    = "copy"
 	ImportModeMove    = "move"
 	ImportModeRebuild = "rebuild"
-	ImportModeRecord  = "record" // an "import <library> <library>" or a backfilled rebuild session
+	ImportModeRecord  = "record" // a rebuild session backfilled from the catalog (its name there)
 )
 
 // Import outcomes (ImportRecord.Outcome).
