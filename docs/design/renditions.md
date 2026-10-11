@@ -390,3 +390,113 @@ are plain JSON numbers with those exact names; the `large` route accepts
 the same `?v=` query as `thumb` and ignores it; a large that cannot be
 produced answers with an error status (404) or the thumb bytes, either of
 which the tile handles.
+
+## Review fixes
+
+From the review of `feat/renditions` (S1, M1 to M9). These supersede the
+sections above where they disagree (decisions 4 and 6 of the backend, the
+Tile, `renditionFor` and Lightbox notes of the frontend, the HTTP table's
+read-only row).
+
+1. **Derivation queue (S1, server).** `largeDeriver.do` joins or creates
+   the per-(store, hash) flight and waits for it with the requester's
+   context. A flight waiting for a slot counts its waiters; when the last
+   one gives up (the browser closed the connection after a scroll) the
+   flight leaves the queue and never derives. Free slots go to the most
+   recently queued flight (LIFO: the newest request is the tile most
+   likely still on screen). Only a started flight detaches
+   (`context.WithoutCancel` of the creating request plus `largeTimeout`,
+   30 s), in its own goroutine, so every request that joined it gets the
+   result. The goroutine removes the flight, releases the slot, starts
+   the next flight and closes `done` in a `defer`, also on panic.
+   Tests: `TestLargeQueueDropsAbandonedLIFO` (one slot held, six queued,
+   the four oldest cancelled: the newest derives first, then the next,
+   the cancelled ones never), `TestLargeQueueSharedFlight` (a queued
+   flight stays while one of its two waiters remains),
+   `TestLargeDerivationPanic`.
+2. **Blank tiles (S1, web).** A tile whose rendition is the large or the
+   preview shows the thumb URL as `img.under` from the start until its
+   own image has loaded (the thumb is in the browser cache when the grid
+   showed it before, and small either way); during a swap the previously
+   loaded image is the underlay as before. The extra `<img>` exists only
+   until the shown URL fires `load`. Tests in `Grid.test.ts` and
+   `Renditions.test.ts`.
+3. **Read-only folders (M1).** `thumbs.DeriveLargeData` encodes, then
+   tries `PutLarge`, and returns the bytes either way (`DerivedLarge`:
+   `Data`, `Written`, `WriteErr`). The server serves derived bytes it
+   could not store as `200` with `Cache-Control: no-store` (the real
+   640 px WebP, not the thumb). `PutLarge` records a failed write on the
+   Store (`LargeUnwritable`), and `DeriveLargeData` skips the write
+   attempt for `largeRetryAfter` (5 minutes) after one; a successful
+   write clears it, and a reopened Store starts afresh. The thumb
+   fallback is kept for failed derivations only.
+   `TestLargeReadOnlyFolder` (two requests: the derived bytes, the
+   second without a write attempt), `TestLargeEmptyFailedUnwritable`.
+4. **`largeMissing` cost (M2).** An on-demand fill no longer invalidates
+   the count; it decrements it (`largeMissingDone`). Only the first count
+   of an open library runs in the request. After `largeMissingTTL` the
+   last value is served while one background goroutine recounts (it
+   takes the library's handles with `acquire`, so a closing library is
+   left alone). When a job ends, the job goroutine recounts before the
+   job is reported done, so the library JSON never blocks on the walk
+   and shows the job's result as soon as the job is done.
+5. **Panic guard (M3).** `EncodeWebP` runs the encoder under
+   `imaging.guard` (its message is now "codec panic"); the server flight
+   is closed and deleted in a `defer` (item 1); the job's large pass
+   recovers a panic per row, marks the hash failed, logs it and goes on
+   (large-only rows record nothing in the catalog, so "failed" is that
+   log line and `OnLargeFailed`). `TestEncodeWebPPanicGuarded`.
+6. **Windows file handle (M4).** `EncodeLarge` reads the preview into
+   memory (at most 64 MiB) and closes it before sniffing, decoding and
+   encoding, so a concurrent `Put` can rename it. Not tested on Windows
+   here; the code path is shared with every other platform.
+7. **Rendition threshold (M5, web).** `renditionFor(tileCssPx, dpr,
+   aspect)` with `aspect` = long / short side (`aspectOf(w, h)` from the
+   item, 1 when unknown) compares the tile's device pixels against each
+   rendition's short side: thumb while `256 / aspect` covers it, else the
+   large while `640 / aspect` does, else the preview (`api.previewUrl`).
+   The grid chooses per tile. At the default zoom (about 182 CSS px) a
+   3:2 photo now takes the large at ratio 1 (its thumb's short side is
+   171 px), a 4:3 one keeps the thumb (192 px); one-column tiles get the
+   preview. Tests: `rendition.test.ts` (square, 3:2 and 16:9 at several
+   sizes and ratios), `Grid.test.ts` (thumb to large to preview and back,
+   each with the previous image underneath; a 16:9 tile takes the large
+   where a 4:3 one keeps the thumb).
+8. **Lightbox placeholder (M6, web).** The large is dropped from the
+   lightbox: the blurred placeholder is the thumb again (cached by the
+   grid, instant), and the preview over it. Layering the large in
+   between would cost a request, and on an unfilled library a server
+   derivation of the very preview the lightbox is fetching anyway, for a
+   few hundred milliseconds of a sharper blur.
+9. **Broken or impossible larges (M7).** `PutLarge` removes a
+   zero-length large before the no-replace rename, and the server treats
+   an empty large file as missing (derived again and replaced;
+   `TestLargeEmptyFileReplaced`). A derivation that fails for a reason
+   other than the context or a missing preview is remembered by the
+   Store (`MarkLargeFailed`, at most 65 536 hashes): `DeriveLarge` and
+   `DeriveLargeData` then fail at once with `ErrLargeFailed`. In a job
+   that Store is the run's (the large pass skips the hash, and nothing is
+   logged twice; the job reports the hash through
+   `importer.Options.OnLargeFailed`, which the server forwards to its own
+   Store). In the server it is the open library's read-only Store; it
+   is logged once (debug) and, until the library is reopened, served the
+   thumb without a derivation and left out of `largeMissing` (the count
+   is decremented at the failure, and recounts exclude it).
+   `TestLargeFailedHashRemembered`, `TestRunThumbsLargeFailureReported`.
+10. **Fake server parity (M9).** The fake's rendition routes send
+    `Cache-Control: private, max-age=604800`, WebP bytes and
+    `image/webp` for a large, the 404 bodies `no large thumbnail` /
+    `no thumbnail` / `no preview`, and for a hash in `largeFallback` the
+    thumb's bytes with `no-store`. `Renditions.test.ts` loads the tiles'
+    images through the fake (`load` for a 200 image, `error`
+    otherwise): a fallback large counts as loaded and keeps its URL, a
+    404 falls back to the thumb.
+
+**Known limitation (M8).** Emptying the trash while an on-demand
+derivation of a trashed item's large is between encoding and writing can
+leave that large behind (`Delete` ran first). It is harmless (the hash
+still names the same image) and counted in the cache size; nothing
+removes it until the cache is deleted or rebuilt.
+
+Smoke (`smoke8.py` on a copy of the JPEG-era workspace): `FAILS: none`
+without changes to the script.
