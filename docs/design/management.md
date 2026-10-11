@@ -505,7 +505,8 @@ navigation and the rest are unchanged.
 
 The filter bar gains Rating (≥ 1…5 stars), Tags (multi-select chips, AND),
 Album (select), and **Dates** with two modes:
-- Range: two date inputs (day precision), either side open.
+- Range: a calendar range picker (day precision), either side open; see
+  "Dates and the calendar picker (web)".
 - Every year: month/day from and to, with presets Today, Christmas
   (12-24..12-26), New Year (12-31..01-01), Midsummer (06-19..06-26),
   Summer (06-01..08-31), This month. The year range inputs stay available
@@ -1186,3 +1187,101 @@ similar groups are paginated and ignored by group.
   `createTag`, `renameTag`, `deleteTag`, and their tests.
 - Album counts and covers that include trashed members (review L6) are a
   backend fix; the client shows what the server answers.
+
+## Dates and the calendar picker (web)
+
+### One date format: dd/mm/yyyy
+
+Every date the web UI shows is day first with slashes, `14/07/2024`,
+whatever the browser's locale; times use the 24-hour clock. The helpers
+in `web/src/lib/format.ts` are the only place dates become text:
+
+| Helper | Input | Output and where |
+| --- | --- | --- |
+| `formatWallDate` | wall-clock capture time | `14/07/2024`: tiles, Similar, the Library span, Map titles, the trash date in the lightbox |
+| `formatTakenAt` | wall clock + offset | `14/07/2024 13:05:22 UTC+03:00`: lightbox title and info, as recorded, never shifted |
+| `formatInstant` | RFC 3339 instant | `14/07/2024 13:05` in the viewer's zone: import records, jobs, the last similar run, backup target times, the lock holder's "since" |
+| `formatLocalDay` | `Date` | `14/07/2024` in the viewer's zone: `formatRecent` (Imports page) past a week |
+| `formatDay` | day `2024-07-14` | `14/07/2024`: the Dates summary, the calendar inputs, a day bound in the year selects |
+| `parseDay` | typed text | `2024-07-14`, or null |
+
+`parseDay` accepts `dd/mm/yyyy`, also `d/m/yyyy` and `dd.mm.yyyy`; the year
+has four digits and the day must exist (`29/02/2023` is rejected). The
+`locale` parameters that only decided date order are gone; they remain
+where they pick words: month names (`monthName`, `bucketLabel` for the
+grid's "July 2024" headers, `describeRecur`'s "24 Dec – 26 Dec every
+year") and relative times (`formatAgo`, the relative part of
+`formatRecent`).
+
+`describeDates` (the Dates button) shows whole-year bounds as years
+(`2020 – 2024`, `2012`) and anything else as days on both sides
+(`01/01/2020 – 29/02/2020`, `20/12/2024 –`, `– 15/07/2024`).
+
+### The calendar range picker
+
+`components/Calendar.svelte` (no dependencies) is the Range tab of the
+Dates filter. Props: `from`, `to` (inclusive days, either may be absent),
+`years` (the library's years), `onchange(from, to)`, optional `min`/`max`.
+The month grid comes from `calendarMonths(year, month)` in
+`lib/calendar.ts`: 6 weeks of 7 days, Monday first, with the leading and
+trailing days of the neighbouring months.
+
+- Layout, top to bottom: Start and End text inputs (dd/mm/yyyy), presets
+  (Last 7 days, Last 30 days, This month, This year, Last year; the
+  matching one is marked), the month grid(s). Two months side by side
+  from 640 px of viewport width, one month below. In the two-month view a
+  day appears once: the trailing days of the left month and the leading
+  days of the right month are left blank.
+- Header: previous/next month buttons, and a month select and a year
+  select for the first shown month. Years run from the library's earliest
+  to latest year (30 years either side of the shown year when unknown), so
+  any year is one step away.
+- Picking: the first click sets a start (applied at once as a one-day
+  range); the second click, on that day or later, sets the end; a click
+  before the start starts over from that day. While a start waits for its
+  end, hovering (or moving with the keys) previews the end with a lighter
+  band. Any other change (a preset, typed text, Clear dates) ends the
+  waiting start.
+- Look: the range is one continuous band behind the days, the start and
+  end are solid accent discs, today has a ring, days of other months are
+  dimmed but clickable, days outside `min`/`max` are struck through and
+  inert. Only the theme variables of `app.css` are used, so light and dark
+  both follow the system.
+- Typed days apply on Enter or blur. Invalid text (not a real day, outside
+  `min`/`max`, or a start after the end) is marked (`aria-invalid`, red
+  border, one hint line) and not applied; emptying a field opens that
+  side. Applying a typed day or a preset moves the view to show it.
+- The Dates panel still closes on Escape and outside click; calendar
+  clicks and presets apply at once as before. The Every year tab is
+  unchanged (its year selects show a day bound as dd/mm/yyyy); the Range
+  tab never had year limits, the year select and the This year / Last
+  year presets cover that.
+
+Keyboard (roving tabindex: one day per view takes Tab, the focused day,
+else the 1st of the first shown month):
+
+| Key | Action |
+| --- | --- |
+| Left / Right | previous / next day |
+| Up / Down | same weekday, previous / next week |
+| PageUp / PageDown | same day, previous / next month (clamped to the month's length) |
+| Shift+PageUp / Shift+PageDown | same day, previous / next year |
+| Home / End | Monday / Sunday of the week |
+| Enter / Space | pick the focused day (start or end, as a click) |
+
+The view follows the focused day across months. ARIA: each month is a
+`role="grid"` labelled with its month, the weekday initials are column
+headers with the full names, each day is a `role="gridcell"` with
+`aria-selected` (in the applied range), `aria-current="date"` for today
+and an `aria-label` with the full date ("Tuesday 5 March 2024"). A polite
+live region announces "Start 05/03/2024. Choose the end day." and
+"Selected 05/03/2024 to 10/03/2024".
+
+Tests: `lib/format.test.ts` (the formats, strict `parseDay`),
+`lib/calendar.test.ts` (Feb 2024 and Feb 2023 cells, Monday alignment,
+December to January, month shifts, presets, year options),
+`Calendar.svelte.test.ts` (render, start/end and restart clicks, hover
+preview, keys, typed and invalid input, presets, month and year
+navigation; a `.svelte.test.ts` file so the props can be `$state`), and
+`Management.test.ts` (typed days and calendar clicks through the Dates
+filter into the URL).

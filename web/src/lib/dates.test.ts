@@ -108,14 +108,14 @@ describe('day ranges', () => {
   it('summarises the filter', () => {
     expect(describeDates('2010-01-01', '2013-01-01', undefined)).toBe('2010 – 2012');
     expect(describeDates('2012-01-01', '2013-01-01', undefined)).toBe('2012');
-    expect(describeDates('2024-12-20', undefined, undefined)).toBe('2024-12-20 –');
+    expect(describeDates('2024-12-20', undefined, undefined)).toBe('20/12/2024 –');
     expect(describeDates(undefined, '2025-01-01', undefined)).toBe('– 2024');
-    expect(describeDates('2024-05-03', '2024-05-10', undefined)).toBe('2024-05-03 – 2024-05-09');
+    expect(describeDates('2024-05-03', '2024-05-10', undefined)).toBe('03/05/2024 – 09/05/2024');
     expect(describeDates(undefined, undefined, '12-24..12-26', 'en-GB')).toBe('24 Dec – 26 Dec every year');
     expect(describeDates('2010-01-01', undefined, '06-01..08-31', 'en-GB')).toBe('1 Jun – 31 Aug every year, 2010 –');
     expect(describeDates(undefined, undefined, undefined)).toBe('');
     // A day on one side shows days on both, not "2020 – 2020-02-29".
-    expect(describeDates('2020-01-01', '2020-03-01', undefined)).toBe('2020-01-01 – 2020-02-29');
-    expect(describeDates('2020-03-05', '2021-01-01', undefined)).toBe('2020-03-05 – 2020-12-31');
+    expect(describeDates('2020-01-01', '2020-03-01', undefined)).toBe('01/01/2020 – 29/02/2020');
+    expect(describeDates('2020-03-05', '2021-01-01', undefined)).toBe('05/03/2020 – 31/12/2020');
   });
 });

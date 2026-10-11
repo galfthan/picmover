@@ -8,8 +8,8 @@
 
 <script lang="ts">
   // The Dates filter (docs/design/management.md "Filters"): a button with a
-  // summary that opens a panel with two modes. Range: two day inputs (the
-  // last day is inclusive here, exclusive in the URL), either side open.
+  // summary that opens a panel with two modes. Range: the calendar picker
+  // (the last day is inclusive here, exclusive in the URL), either side open.
   // Every year: month/day from and to (wrapping over New Year is fine),
   // presets, and whole-year limits. Every change applies at once.
   import {
@@ -26,7 +26,8 @@
     type MonthDay,
     type Recur,
   } from '../lib/dates';
-  import { monthName } from '../lib/format';
+  import { formatDay, monthName } from '../lib/format';
+  import Calendar from './Calendar.svelte';
 
   interface Props {
     from?: string;
@@ -76,8 +77,8 @@
     }
   }
 
-  function setRange(f: string, lastDay: string) {
-    onchange({ from: f || undefined, to: exclusiveEnd(lastDay), recur: undefined });
+  function setRange(f: string | undefined, lastDay: string | undefined) {
+    onchange({ from: f || undefined, to: lastDay ? exclusiveEnd(lastDay) : undefined, recur: undefined });
   }
 
   function setRecur(r: Recur) {
@@ -107,7 +108,7 @@
     Dates{#if summary}: <span class="sum">{summary}</span>{/if}
   </button>
   {#if open}
-    <div class="panel" id={uid} role="group" aria-label="Date filter">
+    <div class="panel" class:wide={tab === 'range'} id={uid} role="group" aria-label="Date filter">
       <div class="tabs" role="tablist">
         <button type="button" role="tab" aria-selected={tab === 'range'} class:on={tab === 'range'} onclick={() => (tab = 'range')}
           >Range</button
@@ -118,17 +119,8 @@
       </div>
 
       {#if tab === 'range'}
-        <div class="rows">
-          <label>
-            <span>From</span>
-            <input type="date" value={from ?? ''} max={inclusiveEnd(to) || undefined} onchange={(e) => setRange(e.currentTarget.value, inclusiveEnd(to))} />
-          </label>
-          <label>
-            <span>To</span>
-            <input type="date" value={inclusiveEnd(to)} min={from || undefined} onchange={(e) => setRange(from ?? '', e.currentTarget.value)} />
-          </label>
-          <p class="muted small">Either side can stay empty. Both days are included.</p>
-        </div>
+        <Calendar from={from} to={inclusiveEnd(to) || undefined} {years} onchange={setRange} />
+        <p class="muted small note">Either side can stay empty. Both days are included.</p>
       {:else}
         <div class="presets">
           {#each presets as p (p.id)}
@@ -156,13 +148,13 @@
             <span>Years</span>
             <select aria-label="From year" value={yFrom !== null ? String(yFrom) : from ? 'day' : ''} onchange={(e) => setYear('from', e.currentTarget.value)}>
               <option value="">Any</option>
-              {#if from && yFrom === null}<option value="day">{from}</option>{/if}
+              {#if from && yFrom === null}<option value="day">{formatDay(from)}</option>{/if}
               {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
             </select>
             <span class="muted">–</span>
             <select aria-label="To year" value={yTo !== null ? String(yTo) : to ? 'day' : ''} onchange={(e) => setYear('to', e.currentTarget.value)}>
               <option value="">Any</option>
-              {#if to && yTo === null}<option value="day">{inclusiveEnd(to) || to}</option>{/if}
+              {#if to && yTo === null}<option value="day">{formatDay(inclusiveEnd(to) || to)}</option>{/if}
               {#each years as y (y)}<option value={String(y)}>{y}</option>{/each}
             </select>
           </div>
@@ -228,25 +220,21 @@
     flex-direction: column;
     gap: 8px;
   }
-  .rows label,
   .md {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .rows label > span,
   .md > span:first-child {
     width: 3.2em;
     color: var(--muted);
   }
-  input[type='date'] {
-    min-height: 32px;
-    padding: 0 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface);
-    color: var(--text);
-    font: inherit;
+  .panel.wide {
+    width: max-content;
+    max-width: calc(100vw - 16px);
+  }
+  .note {
+    margin: 8px 0 0;
   }
   .rows p {
     margin: 0;
