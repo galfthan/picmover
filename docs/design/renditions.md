@@ -500,3 +500,57 @@ removes it until the cache is deleted or rebuilt.
 
 Smoke (`smoke8.py` on a copy of the JPEG-era workspace): `FAILS: none`
 without changes to the script.
+
+## Dimension filter
+
+Added to PR 8 at the user's request. Imports with a low minimum size let
+thumbnails and other small images slip into a library; the gallery needs
+a way to find them (and the full-size ones) so they can be reviewed and,
+if wanted, trashed.
+
+### Contract
+
+- **Measure.** The longer edge in pixels, `MAX(width, height)` of the
+  stored (pre-orientation) dimensions. Orientation does not matter for
+  "how big is this picture". Videos have dimensions too and are filtered
+  the same way; combine with `type=image` to restrict to photos.
+- **Parameters** on every endpoint that takes the browsing filters
+  (timeline, media, geo, geo/items, similar where filters apply):
+
+  | Param | Meaning |
+  |---|---|
+  | `minpx` | longer edge ≥ this many pixels |
+  | `maxpx` | longer edge ≤ this many pixels |
+
+  Positive integers, at most 1 000 000. `minpx > maxpx` is 400.
+  Malformed → 400 `{"error": "..."}` naming the parameter, like the other
+  filters. Rows whose dimensions are unknown (`width` or `height` NULL or
+  0: unreadable files, some videos) never match when either bound is set.
+- **Catalog.** `Filter.MinSide`, `Filter.MaxSide int` (0 = none) in
+  `internal/catalog/query.go`, rendered in `Filter.where` as
+  `width > 0 AND height > 0 AND MAX(width, height) >= ?` / `<= ?`. No new
+  index: the browsing queries already scan with the other unindexed
+  filters (camera), and 136k rows take milliseconds.
+- **Web.** `Filters.minPx`, `Filters.maxPx` in `lib/api.ts`; URL keys
+  `minpx`/`maxpx` in `lib/filters.ts` (parsed like the other positive
+  ints, dropped when malformed or `minpx > maxpx`); sent by
+  `filterParams`. The bar (`components/Filters.svelte`) gets a **Size**
+  control built like `DateFilter`: a button whose label summarises the
+  filter ("Any size", "≥ 2000 px", "≤ 640 px", "640–2000 px") and opens
+  a panel with two number inputs (min, max, "longer edge, pixels"),
+  presets ("Thumbnails ≤ 640", "Small ≤ 1600", "Full size ≥ 2000") and a
+  Clear. A preset applies at once; typed values apply on Enter, on blur
+  and when the panel closes, never per keystroke (the timeline reloads
+  on every filter change). `hasFilters` counts them, Clear removes them.
+  The fake API (`testing/fakes.ts`) filters by the items' width/height
+  and answers 400 for malformed values exactly like the server.
+- **Docs.** This section is the contract; append "As implemented" and
+  add `minpx`/`maxpx` rows to the filter table in `management.md`.
+- **Tests.** Go: `Filter.where` with min, max, both, unknown dimensions
+  excluded, bounds validation; server parse: `minpx=0`, `minpx=abc`,
+  `minpx=5000&maxpx=100`, `maxpx=1000001` are 400, a good pair narrows
+  timeline and media. Web: `filters.test.ts` round trip and rejection of
+  `minpx > maxpx`; a Filters component test that a preset calls
+  `onchange` with the pair and that Clear removes it.
+- **Not in scope.** Megapixel or aspect filters, a dimensions column in
+  the grid, bulk trash shortcuts (selection + Trash already works).
