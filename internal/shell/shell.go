@@ -307,10 +307,15 @@ func (a *app) config() Config {
 // hooks are the server's /api/app callbacks.
 func (a *app) hooks() *server.AppHooks {
 	return &server.AppHooks{
-		Token:       a.token,
-		Version:     a.opts.Version,
-		Platform:    runtime.GOOS,
-		Window:      a.win != nil,
+		Token:    a.token,
+		Version:  a.opts.Version,
+		Platform: runtime.GOOS,
+		Window: func() (bool, string) {
+			if a.win != nil {
+				return true, server.WindowOK
+			}
+			return false, server.WindowUnsupported
+		},
 		CloseToTray: func() bool { return a.config().CloseToTray },
 		OnOpen:      func() { <-a.ready; a.open("") },
 		OnQuit: func(force bool) error {

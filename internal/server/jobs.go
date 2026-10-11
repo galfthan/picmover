@@ -670,6 +670,12 @@ func (m *jobManager) start(e *libEntry, p jobParams, zone *time.Location) (*job,
 	if m.paused {
 		return nil, errSwitching
 	}
+	// A library of a workspace that is no longer served (the request
+	// found it before a switch). A switch keeps the manager paused until
+	// it has retired every old entry, so this check cannot race it.
+	if e.retired.Load() {
+		return nil, errRetired
+	}
 	if m.running != nil {
 		return nil, errBusy
 	}

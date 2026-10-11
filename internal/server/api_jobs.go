@@ -114,7 +114,7 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 	}
 	j, err := s.jobs.start(e, p, zone)
 	switch {
-	case errors.Is(err, errBusy), errors.Is(err, errSwitching):
+	case errors.Is(err, errBusy), errors.Is(err, errSwitching), errors.Is(err, errRetired):
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	case errors.Is(err, errClosed):

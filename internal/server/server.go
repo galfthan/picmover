@@ -205,16 +205,31 @@ func checkWorkspaceDir(dir string) (string, error) {
 	return root, nil
 }
 
-// installSingle serves the library opened by the caller in single mode:
-// it opens user.db when user is nil, records the library as open with
-// the lock held (unlock releases it when the library is closed), and
-// tidies the import history. The workspace must have no entries.
+// installSingle serves the library opened by the caller in single mode
+// (New): see newSingleEntry. The workspace must have no entries.
 func (ws *workspace) installSingle(lib *library.Library, db *catalog.DB, store *thumbs.Store, user *userdata.DB, unlock func()) error {
+	e, err := ws.newSingleEntry(lib, db, store, user, unlock)
+	if err != nil {
+		return err
+	}
+	ws.mu.Lock()
+	ws.libs[e.id] = e
+	ws.mu.Unlock()
+	ws.conf.Store(&wsConf{root: e.path, single: true})
+	return nil
+}
+
+// newSingleEntry is the single-mode entry of a library opened by the
+// caller: it opens user.db when user is nil, records the library as open
+// with the lock held (unlock releases it when the library is closed),
+// and tidies the import history (no job runs). The entry is not
+// registered.
+func (ws *workspace) newSingleEntry(lib *library.Library, db *catalog.DB, store *thumbs.Store, user *userdata.DB, unlock func()) (*libEntry, error) {
 	if user == nil {
 		var err error
 		user, err = userdata.Open(context.Background(), filepath.Join(lib.Root(), userdata.FileName))
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	// Keep enough idle connections for the concurrent reads of a page
@@ -222,17 +237,13 @@ func (ws *workspace) installSingle(lib *library.Library, db *catalog.DB, store *
 	// would reopen, re-running the connection pragmas, on every request).
 	db.SetMaxIdleConns(maxIdleConns)
 	root := lib.Root()
-	id := singleID(root)
 	lockInfo, _ := os.Stat(lib.LockPath())
-	ws.mu.Lock()
-	ws.libs[id] = &libEntry{id: id, path: root, state: libOpen, lib: lib, db: db,
+	e := &libEntry{id: singleID(root), path: root, state: libOpen, lib: lib, db: db,
 		store: store, user: user, unlock: unlock, external: true, lockInfo: lockInfo}
-	ws.mu.Unlock()
-	ws.conf.Store(&wsConf{root: root, single: true})
 	backfillImports(context.Background(), db, user, ws.log)
 	// No job runs yet: every running record is a crashed run's.
 	closeCrashedImports(context.Background(), db, user, nil, ws.log)
-	return nil
+	return e, nil
 }
 
 // StopJobs is the first phase of a shutdown: it refuses new jobs,
