@@ -52,6 +52,7 @@ const (
 var (
 	errBusy               = errors.New("a job is already running")
 	errClosed             = errors.New("the server is shutting down")
+	errSwitching          = errors.New("the workspace is being changed")
 	errTooManySubscribers = fmt.Errorf("too many event streams for this job (at most %d)", maxSubscribers)
 )
 
@@ -630,6 +631,7 @@ type jobManager struct {
 	jobs    []*job // oldest first: the running job and the last keepFinished finished ones
 	running *job
 	closed  bool
+	paused  bool // a workspace switch is in progress: no job starts
 	wg      sync.WaitGroup
 }
 
@@ -665,6 +667,9 @@ func (m *jobManager) start(e *libEntry, p jobParams, zone *time.Location) (*job,
 	if m.closed {
 		return nil, errClosed
 	}
+	if m.paused {
+		return nil, errSwitching
+	}
 	if m.running != nil {
 		return nil, errBusy
 	}
@@ -678,6 +683,36 @@ func (m *jobManager) start(e *libEntry, p jobParams, zone *time.Location) (*job,
 	m.wg.Add(1)
 	go m.run(j)
 	return j, nil
+}
+
+// count returns the number of running jobs (0 or 1: one job runs at a
+// time).
+func (m *jobManager) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running != nil {
+		return 1
+	}
+	return 0
+}
+
+// pause stops new jobs from starting while the workspace is switched;
+// it fails with the number of running jobs when one runs. resume undoes
+// it.
+func (m *jobManager) pause() (running int, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running != nil {
+		return 1, false
+	}
+	m.paused = true
+	return 0, true
+}
+
+func (m *jobManager) resume() {
+	m.mu.Lock()
+	m.paused = false
+	m.mu.Unlock()
 }
 
 // trimLocked drops finished jobs beyond the newest keepFinished.

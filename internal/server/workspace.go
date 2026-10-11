@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ const (
 const (
 	modeWorkspace = "workspace"
 	modeSingle    = "single"
+	modeUnset     = "unset" // no workspace set (the desktop app's first run)
 )
 
 const (
@@ -250,9 +252,10 @@ func (ws *workspace) lockLocked(ctx context.Context, e *libEntry, lib *library.L
 // workspace is the library registry: a folder of libraries (workspace
 // mode) or one library (single mode).
 type workspace struct {
-	root   string // absolute; the workspace folder, or the library root in single mode
-	single bool
-	log    *slog.Logger
+	// conf is the folder served and how (root, single, unset); the app
+	// replaces it as a whole when it switches the workspace (setConf).
+	conf atomic.Pointer[wsConf]
+	log  *slog.Logger
 
 	// ownedImports reports the import records the live job on a library
 	// owns (jobManager.ownedImports); nil until the job manager exists.
@@ -262,6 +265,30 @@ type workspace struct {
 	closed bool                 // shut down: nothing opens any more
 	libs   map[string]*libEntry // by id
 	peeks  map[string]peekEntry // by library folder
+}
+
+// wsConf is what a workspace serves.
+type wsConf struct {
+	root   string // absolute; the workspace folder, or the library root in single mode; "" when unset
+	single bool
+}
+
+// root is the served folder: the workspace folder, the library root in
+// single mode, "" when no workspace is set (the app's first run).
+func (ws *workspace) root() string { return ws.cfg().root }
+
+// single reports single mode (one library).
+func (ws *workspace) single() bool { return ws.cfg().single }
+
+// unset reports that no workspace is set: nothing is listed and every
+// library route answers 409 {state: "unset"}.
+func (ws *workspace) unset() bool { return ws.cfg().root == "" }
+
+func (ws *workspace) cfg() *wsConf {
+	if c := ws.conf.Load(); c != nil {
+		return c
+	}
+	return &wsConf{}
 }
 
 // fileStamp identifies a file's content cheaply: size and mtime (zero when
@@ -346,17 +373,21 @@ type listed struct {
 // out; a symlinked entry is listed only when it resolves to a plain
 // folder directly under the root (see linkTarget).
 func (ws *workspace) discover() ([]listed, error) {
-	if ws.single {
-		return []listed{{id: singleID(ws.root), path: ws.root, library: true}}, nil
+	c := ws.cfg()
+	switch {
+	case c.root == "":
+		return nil, nil
+	case c.single:
+		return []listed{{id: singleID(c.root), path: c.root, library: true}}, nil
 	}
-	ents, err := os.ReadDir(ws.root)
+	ents, err := os.ReadDir(c.root)
 	if err != nil {
 		return nil, err
 	}
 	var out []listed
 	for _, e := range ents {
 		name := e.Name()
-		p := filepath.Join(ws.root, name)
+		p := filepath.Join(c.root, name)
 		if !validLibID(name) || isHidden(e, p) {
 			continue
 		}
@@ -388,9 +419,9 @@ func (ws *workspace) linkOK(p string) bool {
 	if err != nil {
 		return false
 	}
-	root, err := filepath.EvalSymlinks(ws.root)
+	root, err := filepath.EvalSymlinks(ws.root())
 	if err != nil {
-		root = ws.root
+		root = ws.root()
 	}
 	if filepath.Dir(resolved) != filepath.Clean(root) || strings.HasPrefix(filepath.Base(resolved), ".") {
 		return false
@@ -664,7 +695,7 @@ func (ws *workspace) beginRebuild(ctx context.Context, e *libEntry) (lib *librar
 		}
 	default:
 		e.holder = nil
-		if fi, err := os.Lstat(e.path); err == nil && fi.Mode()&fs.ModeSymlink != 0 && !ws.single {
+		if fi, err := os.Lstat(e.path); err == nil && fi.Mode()&fs.ModeSymlink != 0 && !ws.single() {
 			if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); err != nil {
 				e.mu.Unlock()
 				return nil, nil, errViaSymlink
@@ -728,7 +759,7 @@ func (ws *workspace) endRebuild(ctx context.Context, e *libEntry, db *catalog.DB
 		return
 	}
 	e.closeCatalogLocked()
-	if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); errors.Is(err, fs.ErrNotExist) && !ws.single {
+	if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); errors.Is(err, fs.ErrNotExist) && !ws.single() {
 		e.state, e.errMsg = libFolder, ""
 	} else {
 		if failure == nil {
@@ -765,7 +796,7 @@ func (ws *workspace) closeAll() {
 // its listing entry. The name must be a valid, non-reserved id that does
 // not exist yet (errExists).
 func (ws *workspace) createLibrary(ctx context.Context, name string) (listed, error) {
-	p := filepath.Join(ws.root, name)
+	p := filepath.Join(ws.root(), name)
 	if err := os.Mkdir(p, 0o755); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return listed{}, errExists
@@ -830,3 +861,33 @@ func publicLibError(err error) string {
 
 // genericLibError is publicLibError's text for an error it does not know.
 const genericLibError = "the catalog could not be read (see the server log)"
+
+// replace points the workspace at c (the desktop app's workspace
+// switch): every registered library is retired, and the registry and
+// the peek cache start empty. The caller makes sure no job runs.
+func (ws *workspace) replace(c *wsConf) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	for _, e := range ws.libs {
+		e.retire()
+	}
+	ws.libs = map[string]*libEntry{}
+	ws.peeks = map[string]peekEntry{}
+	ws.conf.Store(c)
+}
+
+// retire closes a library that leaves the registry: its handles close
+// and its lock is released now, or when the last request using them
+// ends. A lock handed to the server in single mode is released too.
+func (e *libEntry) retire() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.external = false // closeHandlesLocked releases every lock
+	if e.state == libOpen || e.state == libRebuilding {
+		e.state = libClosed
+	}
+	e.stale = true
+	if e.inflight == 0 {
+		e.closeHandlesLocked()
+	}
+}
