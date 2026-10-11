@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/importer"
 	"picmover/internal/library"
 	"picmover/internal/testimg"
 )
@@ -804,5 +805,21 @@ func TestBackupCatalog(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(db); string(b) != "db2" {
 		t.Error("catalog moved although the backup failed")
+	}
+}
+
+func TestStatusTransferRate(t *testing.T) {
+	if got := transferRate(3<<20, 2*time.Second); got != 3<<19 {
+		t.Errorf("transferRate = %d", got)
+	}
+	if transferRate(0, time.Second) != 0 || transferRate(-5, time.Second) != 0 || transferRate(5, 0) != 0 {
+		t.Error("rate shown while no bytes moved")
+	}
+	s := importer.Stats{Imported: 1, BytesCopied: 5 << 20}
+	if got := formatStatus(s, 1<<20); !strings.Contains(got, "Copied 5.0 MiB (1.0 MiB/s)") {
+		t.Errorf("status = %q", got)
+	}
+	if got := formatStatus(s, 0); strings.Contains(got, "/s") {
+		t.Errorf("idle status shows a rate: %q", got)
 	}
 }
