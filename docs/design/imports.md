@@ -442,3 +442,131 @@ Assumptions beyond the contract (the backend should match):
   recommended.
 - `GET imports/<iid>` for an unknown id answers 404 (the page shows it as
   missing; other errors are shown with Retry).
+
+## Review fixes
+
+An end-to-end review of the branch (feat/phone-import at c479a2f) found
+one serious cost problem and eight minor ones. Version 3 of `user.db` was
+not released yet, so its schema changed in place; the v1 → v3 and v2 → v3
+migrations create the new shape. What changed:
+
+1. **Rebuilds keep no items (S1).** A record of mode `rebuild` or
+   `record` (a rebuild session backfilled from the catalog) stores its
+   counts (every row as `existing`) and no `import_items` rows: "every
+   row of the library" is the library itself, and 136k rows per rebuild
+   made `user.db` grow by about 9 MB each time. The rule is
+   `userdata.ModeKeepsItems` / `ImportRecord.KeepsItems`: `FinishImport`,
+   the backfill and the crash closing ignore items for those modes, and
+   `importrec.Recorder` does not even collect them. In JSON their `items`
+   and `cover` are `null`; `import=<id>` of such a record is an empty
+   grid; the detail panel no longer lists rebuilds. The web shows the
+   record page without a grid: its facts, Rename and Delete record, and
+   "A rebuild records every file of the library where it is, so its
+   record keeps no list of pictures of its own" with a link to the whole
+   library.
+2. **Stored summary (S1).** `imports` gained `items` (NULL for the modes
+   above, else the number of item rows) and `cover` (the newest item by
+   capture time, NULL when none), written by `FinishImport` (the caller
+   passes the cover: `importrec.Recorder.Finish` asks the catalog's
+   `NewestOf`, falling back to the last item), by the backfill
+   (`catalog.Session.Newest`, computed while reading the session's rows)
+   and by the crash closing. `GET imports` returns these stored values and
+   never reads `import_items`; so does `picmover imports`. `GET
+   imports/{iid}` (and the answer of the rename) computes the live count
+   and cover for that one record with one catalog query
+   (`catalog.LiveSummary`, a materialized CTE over `json_each`). So the
+   list's `items`/`cover` are as of the finish (a later trash does not
+   change them) and the record page's are live. Measured with the
+   reviewer's bench approach (136k-row catalog; one backfilled `record`
+   session, two rebuild records, one full-library copy import of 136k
+   items, 20 small imports): `ListImports` takes about 0.06 ms (it was
+   3.3 s); `GET imports/{iid}` of the 136k-item import about 0.5 s;
+   `FinishImport` of that import about 1 s, of a rebuild about 3 ms;
+   `user.db` 9 MB in all.
+3. **`AUTOINCREMENT` (M2).** `imports.id INTEGER PRIMARY KEY
+   AUTOINCREMENT`: deleting the newest record no longer lets the next
+   import take its id, so old links and job "Show imported" buttons never
+   open another import. Tested in `TestImportIDsNotReused` (and the smoke
+   script).
+4. **Crashed imports (M3).** `Recorder.SetSession` writes
+   `catalog_session` on the record (once) from the importer's progress
+   callback, in the server's jobs and in the CLI (which also passes it to
+   `FinishImport` as before). `userdata.RunningImports` and
+   `CloseCrashedImport`, driven by `importrec.CloseCrashed`, close a
+   `running` record as `failed`, `finished_at` now, with the catalog rows
+   of its session (`media.import_session_id`, read by
+   `catalog.SessionHashes`/`SessionHashesFile`) as `imported` items and
+   `imported` set to their number, when the session is known (else
+   without items). The server does it on every library open (after the
+   backfill) and skips the record its live job owns
+   (`jobManager.ownedImports`; while a live import or rebuild job on the
+   library has no record id yet, nothing is closed). In single mode no job
+   exists at open. The CLI closes every running record: `import` (with
+   the live catalog, under the library lock), `rebuild` (with the old
+   catalog file, read-only, before its backup) and the `imports` listing
+   (only when there is a running record, `user.db` is at version 3, the
+   library lock can be taken without waiting, the catalog rows of every
+   such session can be read and `user.db` opens for writing; otherwise it
+   skips the step silently).
+5. **Backfill robustness (M1).** The rebuild's backfill failure is a
+   warning on stderr (CLI) or a warning in the job log and the server log
+   (server). `catalog.Sessions` reads the columns schema versions 2 and 3
+   share, by name (`pragma_table_info`), with missing counters as 0, so
+   `SessionsFile` now accepts a version-2 catalog (version 1 and newer
+   versions are still refused). `imports_backfilled` is the only guard:
+   records written before a backfill succeeded (a rebuild's own record,
+   records of imports while the backfill kept failing) no longer prevent
+   it. A session that is already a record (same `catalog_session` and a
+   start within 60 s) is skipped, so a later backfill from the live
+   catalog does not duplicate the records this version wrote. The marker
+   is set in the backfill's transaction, so only on success. The rebuild's
+   own record is begun after the backfill attempt. Tested with a v2-shaped
+   catalog file (`TestSessionsFileV2`, `TestBackfillFileV2`) and in the CLI
+   (`TestRebuildMigrationNoticeAndBackfillWarning`).
+6. **`record` mode wording (M4).** `web/src/lib/imports.ts`: `isRebuild`
+   (rebuild or record); `modeLabel('record')` is "Rebuild"; `importCounts`
+   says "1,234 files recorded" for both; `importLine` says "Recorded
+   <date>" (plus the name), never "Imported … from …". The record page is
+   titled "Rebuild: <title>" and its facts say "of <path>".
+7. **Fake server parity (M5).** `web/src/testing/fakes.ts` now answers as
+   the server: `sourceName` in the detail's `imports`; the list carries the
+   stored summary (computed when the fake starts) and one record the live
+   count and the newest live item by capture time (no thumbnail check);
+   rebuild and record records have `items`/`cover` null; a malformed
+   `import=` is 400 `invalid import "…": want an import id`, an unknown one
+   404 `no such import`, an empty one no filter; a malformed record id is
+   404 `no such import` (the server's `pathID`, as for albums) and an
+   unknown one 404 `not found: import N`; a rename without `name` is 400
+   `name is required`, with control characters 400 `invalid name: control
+   characters are not allowed`, over 200 characters 400 `invalid name:
+   want 1-200 characters`. The tests that relied on the differences now
+   check the real shapes: the cover is the newest item by capture time,
+   the lightbox line reads "Imported … from Camera · Phone dump", and new
+   tests cover the rebuild record page, the control-character refusal and
+   the fake's status codes and summaries.
+8. **`imports` command (M6).** `Library: <path>` is printed on every path,
+   `--rename` and `--delete` included. The plain listing opens `user.db`
+   with `OpenReadOnly`, needs no catalog (only `media.db` or `user.db` to
+   exist, so a mistyped folder is still refused), migrates and backfills
+   nothing (a missing, version-1 or version-2 `user.db` lists no records
+   and says that the next import or serve upgrades it) and so works on a
+   read-only library or one whose catalog needs a rebuild. `--rename` and
+   `--delete` open as before (current catalog, `user.db` migrated,
+   backfill).
+9. **Backup copy race (M7).** `backupCopy` writes the `VACUUM INTO` copy
+   to `user.db.bak-<stamp>.<pid>-<12 hex>.tmp` (random, so two processes
+   or goroutines never share it, and not pre-created since `VACUUM INTO`
+   refuses an existing file), then renames it with
+   `library.RenameNoReplace` to `user.db.bak-<stamp>`, or `-2`, `-3`, …
+   (up to 100) when taken; the temp file is removed on failure.
+   `library.IsUserDBBackup` (the importer's "internal file" test) accepts
+   the counter and the temp name. `TestConcurrentFirstOpens` opens a v2
+   file twice at once (five rounds): both succeed, one copy is left.
+10. **Rebuild migration notice (M8).** `trashTimes` returns the
+    "user.db upgraded from schema version N to 3 (the old file is kept as
+    …)" line when its open migrated the file, and `rebuild` (and the
+    rebuild step of `restore`) prints it.
+
+Not changed: the review's suggestion to store `existing` for backfilled
+`record` items is moot (they keep no items). `import=` of a rebuild record
+answers an empty grid rather than an error.
