@@ -340,7 +340,7 @@ operation, `LIBMTP_Get_File_To_File` for MTP); that is what Nautilus and
 per-request path. So on Linux a source file on a phone mount is staged by
 running
 
-    gio copy -- <uri> <library>/.picmover/tmp/copy-XXXX.part
+    gio copy -- <uri> <library>/.picmover/tmp/pull-XXXX/copy.part
 
 and hashing the local temp file.
 
@@ -348,7 +348,9 @@ and hashing the local temp file.
 
 - `Dir()`: `$XDG_RUNTIME_DIR/gvfs`, else `/run/user/<uid>/gvfs` (the
   server's folder browser lists it as a root, as before, now through
-  `gvfs.Dir`).
+  `gvfs.Dir`), with symlinks resolved (`filepath.EvalSymlinks`) when the
+  directory exists, since the importer resolves its source the same way;
+  otherwise the unresolved path.
 - `Mount(p)`: for an absolute clean path below `Dir()`, the mount
   directory name is `<scheme>:host=<host>` possibly followed by
   `,key=value` parts; it returns the scheme, the host as written there,
@@ -365,10 +367,12 @@ and hashing the local temp file.
   `mtp://Google_Pixel_7_1A2B3C4D/Internal%20shared%20storage/DCIM/Camera/PXL_2025%20%281%29.jpg`.
 - `Pull(ctx, src, dst, onProgress)`: `gio` is found with
   `exec.LookPath` once (`ErrUnavailable` when missing) and run with
-  `exec.CommandContext` as `gio copy -- <uri> <dst>`; stdout and stderr
-  are kept in one 4 KiB tail buffer. If that fails with a message saying
-  the location is not mounted, `gio copy -- <fuse path> <dst>` is tried
-  once; if that works, later pulls start with the plain path. While gio
+  `exec.CommandContext` as `gio copy -- <uri> <dst>`, with `LC_ALL=C`
+  added to its environment; stdout and stderr are kept in one 4 KiB tail
+  buffer. If that fails for any reason other than cancellation,
+  `gio copy -- <fuse path> <dst>` is tried once; the form that worked is
+  tried first by later pulls (`plainFirst`). When both fail the error
+  carries both messages. While gio
   runs, `dst`'s size is polled every 200 ms and growth reported through
   `onProgress` (on the caller's goroutine). A non-zero exit returns an
   error ending in gio's last output line; cancellation kills gio and
@@ -377,29 +381,40 @@ and hashing the local temp file.
 ### Library (`internal/library/pull.go`)
 
 `StagePulled(ctx, src, tmpDir, pull, onWrite)` returns the same
-`Staged` as `Stage`: it stats `src` (never reads it), reserves a
-`copy-*.part` name with `CreateTemp`, runs `pull` onto it, passes the
-pull's progress to `onWrite` as increments (and the rest of the final
-size afterwards), hashes the temp file locally, requires its size to
-equal the source's `Stat` size (`ErrSizeChanged`), and sets the source
-mtime. `HashPulled(ctx, tmpDir, pull)` pulls into a temp file, hashes it
-and removes it. Every error, cancellation included, removes the temp.
+`Staged` as `Stage`: it stats `src` (never reads it), runs `pull` into
+a directory of its own (`pullTemp`, below), passes the pull's progress
+to `onWrite` as increments (and the rest of the final size afterwards),
+hashes the temp file locally, requires its size to equal the source's
+`Stat` size (`ErrSizeChanged`), and sets the source mtime.
+`HashPulled(ctx, src, tmpDir, pull)` stats `src`, pulls into a temp
+file, hashes it, removes it, and applies the same size check
+(`ErrSizeChanged`). Every error, cancellation included, removes the
+temp.
 
-Deviation: the reserved empty file is removed again before `pull` runs,
-so gio creates the destination itself. `gio copy` would overwrite it,
-but GIO replaces an existing local file by writing a hidden
+`pullTemp`: every pull gets its own directory `pull-*` in the library
+temp directory (`os.MkdirTemp`), and gio creates `<dir>/copy.part`
+there. On success the file is renamed onto a `copy-*.part` name in the
+temp directory reserved with `CreateTemp` (the rename replaces that
+empty reservation) and the directory is removed; on failure or
+cancellation the whole directory is removed. gio must create the
+destination itself: `gio copy` would overwrite an existing file, but GIO
+replaces an existing local file by writing a hidden
 `.goutputstream-XXXXXX` file in the same directory and renaming it at
-the end (the generic copy fallback; the gvfs pull path writes directly):
-the size polled would stay 0 until the end, and a killed gio would leave
-the hidden file behind. A name collision with the removed file is
-impossible in practice (random name, private directory); `CleanTemp`
-clears the directory at the start of every run anyway.
+the end (the generic copy fallback; the gvfs pull path writes directly),
+so the size polled would stay 0 until the end and a killed gio would
+leave the hidden file behind. The pull's name is never one that another
+`CreateTemp` in the shared temp directory (other workers' `StageFile`,
+`CopyVerified`) can draw, which matters because libmtp opens the
+destination without `O_EXCL`. A file the daemon still creates after gio
+was killed finds its directory gone (or is removed with it);
+`CleanTemp` removes everything in the temp directory, `pull-*`
+directories included, at the start of every run.
 
 ### Importer
 
 - `Run` sets `usePull` when gio is available (not in record-in-place
   mode) and logs `gio=true` on "import started" when it is set and the
-  source root is on a device mount.
+  source root is on a device mount or is the gvfs directory itself.
 - `stage`: for a device path while `usePull` holds, `StagePulled` with
   `gvfs.Pull`, holding the `readers` slot for the whole pull; progress
   goes to `bytesCopied` and `*counted` as with `StageFile`. Debug log
@@ -408,14 +423,18 @@ clears the directory at the start of every run anyway.
   path): for a device path, `HashPulled` into a second temp file. A move
   therefore still reads the source twice, as two independent pulls.
 - Fallback: the pull error `gvfs.ErrUnavailable` turns pulling off for
-  the run silently; any other pull error turns it off for the rest of the
-  run (an atomic flag) with one warning `gio copy failed, reading
-  through FUSE` (`file`, `err`), and that file is read through FUSE.
-  The bytes the failed pull counted are taken back first. A pull that
-  worked but whose copy has the wrong size, or cannot be hashed, reads
-  only that file through FUSE (debug log "pulled copy not used"); the
-  FUSE read then applies its own size check. Cancellation returns the
-  error without a fallback.
+  the run silently. Any other pull error reads that file through FUSE
+  (debug log "gio copy failed, reading this file through FUSE") and
+  counts as a failure; after three failed pulls in a row
+  (`maxPullFailures`; a pull that works resets the count) pulling is
+  turned off for the rest of the run with one warning `gio copy failed
+  repeatedly, reading the rest through FUSE` (`in_a_row`, `file`,
+  `err`). The bytes a failed pull counted are taken back first. A pull
+  that worked but whose copy has the wrong size, or cannot be hashed,
+  reads only that file through FUSE (debug log "pulled copy not used");
+  the FUSE read then applies its own size check. This holds for staging
+  and for the move verification (`hashSource`) alike. Cancellation
+  returns the error without a fallback.
 - Zip archives on a phone keep the FUSE read. `Stats` are unchanged.
 
 ### Tests
@@ -425,31 +444,81 @@ clears the directory at the start of every run anyway.
   host; extra key=value parts; the mount directory; non-device and
   malformed paths), `TestDir`.
 - `internal/gvfs/gvfs_linux_test.go`, with a shell script standing in for
-  gio: `TestPull` (the exact argv, overwrite of a pre-created
-  destination, monotonic progress), `TestPullFailure` (last stderr line,
-  `dst` removed, no retry), `TestPullFallsBackToPlainPath`,
-  `TestPullCancelled` (killed, `dst` removed), `TestPullNotOnMount`.
+  gio: `TestPull` (the exact argv, `dst` created by gio in a directory
+  of its own, monotonic progress, `LC_ALL=C`), `TestPullFailure` (both
+  forms tried, both stderr lines, `dst` removed),
+  `TestPullRetriesOtherForm` (URI form fails with a Finnish message, or
+  the plain path fails; the working form is tried first afterwards),
+  `TestDirSymlinked`, `TestPullCancelled` (killed, `dst` removed),
+  `TestPullNotOnMount`.
 - `internal/library/pull_test.go`: `TestStagePulled` (hash, size,
-  progress increments, mtime, `Commit`, `HashPulled`),
-  `TestStagePulledFailures` (size mismatch, pull error, cancellation
-  during and right after the pull, missing source; no temp left).
+  progress increments, mtime, `Commit`, `HashPulled`; the pull writes
+  `pull-*/copy.part`), `TestStagePulledFailures` (size mismatch, short
+  `HashPulled`, pull error, a late write into a removed pull directory,
+  cancellation during and right after the pull, missing source; no temp
+  left), `TestCleanTempRemovesPullDirs`.
 - `internal/importer/gio_test.go` (hooks `pull`, `isDevice`, `gioOK`):
   `TestDevicePullStages` (device files pulled once, never opened through
   FUSE; a local file in the same import is), `TestDevicePullLogsGio`,
-  `TestDevicePullFallsBack` (failing gio: one pull, one warning, all files
-  through FUSE, `BytesCopied` exact; no gio: no warning),
+  `TestDevicePullLogsGioForGvfsDir`, `TestDevicePullFallsBack` (the
+  three-failure rule with a reset in between: one warning, a debug line
+  per failed pull, `BytesCopied` exact), `TestDevicePullNoGio` (gio
+  unavailable from the start: no pull, no warning),
   `TestDevicePullSizeMismatch`, `TestDevicePullMoveVerifies` (second
-  pull; a differing second pull keeps the source),
-  `TestDevicePullMoveVerifyFallsBack`.
+  pull; a differing second pull of the same size keeps the source),
+  `TestDevicePullMoveVerifyFallsBack`, `TestDevicePullShortMove`.
 
 ### Not verified
 
 The development container has neither gvfs nor gio: the real
 `gio copy` from an MTP or gphoto2 mount, its speed, its exact error
-messages (the "not mounted" retry matches `not mounted`, `no such
-mount`, `mount does not exist`, `mount not found`), whether the gphoto2
-backend pulls whole files, and what the daemon does with a pull whose gio
-client was killed (it may keep writing the unlinked temp file until the
-transfer ends) are untested. gio needs the session's D-Bus; run outside
-the desktop session it fails and the import falls back to FUSE with the
-warning.
+messages (no longer matched: any failure retries the other form),
+whether the gphoto2 backend pulls whole files, and what the daemon does
+with a pull whose gio client was killed (it may keep writing the
+unlinked temp file until the transfer ends, or create it late in the
+removed pull directory) are untested. gio needs the session's D-Bus; run
+outside the desktop session every pull fails and after three files the
+import falls back to FUSE with the warning.
+
+### Review fixes (gvfs)
+
+Fixes for the review of `fix/import-gio` (27da386..b74a5cd).
+
+1. Short verification pull (serious): `HashPulled` takes the source
+   path, stats it and returns an error wrapping `ErrSizeChanged` when
+   the pulled size differs, like `StagePulled`. `hashSource` then reads
+   that file through FUSE, so a device whose pulls come back short no
+   longer blocks a move (before: every run ended in `ErrHashMismatch`).
+   Test `TestDevicePullShortMove`: a pull always one byte short with
+   `--move` imports and moves the file with 2 pulls and 2 FUSE opens.
+2. One failed pull no longer turns pulling off for the run: that file is
+   read through FUSE (debug line), and pulling is turned off only after
+   three failed pulls in a row (`maxPullFailures`; a pull that works
+   resets the count), with one warning. A pulled copy of the wrong size
+   is not a pull failure. Test `TestDevicePullFallsBack`.
+3. Retry on any failure: `gvfs.pull` no longer matches English "not
+   mounted" messages (they come translated from the daemon); when the
+   first form fails and ctx is not cancelled, the other form is tried
+   once and the working one remembered (`plainFirst`, now also cleared
+   when the URI form is the one that works). gio runs with `LC_ALL=C`.
+   Tests `TestPullRetriesOtherForm` (both orders), `TestPullFailure`.
+4. Per-pull temp directory: `pullTemp` pulls into
+   `<tmp>/pull-*/copy.part` and renames the result onto a `copy-*.part`
+   reservation; the name gio writes is never one another `CreateTemp`
+   can draw. The design text no longer calls the shared temp directory
+   private. `CleanTemp` already removed every entry with `RemoveAll`, so
+   stale `pull-*` directories are covered (doc comment and
+   `TestCleanTempRemovesPullDirs` added).
+5. Late file after cancellation: the whole pull directory is removed on
+   failure or cancellation, so a file the daemon opens after gio was
+   killed finds no directory (tested with a late write).
+6. Logging and symlinks: `gvfs.Dir()` resolves symlinks when the
+   directory exists (`TestDirSymlinked`); `gio=true` is also logged when
+   the source root is the gvfs directory itself
+   (`TestDevicePullLogsGioForGvfsDir`).
+7. Tests: the "no gio" case now has gio unavailable from the start
+   (`TestDevicePullNoGio`: no pull, no warning, every file through FUSE)
+   instead of a pull hook returning `ErrUnavailable`; `TestPull` no
+   longer pre-creates the destination; the differing verification pull
+   in `TestDevicePullMoveVerifies` keeps the source's size, so it still
+   tests the hash mismatch rather than the new size fallback.
