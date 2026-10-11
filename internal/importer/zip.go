@@ -16,8 +16,15 @@ import (
 // processZip imports the media entries of a zip archive. Each entry is
 // extracted to a temp dir inside the library, processed like a file (never
 // moved) and the temp file removed. The archive itself is never deleted.
+// Reads of the archive (its directory, then each entry's extraction) hold a
+// SourceReaders slot; processing an extracted entry does not.
 func (im *Importer) processZip(ctx context.Context, zipPath string, pend chan<- *pending) {
+	release, err := im.sourceSlot(ctx, zipPath)
+	if err != nil {
+		return // cancelled
+	}
 	zr, err := zip.OpenReader(zipPath)
+	release()
 	if err != nil {
 		im.report(Result{Status: StatusError, Source: zipPath, Message: "cannot open zip", Err: err})
 		return
@@ -49,7 +56,13 @@ func (im *Importer) processZip(ctx context.Context, zipPath string, pend chan<- 
 			continue
 		}
 		tmp := filepath.Join(tmpDir, name)
-		if err := extractEntry(ctx, f, tmp); err != nil {
+		release, err := im.sourceSlot(ctx, zipPath)
+		if err != nil {
+			return // cancelled
+		}
+		err = extractEntry(ctx, f, tmp)
+		release()
+		if err != nil {
 			os.Remove(tmp)
 			if ctx.Err() != nil {
 				return

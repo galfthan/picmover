@@ -4,6 +4,7 @@ package importer
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -39,21 +40,17 @@ func sameDevice(src, dir string) bool {
 }
 
 // volumeSerial returns the serial number of the volume holding p, a file
-// or a directory (opened with FILE_FLAG_BACKUP_SEMANTICS).
+// or a directory. It opens p with os.Open, which applies Go's long-path
+// handling (\\?\ prefix) and opens directories with
+// FILE_FLAG_BACKUP_SEMANTICS.
 func volumeSerial(p string) (uint32, error) {
-	name, err := windows.UTF16PtrFromString(p)
+	f, err := os.Open(p)
 	if err != nil {
 		return 0, err
 	}
-	h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return 0, err
-	}
-	defer windows.CloseHandle(h)
+	defer f.Close()
 	var fi windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(h, &fi); err != nil {
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &fi); err != nil {
 		return 0, err
 	}
 	return fi.VolumeSerialNumber, nil

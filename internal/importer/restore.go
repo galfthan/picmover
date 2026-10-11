@@ -64,8 +64,9 @@ func RestoreFromTrash(ctx context.Context, lib *library.Library, db *catalog.DB,
 // again (otherwise "Empty trash" would delete the library's only copy).
 // The trashed copy is hashed before the restore and the restored file
 // after it; only then is a move source deleted. The result is imported,
-// "restored from trash".
-func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, origin string, fromZip bool) *Result {
+// "restored from trash". A staged (copy-first) move source is read a second
+// time (verifySource) before it is deleted, as for any copy-first move.
+func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, origin string, fromZip, staged bool) *Result {
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
 		return &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import"}
 	}
@@ -121,6 +122,13 @@ func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, or
 		im.log.Error("verify restored file", "dest", rel, "err", err)
 		r.Message += "; the restored copy could not be verified" + keepSource
 		return r
+	}
+	if staged {
+		if err := im.verifySource(ctx, srcPath, hash); err != nil {
+			im.log.Error("verify move source", "source", srcPath, "err", err)
+			r.Message += "; the source could not be verified" + keepSource
+			return r
+		}
 	}
 	if err := os.Remove(srcPath); err != nil {
 		im.log.Error("remove move source", "source", srcPath, "err", err)

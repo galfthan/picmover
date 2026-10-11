@@ -10,24 +10,31 @@
 //     reached directly, not a zip entry) that is copied: a copy, a
 //     ForceCopy move, or a move to another device (sameDevice). The file
 //     is staged into <library>/.picmover/tmp/copy-*.part in one
-//     sequential read, hashed as it is written (library.StageFile, at most
-//     SourceReaders at a time); the source is not opened again. Duplicates
-//     (catalog or in-flight in this import) are dropped, trashed content is
-//     restored from the trash instead, metadata is extracted from the staged
-//     copy, a unique destination is reserved and the copy is committed
-//     into place (library.Commit: fsync, rename). The recorded hash is
-//     that of the bytes written; there is no read-back.
+//     sequential read, hashed as it is written (library.StageFile).
+//     Duplicates (catalog or in-flight in this import) are dropped, trashed
+//     content is restored from the trash instead, metadata is extracted
+//     from the staged copy and a unique destination is reserved. A copy
+//     reads the source once. A move reads it twice: before the copy is
+//     committed, or an identical file at the destination accepted, the
+//     source is hashed again (verifySource); unless that hash equals the
+//     staged one nothing is placed and the source is kept. A restore from
+//     the trash is checked the same way before its source is deleted. So
+//     the original is deleted only after a second read has proved the
+//     bytes. The copy is committed into place with library.Commit (fsync,
+//     rename); the recorded hash is that of the bytes written.
 //   - Hash-first, for everything else (record in place, zip entries,
 //     symlinks, files inside the library, same-device moves): the file is
 //     hashed, duplicates are dropped, metadata is extracted from the file,
 //     and it is kept in place, renamed, or copied through a verified temp
 //     file (library.CopyVerified).
 //
-// Every staged temp file not placed is removed. A single writer batches
-// the finished files into catalog transactions. Only after a transaction has
-// committed are move sources deleted; if an insert loses a hash race or the
-// commit fails, the file operations of the affected items are undone.
-// Nothing is ever overwritten.
+// Every read of a source file outside the library (staging, the move
+// verification, hashing, CopyVerified, zip archives) holds one of the
+// SourceReaders slots for the read only. Every staged temp file not placed
+// is removed. A single writer batches the finished files into catalog
+// transactions. Only after a transaction has committed are move sources
+// deleted; if an insert loses a hash race or the commit fails, the file
+// operations of the affected items are undone. Nothing is ever overwritten.
 //
 // After the copy stage, unless Options.NoThumbs, Run runs the thumbnail
 // stage (RunThumbs) over the rows of this session: N workers generate the
@@ -99,9 +106,8 @@ type Options struct {
 	OnProgress       func(Stats)        // optional, called every ProgressInterval and once at the end
 	ProgressInterval time.Duration      // <=0: 200ms
 	ForceCopy        bool               // testing: never rename when moving; always copy, then delete the source
-	// SourceReaders bounds how many workers read source files at once
-	// (only the staging copy of the copy-first path; see the package
-	// comment). <=0: auto, which is 1 when the source is on a FUSE mount
+	// SourceReaders bounds how many workers read source files outside the
+	// library at once (see the package comment). <=0: auto, which is 1 when the source is on a FUSE mount
 	// (Linux: gvfs MTP, gphoto2 phone mounts) and Workers otherwise. At
 	// most Workers.
 	SourceReaders int
@@ -519,7 +525,7 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			return fail("copy", err)
 		}
 		staged, hash, size = st.Path, st.Hash, st.Size
-	} else if hash, size, err = im.hashSource(srcPath); err != nil {
+	} else if hash, size, err = im.hashSource(ctx, srcPath); err != nil {
 		return fail("hash", err)
 	}
 
@@ -534,7 +540,7 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			if !m.DeletedAt.IsZero() {
 				// The content is in the trash: restore it rather than
 				// report a duplicate that "Empty trash" would delete.
-				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip)
+				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip, copyFirst)
 			}
 		}
 		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog"}
@@ -574,6 +580,11 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			Message: fmt.Sprintf("%dx%d below minimum %d", info.Width, info.Height, im.opts.MinDimension)}
 	}
 
+	if staged != "" && info.Source == "mtime" {
+		// The fallback date is the staged copy's mtime, which is the
+		// source's only if StageFile could set it: use the source's own.
+		info.TakenAt = fi.ModTime().In(info.TakenAt.Location())
+	}
 	takenAt, offsetKnown, source := info.TakenAt, info.OffsetKnown, info.Source
 	if takenAt.IsZero() {
 		takenAt, offsetKnown, source = fi.ModTime(), true, "mtime"
@@ -643,6 +654,21 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		claim = strings.ToLower(rel)
 	}
 	dst := im.lib.Abs(rel)
+	if identical {
+		// The identical file may be the source itself, reached through a
+		// path Contains does not recognise (a bind mount, a hard link, a
+		// mapped drive): then it is in place and is never deleted.
+		if dfi, err := os.Stat(dst); err == nil && os.SameFile(fi, dfi) {
+			inPlace = true
+		}
+	}
+	if copyFirst && im.opts.Move && !inPlace {
+		// A move deletes the source: read it a second time and require
+		// the bytes staged before anything is placed.
+		if err := im.verifySource(ctx, srcPath, hash); err != nil {
+			return fail("copy", err)
+		}
+	}
 
 	moved, copied, nbytes := false, false, int64(0)
 	switch {
@@ -666,7 +692,12 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			}
 		}
 		if !moved {
+			release, err := im.sourceSlot(ctx, srcPath)
+			if err != nil {
+				return fail("copy", err)
+			}
 			n, err := im.lib.CopyVerified(ctx, srcPath, dst, hash)
+			release()
 			if err != nil {
 				return fail("copy", err)
 			}
@@ -707,12 +738,11 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 // (library.StageFile), holding one of the SourceReaders slots while it
 // reads. Every buffer written is added to bytesCopied and to *counted.
 func (im *Importer) stage(ctx context.Context, src string, counted *int64) (library.Staged, error) {
-	select {
-	case im.readers <- struct{}{}:
-	case <-ctx.Done():
-		return library.Staged{}, ctx.Err()
+	release, err := im.sourceSlot(ctx, src)
+	if err != nil {
+		return library.Staged{}, err
 	}
-	defer func() { <-im.readers }()
+	defer release()
 	in, err := im.openSource(src)
 	if err != nil {
 		return library.Staged{}, err
@@ -724,8 +754,53 @@ func (im *Importer) stage(ctx context.Context, src string, counted *int64) (libr
 	})
 }
 
-// hashSource hashes the file at p (the hash-first path).
-func (im *Importer) hashSource(p string) (uint64, int64, error) {
+// sourceSlot takes one of the SourceReaders slots for a read of p, a
+// source file, unless p is inside the library. It returns the function
+// that releases the slot; call it as soon as the read ends, never across
+// metadata extraction or catalog calls. When ctx is cancelled while
+// waiting it returns ctx.Err() and holds nothing.
+func (im *Importer) sourceSlot(ctx context.Context, p string) (release func(), err error) {
+	if im.lib.Contains(p) {
+		return func() {}, nil
+	}
+	select {
+	case im.readers <- struct{}{}:
+		return func() { <-im.readers }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// verifySource hashes the source src of a copy-first move again, holding
+// a SourceReaders slot, and returns an error wrapping
+// library.ErrHashMismatch unless it still has the staged hash want. Copy
+// is one read of the source; move is two, the second proving the bytes
+// before the original is deleted.
+func (im *Importer) verifySource(ctx context.Context, src string, want uint64) error {
+	got, _, err := im.hashSource(ctx, src)
+	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			return err
+		}
+		return fmt.Errorf("%w: %s: the source could not be read again to verify the copy before the move: %v",
+			library.ErrHashMismatch, src, err)
+	}
+	if got != want {
+		return fmt.Errorf("%w: %s: the source changed or could not be read consistently (copied %016x, read again %016x); the source is kept",
+			library.ErrHashMismatch, src, want, got)
+	}
+	return nil
+}
+
+// hashSource hashes the file at p (the hash-first path, and the second read
+// of a copy-first move), holding a SourceReaders slot when p is outside the
+// library.
+func (im *Importer) hashSource(ctx context.Context, p string) (uint64, int64, error) {
+	release, err := im.sourceSlot(ctx, p)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer release()
 	f, err := im.openSource(p)
 	if err != nil {
 		return 0, 0, err
