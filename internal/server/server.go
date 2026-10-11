@@ -132,6 +132,8 @@ func New(opts Options) (*Server, error) {
 		ws.libs[id] = &libEntry{id: id, path: ws.root, state: libOpen, lib: opts.Library, db: opts.Catalog,
 			store: opts.Store, user: user, unlock: func() {}, external: true, lockInfo: lockInfo}
 		backfillImports(context.Background(), opts.Catalog, user, log)
+		// No job runs yet: every running record is a crashed run's.
+		closeCrashedImports(context.Background(), opts.Catalog, user, nil, log)
 	}
 	s := &Server{
 		ws:      ws,
@@ -154,6 +156,7 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 	s.jobs = newJobManager(ws, s.ffmpeg, log, opts.jobOptions)
+	ws.ownedImports = s.jobs.ownedImports
 	s.handler = s.middleware(s.routes())
 	return s, nil
 }

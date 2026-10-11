@@ -31,7 +31,7 @@ func TestImportsAPI(t *testing.T) {
 	rec := l[0]
 	if rec.ID != 1 || rec.Mode != "copy" || rec.Outcome != "done" || rec.Host != "" || rec.Name != "" ||
 		rec.SourceName != "src" || rec.Source != filepath.Join(f.base, "src") || rec.Imported != 5 ||
-		rec.Skipped != 1 || rec.Items != 5 || rec.FinishedAt == nil || rec.Cover == nil ||
+		rec.Skipped != 1 || rec.Items == nil || *rec.Items != 5 || rec.FinishedAt == nil || rec.Cover == nil ||
 		*rec.Cover != hexHash(f.hashes["e.jpg"]) { // the newest by capture time
 		t.Fatalf("backfilled record %+v", rec)
 	}
@@ -42,7 +42,7 @@ func TestImportsAPI(t *testing.T) {
 	}
 	w := f.get(lp + "imports/1")
 	wantStatus(t, w, http.StatusOK)
-	if got := decode[importJSON](t, w); got.ID != rec.ID || got.Items != rec.Items || got.Cover == nil ||
+	if got := decode[importJSON](t, w); got.ID != rec.ID || got.Items == nil || *got.Items != *rec.Items || got.Cover == nil ||
 		*got.Cover != *rec.Cover || got.StartedAt != rec.StartedAt || *got.FinishedAt != *rec.FinishedAt {
 		t.Fatalf("record %+v, list %+v", got, rec)
 	}
@@ -86,7 +86,7 @@ func TestImportsAPI(t *testing.T) {
 	// Rename.
 	w = f.post(lp+"imports/1", `{"name":"  Summer phone  "}`)
 	wantStatus(t, w, http.StatusOK)
-	if got := decode[importJSON](t, w); got.Name != "Summer phone" || got.Items != 5 {
+	if got := decode[importJSON](t, w); got.Name != "Summer phone" || got.Items == nil || *got.Items != 5 {
 		t.Fatalf("renamed %+v", got)
 	}
 	wantError(t, f.post(lp+"imports/1", `{"name":"`+strings.Repeat("x", 201)+`"}`), http.StatusBadRequest, "invalid name")
@@ -98,10 +98,15 @@ func TestImportsAPI(t *testing.T) {
 		t.Fatalf("cleared %+v", got)
 	}
 
-	// The live item count and cover follow the trash.
+	// The record's live item count and cover follow the trash; the list
+	// keeps the stored summary (it never reads the items).
 	f.post(lp+"trash", `{"hashes":["`+hexHash(f.hashes["e.jpg"])+`"]}`)
-	if got := f.imports()[0]; got.Items != 4 || got.Cover == nil || *got.Cover == hexHash(f.hashes["e.jpg"]) {
+	w = f.get(lp + "imports/1")
+	if got := decode[importJSON](t, w); got.Items == nil || *got.Items != 4 || got.Cover == nil || *got.Cover == hexHash(f.hashes["e.jpg"]) {
 		t.Fatalf("after trash %+v", got)
+	}
+	if got := f.imports()[0]; got.Items == nil || *got.Items != 5 || got.Cover == nil || *got.Cover != hexHash(f.hashes["e.jpg"]) {
+		t.Fatalf("list after trash %+v", got)
 	}
 
 	// Mutation rules.
@@ -151,7 +156,7 @@ func TestImportsRunningRecord(t *testing.T) {
 	w := f.get(lp + "imports/" + itoa64(id))
 	wantStatus(t, w, http.StatusOK)
 	got := decode[importJSON](t, w)
-	if got.Outcome != "running" || got.FinishedAt != nil || got.Items != 0 || got.Cover != nil || got.SourceName != "phone" {
+	if got.Outcome != "running" || got.FinishedAt != nil || got.Items == nil || *got.Items != 0 || got.Cover != nil || got.SourceName != "phone" {
 		t.Fatalf("running record %+v", got)
 	}
 	// Its filter is empty, not an error.
@@ -177,8 +182,11 @@ func TestJobsRecordImports(t *testing.T) {
 	wantStatus(t, w, http.StatusOK)
 	rec := decode[importJSON](t, w)
 	if rec.Mode != "copy" || rec.Outcome != "done" || rec.Imported != 3 || rec.Duplicates != 1 || rec.Skipped != 1 ||
-		rec.Items != 3 || rec.Source != src || rec.FinishedAt == nil || rec.Bytes == 0 {
+		rec.Items == nil || *rec.Items != 3 || rec.Cover == nil || rec.Source != src || rec.FinishedAt == nil || rec.Bytes == 0 {
 		t.Fatalf("import record %+v", rec)
+	}
+	if l := f.imports(); l[0].ID != 2 || l[0].Items == nil || *l[0].Items != 3 || l[0].Cover == nil || *l[0].Cover != *rec.Cover {
+		t.Fatalf("listed %+v, record %+v", l[0], rec)
 	}
 	hs, err := f.userDB().ImportHashes(context.Background(), 2)
 	if err != nil || len(hs) != 3 {
@@ -195,7 +203,7 @@ func TestJobsRecordImports(t *testing.T) {
 		t.Fatalf("thumbs job %+v", j)
 	}
 
-	// A rebuild: mode rebuild, every row existing.
+	// A rebuild: mode rebuild, every row existing, no items.
 	w = f.post(lp+"jobs", `{"kind":"rebuild","noThumbs":true}`)
 	wantStatus(t, w, http.StatusCreated)
 	j = f.pollJob(decode[jobJSON](t, w).ID)
@@ -205,8 +213,17 @@ func TestJobsRecordImports(t *testing.T) {
 	w = f.get(lp + "imports/3")
 	wantStatus(t, w, http.StatusOK)
 	rec = decode[importJSON](t, w)
-	if rec.Mode != "rebuild" || rec.Imported != 0 || rec.Existing == 0 || rec.Items == 0 || rec.Source != f.lib.Root() {
+	if rec.Mode != "rebuild" || rec.Imported != 0 || rec.Existing == 0 || rec.Items != nil || rec.Cover != nil || rec.Source != f.lib.Root() {
 		t.Fatalf("rebuild record %+v (job %+v)", rec, j)
+	}
+	if hs, _ := f.userDB().ImportHashes(context.Background(), 3); len(hs) != 0 {
+		t.Fatalf("rebuild items %d", len(hs))
+	}
+	if l := f.imports(); l[0].ID != 3 || l[0].Items != nil || l[0].Cover != nil {
+		t.Fatalf("listed rebuild %+v", l[0])
+	}
+	if n := f.countAll("import=3"); n != 0 {
+		t.Fatalf("rebuild filter %d", n)
 	}
 	// The earlier records survive the rebuild; their items still filter.
 	if l := f.imports(); len(l) != 3 {
@@ -237,7 +254,66 @@ func TestWorkspaceOpenBackfills(t *testing.T) {
 	w := f.get("/api/l/penny/imports")
 	wantStatus(t, w, http.StatusOK)
 	l := decode[importsJSON](t, w).Imports
-	if len(l) != 1 || l[0].Mode != "move" || l[0].SourceName != "sd1" || l[0].Items != 1 || l[0].Outcome != "done" {
+	if len(l) != 1 || l[0].Mode != "move" || l[0].SourceName != "sd1" || l[0].Items == nil || *l[0].Items != 1 || l[0].Outcome != "done" {
 		t.Fatalf("penny imports %+v", l)
+	}
+}
+
+// Records left running by a process that died are closed when the
+// library is opened: outcome failed, items from their catalog session.
+func TestOpenClosesCrashedImports(t *testing.T) {
+	f, root := newWorkspace(t)
+	ctx := context.Background()
+	dir := filepath.Join(root, "penny")
+	db, err := catalog.Open(ctx, filepath.Join(dir, "media.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := db.BeginSession(ctx, "/cards/sd2", "copy") // never finished: the process died
+	for i, h := range []uint64{81, 82} {
+		if _, err := db.InsertMedia(ctx, nil, &catalog.Media{Hash: h, Size: int64(i + 1), RelPath: "image/" + itoa64(int64(h)) + ".jpg",
+			FileType: "image", Ext: "jpg", ImportSessionID: sid, TakenAt: time.Unix(int64(1000+i), 0)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+	u, err := userdata.Open(ctx, filepath.Join(dir, userdata.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.BackfillImports(ctx, nil); err != nil { // backfilled before the crash
+		t.Fatal(err)
+	}
+	crashed, _ := u.BeginImport(ctx, userdata.ImportRecord{Source: "/cards/sd2", Mode: userdata.ImportModeCopy})
+	u.SetImportSession(ctx, crashed, sid)
+	early, _ := u.BeginImport(ctx, userdata.ImportRecord{Source: "/cards/sd3", Mode: userdata.ImportModeCopy})
+	u.Close()
+
+	wantStatus(t, f.post("/api/libraries/penny/open", `{}`), http.StatusOK)
+	l := decode[importsJSON](t, f.get("/api/l/penny/imports")).Imports
+	if len(l) != 2 {
+		t.Fatalf("imports %+v", l)
+	}
+	for _, r := range l {
+		if r.Outcome != "failed" || r.FinishedAt == nil {
+			t.Fatalf("not closed %+v", r)
+		}
+		switch r.ID {
+		case crashed:
+			if r.Items == nil || *r.Items != 2 || r.Cover == nil || *r.Cover != hexHash(82) || r.Imported != 2 {
+				t.Fatalf("crashed record %+v", r)
+			}
+		case early:
+			if r.Items == nil || *r.Items != 0 || r.Cover != nil {
+				t.Fatalf("record without session %+v", r)
+			}
+		}
+	}
+	var n int64
+	for _, b := range decode[timelineJSON](t, f.get("/api/l/penny/timeline?import="+itoa64(crashed))).Buckets {
+		n += b.Count
+	}
+	if n != 2 {
+		t.Fatalf("crashed record's grid %d", n)
 	}
 }

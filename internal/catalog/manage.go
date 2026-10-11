@@ -193,6 +193,24 @@ func (d *DB) NewestOf(ctx context.Context, hashes []uint64) (hash uint64, ok boo
 	return uint64(h), true, nil
 }
 
+// LiveSummary returns how many of hashes have a live row and the newest
+// of them (as NewestOf; ok false when none is live), in one query: the
+// live count and cover of an import record.
+func (d *DB) LiveSummary(ctx context.Context, hashes []uint64) (n int64, newest uint64, ok bool, err error) {
+	if len(hashes) == 0 {
+		return 0, 0, false, nil
+	}
+	var h sql.NullInt64
+	err = d.QueryRowContext(ctx, `WITH live AS MATERIALIZED (SELECT id, hash, taken_at FROM media
+		WHERE deleted_at IS NULL AND hash IN (SELECT value FROM json_each(?)))
+		SELECT (SELECT COUNT(*) FROM live),
+		(SELECT hash FROM live ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1)`, hashArray(hashes)).Scan(&n, &h)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("catalog: live summary: %w", err)
+	}
+	return n, uint64(h.Int64), h.Valid, nil
+}
+
 // PHashItem is the perceptual hash of one row, the input of the
 // near-duplicate search.
 type PHashItem struct {
@@ -445,41 +463,69 @@ func peekFile(ctx context.Context, path string, immutable bool) (Peek, error) {
 }
 
 // SessionsFile is Sessions on the catalog at path opened read-only like
-// PeekFile (nothing is written, created, checkpointed or converted; an
-// error wrapping ErrNeedsRebuild for another schema version). A rebuild
-// reads the old catalog's sessions with it before renaming it away.
+// PeekFile (nothing is written, created, checkpointed or converted). It
+// reads schema versions 2 and 3 (an older catalog is exactly what a
+// rebuild replaces); another version is an error wrapping
+// ErrNeedsRebuild. A rebuild reads the old catalog's sessions with it
+// before renaming it away.
 func SessionsFile(ctx context.Context, path string) ([]Session, error) {
-	if err := checkPath(path); err != nil {
-		return nil, err
-	}
-	s, err := sessionsFile(ctx, path, false)
-	if err != nil && ctx.Err() == nil && cannotOpenReadOnly(err) && !walHasData(path) {
-		if s2, err2 := sessionsFile(ctx, path, true); err2 == nil {
-			return s2, nil
-		}
-	}
-	return s, err
+	var out []Session
+	err := readFile(ctx, path, func(d *DB) error {
+		var err error
+		out, err = d.Sessions(ctx)
+		return err
+	})
+	return out, err
 }
 
-func sessionsFile(ctx context.Context, path string, immutable bool) ([]Session, error) {
+// SessionHashesFile is SessionHashes on the catalog file at path, read
+// like SessionsFile.
+func SessionHashesFile(ctx context.Context, path string, session int64) (hashes []uint64, newest uint64, err error) {
+	err = readFile(ctx, path, func(d *DB) error {
+		var err error
+		hashes, newest, err = d.SessionHashes(ctx, session)
+		return err
+	})
+	return hashes, newest, err
+}
+
+// readFile runs fn on the catalog at path opened read-only like PeekFile
+// (retried immutable in an unwritable folder when no WAL holds data),
+// accepting schema versions 2 to SchemaVersion.
+func readFile(ctx context.Context, path string, fn func(*DB) error) error {
+	if err := checkPath(path); err != nil {
+		return err
+	}
+	err := readFileOnce(ctx, path, false, fn)
+	if err != nil && ctx.Err() == nil && cannotOpenReadOnly(err) && !walHasData(path) {
+		if err2 := readFileOnce(ctx, path, true, fn); err2 == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func readFileOnce(ctx context.Context, path string, immutable bool, fn func(*DB) error) error {
 	dsn := readOnlyDSN(path)
 	if immutable {
 		dsn += "&immutable=1"
 	}
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("catalog: open %s: %w", path, err)
+		return fmt.Errorf("catalog: open %s: %w", path, err)
 	}
 	defer sqldb.Close()
 	sqldb.SetMaxOpenConns(1)
 	v, hasMedia, err := schemaState(ctx, sqldb)
 	if err != nil {
-		return nil, fmt.Errorf("catalog: open %s: %w", path, err)
+		return fmt.Errorf("catalog: open %s: %w", path, err)
 	}
-	if err := checkSchema(path, v, hasMedia, false); err != nil {
-		return nil, err
+	if v != 2 || !hasMedia {
+		if err := checkSchema(path, v, hasMedia, false); err != nil {
+			return err
+		}
 	}
-	return (&DB{DB: sqldb, path: path}).Sessions(ctx)
+	return fn(&DB{DB: sqldb, path: path})
 }
 
 // readOnlyDSN returns a SQLite URI that opens path read-only.

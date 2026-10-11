@@ -33,14 +33,16 @@ var hostName = func() string {
 // the counts, the outcome and the items. Its methods are safe for
 // concurrent use (OnResult is called from pipeline goroutines).
 type Recorder struct {
-	user *userdata.DB
-	log  *slog.Logger
+	user  *userdata.DB
+	log   *slog.Logger
+	keeps bool // the mode keeps items (userdata.ModeKeepsItems)
 
-	mu    sync.Mutex
-	id    int64
-	err   error
-	seen  map[uint64]bool
-	items []userdata.ImportItem
+	mu      sync.Mutex
+	id      int64
+	err     error
+	session int64 // the catalog session written by SetSession
+	seen    map[uint64]bool
+	items   []userdata.ImportItem
 }
 
 // Begin records the start of a run from source (cleaned; for a rebuild the
@@ -51,7 +53,7 @@ func Begin(ctx context.Context, user *userdata.DB, openErr error, source, mode s
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	r := &Recorder{user: user, log: log, seen: map[uint64]bool{}}
+	r := &Recorder{user: user, log: log, keeps: userdata.ModeKeepsItems(mode), seen: map[uint64]bool{}}
 	if user == nil {
 		if openErr == nil {
 			openErr = errors.New("no user.db")
@@ -115,8 +117,12 @@ func ItemStatus(res importer.Result) (status string, ok bool) {
 }
 
 // OnResult collects the item of an importer result (a hash seen before
-// keeps its first status).
+// keeps its first status). A rebuild collects none: its record keeps no
+// items (userdata.ModeKeepsItems).
 func (r *Recorder) OnResult(res importer.Result) {
+	if !r.keeps {
+		return
+	}
 	status, ok := ItemStatus(res)
 	if !ok {
 		return
@@ -144,11 +150,43 @@ func Outcome(runErr error) string {
 	return userdata.ImportFailed
 }
 
+// SetSession writes the catalog session of the run on the record as
+// soon as the importer has one (from its progress callback), so the
+// record of a process that dies keeps its link to the rows it committed
+// (CloseCrashed). It writes once; 0 and later calls are ignored. A
+// failure is logged at error level and kept in Err.
+func (r *Recorder) SetSession(ctx context.Context, session int64) {
+	if session == 0 {
+		return
+	}
+	r.mu.Lock()
+	id, done := r.id, r.session != 0
+	if id != 0 && !done {
+		r.session = session
+	}
+	r.mu.Unlock()
+	if id == 0 || done {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if err := r.user.SetImportSession(wctx, id, session); err != nil {
+		r.fail("session", err)
+	}
+}
+
+// Newest finds the newest live row among hashes (catalog.DB.NewestOf):
+// the cover of a finished record.
+type Newest interface {
+	NewestOf(ctx context.Context, hashes []uint64) (hash uint64, ok bool, err error)
+}
+
 // Finish records the end of the run: outcome (userdata.Import*), the
-// counts from stats, the catalog session and the items collected. It
-// uses a context that is not cancelled with ctx, so a cancelled run is
-// still recorded. It returns Err.
-func (r *Recorder) Finish(ctx context.Context, outcome string, stats importer.Stats, sessionID int64) error {
+// counts from stats, the catalog session, the items collected and their
+// cover, the newest of them in cat (nil, or a failure to read it: the
+// last item). It uses a context that is not cancelled with ctx, so a
+// cancelled run is still recorded. It returns Err.
+func (r *Recorder) Finish(ctx context.Context, outcome string, stats importer.Stats, sessionID int64, cat Newest) error {
 	id := r.ID()
 	if id == 0 {
 		return r.Err()
@@ -156,17 +194,74 @@ func (r *Recorder) Finish(ctx context.Context, outcome string, stats importer.St
 	r.mu.Lock()
 	items := r.items
 	r.mu.Unlock()
-	rec := userdata.ImportRecord{Outcome: outcome, Imported: stats.Imported, Existing: stats.Existing,
-		Duplicates: stats.Duplicates, Skipped: stats.SkippedSmall + stats.NonMedia, Errors: stats.Errors,
-		Bytes: stats.BytesCopied, CatalogSession: sessionID}
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 	defer cancel()
+	var cover uint64
+	if cat != nil && len(items) > 0 {
+		hashes := make([]uint64, len(items))
+		for i, it := range items {
+			hashes[i] = it.Hash
+		}
+		if h, ok, err := cat.NewestOf(wctx, hashes); err != nil {
+			r.log.Warn("import record cover", "err", err)
+		} else if ok {
+			cover = h
+		}
+	}
+	rec := userdata.ImportRecord{Outcome: outcome, Imported: stats.Imported, Existing: stats.Existing,
+		Duplicates: stats.Duplicates, Skipped: stats.SkippedSmall + stats.NonMedia, Errors: stats.Errors,
+		Bytes: stats.BytesCopied, CatalogSession: sessionID, Cover: cover}
 	if err := r.user.FinishImport(wctx, id, rec, items); err != nil {
 		r.fail("finish", err)
 		return r.Err()
 	}
 	r.log.Info("import record written", "import", id, "outcome", outcome, "items", len(items))
 	return nil
+}
+
+// SessionRows returns the rows of a catalog session: their hashes and
+// the newest live one (catalog.DB.SessionHashes).
+type SessionRows func(ctx context.Context, session int64) (hashes []uint64, newest uint64, err error)
+
+// CloseCrashed closes the records left running by a process that died:
+// every running record for which owned (nil: none) is false gets outcome
+// failed, finished now, and the rows of its catalog session (when it is
+// known and rows is not nil) as its imported items. A session whose rows
+// cannot be read closes the record without items (logged). It returns
+// the number of records closed.
+func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owned func(id int64) bool, log *slog.Logger) (int, error) {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	running, err := user.RunningImports(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, rec := range running {
+		if owned != nil && owned(rec.ID) {
+			continue
+		}
+		var (
+			hashes []uint64
+			newest uint64
+		)
+		if rec.CatalogSession != 0 && rows != nil && rec.KeepsItems() {
+			if hashes, newest, err = rows(ctx, rec.CatalogSession); err != nil {
+				log.Warn("crashed import record: catalog rows", "import", rec.ID, "session", rec.CatalogSession, "err", err)
+				hashes, newest = nil, 0
+			}
+		}
+		closed, err := user.CloseCrashedImport(ctx, rec.ID, hashes, newest)
+		if err != nil {
+			return n, err
+		}
+		if closed {
+			n++
+			log.Info("crashed import record closed", "import", rec.ID, "items", len(hashes))
+		}
+	}
+	return n, nil
 }
 
 // Backfill copies the catalog's import sessions into user's import
@@ -198,7 +293,7 @@ func backfill(ctx context.Context, user *userdata.DB, list func(context.Context)
 	for _, s := range sessions {
 		in = append(in, userdata.BackfillSession{CatalogSession: s.ID, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt,
 			Source: s.Source, Mode: s.Mode, Imported: s.Imported, Existing: s.Existing, Duplicates: s.Duplicates,
-			Skipped: s.SkippedSmall + s.NonMedia, Errors: s.Errors, Hashes: s.Hashes})
+			Skipped: s.SkippedSmall + s.NonMedia, Errors: s.Errors, Hashes: s.Hashes, Cover: s.Newest})
 	}
 	return user.BackfillImports(ctx, in)
 }

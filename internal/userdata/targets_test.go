@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -95,11 +96,13 @@ func TestMigrateV1BackupFails(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, FileName)
 	v1Schema(t, p)
-	// Every candidate backup name is taken: the migration is refused and
-	// the file stays at version 1.
+	// Every candidate backup name is taken: the migration is refused, the
+	// file stays at version 1 and no temporary copy is left.
 	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.Local)
-	for i := 0; i < 10; i++ {
-		os.WriteFile(p+".bak-"+now.Add(time.Duration(i)*time.Second).Format(backupStampLayout), []byte("x"), 0o644)
+	base := p + ".bak-" + now.Format(backupStampLayout)
+	os.WriteFile(base, []byte("x"), 0o644)
+	for i := 2; i <= 100; i++ {
+		os.WriteFile(fmt.Sprintf("%s-%d", base, i), []byte("x"), 0o644)
 	}
 	sqldb, err := sql.Open("sqlite", p+dsnParams)
 	if err != nil {
@@ -115,6 +118,9 @@ func TestMigrateV1BackupFails(t *testing.T) {
 	sqldb.Close()
 	if v != 1 {
 		t.Fatalf("user_version %d after a refused migration", v)
+	}
+	if tmps, _ := filepath.Glob(p + ".bak-*.tmp"); len(tmps) != 0 {
+		t.Fatalf("temporary copies left: %v", tmps)
 	}
 }
 

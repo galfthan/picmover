@@ -7,9 +7,13 @@ import (
 	"picmover/internal/userdata"
 )
 
-// importJSON is an import record. Counts are the run's; items is the
-// number of its items that are live rows now (like an album's count) and
-// cover the newest of them (a hash, null when none is live).
+// importJSON is an import record. Counts are the run's. items and cover
+// are null for a record that keeps no items (a rebuild, mode rebuild or
+// record). In the list they are the stored summary (the number of items
+// and the newest of them when the record was finished: the list never
+// reads the items); for one record (GET imports/{iid}, the rename answer)
+// they are live: the number of its items that are live rows now (like an
+// album's count) and the newest of them (null when none is live).
 type importJSON struct {
 	ID         int64   `json:"id"`
 	Name       string  `json:"name"`
@@ -26,7 +30,7 @@ type importJSON struct {
 	Skipped    int64   `json:"skipped"`
 	Errors     int64   `json:"errors"`
 	Bytes      int64   `json:"bytes"`
-	Items      int64   `json:"items"`
+	Items      *int64  `json:"items"`
 	Cover      *string `json:"cover"`
 }
 
@@ -45,9 +49,8 @@ type importsJSON struct {
 
 func rfc3339(t time.Time) string { return t.Local().Format(time.RFC3339) }
 
-// newImport returns the import object of rec, its live item count and
-// cover from the catalog.
-func (s *Server) newImport(r *http.Request, l *libHandles, rec userdata.ImportRecord) (importJSON, error) {
+// importObject returns the import object of rec with its stored summary.
+func importObject(rec userdata.ImportRecord) importJSON {
 	out := importJSON{ID: rec.ID, Name: rec.Name, StartedAt: rfc3339(rec.StartedAt), Source: rec.Source,
 		SourceName: rec.SourceName, Mode: rec.Mode, Host: rec.Host, Outcome: rec.Outcome, Imported: rec.Imported,
 		Existing: rec.Existing, Duplicates: rec.Duplicates, Skipped: rec.Skipped, Errors: rec.Errors, Bytes: rec.Bytes}
@@ -55,27 +58,42 @@ func (s *Server) newImport(r *http.Request, l *libHandles, rec userdata.ImportRe
 		f := rfc3339(rec.FinishedAt)
 		out.FinishedAt = &f
 	}
-	hashes, err := l.user.ImportHashes(r.Context(), rec.ID)
-	if err != nil || len(hashes) == 0 {
-		return out, err
+	if rec.KeepsItems() {
+		n := rec.Items
+		out.Items = &n
+		if rec.Cover != 0 {
+			c := hexHash(rec.Cover)
+			out.Cover = &c
+		}
 	}
-	live, err := l.db.LiveHashes(r.Context(), hashes)
+	return out
+}
+
+// liveImport returns the import object of rec with its live item count
+// and cover from the catalog (one query).
+func (s *Server) liveImport(r *http.Request, l *libHandles, rec userdata.ImportRecord) (importJSON, error) {
+	out := importObject(rec)
+	if !rec.KeepsItems() {
+		return out, nil
+	}
+	hashes, err := l.user.ImportHashes(r.Context(), rec.ID)
 	if err != nil {
 		return out, err
 	}
-	out.Items = int64(len(live))
-	if len(live) == 0 {
-		return out, nil
-	}
-	h, found, err := l.db.NewestOf(r.Context(), hashes)
-	if err != nil || !found {
+	n, newest, found, err := l.db.LiveSummary(r.Context(), hashes)
+	if err != nil {
 		return out, err
 	}
-	c := hexHash(h)
-	out.Cover = &c
+	out.Items, out.Cover = &n, nil
+	if found {
+		c := hexHash(newest)
+		out.Cover = &c
+	}
 	return out, nil
 }
 
+// handleImports lists the records with their stored summary; it reads no
+// items (a record may hold the items of a whole import of thousands).
 func (s *Server) handleImports(w http.ResponseWriter, r *http.Request, l *libHandles) {
 	recs, err := l.user.ListImports(r.Context())
 	if err != nil {
@@ -84,18 +102,13 @@ func (s *Server) handleImports(w http.ResponseWriter, r *http.Request, l *libHan
 	}
 	out := importsJSON{Imports: make([]importJSON, 0, len(recs))}
 	for _, rec := range recs {
-		j, err := s.newImport(r, l, rec.ImportRecord)
-		if err != nil {
-			s.internalError(w, r, err)
-			return
-		}
-		out.Imports = append(out.Imports, j)
+		out.Imports = append(out.Imports, importObject(rec))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) writeImport(w http.ResponseWriter, r *http.Request, l *libHandles, rec userdata.ImportRecord) {
-	j, err := s.newImport(r, l, rec)
+	j, err := s.liveImport(r, l, rec)
 	if err != nil {
 		s.internalError(w, r, err)
 		return

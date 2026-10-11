@@ -167,9 +167,12 @@ func libraryAt(dir string) (*library.Library, error) {
 // "picmover rebuild" does; the library lock is held by the caller. It
 // returns 1 when files could not be recorded.
 func restoreRebuild(ctx context.Context, cmd *cobra.Command, lib *library.Library, noThumbs bool) (int, error) {
-	times, err := trashTimes(ctx, lib.Root())
+	times, migrated, err := trashTimes(ctx, lib.Root())
 	if err != nil {
 		return exitUnusable, unusable(err)
+	}
+	if migrated != "" {
+		fmt.Fprintln(cmd.OutOrStdout(), migrated)
 	}
 	p := importParams{source: lib.Root(), libRoot: lib.Root(), recordInPlace: true, trashTimes: times,
 		locked: true, isNew: true, noThumbs: noThumbs, quiet: true, logPrefix: "rebuild", what: "Rebuild"}

@@ -391,12 +391,13 @@ func (m *jobManager) beginRecord(j *job, user *userdata.DB, source, mode string,
 	return rec
 }
 
-// finishRecord ends the job's import record; a failure is logged.
-func (m *jobManager) finishRecord(j *job, rec *importrec.Recorder, outcome string, stats importer.Stats, sessionID int64) {
+// finishRecord ends the job's import record, its cover the newest item
+// in cat (nil: none needed); a failure is logged.
+func (m *jobManager) finishRecord(j *job, rec *importrec.Recorder, outcome string, stats importer.Stats, sessionID int64, cat importrec.Newest) {
 	if rec.ID() == 0 {
 		return // the failure was logged by beginRecord
 	}
-	if err := rec.Finish(context.Background(), outcome, stats, sessionID); err != nil {
+	if err := rec.Finish(context.Background(), outcome, stats, sessionID, cat); err != nil {
 		m.log.Error("import record could not be written", "id", j.id, "library", j.libID, "err", err)
 	}
 }
@@ -634,6 +635,26 @@ func newJobManager(ws *workspace, ffmpeg string, log *slog.Logger, adjust func(*
 	return &jobManager{ws: ws, ffmpeg: ffmpeg, log: log, adjust: adjust}
 }
 
+// ownedImports reports which import records the live job on e owns, for
+// closing the records of crashed runs on open: owned (nil: none) and ok
+// false when a live import or rebuild job on e has no record id yet (it
+// may be writing one), so no running record can be told crashed.
+func (m *jobManager) ownedImports(e *libEntry) (owned func(id int64) bool, ok bool) {
+	m.mu.Lock()
+	j := m.running
+	m.mu.Unlock()
+	if j == nil || j.entry != e || (j.params.Kind != kindImport && j.params.Kind != kindRebuild) {
+		return nil, true
+	}
+	j.mu.Lock()
+	id := j.importID
+	j.mu.Unlock()
+	if id == 0 {
+		return nil, false
+	}
+	return func(x int64) bool { return x == id }, true
+}
+
 // start creates and starts a job on the library of e; errBusy when one
 // is running (on any library).
 func (m *jobManager) start(e *libEntry, p jobParams, zone *time.Location) (*job, error) {
@@ -788,6 +809,9 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		ProgressInterval: progressInterval,
 		OnProgress: func(s importer.Stats) {
 			j.onProgress(s, im.SessionID())
+			if rec != nil {
+				rec.SetSession(j.ctx, im.SessionID())
+			}
 		},
 	}
 	if j.params.Kind == kindImport {
@@ -826,7 +850,7 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 	}
 	sessionID = im.SessionID()
 	if rec != nil {
-		m.finishRecord(j, rec, importrec.Outcome(runErr), stats, sessionID)
+		m.finishRecord(j, rec, importrec.Outcome(runErr), stats, sessionID, h.db)
 	}
 	state, code, msg = outcome(j.params.Kind, stats, runErr, logPath, lib.Root())
 	switch {
@@ -967,7 +991,8 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 	// first time) before it is renamed away; read-only, best effort.
 	if _, err := os.Stat(dbPath); err == nil {
 		if _, err := importrec.BackfillFile(ctx, dbPath, user); err != nil {
-			logger.Info("import history backfill from the old catalog", "err", err)
+			logger.Warn("import history backfill from the old catalog failed; it is tried again on the next open", "err", err)
+			m.log.Warn("import history backfill from the old catalog", "id", j.id, "library", j.entry.id, "err", err)
 		}
 	}
 	backup := ""
@@ -1033,6 +1058,7 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 		ProgressInterval: progressInterval,
 		OnProgress: func(s importer.Stats) {
 			j.onProgress(s, im.SessionID())
+			rec.SetSession(j.ctx, im.SessionID())
 		},
 	}
 	if m.adjust != nil {
@@ -1045,7 +1071,7 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 	if !im.RecordStageDone() && recOutcome == userdata.ImportDone {
 		recOutcome = userdata.ImportFailed // rolled back below
 	}
-	m.finishRecord(j, rec, recOutcome, stats, sessionID)
+	m.finishRecord(j, rec, recOutcome, stats, sessionID, nil) // a rebuild record has no items
 	if !im.RecordStageDone() {
 		if runErr == nil {
 			runErr = errors.New("the record stage did not finish")

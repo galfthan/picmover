@@ -197,9 +197,6 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if !p.quiet {
 			status = newStatusLine(out)
 		}
-		if status != nil {
-			opts.OnProgress = func(s importer.Stats) { status.show(formatStatus(s)) }
-		}
 		// The import history (user.db, created when missing). A user.db
 		// that cannot be opened only costs the record.
 		user, userErr := userdata.Open(ctx, filepath.Join(lib.Root(), userdata.FileName))
@@ -208,13 +205,15 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		} else {
 			defer user.Close()
 			if from, bak := user.Migrated(); from != 0 {
-				fmt.Fprintf(out, "user.db upgraded from schema version %d to %d (the old file is kept as %s)\n",
-					from, userdata.SchemaVersion, filepath.Base(bak))
+				fmt.Fprintln(out, migrationNotice(from, bak))
 			}
 			if !p.recordInPlace {
 				// A rebuild backfills from the old catalog before its
 				// backup (cmd/rebuild.go); this catalog is the live one.
 				backfill(ctx, db, user, logger)
+				// Holding the library lock, no other run can own a
+				// running record: each is a crashed run's.
+				closeCrashed(ctx, user, db.SessionHashes, logger)
 			}
 		}
 		mode := userdata.ImportModeCopy
@@ -226,6 +225,15 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		}
 		rec := importrec.Begin(ctx, user, userErr, p.source, mode, logger)
 		opts.OnResult = rec.OnResult
+		var im *importer.Importer
+		opts.OnProgress = func(s importer.Stats) {
+			if status != nil {
+				status.show(formatStatus(s))
+			}
+			// The record links to its catalog session while it runs, so
+			// a crash leaves it findable (FinishImport writes it too).
+			rec.SetSession(ctx, im.SessionID())
+		}
 		if !p.recordInPlace {
 			// Content found in the trash is restored; its user.db trash
 			// row is removed when there is a user.db.
@@ -236,7 +244,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 				return untrashUserDB(ctx, lib.Root(), hash)
 			}
 		}
-		im := importer.New(lib, db, opts)
+		im = importer.New(lib, db, opts)
 		stats, runErr = im.Run(ctx)
 		recorded = im.RecordStageDone()
 		if status != nil {
@@ -246,7 +254,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if p.recordInPlace && !recorded && outcome == userdata.ImportDone {
 			outcome = userdata.ImportFailed // rolled back below
 		}
-		rec.Finish(ctx, outcome, stats, im.SessionID())
+		rec.Finish(ctx, outcome, stats, im.SessionID(), db)
 		sum.importID, sum.recordErr = rec.ID(), rec.Err()
 		if p.recordInPlace && !recorded {
 			closeDB()
@@ -431,6 +439,20 @@ func backfill(ctx context.Context, db *catalog.DB, user *userdata.DB, logger *sl
 		logger.Error("import history backfill", "err", err)
 	case n > 0:
 		logger.Info("import history backfilled from the catalog", "records", n)
+	}
+}
+
+// closeCrashed closes the import records left running by a process that
+// died (importrec.CloseCrashed: outcome failed, items from the catalog
+// rows of their session, rows nil: none); the caller holds the library
+// lock, so no record is a live run's. A failure is logged.
+func closeCrashed(ctx context.Context, user *userdata.DB, rows importrec.SessionRows, logger *slog.Logger) {
+	n, err := importrec.CloseCrashed(ctx, user, rows, nil, logger)
+	switch {
+	case err != nil:
+		logger.Error("close crashed import records", "err", err)
+	case n > 0:
+		logger.Info("crashed import records closed", "records", n)
 	}
 }
 

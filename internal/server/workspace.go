@@ -246,6 +246,10 @@ type workspace struct {
 	single bool
 	log    *slog.Logger
 
+	// ownedImports reports the import records the live job on a library
+	// owns (jobManager.ownedImports); nil until the job manager exists.
+	ownedImports func(e *libEntry) (owned func(id int64) bool, ok bool)
+
 	mu     sync.Mutex
 	closed bool                 // shut down: nothing opens any more
 	libs   map[string]*libEntry // by id
@@ -539,6 +543,11 @@ func (ws *workspace) open(ctx context.Context, e *libEntry) error {
 	}
 	ws.log.Info("library opened", "id", e.id, "root", lib.Root())
 	backfillImports(ctx, db, e.user, ws.log)
+	if ws.ownedImports != nil {
+		if owned, ok := ws.ownedImports(e); ok {
+			closeCrashedImports(ctx, db, e.user, owned, ws.log)
+		}
+	}
 	return nil
 }
 
@@ -552,6 +561,23 @@ func backfillImports(ctx context.Context, db *catalog.DB, user *userdata.DB, log
 		log.Error("import history backfill", "err", err)
 	case n > 0:
 		log.Debug("import history backfilled from the catalog", "records", n)
+	}
+}
+
+// closeCrashedImports closes the import records left running by a
+// process that died (importrec.CloseCrashed), filling their items from
+// the catalog rows of their session; records owned (nil: none) by a live
+// job are kept. A failure is logged and never fails the open.
+func closeCrashedImports(ctx context.Context, db *catalog.DB, user *userdata.DB, owned func(int64) bool, log *slog.Logger) {
+	if user == nil {
+		return
+	}
+	n, err := importrec.CloseCrashed(ctx, user, db.SessionHashes, owned, log)
+	switch {
+	case err != nil:
+		log.Error("close crashed import records", "err", err)
+	case n > 0:
+		log.Info("crashed import records closed", "records", n)
 	}
 }
 

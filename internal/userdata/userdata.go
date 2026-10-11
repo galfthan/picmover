@@ -15,6 +15,7 @@ package userdata
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"picmover/internal/library"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
@@ -106,9 +109,14 @@ CREATE TABLE meta (
 `
 
 // schemaV3 is what version 3 adds to version 2: the import history.
+// Ids are never reused (AUTOINCREMENT): a link to a deleted record must
+// not open a later one. items and cover are the stored summary of the
+// record's items (written when it is finished; the list never reads
+// import_items): items is NULL for the modes that keep no items (rebuild,
+// record), cover NULL when there is none.
 const schemaV3 = `
 CREATE TABLE imports (
-    id              INTEGER PRIMARY KEY,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL DEFAULT '',
     started_at      INTEGER NOT NULL,
     finished_at     INTEGER,
@@ -123,7 +131,9 @@ CREATE TABLE imports (
     skipped         INTEGER NOT NULL DEFAULT 0,
     errors          INTEGER NOT NULL DEFAULT 0,
     bytes           INTEGER NOT NULL DEFAULT 0,
-    catalog_session INTEGER
+    catalog_session INTEGER,
+    items           INTEGER,
+    cover           INTEGER
 );
 CREATE TABLE import_items (
     import_id INTEGER NOT NULL REFERENCES imports(id) ON DELETE CASCADE,
@@ -322,6 +332,17 @@ func (d *DB) ensureSchema(ctx context.Context) error {
 	}
 }
 
+// Version returns the database's schema version: SchemaVersion for a
+// database opened by Open; an older one is possible for OpenReadOnly
+// (version 2 has no import history).
+func (d *DB) Version(ctx context.Context) (int, error) {
+	v, _, err := d.version(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("userdata: version: %w", err)
+	}
+	return v, nil
+}
+
 // version returns user_version and the number of tables.
 func (d *DB) version(ctx context.Context) (v, tables int, err error) {
 	err = d.db.QueryRowContext(ctx, `SELECT (SELECT user_version FROM pragma_user_version),
@@ -407,26 +428,42 @@ func (d *DB) migrate(ctx context.Context) error {
 }
 
 // backupCopy writes a consistent copy of the database (VACUUM INTO) to
-// <path>.bak-<stamp> and returns its path. An existing name is never
-// replaced: the next second's stamp is tried.
+// <path>.bak-<stamp> and returns its path. The copy is written to a
+// temporary name unique to this call (VACUUM INTO refuses an existing
+// file, so two processes migrating at once must not share one) and then
+// renamed without replacing: when <path>.bak-<stamp> is taken (another
+// copy in the same second), -2, -3, ... are tried.
 func (d *DB) backupCopy(ctx context.Context) (string, error) {
-	now := d.now()
-	for i := 0; i < 10; i++ {
-		p := d.path + ".bak-" + now.Add(time.Duration(i)*time.Second).Format(backupStampLayout)
-		if _, err := os.Lstat(p); err == nil {
-			continue
+	base := d.path + ".bak-" + d.now().Format(backupStampLayout)
+	var rnd [6]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return "", err
+	}
+	tmp := fmt.Sprintf("%s.%d-%x.tmp", base, os.Getpid(), rnd)
+	if err := d.Snapshot(ctx, tmp); err != nil {
+		os.Remove(tmp) // the name is ours alone
+		return "", err
+	}
+	for i := 1; i <= 100; i++ {
+		p := base
+		if i > 1 {
+			p = fmt.Sprintf("%s-%d", base, i)
 		}
-		if err := d.Snapshot(ctx, p); err != nil {
+		err := library.RenameNoReplace(tmp, p)
+		if err == nil {
+			return p, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			os.Remove(tmp)
 			return "", err
 		}
-		return p, nil
 	}
+	os.Remove(tmp)
 	return "", errors.New("no free backup name")
 }
 
-// backupStampLayout is library.BackupStampLayout (userdata does not
-// import library).
-const backupStampLayout = "20060102-150405"
+// backupStampLayout is library.BackupStampLayout.
+const backupStampLayout = library.BackupStampLayout
 
 // writeIdentity stores a new library_id (16 random hex digits) and
 // created_at in meta, unless they exist.

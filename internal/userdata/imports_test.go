@@ -188,7 +188,7 @@ func TestImportRecords(t *testing.T) {
 	now = now.Add(time.Minute)
 	items := []ImportItem{{10, ItemImported}, {11, ItemExisting}, {12, ItemRestored}, {10, ItemExisting}, {1 << 63, ItemImported}}
 	if err := d.FinishImport(ctx, id, ImportRecord{Outcome: ImportDone, Imported: 3, Existing: 1, Duplicates: 2,
-		Skipped: 4, Errors: 1, Bytes: 12345, CatalogSession: 7}, items); err != nil {
+		Skipped: 4, Errors: 1, Bytes: 12345, CatalogSession: 7, Cover: 12}, items); err != nil {
 		t.Fatal(err)
 	}
 	rec, err = d.GetImport(ctx, id)
@@ -220,9 +220,9 @@ func TestImportRecords(t *testing.T) {
 		t.Fatalf("finish unknown: %v", err)
 	}
 
-	// The list: newest first, item count and first item.
+	// The list: newest first, with the stored item count and cover.
 	l, err := d.ListImports(ctx)
-	if err != nil || len(l) != 2 || l[0].ID != id || l[0].Items != 4 || l[0].Cover != 10 ||
+	if err != nil || len(l) != 2 || l[0].ID != id || l[0].Items != 4 || l[0].Cover != 12 ||
 		l[1].ID != crashed || l[1].Items != 0 || l[1].Cover != 0 || l[1].Outcome != ImportRunning {
 		t.Fatalf("list %+v %v", l, err)
 	}
@@ -293,16 +293,20 @@ func TestBackfillImports(t *testing.T) {
 		t.Fatalf("list %+v %v", l, err)
 	}
 	if r := l[0]; r.CatalogSession != 3 || r.Outcome != ImportCancelled || r.Mode != "record" || r.SourceName != "lib" ||
-		r.Host != "" || r.Name != "" || r.Items != 1 || r.Existing != 1 || !r.FinishedAt.IsZero() {
+		r.Host != "" || r.Name != "" || r.KeepsItems() || r.Items != 0 || r.Existing != 1 || !r.FinishedAt.IsZero() {
 		t.Fatalf("unfinished session %+v", r)
 	}
 	if r := l[1]; r.CatalogSession != 1 || r.Outcome != ImportDone || !r.StartedAt.Equal(t0) ||
-		!r.FinishedAt.Equal(t0.Add(time.Minute)) || r.Imported != 2 || r.Duplicates != 1 || r.Skipped != 3 || r.Items != 2 {
+		!r.FinishedAt.Equal(t0.Add(time.Minute)) || r.Imported != 2 || r.Duplicates != 1 || r.Skipped != 3 || r.Items != 2 ||
+		r.Cover != 2 {
 		t.Fatalf("finished session %+v", r)
 	}
 	hs, _ := d.ImportHashes(ctx, l[1].ID)
 	if !reflect.DeepEqual(hs, []uint64{1, 2}) {
 		t.Fatalf("hashes %v", hs)
+	}
+	if hs, _ := d.ImportHashes(ctx, l[0].ID); len(hs) != 0 {
+		t.Fatalf("a record session kept items %v", hs)
 	}
 	if ok, err := d.ImportsBackfilled(ctx); err != nil || !ok {
 		t.Fatalf("backfilled %v %v", ok, err)
@@ -312,18 +316,165 @@ func TestBackfillImports(t *testing.T) {
 		t.Fatalf("second backfill %d %v", n, err)
 	}
 
-	// A database that already has records is only marked.
+	// Records written before the backfill (a rebuild's own record, say)
+	// do not prevent it; a session that is already a record (same catalog
+	// session, started within a minute) is not copied again.
 	d2 := openTest(t)
 	if _, err := d2.BeginImport(ctx, ImportRecord{Source: "/x", Mode: ImportModeRebuild}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := d2.BackfillImports(ctx, sessions); err != nil || n != 0 {
+	own, err := d2.BeginImport(ctx, ImportRecord{Source: "/src/a", Mode: ImportModeCopy, StartedAt: t0.Add(-20 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.FinishImport(ctx, own, ImportRecord{Outcome: ImportDone, CatalogSession: 1}, []ImportItem{{1, ItemImported}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := d2.BackfillImports(ctx, sessions); err != nil || n != 1 {
 		t.Fatalf("backfill with records %d %v", n, err)
 	}
 	if ok, _ := d2.ImportsBackfilled(ctx); !ok {
 		t.Fatal("not marked")
 	}
-	if l, _ := d2.ListImports(ctx); len(l) != 1 {
+	if l, _ := d2.ListImports(ctx); len(l) != 3 || l[1].CatalogSession != 3 {
 		t.Fatalf("list %+v", l)
+	}
+	// The same catalog session id an hour away is another session.
+	d3 := openTest(t)
+	other, _ := d3.BeginImport(ctx, ImportRecord{Source: "/src/b", Mode: ImportModeCopy, StartedAt: t0.Add(time.Hour)})
+	d3.FinishImport(ctx, other, ImportRecord{Outcome: ImportDone, CatalogSession: 1}, nil)
+	if n, err := d3.BackfillImports(ctx, sessions); err != nil || n != 2 {
+		t.Fatalf("backfill beside another catalog's session %d %v", n, err)
+	}
+	// A failed backfill leaves the marker unset.
+	d4 := openTest(t)
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := d4.BackfillImports(cctx, sessions); err == nil {
+		t.Fatal("cancelled backfill succeeded")
+	}
+	if ok, _ := d4.ImportsBackfilled(ctx); ok {
+		t.Fatal("marked after a failure")
+	}
+}
+
+func TestRebuildRecordsKeepNoItems(t *testing.T) {
+	ctx := context.Background()
+	d := openTest(t)
+	for _, mode := range []string{ImportModeRebuild, ImportModeRecord} {
+		id, err := d.BeginImport(ctx, ImportRecord{Source: "/lib", Mode: mode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.FinishImport(ctx, id, ImportRecord{Outcome: ImportDone, Existing: 2, Cover: 5},
+			[]ImportItem{{5, ItemExisting}, {6, ItemExisting}}); err != nil {
+			t.Fatal(err)
+		}
+		rec, err := d.GetImport(ctx, id)
+		if err != nil || rec.KeepsItems() || rec.Items != 0 || rec.Cover != 0 || rec.Existing != 2 {
+			t.Fatalf("%s record %+v %v", mode, rec, err)
+		}
+		var items sql.NullInt64
+		d.db.QueryRow("SELECT items FROM imports WHERE id = ?", id).Scan(&items)
+		if items.Valid {
+			t.Fatalf("%s record stores items %d", mode, items.Int64)
+		}
+		if hs, _ := d.ImportHashes(ctx, id); len(hs) != 0 {
+			t.Fatalf("%s record has items %v", mode, hs)
+		}
+	}
+	if refs, _ := d.ImportsOf(ctx, 5); len(refs) != 0 {
+		t.Fatalf("a rebuild names its items: %+v", refs)
+	}
+}
+
+func TestImportIDsNotReused(t *testing.T) {
+	ctx := context.Background()
+	d := openTest(t)
+	a, _ := d.BeginImport(ctx, ImportRecord{Source: "/a", Mode: ImportModeCopy})
+	b, _ := d.BeginImport(ctx, ImportRecord{Source: "/b", Mode: ImportModeCopy})
+	if err := d.DeleteImport(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	c, err := d.BeginImport(ctx, ImportRecord{Source: "/c", Mode: ImportModeCopy})
+	if err != nil || c <= b || a >= b {
+		t.Fatalf("ids %d %d, then %d after deleting the newest: %v", a, b, c, err)
+	}
+}
+
+func TestCrashedImports(t *testing.T) {
+	ctx := context.Background()
+	d := openTest(t)
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	d.now = func() time.Time { return now }
+	crashed, _ := d.BeginImport(ctx, ImportRecord{Source: "/media/phone/DCIM", Mode: ImportModeCopy})
+	if err := d.SetImportSession(ctx, crashed, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetImportSession(ctx, 999, 9); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session of unknown: %v", err)
+	}
+	rebuild, _ := d.BeginImport(ctx, ImportRecord{Source: "/lib", Mode: ImportModeRebuild})
+	done, _ := d.BeginImport(ctx, ImportRecord{Source: "/x", Mode: ImportModeCopy})
+	d.FinishImport(ctx, done, ImportRecord{Outcome: ImportDone}, nil)
+	run, err := d.RunningImports(ctx)
+	if err != nil || len(run) != 2 || run[0].ID != crashed || run[0].CatalogSession != 9 || run[1].ID != rebuild {
+		t.Fatalf("running %+v %v", run, err)
+	}
+	now = now.Add(time.Hour)
+	if ok, err := d.CloseCrashedImport(ctx, crashed, []uint64{3, 4}, 3); err != nil || !ok {
+		t.Fatalf("close %v %v", ok, err)
+	}
+	rec, _ := d.GetImport(ctx, crashed)
+	if rec.Outcome != ImportFailed || !rec.FinishedAt.Equal(now) || rec.Imported != 2 || rec.Items != 2 || rec.Cover != 3 {
+		t.Fatalf("closed %+v", rec)
+	}
+	if hs, _ := d.ImportHashes(ctx, crashed); !reflect.DeepEqual(hs, []uint64{3, 4}) {
+		t.Fatalf("items %v", hs)
+	}
+	if ok, _ := d.CloseCrashedImport(ctx, crashed, nil, 0); ok {
+		t.Fatal("closed twice")
+	}
+	if ok, _ := d.CloseCrashedImport(ctx, done, nil, 0); ok {
+		t.Fatal("closed a finished record")
+	}
+	if ok, err := d.CloseCrashedImport(ctx, rebuild, []uint64{3}, 0); err != nil || !ok {
+		t.Fatalf("close rebuild %v %v", ok, err)
+	}
+	if rec, _ := d.GetImport(ctx, rebuild); rec.Outcome != ImportFailed || rec.Items != 0 || rec.Imported != 0 {
+		t.Fatalf("closed rebuild %+v", rec)
+	}
+	if hs, _ := d.ImportHashes(ctx, rebuild); len(hs) != 0 {
+		t.Fatalf("rebuild items %v", hs)
+	}
+}
+
+// TestConcurrentFirstOpens: two opens of a version-2 file at once both
+// succeed (each backup copy has a name of its own) and one copy is left.
+func TestConcurrentFirstOpens(t *testing.T) {
+	ctx := context.Background()
+	for round := 0; round < 5; round++ {
+		dir := t.TempDir()
+		p := filepath.Join(dir, FileName)
+		v2Schema(t, p)
+		errs := make(chan error, 2)
+		for range 2 {
+			go func() {
+				d, err := Open(ctx, p)
+				if err == nil {
+					d.Close()
+				}
+				errs <- err
+			}()
+		}
+		for range 2 {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+		baks, _ := filepath.Glob(filepath.Join(dir, "user.db.bak-*"))
+		if len(baks) != 1 {
+			t.Fatalf("round %d: backups %v", round, baks)
+		}
 	}
 }

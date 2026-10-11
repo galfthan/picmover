@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"picmover/internal/catalog"
 	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/userdata"
@@ -99,14 +101,18 @@ Exit status as for import.`,
 			out := cmd.OutOrStdout()
 			// user.db is read before the backup: an unreadable one must
 			// never leave the library without its catalog.
-			if p.trashTimes, err = trashTimes(ctx, root); err != nil {
+			var migrated string
+			if p.trashTimes, migrated, err = trashTimes(ctx, root); err != nil {
 				return err
 			}
-			if hasCatalog {
-				// The old catalog's import sessions go into the import
-				// history before the catalog is renamed away.
-				backfillBeforeRebuild(ctx, root, dbPath)
+			if migrated != "" {
+				fmt.Fprintln(out, migrated)
 			}
+			// The old catalog's import sessions go into the import history
+			// before the catalog is renamed away, and the records of runs
+			// that died are closed with its rows; the rebuild's own record
+			// is begun only after this.
+			prepareHistory(ctx, root, dbPath, hasCatalog, cmd.ErrOrStderr())
 			if hasCatalog {
 				backup, err := backupCatalog(dbPath, time.Now())
 				if err != nil {
@@ -134,33 +140,61 @@ Exit status as for import.`,
 }
 
 // trashTimes reads the trash timestamps from the library's user.db, or
-// returns nil when there is none (it is not created).
-func trashTimes(ctx context.Context, root string) (map[uint64]time.Time, error) {
+// returns nil when there is none (it is not created). Opening it upgrades
+// an older user.db: migrated is then the notice to print, else "".
+func trashTimes(ctx context.Context, root string) (times map[uint64]time.Time, migrated string, err error) {
 	p := filepath.Join(root, userdata.FileName)
 	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, "", nil
 	}
 	u, err := userdata.Open(ctx, p)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer u.Close()
-	return u.TrashedAt(ctx, nil)
+	if from, bak := u.Migrated(); from != 0 {
+		migrated = migrationNotice(from, bak)
+	}
+	times, err = u.TrashedAt(ctx, nil)
+	return times, migrated, err
 }
 
-// backfillBeforeRebuild copies the import sessions of the catalog at
-// dbPath into the import history of the library's user.db the first time
-// (importrec.Backfill), before a rebuild replaces the catalog. It is best
-// effort: a catalog of another format or any failure only means no
-// backfill. A missing user.db is created (the rebuild's record would
-// create it anyway).
-func backfillBeforeRebuild(ctx context.Context, root, dbPath string) {
+// migrationNotice is the line printed when opening user.db upgraded it.
+func migrationNotice(from int, backup string) string {
+	return fmt.Sprintf("user.db upgraded from schema version %d to %d (the old file is kept as %s)",
+		from, userdata.SchemaVersion, filepath.Base(backup))
+}
+
+// prepareHistory readies the import history of the library's user.db
+// before a rebuild replaces the catalog at dbPath (hasCatalog: it
+// exists): the old catalog's import sessions are copied the first time
+// (importrec.BackfillFile, reading the catalog only, schema version 2 or
+// 3), and the records left running by a process that died are closed
+// with the rows of their session in it (the rebuild holds the library
+// lock, so none is a live run's). A missing user.db is created (the
+// rebuild's record would create it anyway). Nothing here fails the
+// rebuild: a failure is printed as a warning on errOut and the backfill
+// is tried again on the next open, since its marker is set only on
+// success.
+func prepareHistory(ctx context.Context, root, dbPath string, hasCatalog bool, errOut io.Writer) {
 	u, err := userdata.Open(ctx, filepath.Join(root, userdata.FileName))
 	if err != nil {
+		fmt.Fprintf(errOut, "Warning: the import history could not be opened: %v\n", err)
 		return
 	}
 	defer u.Close()
-	importrec.BackfillFile(ctx, dbPath, u) // the catalog is read only, never written
+	var rows importrec.SessionRows
+	if hasCatalog {
+		if _, err := importrec.BackfillFile(ctx, dbPath, u); err != nil {
+			fmt.Fprintf(errOut, "Warning: the old catalog's import sessions could not be copied into the import history: %v\n", err)
+		}
+		rows = func(ctx context.Context, session int64) ([]uint64, uint64, error) {
+			return catalog.SessionHashesFile(ctx, dbPath, session)
+		}
+	}
+	if _, err := importrec.CloseCrashed(ctx, u, rows, nil, nil); err != nil {
+		fmt.Fprintf(errOut, "Warning: the records of interrupted imports could not be closed: %v\n", err)
+	}
 }
 
 // missingCatalogNote describes a rebuild of a library that has no media.db
