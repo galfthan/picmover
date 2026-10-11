@@ -146,7 +146,7 @@ func New(opts Options) (*Server, error) {
 		log:     log,
 		static:  opts.Static,
 		guard:   g,
-		large:   newLargeDeriver(),
+		large:   newLargeDeriver(log),
 
 		bodyTimeout: bodyReadTimeout,
 	}
