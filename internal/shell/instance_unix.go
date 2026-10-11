@@ -46,3 +46,7 @@ func lockInstance(configDir string) (release func(), err error) {
 
 // allowForeground is a Windows matter.
 func allowForeground(pid int) {}
+
+// isSharingViolation: only Windows refuses a rename over a file another
+// process holds open.
+func isSharingViolation(error) bool { return false }

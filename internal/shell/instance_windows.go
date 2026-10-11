@@ -40,3 +40,10 @@ func allowForeground(pid int) {
 		procAllowSetForegroundWindow.Call(uintptr(pid))
 	}
 }
+
+// isSharingViolation reports the errors a rename over a file gives while
+// another process (an antivirus, the indexer) holds it open.
+func isSharingViolation(err error) bool {
+	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_LOCK_VIOLATION) ||
+		errors.Is(err, windows.ERROR_ACCESS_DENIED)
+}

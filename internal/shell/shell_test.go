@@ -124,7 +124,7 @@ func TestBrowserCommands(t *testing.T) {
 	path["chromium"] = "/usr/bin/chromium"
 	started = nil
 	if err := l.openApp(u); err != nil || len(started) != 1 ||
-		started[0] != "/usr/bin/chromium --app="+u+" --user-data-dir=/cache/picmover/app-profile" {
+		started[0] != "/usr/bin/chromium --app="+u+" --user-data-dir=/cache/picmover/app-profile --no-first-run --no-default-browser-check" {
 		t.Fatalf("app mode %v %v", started, err)
 	}
 	// "Open in browser" always uses the default browser.
@@ -450,7 +450,8 @@ func TestRunSingleInstance(t *testing.T) {
 	var app map[string]any
 	json.NewDecoder(resp.Body).Decode(&app)
 	resp.Body.Close()
-	if app["app"] != true || app["workspace"] != ws || app["platform"] != runtime.GOOS || app["window"] != false || app["version"] != "test" {
+	if app["app"] != true || app["workspace"] != ws || app["platform"] != runtime.GOOS || app["window"] != false || app["version"] != "test" ||
+		app["windowReason"] != server.WindowUnsupported {
 		t.Fatalf("/api/app %v", app)
 	}
 	mu.Lock()
@@ -499,8 +500,14 @@ func TestRunSingleInstance(t *testing.T) {
 	if err != nil || c.Workspace != ws || c.Port != in.Port || c.LastOpened == "" {
 		t.Fatalf("saved config %+v %v", c, err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, LogName)); !strings.Contains(string(b), "picmover-app stopped") {
+	b, _ := os.ReadFile(filepath.Join(dir, LogName))
+	if !strings.Contains(string(b), "picmover-app stopped") {
 		t.Fatalf("log:\n%s", b)
+	}
+	// The second instance wrote nothing to the first one's log (it takes
+	// the lock before opening the log, and reports on stderr).
+	if strings.Contains(string(b), "another instance") || strings.Count(string(b), "picmover-app starting") != 1 {
+		t.Fatalf("the second instance wrote to the log:\n%s", b)
 	}
 	// The lock is free again; no instance runs, so a hand-off fails.
 	release, err := lockInstance(dir)

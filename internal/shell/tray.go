@@ -75,7 +75,9 @@ func trayReady(h trayHooks) {
 	mChange := systray.AddMenuItem("Change workspace…", "Choose another folder of libraries")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem(quitLabel(h.jobCount()), "Quit picmover (running jobs are cancelled safely)")
-	systray.SetOnTapped(func() { go h.open() }) // Linux: a left click on the icon opens the window
+	// A left click on the icon opens the window (Windows and Linux); the
+	// menu is on the right click.
+	systray.SetOnTapped(func() { go h.open() })
 
 	go func() {
 		tick := time.NewTicker(trayRefresh)

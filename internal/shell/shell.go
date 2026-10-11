@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,9 +78,17 @@ type app struct {
 	cacheDir  string
 	log       *slog.Logger
 	browser   launcher
-	win       nativeWindow // nil: no native window
 	run       runner
 	token     string
+
+	// winMu guards win and winReason: the native window (nil: none) and
+	// why it is or is not used (server.WindowOK, ...). A window that
+	// fails is dropped for the rest of the run (WindowFailed).
+	winMu     sync.Mutex
+	win       nativeWindow
+	winReason string
+	// confirming is set while the tray's Quit question is shown.
+	confirming atomic.Bool
 
 	cfgMu sync.Mutex
 	cfg   Config
@@ -120,6 +129,29 @@ func Run(ctx context.Context, opts Options) (err error) {
 		fmt.Fprintf(stderr, "picmover-app: %v\n", err)
 		return err
 	}
+
+	// The single-instance lock comes before the log: a second instance
+	// never opens (or rotates) the first one's log file; it reports on
+	// stderr only (nothing on Windows, which has no console).
+	release, err := lockInstance(configDir)
+	if errors.Is(err, ErrRunning) {
+		fmt.Fprintln(stderr, "picmover-app: another instance is running; asking it to show its window")
+		hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := handOff(hctx, configDir, 5*time.Second); err != nil {
+			err = fmt.Errorf("picmover-app is already running but did not answer: %w", err)
+			fmt.Fprintf(stderr, "picmover-app: %v\n", err)
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		err = fmt.Errorf("single-instance lock: %w", err)
+		fmt.Fprintf(stderr, "picmover-app: %v\n", err)
+		return err
+	}
+	defer release()
+
 	logw, err := openLog(logPath(configDir), logMaxBytes, logKeep)
 	if err != nil {
 		fmt.Fprintf(stderr, "picmover-app: %v\n", err)
@@ -137,21 +169,6 @@ func Run(ctx context.Context, opts Options) (err error) {
 			fmt.Fprintf(stderr, "picmover-app: %v (log: %s)\n", err, logPath(configDir))
 		}
 	}()
-
-	release, err := lockInstance(configDir)
-	if errors.Is(err, ErrRunning) {
-		logger.Info("another instance is running; asking it to show its window")
-		hctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if err := handOff(hctx, configDir, 5*time.Second); err != nil {
-			return fmt.Errorf("picmover-app is already running but did not answer: %w", err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("single-instance lock: %w", err)
-	}
-	defer release()
 
 	a := &app{opts: opts, configDir: configDir, cacheDir: cacheDir, log: logger,
 		browser: newLauncher(runtime.GOOS, cacheDir), wsChanged: make(chan struct{}, 1), ready: make(chan struct{}),
@@ -193,10 +210,15 @@ func (a *app) main(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if w, ok, why := newNativeWindow(a.windowConfig()); ok && !a.opts.Browser {
-		a.win = w
-	} else if why != "" && !a.opts.Browser {
-		a.log.Warn("no native window; using the browser", "reason", why)
+	if a.opts.Browser {
+		a.setWindow(nil, server.WindowBrowserFlag)
+		a.log.Info("native window disabled (--browser)")
+	} else {
+		w, reason, detail := newNativeWindow(a.windowConfig())
+		a.setWindow(w, reason)
+		if w == nil && reason != server.WindowUnsupported {
+			a.log.Warn("no native window; using the browser", "reason", reason, "detail", detail)
+		}
 	}
 
 	switch {
@@ -238,6 +260,9 @@ func (a *app) main(ctx context.Context) error {
 	}
 	a.run = run
 	close(a.ready)
+	// Windows logoff or shutdown quits like the tray's Quit (a GUI process
+	// gets no console signals). In every mode, --browser included.
+	watchSessionEnd(a.log, a.sessionEnd)
 	a.log.Info(run.Banner(), "url", run.URL())
 	_, ps, _ := net.SplitHostPort(run.Addr())
 	actual, _ := strconv.Atoi(ps)
@@ -307,15 +332,10 @@ func (a *app) config() Config {
 // hooks are the server's /api/app callbacks.
 func (a *app) hooks() *server.AppHooks {
 	return &server.AppHooks{
-		Token:    a.token,
-		Version:  a.opts.Version,
-		Platform: runtime.GOOS,
-		Window: func() (bool, string) {
-			if a.win != nil {
-				return true, server.WindowOK
-			}
-			return false, server.WindowUnsupported
-		},
+		Token:       a.token,
+		Version:     a.opts.Version,
+		Platform:    runtime.GOOS,
+		Window:      a.windowState,
 		CloseToTray: func() bool { return a.config().CloseToTray },
 		OnOpen:      func() { <-a.ready; a.open("") },
 		OnQuit: func(force bool) error {
@@ -343,20 +363,56 @@ func (a *app) pageURL(fragment string) string { return a.run.URL() + fragment }
 // window.
 func (a *app) open(fragment string) {
 	u := a.pageURL(fragment)
-	if a.win != nil {
+	if w := a.window(); w != nil {
 		nav := ""
 		if fragment != "" {
 			nav = u
 		}
-		if err := a.win.Open(u, nav); err == nil {
+		err := w.Open(u, nav)
+		if err == nil {
 			return
-		} else {
-			a.log.Warn("the window could not be opened; using the browser", "err", err)
 		}
+		a.windowFailed(w, err)
 	}
 	if err := a.browser.openApp(u); err != nil {
 		a.log.Error("cannot open the browser", "url", u, "err", err)
 	}
+}
+
+// setWindow records the native window (nil: none) and the reason.
+func (a *app) setWindow(w nativeWindow, reason string) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	a.win, a.winReason = w, reason
+}
+
+// window is the native window in use, or nil.
+func (a *app) window() nativeWindow {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	return a.win
+}
+
+// windowState is GET /api/app's window and windowReason.
+func (a *app) windowState() (bool, string) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.winReason == "" {
+		return a.win != nil, server.WindowUnsupported
+	}
+	return a.win != nil, a.winReason
+}
+
+// windowFailed drops the native window w after it could not be created:
+// the browser is used for the rest of the run. Logged once.
+func (a *app) windowFailed(w nativeWindow, err error) {
+	a.winMu.Lock()
+	defer a.winMu.Unlock()
+	if a.win != w {
+		return // already dropped
+	}
+	a.win, a.winReason = nil, server.WindowFailed
+	a.log.Error("the native window could not be created; using the browser for the rest of this run", "err", err)
 }
 
 // openInBrowser opens the UI in the default browser.
@@ -388,25 +444,57 @@ func (a *app) windowClosed(size WindowSize) {
 // trayQuit is the tray's Quit: with a job running it asks first when the
 // window is open (Windows), else cancels the job like Ctrl+C in serve.
 func (a *app) trayQuit() {
-	if n := a.run.JobCount(); n > 0 && a.win != nil && a.win.IsOpen() {
-		if !confirmQuit(a.win.Handle(), n) {
-			return
+	if n := a.run.JobCount(); n > 0 {
+		if w := a.window(); w != nil && w.IsOpen() {
+			// One question at a time: further Quit clicks while it is up
+			// are ignored.
+			if !a.confirming.CompareAndSwap(false, true) {
+				return
+			}
+			ok := confirmQuitFn(w, n)
+			a.confirming.Store(false)
+			if !ok {
+				return
+			}
 		}
 	}
 	a.quit()
 }
 
+// confirmQuitFn asks the Quit question (a hook for tests).
+var confirmQuitFn = confirmQuit
+
+// sessionEndDeadline bounds the quit when Windows ends the session: the
+// system does not wait much longer before it shows the app as blocking.
+const sessionEndDeadline = 5 * time.Second
+
+// sessionEnd runs the quit sequence when the user logs off or Windows
+// shuts down, and returns when it finished or after sessionEndDeadline.
+func (a *app) sessionEnd() {
+	a.log.Info("the session is ending; quitting")
+	go a.quitWithin(sessionEndDeadline)
+	select {
+	case <-a.done:
+	case <-time.After(sessionEndDeadline):
+		a.log.Warn("the quit did not finish before the session ended")
+	}
+}
+
 // quit is the quit sequence (once): close the window, shut the server
 // down (cancelling a job, waiting up to 30 s for it), remove the instance
 // file and end the tray loop. Run returns afterwards.
-func (a *app) quit() {
+func (a *app) quit() { a.quitWithin(quitDeadline) }
+
+// quitWithin is quit with the shutdown bounded by deadline (the first
+// call's deadline wins).
+func (a *app) quitWithin(deadline time.Duration) {
 	a.quitOnce.Do(func() {
 		close(a.quitting)
 		a.log.Info("quitting", "jobs", a.run.JobCount())
-		if a.win != nil {
-			a.win.Close()
+		if w := a.window(); w != nil {
+			w.Close()
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), quitDeadline)
+		ctx, cancel := context.WithTimeout(context.Background(), deadline)
 		if err := a.run.Shutdown(ctx); err != nil {
 			a.log.Error("server stopped with an error", "err", err)
 		}
