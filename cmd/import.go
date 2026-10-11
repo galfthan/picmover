@@ -193,14 +193,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 			status = newStatusLine(out)
 		}
 		if status != nil {
-			// The transfer rate is measured between two ticks.
-			prevBytes, prevAt := int64(0), time.Now()
-			opts.OnProgress = func(s importer.Stats) {
-				now := time.Now()
-				rate := transferRate(s.BytesCopied-prevBytes, now.Sub(prevAt))
-				prevBytes, prevAt = s.BytesCopied, now
-				status.show(formatStatus(s, rate))
-			}
+			opts.OnProgress = func(s importer.Stats) { status.show(formatStatus(s)) }
 		}
 		if !p.recordInPlace {
 			// Content found in the trash is restored; its user.db trash
@@ -318,27 +311,18 @@ func redrawLine(line string, width int, vt bool) string {
 	return "\r" + strings.Repeat(" ", width) + "\r" + line
 }
 
-// formatStatus is the live status line of an import; rate is the current
-// transfer rate in bytes per second, shown only while bytes are moving.
-func formatStatus(s importer.Stats, rate int64) string {
+// formatStatus is the live status line of an import; the transfer rate
+// is shown only while bytes are moving.
+func formatStatus(s importer.Stats) string {
 	line := fmt.Sprintf("Scanned %d | Imported %d | Existing %d | Duplicates %d | Small %d | Non-media %d | Errors %d | Copied %s",
 		s.Scanned, s.Imported, s.Existing, s.Duplicates, s.SkippedSmall, s.NonMedia, s.Errors, humanSize(s.BytesCopied))
-	if rate > 0 {
-		line += " (" + humanSize(rate) + "/s)"
+	if s.Rate > 0 {
+		line += " (" + humanSize(s.Rate) + "/s)"
 	}
 	if n := thumbsProcessed(s); n > 0 {
 		line += fmt.Sprintf(" | Thumbs %d", n)
 	}
 	return line
-}
-
-// transferRate returns delta bytes over elapsed in bytes per second; 0
-// when nothing was copied (or a discarded copy was taken back).
-func transferRate(delta int64, elapsed time.Duration) int64 {
-	if delta <= 0 || elapsed <= 0 {
-		return 0
-	}
-	return int64(float64(delta) / elapsed.Seconds())
 }
 
 // thumbsProcessed is the number of rows the thumbnail stage has finished.

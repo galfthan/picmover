@@ -357,6 +357,8 @@ export interface JobStats {
   nonMedia: number;
   errors: number;
   bytesCopied: number;
+  /** Transfer rate in bytes per second; 0 when nothing is moving. */
+  rate: number;
   thumbsDone: number;
   thumbsUnsupported: number;
   thumbsFailed: number;

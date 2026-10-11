@@ -297,6 +297,23 @@ section is what the code does.
    `TestFSRootsGvfs`. `TestCrossDeviceMoveStagesOnce` and
    `TestForceCopyTakesCopyFirst` now expect two opens.
 
+### Transfer rate
+
+The rate is computed once, in the importer, and shown by the CLI and the
+web UI. `importer.Stats` has `Rate int64` (bytes per second). On every
+progress tick `startProgress` records the growth of `bytesCopied` since
+the previous tick (a negative delta, when a discarded staged file is
+subtracted, counts as 0) and stores the bytes over the time covered by
+the ticks of about the last two seconds (`rateWindow`, always at least the
+newest tick). The final `OnProgress` call reports 0; `Importer.Stats()`
+returns the last computed rate (0 without `OnProgress`). The CLI status
+line shows `(<humanSize>/s)` from `s.Rate` (its own delta computation,
+`transferRate`, is gone); the server job stats carry it as `rate` next to
+`bytesCopied`, and the import progress card shows `(12.3 MiB/s)` after
+the copied size while it is positive. Tests: `TestRateWindow`,
+`TestStatusTransferRate`, the final-progress check in
+`TestImportGeneratesThumbs`, and the web smoke test.
+
 Not changed in code:
 
 - A staged size that differs from the `Stat` size still fails that file

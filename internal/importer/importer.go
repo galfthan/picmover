@@ -89,6 +89,11 @@ type Result struct {
 type Stats struct {
 	Scanned, Imported, Existing, Duplicates, SkippedSmall, NonMedia, Errors int64
 	BytesCopied                                                             int64
+	// Rate is the transfer rate in bytes per second, BytesCopied's growth
+	// smoothed over about the last two seconds of progress ticks; 0 when
+	// nothing is moving, before the first tick, without OnProgress, and in
+	// the final OnProgress call.
+	Rate int64
 	// Thumbnail stage: rows that got renditions (ok), that cannot have
 	// any (unsupported), and that failed (error).
 	ThumbsDone, ThumbsUnsupported, ThumbsFailed int64
@@ -182,6 +187,7 @@ type Importer struct {
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
+	rate                                                                               atomic.Int64 // last computed Stats.Rate
 }
 
 // pending is a file that is fully on disk in the library and waits for the
@@ -377,9 +383,11 @@ func (im *Importer) startProgress() (stop func()) {
 		defer close(done)
 		t := time.NewTicker(im.opts.ProgressInterval)
 		defer t.Stop()
+		w := rateWindow{span: rateSpan, prevBytes: im.bytesCopied.Load(), prevAt: time.Now()}
 		for {
 			select {
-			case <-t.C:
+			case now := <-t.C:
+				im.rate.Store(w.add(now, im.bytesCopied.Load()))
 				im.opts.OnProgress(im.Stats())
 			case <-stopc:
 				return
@@ -389,8 +397,53 @@ func (im *Importer) startProgress() (stop func()) {
 	return func() {
 		close(stopc)
 		<-done
+		im.rate.Store(0)
 		im.opts.OnProgress(im.Stats())
 	}
+}
+
+// rateSpan is about how far back the transfer rate looks.
+const rateSpan = 2 * time.Second
+
+// rateWindow computes the transfer rate from the BytesCopied of
+// successive progress ticks: the bytes added over the ticks of about the
+// last span, divided by the time those ticks cover. A tick whose
+// BytesCopied went down (a discarded staged file was subtracted) adds 0.
+type rateWindow struct {
+	span      time.Duration
+	prevBytes int64
+	prevAt    time.Time
+	ticks     []rateTick
+}
+
+type rateTick struct {
+	start time.Time     // the previous tick
+	dur   time.Duration // since the previous tick
+	bytes int64         // bytes added since the previous tick, >= 0
+}
+
+// add records a tick at now with the counter at bytes and returns the
+// rate in bytes per second.
+func (w *rateWindow) add(now time.Time, bytes int64) int64 {
+	d := max(bytes-w.prevBytes, 0)
+	w.ticks = append(w.ticks, rateTick{start: w.prevAt, dur: now.Sub(w.prevAt), bytes: d})
+	w.prevBytes, w.prevAt = bytes, now
+	// Keep the ticks that start within span (always the newest one).
+	i := 0
+	for i < len(w.ticks)-1 && now.Sub(w.ticks[i].start) > w.span {
+		i++
+	}
+	w.ticks = append(w.ticks[:0], w.ticks[i:]...)
+	var sum int64
+	var dur time.Duration
+	for _, t := range w.ticks {
+		sum += t.bytes
+		dur += t.dur
+	}
+	if sum <= 0 || dur <= 0 {
+		return 0
+	}
+	return int64(float64(sum) / dur.Seconds())
 }
 
 // RecordStageDone reports whether Run finished its copy (or record) stage:
@@ -415,6 +468,7 @@ func (im *Importer) Stats() Stats {
 		NonMedia:     im.nonMedia.Load(),
 		Errors:       im.errs.Load(),
 		BytesCopied:  im.bytesCopied.Load(),
+		Rate:         im.rate.Load(),
 
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),

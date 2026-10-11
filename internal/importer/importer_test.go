@@ -875,7 +875,7 @@ func TestImportGeneratesThumbs(t *testing.T) {
 	if st.Imported != 3 || st.ThumbsDone != 3 || st.ThumbsUnsupported != 0 || st.ThumbsFailed != 0 {
 		t.Fatalf("stats = %+v", st)
 	}
-	if last.ThumbsDone != 3 {
+	if last.ThumbsDone != 3 || last.Rate != 0 {
 		t.Errorf("last progress = %+v", last)
 	}
 	store := openStore(t, e.lib)
@@ -1046,5 +1046,34 @@ func TestRebuildReusesThumbCache(t *testing.T) {
 		if fi, err := os.Stat(store.PreviewPath(m.Hash)); err != nil || !fi.ModTime().Equal(mtimes[rel]) {
 			t.Errorf("%s: preview rewritten (%v)", rel, err)
 		}
+	}
+}
+
+func TestRateWindow(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	at := func(ms int) time.Time { return t0.Add(time.Duration(ms) * time.Millisecond) }
+	w := rateWindow{span: 2 * time.Second, prevAt: t0}
+	// 1 MiB every 500 ms: 2 MiB/s.
+	for i := 1; i <= 4; i++ {
+		if got := w.add(at(500*i), int64(i)<<20); got != 2<<20 {
+			t.Fatalf("tick %d: rate = %d", i, got)
+		}
+	}
+	// A discarded staged file takes bytes back: the tick adds 0, the
+	// window (last 2 s) now holds 3 MiB.
+	if got := w.add(at(2500), 3<<20); got != 3<<20*2/4 {
+		t.Errorf("after a negative delta: rate = %d", got)
+	}
+	// Idle ticks push the moving ones out of the window.
+	var got int64
+	for ms := 3000; ms <= 4500; ms += 500 {
+		got = w.add(at(ms), 3<<20)
+	}
+	if got != 0 {
+		t.Errorf("idle rate = %d", got)
+	}
+	// Ticks wider than the window still give a rate.
+	if got := w.add(at(9500), 8<<20); got != 1<<20 {
+		t.Errorf("long tick rate = %d", got)
 	}
 }

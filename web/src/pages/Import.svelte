@@ -124,7 +124,7 @@
       ['Skipped (small)', formatCount(s.skippedSmall)],
       ['Non-media', formatCount(s.nonMedia)],
       ['Errors', formatCount(s.errors)],
-      ['Copied', formatBytes(s.bytesCopied)],
+      ['Copied', formatBytes(s.bytesCopied) + (s.rate > 0 ? ` (${formatBytes(s.rate)}/s)` : '')],
     ] as const;
   });
   // ---- Destination (shown on every state) ----

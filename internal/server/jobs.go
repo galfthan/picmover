@@ -92,6 +92,7 @@ type statsJSON struct {
 	NonMedia          int64 `json:"nonMedia"`
 	Errors            int64 `json:"errors"`
 	BytesCopied       int64 `json:"bytesCopied"`
+	Rate              int64 `json:"rate"` // bytes per second, 0 when idle
 	ThumbsDone        int64 `json:"thumbsDone"`
 	ThumbsUnsupported int64 `json:"thumbsUnsupported"`
 	ThumbsFailed      int64 `json:"thumbsFailed"`
@@ -101,6 +102,7 @@ func newStats(s importer.Stats) statsJSON {
 	return statsJSON{
 		Scanned: s.Scanned, Imported: s.Imported, Existing: s.Existing, Duplicates: s.Duplicates,
 		SkippedSmall: s.SkippedSmall, NonMedia: s.NonMedia, Errors: s.Errors, BytesCopied: s.BytesCopied,
+		Rate:       s.Rate,
 		ThumbsDone: s.ThumbsDone, ThumbsUnsupported: s.ThumbsUnsupported, ThumbsFailed: s.ThumbsFailed,
 	}
 }

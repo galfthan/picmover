@@ -89,7 +89,7 @@
       <div class="stat"><span class="v">{formatCount(s.duplicates)}</span><span class="k">Duplicates</span></div>
       <div class="stat"><span class="v">{formatCount(s.skippedSmall)}</span><span class="k">Skipped (small)</span></div>
       <div class="stat" class:bad={s.errors > 0}><span class="v">{formatCount(s.errors)}</span><span class="k">Errors</span></div>
-      <div class="stat"><span class="v">{formatBytes(s.bytesCopied)}</span><span class="k">Copied</span></div>
+      <div class="stat"><span class="v">{formatBytes(s.bytesCopied)}{#if s.rate > 0}{' '}<span class="rate">({formatBytes(s.rate)}/s)</span>{/if}</span><span class="k">Copied</span></div>
     </div>
   {/if}
   {#if job.kind === 'rebuild'}
@@ -137,6 +137,12 @@
     height: 100%;
     background: var(--accent);
     transition: width 0.25s;
+  }
+  .rate {
+    font-size: 0.7em;
+    font-weight: 400;
+    color: var(--muted);
+    white-space: nowrap;
   }
   .sub {
     margin: 16px 0 8px;
