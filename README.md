@@ -110,7 +110,15 @@ Flags:
 
 **Workspaces.** `picmover serve /media`, where `/media` holds libraries as subfolders (`/media/peter`, `/media/penny`), serves all of them: the browser starts with a page listing the libraries (cover, counts, date span, state), opens any of them, creates new ones, and records a plain subfolder in place (the same as `picmover rebuild`) so it becomes a library. The folder is served as a workspace when it has no `media.db` itself and at least one subfolder has one, or with `--workspace`; it prints `Serving workspace /media (N libraries) at ...`. Each library is locked only once it is opened in the browser, so the others stay free for the CLI; a library in use by another picmover process is shown with that process. `picmover serve /media/peter` still serves one library.
 
-**Ratings, tags, albums, trash.** Select photos in the grid (checkbox, Ctrl/Cmd-click, Shift-click for a range) or use the lightbox to rate (0–5), tag, add to albums, or move to the trash. This user data lives in `<library>/user.db`, keyed by content hash; `rebuild` never touches it, so back it up with your photos. Deleting moves a file to `<library>/.picmover/trash/` (a rename on the same volume, never a copy) and hides it; restore puts it back (under `name_1.ext` when the original name is taken meanwhile). Emptying the trash, after an explicit confirmation, is the only way picmover deletes a file. The filters gain minimum rating, tags, album and "every year" date ranges (for example 24–26 December of every year).
+**Ratings, tags, albums, trash.** Select photos in the grid (checkbox, Ctrl/Cmd-click, Shift-click for a range) or use the lightbox to rate (0–5), tag, add to albums, or move to the trash. This user data lives in `<library>/user.db`, keyed by content hash; `rebuild` never changes it (it only adds its import record), so back it up with your photos. Deleting moves a file to `<library>/.picmover/trash/` (a rename on the same volume, never a copy) and hides it; restore puts it back (under `name_1.ext` when the original name is taken meanwhile). Emptying the trash, after an explicit confirmation, is the only way picmover deletes a file. The filters gain minimum rating, tags, album and "every year" date ranges (for example 24–26 December of every year).
+
+**Import history.** Every import and rebuild is remembered in `user.db` (so a `rebuild` never loses it): when it ran, where the files came from, how it went, and which pictures it brought in. The Imports page lists the records newest first; one click shows an import's pictures in the grid (the `import` filter), where a record can be renamed or deleted (deleting a record never touches a file). The detail panel says when and from where a picture was imported. `import` and `rebuild` print the record's id (`Import record: #12`); a record that cannot be written never fails the import (the summary and the log say so). The first time this version opens a library (`serve`, `import`, `rebuild`, `imports`), the imports its catalog remembers are copied into the history.
+
+```
+./picmover imports /path/to/library                      # list: id, start, mode, outcome, source, counts, bytes, name
+./picmover imports /path/to/library --rename 12 "Phone, summer"   # an empty name clears it
+./picmover imports /path/to/library --delete 12          # forgets the record; the files stay
+```
 
 **Near-duplicates.** The Duplicates page runs a job that compares the perceptual hashes computed with the thumbnails (Hamming distance 1–7, default 6; 136k photos take well under 10 s) and shows groups of similar photos: keep one and trash the rest, or ignore the group.
 
@@ -149,7 +157,7 @@ To recreate the catalog from the files in the library:
 
 The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet`, `--no-thumbs` as for `import`.
 
-Files in the trash (`.picmover/trash/`) are recorded as trashed, with the time they were trashed from `user.db` (else their modification time); `user.db` itself is never changed. A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
+Files in the trash (`.picmover/trash/`) are recorded as trashed, with the time they were trashed from `user.db` (else their modification time); the ratings, tags and albums in `user.db` are never changed, and the rebuild is recorded in its import history (mode `rebuild`). A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
 
 To undo a rebuild, delete the new `media.db` (and its `-wal`/`-shm`) and rename the newest `media.db.bak-<timestamp>` files back to `media.db`. If `media.db` is missing but backups exist, `rebuild` names the newest one before recording the files, so a backup that should have been restored is noticed. To move stray files into the layout instead, use `picmover import <library> <library>`.
 
@@ -231,7 +239,7 @@ A backup set belongs to one library, and remembers which copy of it wrote it las
 
 Exit status of `backup`, `scrub`, `prune`, `restore` and `targets`: 0 when everything was verified; 1 when some files failed (listed), a scrub found damage, `--partial` left files, or a backup could not read a library folder or found catalog files missing; 2 when the target or the library could not be used (including usage errors); 130 when cancelled. That makes them suitable for cron or Task Scheduler. In the browser, the Backups page does the same as jobs.
 
-The first command of this version that opens a library's `user.db` upgrades it to schema version 2 (backup targets and a library id); a copy of the old file is kept as `user.db.bak-<time>`. Older picmover versions refuse the upgraded file.
+The first command of this version that opens a library's `user.db` upgrades it to schema version 3 (version 2: backup targets and a library id; version 3: the import history); a copy of the old file is kept as `user.db.bak-<time>`. Older picmover versions refuse the upgraded file.
 
 Usage errors (a missing argument, an unknown flag) end with a hint such as `see 'picmover import --help'`. Empty arguments (for example an unset shell variable) are rejected.
 
@@ -243,7 +251,7 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
   image_raw/YYYY/MM/<name>
   video/YYYY/MM/<name>
   media.db              catalog (derived from the files; rebuild recreates it)
-  user.db               ratings, tags, albums, trash times (never rebuilt; back it up)
+  user.db               ratings, tags, albums, trash times, import history (never rebuilt; back it up)
   .picmover/trash/      trashed files, under their library path
   .picmover/thumbs.db   thumbnail cache (256 px JPEGs, keyed by content hash)
   .picmover/previews/   preview cache (1600 px JPEGs, <hh>/<hash>.jpg)

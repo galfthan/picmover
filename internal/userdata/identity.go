@@ -134,12 +134,15 @@ func (d *DB) PeekIdentity(ctx context.Context) (Identity, error) {
 
 // ErrNeedsMigration: OpenReadOnly found a user.db of schema version 1,
 // which a command that writes would upgrade first.
-var ErrNeedsMigration = errors.New("user.db has schema version 1 and would be upgraded to version 2 first (a run without --dry-run does that)")
+var ErrNeedsMigration = fmt.Errorf("user.db has schema version 1 and would be upgraded to version %d first (a run without --dry-run does that)", SchemaVersion)
 
 // OpenReadOnly opens an existing user.db read-only (SQLite mode=ro; its
 // WAL is read, nothing is written, nothing is created or migrated). A
 // missing file is fs.ErrNotExist, version 1 ErrNeedsMigration, another
-// version a *VersionError.
+// version a *VersionError. A version-2 file is opened as it is: it has
+// the identity and the backup targets (all a read-only caller, the
+// backup dry run, reads), but not the import history, whose methods fail
+// on it.
 func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -161,7 +164,7 @@ func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
 	switch {
 	case err != nil:
 		err = fmt.Errorf("userdata: open %s: %w", path, err)
-	case v == SchemaVersion:
+	case v == SchemaVersion, v == 2:
 		return d, nil
 	case v == 1:
 		err = ErrNeedsMigration
@@ -178,7 +181,7 @@ func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
 
 // IntegrityCheck checks the user.db file at path read-only: PRAGMA
 // integrity_check reports ok and its schema version is one this picmover
-// reads (1, which Open migrates, or SchemaVersion).
+// reads (an older one, which Open migrates, or SchemaVersion).
 func IntegrityCheck(ctx context.Context, path string) error {
 	sqldb, err := openReadOnly(path)
 	if err != nil {
@@ -189,7 +192,7 @@ func IntegrityCheck(ctx context.Context, path string) error {
 	if err := sqldb.QueryRowContext(ctx, `SELECT user_version FROM pragma_user_version`).Scan(&v); err != nil {
 		return fmt.Errorf("userdata: check %s: %w", path, err)
 	}
-	if v != 1 && v != SchemaVersion {
+	if !migratable(v) && v != SchemaVersion {
 		return fmt.Errorf("userdata: %s: %w", path, &VersionError{Version: v})
 	}
 	rows, err := sqldb.QueryContext(ctx, `PRAGMA integrity_check`)

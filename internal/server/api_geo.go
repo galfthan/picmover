@@ -102,7 +102,7 @@ func (s *Server) geoFilter(w http.ResponseWriter, r *http.Request, l *libHandles
 		return f, b, false
 	}
 	if err := resolveFilter(r.Context(), l, &f, uf); err != nil {
-		s.internalError(w, r, err)
+		s.filterError(w, r, err)
 		return f, b, false
 	}
 	return f, b, true

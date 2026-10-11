@@ -161,6 +161,181 @@ mode, source name, imported/existing/duplicates/errors, bytes, name).
 Cross-library import history, re-running an import, editing items, moving
 items between imports, and statistics over time.
 
+## As implemented (backend)
+
+Branch `feat/import-history-backend` (from `feat/phone-import` at
+a02f117).
+
+### Code
+
+- `internal/userdata/userdata.go`: `SchemaVersion = 3`, `schemaV3`. The
+  migration is one function, `migrate`, driven by a `migrations` table
+  (1 → 2: `backup_targets`, `meta`, identity; 2 → 3: `imports`,
+  `import_items`): one `user.db.bak-<stamp>` copy, one transaction,
+  version re-checked inside it (another process that migrated meanwhile
+  wins and the copy is removed), steps in order, `user_version` last.
+  `Migrated()` reports the version migrated from (1 or 2). `CheckFile`,
+  `IntegrityCheck` accept 1, 2 and 3; `PeekBackupSummary` reads 2 and 3.
+  A file of version 4 or more is refused as before (`VersionError`, file
+  untouched); `OpenReadOnly` (backup dry run) opens a version-2 file as
+  it is (it has the identity and the targets it reads), version 1 is
+  still `ErrNeedsMigration`.
+- `internal/userdata/imports.go`: the record API (below), `CleanImportName`
+  (trimmed, ≤ 200 runes, no control characters, empty allowed),
+  constants for modes, outcomes and item statuses, `BackfillImports` and
+  `ImportsBackfilled`.
+- `internal/catalog`: `Sessions` (every session with its counters and the
+  hashes of its rows, trashed included, row id order) and `SessionsFile`
+  (the same on a catalog file opened read-only like `PeekFile`: nothing is
+  written or checkpointed; a rebuild reads the old catalog with it).
+- `internal/importer`: `Result.Hash` (imported, existing, restored,
+  duplicate; 0 otherwise) and `Result.Restored` (an imported result that
+  restored trashed content). Results of rows whose insert was undone are
+  duplicates or errors, so never become items.
+- `internal/importrec` (new): `Recorder` (`Begin`, `OnResult`, `Finish`,
+  `ID`, `Err`), `ItemStatus`, `Outcome` (done for success and for a
+  failed thumbnail stage, cancelled, failed), `Backfill(catalog, user)`,
+  `BackfillFile(path, user)`. Shared by the CLI and the server. Every
+  write failure is logged at error level and kept in `Err`; nothing in it
+  fails an import.
+- `cmd/import.go`: opens (creating) user.db, backfills from the live
+  catalog (not for a rebuild), begins the record before `importer.Run`,
+  finishes it after, whatever the outcome (a rebuild whose record stage
+  did not finish is `failed` or `cancelled`), and prints `Import record:
+  #N`, or `Import record: could not be written (<reason>; see the log)`.
+  `cmd/rebuild.go` backfills from the old catalog, read-only, before its
+  backup. `cmd/imports.go`: the `imports` command.
+- `internal/server`: `api_imports.go` (endpoints), the `import=` filter in
+  `parseFilter`/`resolveFilter` (`filterError` answers 404), the detail's
+  `imports`, the job's `importId` (`beginRecord`/`finishRecord` in
+  `jobs.go`, for import and rebuild jobs), the backfill in `ws.open` and in
+  `New` (single mode), and `runRebuild` backfills from the old catalog
+  before its backup.
+
+### userdata API (deviations from the contract)
+
+```go
+func (d *DB) BeginImport(ctx, rec ImportRecord) (int64, error)  // StartedAt zero: now; SourceName empty: base of Source
+func (d *DB) FinishImport(ctx, id int64, rec ImportRecord, items []ImportItem) error // ErrNotFound when deleted meanwhile; a repeated hash keeps its first status
+func (d *DB) ListImports(ctx) ([]ImportSummary, error)            // started_at DESC, id DESC
+func (d *DB) GetImport(ctx, id) (ImportRecord, error)             // ErrNotFound
+func (d *DB) ImportHashes(ctx, id) ([]uint64, error)              // insertion order
+func (d *DB) RenameImport(ctx, id, name string) (ImportRecord, error) // returns the record (the contract had error only)
+func (d *DB) DeleteImport(ctx, id) error                          // ErrNotFound
+func (d *DB) ImportsOf(ctx, hash) ([]ImportRecord, error)         // newest first
+func (d *DB) ImportsBackfilled(ctx) (bool, error)
+func (d *DB) BackfillImports(ctx, []BackfillSession) (int, error) // the transaction of "Backfill"
+```
+
+`Result.Restored` is new: `Result` alone did not tell a restore from an
+import (only by its message).
+
+### JSON (what the frontend uses)
+
+Import object (`GET imports` items, `GET imports/{iid}`, the answer of
+`POST imports/{iid}`):
+
+```json
+{"id": 12, "name": "", "startedAt": "2026-10-11T09:30:00+03:00",
+ "finishedAt": "2026-10-11T09:41:12+03:00", "source": "/media/u/phone/DCIM",
+ "sourceName": "DCIM", "mode": "copy", "host": "box", "outcome": "done",
+ "imported": 120, "existing": 3, "duplicates": 7, "skipped": 2, "errors": 1,
+ "bytes": 734003200, "items": 123, "cover": "00ab34cd56ef7890"}
+```
+
+- Times are RFC 3339 in the server's zone; `finishedAt` is `null` while
+  running or for a record never finished (outcome `running`).
+- `mode`: `copy`, `move`, `rebuild`, or `record` (a rebuild session
+  backfilled from the catalog, under its catalog name).
+- `host` is `""` for backfilled records.
+- `items` is the number of the record's items that are live catalog rows
+  now, and `cover` the newest of them by capture time as 16 hex digits,
+  or `null` when none is live: exactly the album rules (`LiveHashes`,
+  `NewestOf`). The contract said "0 if none" and "has a thumbnail"; the
+  album cover does not check the thumbnail, so neither does this.
+- `GET imports` → `{"imports": [...]}`, newest first. `GET imports/{iid}`
+  → the bare object.
+- `POST imports/{iid}` `{"name": "..."}` → 200, the object. A missing
+  `name` is 400 `name is required`; a name over 200 characters or with
+  control characters is 400 `invalid name: ...`.
+- `POST imports/{iid}/delete` `{}` → 200 `{}`.
+- Unknown or malformed `{iid}` → 404 `{"error": ...}` (`not found:
+  import 12`, or `no such import` for a malformed id), as for albums.
+- `GET media/{id}` gains `"imports": [{"id", "name", "startedAt", "mode",
+  "sourceName"}]`, newest first, `[]` when none (`sourceName` added for
+  the "Imported <date> from <source name>" line).
+- Grid filter `import=<iid>` on `timeline`, `media`, `geo`, `geo/items`:
+  a malformed value is 400 `invalid import ...`, an unknown id 404
+  `{"error": "no such import"}` (unlike `album=`, whose unknown id gives
+  an empty grid, unchanged). It intersects with `album`, `tag` and
+  `rating`.
+- Job object: `"importId": <number>|null` for import and rebuild jobs,
+  set before the running state is published; `null` for other kinds and
+  when the record could not be begun.
+
+### CLI
+
+`picmover imports <library>` prints `Library: <path>` and a table `ID
+STARTED MODE OUTCOME SOURCE IMPORTED EXISTING DUPLICATES ERRORS BYTES
+NAME` (an OUTCOME column beyond the contract: a crashed import shows
+`running`). `--rename <id> <name>` (an empty name clears it) and
+`--delete <id>`. It opens the library without the lock (as `targets`) and
+backfills too. Exit status 2 for usage errors and unknown ids, like the
+backup management commands.
+
+### Other deviations and notes
+
+- `import` now creates `user.db` when a library has none (the record
+  needs it); before, it only opened an existing one for a trash restore.
+- The backfill also runs in `imports` and in the server's rebuild job
+  (before the backup, read-only), not only on open. A rebuild of a
+  library whose `user.db` was never backfilled copies the old catalog's
+  sessions first; without that the first rebuild by this version would
+  lose them.
+- `BackfillImports` sets `imports_backfilled` also when `imports` already
+  has rows (it then writes nothing), so the check is not repeated.
+- Backfill success is logged at debug level in the server (its info log
+  stays quiet).
+- `ListImports` and `newImport` read each record's hashes to compute the
+  live count and cover; a rebuild record holds every hash of the library,
+  so the list costs one `json_each` scan per record. Fine for hundreds of
+  records; a summary cache would be the next step if it is not.
+
+### Tests
+
+- `internal/userdata/imports_test.go`: v2 → v3 (data, identity, targets
+  kept; one backup; `CheckFile`, `IntegrityCheck`, `PeekBackupSummary`,
+  `OpenReadOnly` on v2), v1 → v3 (both steps, one backup), migrated schema
+  equal to a fresh one, fresh file at v3; records: begin (crash-shaped:
+  outcome `running`, no finish time), finish, validation, list order and
+  counts, `ImportsOf`, rename rules (trim, clear, 200 runes, control
+  characters), delete (items cascade), backfill (two sessions plus an
+  empty one, once only, skipped but marked when records exist). Refusal of
+  a newer file: the existing `TestOpenSchemaAndVersion`, `TestCheckFile`
+  (now version 4).
+- `internal/catalog/sessions_test.go`: `Sessions` with an empty session
+  and trashed rows; `SessionsFile` reads the same without touching the
+  WAL and refuses another schema.
+- `internal/importer/hash_test.go`: `Hash` on imported, existing, both
+  kinds of duplicate, none on non-media; restored (`Restored`); lost hash
+  race (duplicate with hash) and failed batch (error, no hash).
+- `internal/importrec/importrec_test.go`: `ItemStatus`, `Outcome`,
+  concurrent `OnResult`, finish with a cancelled context, no user.db and
+  a record deleted mid-run (logged at error level, `Err` set), `Backfill`
+  on a catalog with two sessions, one empty.
+- `cmd/imports_test.go`: import and rebuild print and write their records;
+  the `imports` list output, rename, clear, delete (catalog unchanged),
+  argument errors; backfill on the first import of a library without
+  history and from the old catalog on rebuild; a newer `user.db` does not
+  fail the import and the summary and the log say so.
+- `internal/server/imports_test.go`: backfilled record on open (single
+  mode) and on a workspace open; list/get shapes, 404s, rename rules,
+  delete (files and rows stay), live count and cover after a trash, POST
+  mutation rules; `import=` on timeline, media, geo, geo/items, with
+  `album`, unknown id 404, malformed 400; detail `imports`; a running
+  (crash-shaped) record; import and rebuild jobs record and carry
+  `importId`, a thumbs job does not; records survive a rebuild.
+
 ## As implemented (frontend)
 
 Routes (`web/src/lib/routes.ts`): `#/l/<id>/imports` is the page `imports`;

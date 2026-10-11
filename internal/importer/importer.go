@@ -91,6 +91,13 @@ type Result struct {
 	Dest    string // catalog rel path when applicable
 	Message string
 	Err     error
+	// Hash is the content hash for imported (restored included), existing
+	// and duplicate results; 0 for the others. An imported or existing
+	// result is reported only after its catalog row committed.
+	Hash uint64
+	// Restored marks an imported result whose content was in the trash
+	// and was restored instead of imported again.
+	Restored bool
 }
 
 // Stats are the counters of an import run.
@@ -625,10 +632,10 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip, copyFirst)
 			}
 		}
-		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog"}
+		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog", Hash: hash}
 	}
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
-		return nil, &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import"}
+		return nil, &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import", Hash: hash}
 	}
 	keep := false
 	claim := ""
@@ -1240,7 +1247,7 @@ func (im *Importer) commit(batch []*pending) error {
 		if !inserted[i] {
 			im.undo(p)
 			im.release(p)
-			r := Result{Status: StatusDuplicate, Source: p.origin, Message: "duplicate of a file recorded concurrently"}
+			r := Result{Status: StatusDuplicate, Source: p.origin, Message: "duplicate of a file recorded concurrently", Hash: p.hash}
 			if rel, found, err := im.db.LookupHash(ctx, p.hash); err == nil && found {
 				r.Dest = rel
 			}
@@ -1248,7 +1255,7 @@ func (im *Importer) commit(batch []*pending) error {
 			continue
 		}
 		im.release(p)
-		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath}
+		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath, Hash: p.hash}
 		if p.trash {
 			r.Message = "in trash"
 		} else if p.moved {

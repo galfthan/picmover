@@ -66,9 +66,10 @@ func RestoreFromTrash(ctx context.Context, lib *library.Library, db *catalog.DB,
 // after it; only then is a move source deleted. The result is imported,
 // "restored from trash". A staged (copy-first) move source is read a second
 // time (verifySource) before it is deleted, as for any copy-first move.
+// The result has Restored set.
 func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, origin string, fromZip, staged bool) *Result {
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
-		return &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import"}
+		return &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import", Hash: hash}
 	}
 	defer im.inflight.Delete(hash)
 	if l := im.opts.TrashLock; l != nil {
@@ -83,7 +84,7 @@ func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, or
 		return fail("catalog lookup", err)
 	}
 	if m.DeletedAt.IsZero() { // restored meanwhile
-		return &Result{Status: StatusDuplicate, Source: origin, Dest: m.RelPath, Message: "already in catalog"}
+		return &Result{Status: StatusDuplicate, Source: origin, Dest: m.RelPath, Message: "already in catalog", Hash: hash}
 	}
 	keepSource := "; the source file is kept"
 	if h, _, err := library.HashFile(im.lib.TrashPath(m.RelPath)); err != nil || h != hash {
@@ -110,7 +111,7 @@ func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, or
 			im.log.Error("record restore in user.db", "hash", fmt.Sprintf("%016x", hash), "err", err)
 		}
 	}
-	r := &Result{Status: StatusImported, Source: origin, Dest: rel, Message: "restored from trash"}
+	r := &Result{Status: StatusImported, Source: origin, Dest: rel, Message: "restored from trash", Hash: hash, Restored: true}
 	if !im.opts.Move || fromZip {
 		return r
 	}

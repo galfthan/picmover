@@ -583,3 +583,68 @@ func (d *DB) FinishSession(ctx context.Context, id int64, s SessionStats) error 
 	}
 	return checkOneRow(res, id)
 }
+
+// Session is a recorded import session with its counters and the content
+// hashes of its rows.
+type Session struct {
+	ID                    int64
+	StartedAt, FinishedAt time.Time // FinishedAt zero: never finished
+	Source, Mode          string
+	SessionStats
+	// Hashes are the hashes of the rows recorded by the session (trashed
+	// rows included), in row id order.
+	Hashes []uint64
+}
+
+// Sessions returns every import session, oldest first, with the hashes
+// of its rows (the import history backfill of user.db).
+func (d *DB) Sessions(ctx context.Context) ([]Session, error) {
+	rows, err := d.QueryContext(ctx, `SELECT id, started_at, finished_at, source, mode, imported, existing,
+		duplicates, skipped_small, non_media, errors FROM import_sessions ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: sessions: %w", err)
+	}
+	out := []Session{}
+	byID := map[int64]int{}
+	for rows.Next() {
+		var (
+			s        Session
+			started  int64
+			finished sql.NullInt64
+		)
+		if err := rows.Scan(&s.ID, &started, &finished, &s.Source, &s.Mode, &s.Imported, &s.Existing,
+			&s.Duplicates, &s.SkippedSmall, &s.NonMedia, &s.Errors); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("catalog: sessions: %w", err)
+		}
+		s.StartedAt, s.FinishedAt = time.Unix(started, 0).UTC(), fromUnix(finished)
+		byID[s.ID] = len(out)
+		out = append(out, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: sessions: %w", err)
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+	rows, err = d.QueryContext(ctx, `SELECT import_session_id, hash FROM media
+		WHERE import_session_id IS NOT NULL ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: session rows: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid, h int64
+		if err := rows.Scan(&sid, &h); err != nil {
+			return nil, fmt.Errorf("catalog: session rows: %w", err)
+		}
+		if i, ok := byID[sid]; ok {
+			out[i].Hashes = append(out[i].Hashes, uint64(h))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: session rows: %w", err)
+	}
+	return out, nil
+}

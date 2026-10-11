@@ -131,6 +131,7 @@ func New(opts Options) (*Server, error) {
 		lockInfo, _ := os.Stat(opts.Library.LockPath())
 		ws.libs[id] = &libEntry{id: id, path: ws.root, state: libOpen, lib: opts.Library, db: opts.Catalog,
 			store: opts.Store, user: user, unlock: func() {}, external: true, lockInfo: lockInfo}
+		backfillImports(context.Background(), opts.Catalog, user, log)
 	}
 	s := &Server{
 		ws:      ws,
@@ -239,6 +240,10 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("POST /api/l/{lib}/albums/{aid}", s.handleAlbumUpdate)
 	scoped("POST /api/l/{lib}/albums/{aid}/delete", s.handleAlbumDelete)
 	scoped("POST /api/l/{lib}/albums/{aid}/items", s.handleAlbumItems)
+	scoped("GET /api/l/{lib}/imports", s.handleImports)
+	scoped("GET /api/l/{lib}/imports/{iid}", s.handleImport)
+	scoped("POST /api/l/{lib}/imports/{iid}", s.handleImportRename)
+	scoped("POST /api/l/{lib}/imports/{iid}/delete", s.handleImportDelete)
 	scoped("POST /api/l/{lib}/trash", s.handleTrash)
 	scoped("POST /api/l/{lib}/trash/restore", s.handleRestore)
 	scoped("POST /api/l/{lib}/trash/delete", s.handleTrashDelete)

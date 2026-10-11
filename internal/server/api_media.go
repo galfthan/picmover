@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/userdata"
 )
 
 // wallClockLayout is the JSON form of wall-clock capture times: no zone,
@@ -57,19 +58,22 @@ func parseID(s string) (int64, bool) {
 const dateLayout = "2006-01-02"
 
 // userFilter is the part of a filter resolved through user.db: minimum
-// rating, tags (all must match) and album. Zero values mean none.
+// rating, tags (all must match), album and import. Zero values mean none.
 type userFilter struct {
-	rating int
-	tags   []int64
-	album  int64
+	rating   int
+	tags     []int64
+	album    int64
+	importID int64
 }
 
-func (u userFilter) empty() bool { return u.rating == 0 && len(u.tags) == 0 && u.album == 0 }
+func (u userFilter) empty() bool {
+	return u.rating == 0 && len(u.tags) == 0 && u.album == 0 && u.importID == 0
+}
 
 // parseFilter reads the filters shared by timeline, media, geo and
 // geo/items: type, gps, camera, session, from, to, recur, rating, tag
-// (repeatable), album and trashed. A malformed or unknown value is an
-// error (400) naming the parameter.
+// (repeatable), album, import and trashed. A malformed or unknown value
+// is an error (400) naming the parameter.
 func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 	var (
 		f  catalog.Filter
@@ -148,6 +152,13 @@ func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 		}
 		uf.album = id
 	}
+	if v := q.Get("import"); v != "" {
+		id, ok := parseID(v)
+		if !ok {
+			return f, uf, fmt.Errorf("invalid import %q: want an import id", v)
+		}
+		uf.importID = id
+	}
 	return f, uf, nil
 }
 
@@ -168,7 +179,8 @@ func parseRecur(v string) (*catalog.Recur, error) {
 }
 
 // resolveFilter turns the user.db part of a filter into f.Hashes: the
-// intersection of the rated, tagged and album hash sets.
+// intersection of the rated, tagged, album and import hash sets. An
+// unknown import is an error wrapping userdata.ErrNotFound.
 func resolveFilter(ctx context.Context, l *libHandles, f *catalog.Filter, uf userFilter) error {
 	if uf.empty() {
 		return nil
@@ -190,6 +202,16 @@ func resolveFilter(ctx context.Context, l *libHandles, f *catalog.Filter, uf use
 	}
 	if uf.album > 0 {
 		hs, err := l.user.AlbumHashes(ctx, uf.album)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, hs)
+	}
+	if uf.importID > 0 {
+		if _, err := l.user.GetImport(ctx, uf.importID); err != nil {
+			return err
+		}
+		hs, err := l.user.ImportHashes(ctx, uf.importID)
 		if err != nil {
 			return err
 		}
@@ -224,10 +246,20 @@ func (s *Server) filter(w http.ResponseWriter, r *http.Request, l *libHandles) (
 		return f, false
 	}
 	if err := resolveFilter(r.Context(), l, &f, uf); err != nil {
-		s.internalError(w, r, err)
+		s.filterError(w, r, err)
 		return f, false
 	}
 	return f, true
+}
+
+// filterError answers a resolveFilter error: 404 for an unknown import,
+// else 500.
+func (s *Server) filterError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, userdata.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "no such import")
+		return
+	}
+	s.internalError(w, r, err)
 }
 
 // itemJSON is the compact media item of lists.
@@ -327,7 +359,9 @@ type detailJSON struct {
 	Displayable   bool      `json:"displayable"`
 	Tags          []refJSON `json:"tags"`
 	Albums        []refJSON `json:"albums"`
-	DeletedAt     *string   `json:"deletedAt"` // wall clock in the server's zone; null when live
+	// Imports are the import records that have the item, newest first.
+	Imports   []importRefJSON `json:"imports"`
+	DeletedAt *string         `json:"deletedAt"` // wall clock in the server's zone; null when live
 }
 
 // refJSON names a tag or an album.
@@ -487,6 +521,16 @@ func (s *Server) handleMediaDetail(w http.ResponseWriter, r *http.Request, l *li
 	d.Albums = make([]refJSON, 0, len(albums))
 	for _, a := range albums {
 		d.Albums = append(d.Albums, refJSON{ID: a.ID, Name: a.Name})
+	}
+	imports, err := l.user.ImportsOf(ctx, m.Hash)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	d.Imports = make([]importRefJSON, 0, len(imports))
+	for _, rec := range imports {
+		d.Imports = append(d.Imports, importRefJSON{ID: rec.ID, Name: rec.Name, StartedAt: rfc3339(rec.StartedAt),
+			Mode: rec.Mode, SourceName: rec.SourceName})
 	}
 	writeJSON(w, http.StatusOK, d)
 }
