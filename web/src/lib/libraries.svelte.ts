@@ -45,7 +45,7 @@ export interface GateInput {
   rebuilding: ReadonlySet<string>;
 }
 
-/** "in use by picmover import (pid 812) since 10 Oct 2026, 12:00". */
+/** "in use by picmover import (pid 812) since 10/10/2026 12:00". */
 export function holderText(h: Holder | null | undefined): string {
   if (!h) return 'in use by another picmover process';
   const cmd = h.cmd ? `picmover ${h.cmd}` : 'another picmover process';

@@ -6,8 +6,13 @@ import {
   formatDuration,
   formatElapsed,
   formatOffset,
+  formatDay,
+  formatInstant,
+  formatLocalDay,
   formatTakenAt,
+  formatWallDate,
   monthName,
+  parseDay,
   parseWallClock,
 } from './format';
 
@@ -24,7 +29,7 @@ describe('parseWallClock', () => {
     expect(d.getUTCDate()).toBe(1);
     expect(d.getUTCHours()).toBe(10);
     expect(parseWallClock('0005-01-31')!.getUTCFullYear()).toBe(5);
-    expect(formatTakenAt('0099-05-01T10:00:00', null, 'en-GB')).not.toContain('1999');
+    expect(formatTakenAt('0099-05-01T10:00:00', null)).toBe('01/05/0099 10:00:00');
   });
   it('rejects garbage and null', () => {
     expect(parseWallClock(null)).toBeNull();
@@ -36,17 +41,54 @@ describe('parseWallClock', () => {
 describe('formatTakenAt', () => {
   it('renders the wall clock without shifting', () => {
     // Late evening: a local-zone render would roll the date in UTC+ zones.
-    expect(formatTakenAt('2024-07-14T23:30:00', null, 'en-GB')).toBe('14 Jul 2024, 23:30:00');
-    expect(formatTakenAt('2024-01-01T00:00:05', null, 'en-GB')).toBe('1 Jan 2024, 00:00:05');
+    expect(formatTakenAt('2024-07-14T23:30:00', null)).toBe('14/07/2024 23:30:00');
+    expect(formatTakenAt('2024-01-01T00:00:05', null)).toBe('01/01/2024 00:00:05');
   });
   it('appends a known offset', () => {
-    expect(formatTakenAt('2024-07-14T13:05:22', 10800, 'en-GB')).toBe('14 Jul 2024, 13:05:22 UTC+03:00');
-    expect(formatTakenAt('2024-07-14T13:05:22', -19800, 'en-GB')).toBe('14 Jul 2024, 13:05:22 UTC-05:30');
-    expect(formatTakenAt('2024-07-14T13:05:22', 0, 'en-GB')).toBe('14 Jul 2024, 13:05:22 UTC+00:00');
+    expect(formatTakenAt('2024-07-14T13:05:22', 10800)).toBe('14/07/2024 13:05:22 UTC+03:00');
+    expect(formatTakenAt('2024-07-14T13:05:22', -19800)).toBe('14/07/2024 13:05:22 UTC-05:30');
+    expect(formatTakenAt('2024-07-14T13:05:22', 0)).toBe('14/07/2024 13:05:22 UTC+00:00');
   });
   it('handles undated', () => {
     expect(formatTakenAt(null, null)).toBe('Undated');
     expect(formatTakenAt(null, 3600)).toBe('Undated');
+  });
+});
+
+describe('day-first dates', () => {
+  it('formats wall-clock dates as dd/mm/yyyy', () => {
+    expect(formatWallDate('2024-07-14T13:05:22')).toBe('14/07/2024');
+    expect(formatWallDate('2024-01-05')).toBe('05/01/2024');
+    expect(formatWallDate(null)).toBe('Undated');
+  });
+  it('formats instants in the viewer zone with a 24-hour clock', () => {
+    const d = new Date(2024, 6, 14, 13, 5, 0);
+    expect(formatInstant(d.toISOString())).toBe('14/07/2024 13:05');
+    expect(formatInstant(new Date(2024, 0, 2, 0, 7).toISOString())).toBe('02/01/2024 00:07');
+    expect(formatLocalDay(d)).toBe('14/07/2024');
+    expect(formatInstant(null)).toBe('-');
+    expect(formatInstant('garbage')).toBe('garbage');
+  });
+  it('formats calendar days', () => {
+    expect(formatDay('2024-07-14')).toBe('14/07/2024');
+    expect(formatDay('')).toBe('');
+    expect(formatDay(undefined)).toBe('');
+  });
+  it('parses typed days strictly', () => {
+    expect(parseDay('14/07/2024')).toBe('2024-07-14');
+    expect(parseDay('4/7/2024')).toBe('2024-07-04');
+    expect(parseDay('14.07.2024')).toBe('2024-07-14');
+    expect(parseDay(' 29/02/2024 ')).toBe('2024-02-29');
+    expect(parseDay('29/02/2023')).toBeNull();
+    expect(parseDay('31/04/2024')).toBeNull();
+    expect(parseDay('00/01/2024')).toBeNull();
+    expect(parseDay('14/13/2024')).toBeNull();
+    expect(parseDay('14/07/24')).toBeNull();
+    expect(parseDay('14/07.2024')).toBeNull();
+    expect(parseDay('2024-07-14')).toBeNull();
+    expect(parseDay('123/07/2024')).toBeNull();
+    expect(parseDay('')).toBeNull();
+    expect(parseDay(null)).toBeNull();
   });
 });
 

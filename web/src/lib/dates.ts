@@ -7,7 +7,7 @@
 // - Every year: `recur` is "MM-DD" or "MM-DD..MM-DD", inclusive, possibly
 //   wrapping the year end ("12-30..01-02"); "02-29" is allowed.
 
-import { monthName, parseWallClock } from './format';
+import { formatDay, monthName, parseWallClock } from './format';
 
 export interface MonthDay {
   /** 1..12 */
@@ -163,7 +163,8 @@ export function toYear(to: string | undefined): number | null {
 /**
  * Short text for the filter button: "2020 – 2024", "24 Dec – 26 Dec every
  * year, 2010 –", "". Years only when every given bound is a whole year,
- * else days on both sides ("2020-01-01 – 2020-02-29").
+ * else days on both sides ("01/01/2020 – 29/02/2020"). `locale` only picks
+ * the month names of the every-year part.
  */
 export function describeDates(from: string | undefined, to: string | undefined, recur: string | undefined, locale?: string): string {
   const parts: string[] = [];
@@ -173,8 +174,8 @@ export function describeDates(from: string | undefined, to: string | undefined, 
     const fy = fromYear(from);
     const ty = toYear(to);
     const years = (!from || fy !== null) && (!to || ty !== null);
-    const a = from ? (years ? String(fy) : from) : '';
-    const b = to ? (years ? String(ty) : inclusiveEnd(to)) : '';
+    const a = from ? (years ? String(fy) : formatDay(from)) : '';
+    const b = to ? (years ? String(ty) : formatDay(inclusiveEnd(to) || to)) : '';
     if (a && b && a === b) parts.push(a);
     else parts.push(`${a}${a || b ? ' – ' : ''}${b}`.trim());
   }

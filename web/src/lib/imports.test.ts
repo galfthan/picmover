@@ -36,16 +36,16 @@ describe('import record wording', () => {
     const now = Date.parse('2026-10-10T12:00:00Z');
     expect(formatRecent('2026-10-10T09:00:00Z', now, 'en')).toBe('3 hours ago');
     expect(formatRecent('2026-10-09T12:00:00Z', now, 'en')).toBe('yesterday');
-    expect(formatRecent('2026-09-01T12:00:00Z', now, 'en')).toBe('Sep 1, 2026');
+    expect(formatRecent('2026-09-01T12:00:00Z', now, 'en')).toBe('01/09/2026');
     expect(formatRecent(null, now)).toBe('');
     expect(formatRecent('garbage', now)).toBe('');
   });
 
   it('writes the detail line', () => {
-    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'copy', sourceName: 'DCIM' }, '9 Oct 2026')).toBe('Imported 9 Oct 2026 from DCIM');
-    expect(importLine({ id: 1, name: 'Trip', startedAt: null, mode: 'move' }, '9 Oct 2026')).toBe('Imported 9 Oct 2026 · Trip');
+    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'copy', sourceName: 'DCIM' }, '09/10/2026 12:00')).toBe('Imported 09/10/2026 12:00 from DCIM');
+    expect(importLine({ id: 1, name: 'Trip', startedAt: null, mode: 'move' }, '09/10/2026 12:00')).toBe('Imported 09/10/2026 12:00 · Trip');
     expect(importLine({ id: 1, name: '', startedAt: null, mode: 'rebuild' }, '')).toBe('Recorded');
-    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'record', sourceName: 'peter' }, '9 Oct 2026')).toBe('Recorded 9 Oct 2026');
-    expect(importLine({ id: 1, name: 'Old', startedAt: null, mode: 'rebuild', sourceName: 'peter' }, '9 Oct 2026')).toBe('Recorded 9 Oct 2026 · Old');
+    expect(importLine({ id: 1, name: '', startedAt: null, mode: 'record', sourceName: 'peter' }, '09/10/2026 12:00')).toBe('Recorded 09/10/2026 12:00');
+    expect(importLine({ id: 1, name: 'Old', startedAt: null, mode: 'rebuild', sourceName: 'peter' }, '09/10/2026 12:00')).toBe('Recorded 09/10/2026 12:00 · Old');
   });
 });
