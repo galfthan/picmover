@@ -108,9 +108,18 @@
     }
   }
 
-  function onBlur() {
-    // Closing applies already; the inputs leaving the page must not apply twice.
-    if (open) apply();
+  /**
+   * Apply when focus leaves the panel, not when it moves between Min and
+   * Max or to a preset or Clear (a half-entered range would reload the
+   * timeline). A null target while open means a click elsewhere or
+   * Escape, which close (and apply) on their own; closing applies already,
+   * so the inputs leaving the page must not apply twice.
+   */
+  function onBlur(e: FocusEvent) {
+    if (!open) return;
+    const to = e.relatedTarget;
+    if (to === null || (to instanceof Node && wrap?.contains(to))) return;
+    apply();
   }
 </script>
 

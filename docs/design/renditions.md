@@ -573,8 +573,10 @@ if wanted, trashed.
   sits after the Dates control. The button text is the summary itself
   ("Any size", "≥ 2000 px", ...), with a "Size of the longer edge"
   tooltip. A typed min above max is swapped rather than rejected; a
-  malformed typed value clears that bound. Moving focus from Min to Max
-  applies Min (blur), as the contract says. Unchanged values send nothing.
+  malformed typed value clears that bound. Typed values apply on Enter, when focus
+  leaves the panel (not when it moves between Min, Max, the presets and
+  Clear, so a half-entered range never reloads the timeline) and once
+  when the panel closes (outside click, Escape, the button). Unchanged values send nothing.
 - **Fake API.** `select` filters on `w`/`h` (both > 0); `lib` answers 400
   for malformed or crossed bounds with the server's messages. The fixture
   items are unchanged (4000×3000, the trashed one 10×10); the test that
@@ -586,6 +588,7 @@ if wanted, trashed.
   with minpx/maxpx alone and combined with type/gps/from/trashed; media
   and geo narrowed). Web: `lib/filters.test.ts` (round trip, malformed
   and crossed bounds dropped, hasFilters, summary) and
-  `components/SizeFilter.test.ts` (presets through the filter bar, Clear,
-  labels, Enter/blur/close apply and no per-keystroke apply, fake server
+  `SizeFilter.test.ts` (presets through the filter bar, Clear,
+  labels, Enter/close apply, no apply per keystroke or while focus moves
+  inside the panel, one apply when focus leaves it, fake server
   filtering and 400s).

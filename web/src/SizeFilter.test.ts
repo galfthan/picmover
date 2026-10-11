@@ -6,8 +6,8 @@
 // real one.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Filters } from '../lib/api';
-import { fakeServer, hashOf, settle, type FakeServer } from '../testing/fakes';
+import type { Filters } from './lib/api';
+import { fakeServer, hashOf, settle, type FakeServer } from './testing/fakes';
 
 let server: FakeServer;
 let cleanup: (() => void) | null = null;
@@ -15,8 +15,8 @@ const errors: unknown[] = [];
 
 async function mountFilters(filters: Filters) {
   const svelte = await import('svelte');
-  const { library } = await import('../lib/library.svelte');
-  const FiltersBar = (await import('./Filters.svelte')).default;
+  const { library } = await import('./lib/library.svelte');
+  const FiltersBar = (await import('./components/Filters.svelte')).default;
   library.select('peter');
   await settle();
   const onchange = vi.fn<(f: Filters) => void>();
@@ -30,7 +30,7 @@ async function mountFilters(filters: Filters) {
 
 async function mountSize(props: { minPx?: number; maxPx?: number }) {
   const svelte = await import('svelte');
-  const SizeFilter = (await import('./SizeFilter.svelte')).default;
+  const SizeFilter = (await import('./components/SizeFilter.svelte')).default;
   const onchange = vi.fn<(v: { minPx?: number; maxPx?: number }) => void>();
   const target = document.createElement('div');
   document.body.appendChild(target);
@@ -129,42 +129,59 @@ describe('SizeFilter', () => {
     expect(document.querySelector('.sizefilter .panel')).not.toBeNull();
   });
 
-  it('applies typed values on blur and when the panel closes', async () => {
-    const onchange = await mountSize({});
+  it('does not apply while focus moves inside the panel', async () => {
+    const onchange = await mountFilters({});
     await click(sizeButton());
-    await typeIn(input('Max'), '800');
-    input('Max').blur();
+    await typeIn(input('Min'), '5000');
+    // Tab from Min to Max: focus stays in the panel.
+    input('Max').focus();
     await settle();
-    expect(onchange).toHaveBeenLastCalledWith({ minPx: undefined, maxPx: 800 });
+    expect(document.activeElement).toBe(input('Max'));
+    await typeIn(input('Max'), '100');
+    // And on to a preset button.
+    button('Small ≤ 1600')!.focus();
+    await settle();
+    expect(onchange).not.toHaveBeenCalled();
+  });
 
-    cleanup?.();
-    document.body.innerHTML = '';
-    const onchange2 = await mountSize({});
+  it('applies once when focus leaves the panel', async () => {
+    const onchange = await mountFilters({ rating: 1 });
+    await click(sizeButton());
+    await typeIn(input('Min'), '5000');
+    await typeIn(input('Max'), '100');
+    expect(onchange).not.toHaveBeenCalled();
+    document.querySelector<HTMLSelectElement>('select[aria-label="Type"]')!.focus();
+    await settle();
+    // Min above max: the bounds are swapped, not rejected.
+    expect(onchange).toHaveBeenCalledTimes(1);
+    expect(onchange).toHaveBeenLastCalledWith({ rating: 1, minPx: 100, maxPx: 5000 });
+  });
+
+  it('applies when the panel closes', async () => {
+    const onchange = await mountSize({});
     await click(sizeButton());
     await typeIn(input('Min'), '5000');
     await typeIn(input('Max'), '100');
     await key(input('Max'), 'Escape');
     expect(document.querySelector('.sizefilter .panel')).toBeNull();
-    // Leaving Min for Max applied Min (blur); closing applied both, and
-    // min above max is swapped, not rejected.
-    expect(onchange2).toHaveBeenCalledTimes(2);
-    expect(onchange2).toHaveBeenNthCalledWith(1, { minPx: 5000, maxPx: undefined });
-    expect(onchange2).toHaveBeenLastCalledWith({ minPx: 100, maxPx: 5000 });
+    expect(onchange).toHaveBeenCalledTimes(1);
+    expect(onchange).toHaveBeenLastCalledWith({ minPx: 100, maxPx: 5000 });
 
     cleanup?.();
     document.body.innerHTML = '';
-    const onchange3 = await mountSize({ minPx: 300 });
+    const onchange2 = await mountSize({ minPx: 300 });
     await click(sizeButton());
     await typeIn(input('Min'), 'abc');
     document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
     await settle();
     expect(document.querySelector('.sizefilter .panel')).toBeNull();
     // A malformed bound is dropped.
-    expect(onchange3).toHaveBeenLastCalledWith({ minPx: undefined, maxPx: undefined });
+    expect(onchange2).toHaveBeenCalledTimes(1);
+    expect(onchange2).toHaveBeenLastCalledWith({ minPx: undefined, maxPx: undefined });
   });
 
   it('the fake server filters by the longer edge and rejects malformed bounds', async () => {
-    const { libApi, ApiError } = await import('../lib/api');
+    const { libApi, ApiError } = await import('./lib/api');
     const small = server.items.find((x) => x.id === 2)!;
     small.w = 120;
     small.h = 160;
