@@ -246,7 +246,10 @@ POST).
 ```
 GET  /api/app
   200 {"app":true,"version":"…","workspace":"<root of /api/libraries, \"\" while unset>",
-       "closeToTray":true,"platform":"windows"|"linux"|"darwin","window":false}
+       "closeToTray":true,"platform":"windows"|"linux"|"darwin","window":false,
+       "windowReason":"ok"|"no-runtime"|"browser-flag"|"failed"|"unsupported"}
+       (window and windowReason are computed per request: "failed" once the
+       window could not be created and the browser is used instead)
 POST /api/app/open       {}                → 204, empty body (opens/focuses the window or the browser)
 POST /api/app/show       {"token":"…"}     → 204 | 403 {"error":"invalid token"}
 POST /api/app/quit       {"token":"…","force":false}
@@ -256,7 +259,8 @@ POST /api/app/quit       {"token":"…","force":false}
 POST /api/app/workspace  {"path":"…"}      → 200 the /api/libraries body for the new folder
                                            | 400 {"error":"<a sentence for the user>"}
                                            | 409 {"error":"a job is running","jobs":1}
-                                           | 409 {"error":"The library is in use by another picmover process: …"}
+                                           | 409 {"error":"The library is in use by another picmover process (pid …, import, since …)."}
+                                           | 409 {"error":"The library is still in use in this app (a request on it has not finished); try again in a moment."}
                                            | 409 {"error":"The library cannot be opened: …"}
                                            | 503 {"error":"the server is shutting down"}
 ```
@@ -269,7 +273,9 @@ exist.", "The folder cannot be read (permission denied).", "The folder
 cannot be read.", "That is a file, not a folder.", "That folder is inside
 a library's .picmover directory; choose the folder that holds your
 libraries." (any path component `.picmover`, case-insensitive, lexical
-and resolved). A folder with `media.db` is accepted and served as one
+and resolved), "That folder is inside the library <parent>; choose the
+library itself or the folder that holds your libraries." (a parent
+directory has `media.db`). A folder with `media.db` is accepted and served as one
 library (mode `single`); the frontend's fake refuses it with 400, the
 real server does not. The new root is the path with symbolic links
 resolved, which is also what `/api/app` reports and `app.json` stores.
@@ -591,3 +597,118 @@ one), `server.ws` (mode and root), `GET /api/app`, `POST
 listing with the libraries under the new root and open libraries closed),
 `POST /api/app/open` → 204, and 409 `{error:"no workspace", state:"unset"}`
 for every `/api/libraries/...` and `/api/l/...` route while unset.
+
+## Review fixes (backend)
+
+Findings of the review of a8e6ada..a85d4af handled on the Go side (2
+and 9 are the frontend's).
+
+- **1 (switch against an own lock), 3 (retired entries), 4 (unset
+  window)**: `switchWorkspace` now prepares the new configuration first
+  and publishes it in one step (`ws.publish`, under `ws.mu`: registry,
+  peek cache and `conf` swapped together, `errClosed` after a shutdown
+  began); requests see the old configuration or the new one, never an
+  unset gap. Only then are the old registry's entries retired
+  (`retireAll`): it waits up to 5 s (`retireWait`) for the requests still
+  using them, then retires them anyway (their handles close when the
+  last request ends, as before). When the target is a library this
+  process already serves (the single library chosen again, a workspace
+  library chosen as the single one, or, when the target is a workspace,
+  any open library directly inside it) the entry is handed over
+  (`libEntry.handOver`): its lock, catalog, store and user.db move into
+  the new entry, the old entry is left retired and empty, requests still
+  holding its handles keep using them, and nothing is closed or locked
+  again (handed-over entries are not waited for). A switch that fails
+  publishes nothing, so the previous configuration is served untouched;
+  the rollback code is gone. `OnWorkspaceChanged` runs only after a
+  successful publish. `libEntry.retired` (atomic, set under `e.mu`) is
+  refused by `ws.open` and `beginRebuild` (`errRetired`, 409 `{error,
+  state:"closed"}` from the open route) and by `jobManager.start` (409);
+  the job manager stays paused until the old entries are retired, so the
+  check cannot race a switch. A listing taken under the previous
+  configuration (`listed.conf`) never registers an entry in the new
+  registry (`entryFor`/`freshEntry` return a retired, unregistered one).
+  `POST /api/libraries` reads one `cfg()` snapshot, answers 409 `unset`
+  for an empty root and creates in that snapshot's root
+  (`createLibrary(ctx, c, name)` refuses an empty or single root). An
+  `ErrLocked` whose holder is this process (`ownLock`: same pid, same
+  host when recorded) is described as "still in use in this app … try
+  again in a moment", never as another picmover process (switch answer,
+  `publicLibError`, the open route's 409).
+- **5 (hidden Quit question)**: `confirmQuit` restores, raises and
+  focuses the window before the message box; `app.confirming` (atomic)
+  lets one question be up at a time, further Quit clicks are ignored
+  while it is.
+- **6, 11 and the unbounded wait (window creation)**: `newNativeWindow`
+  probes the WebView2 data folder (creates it, writes and removes a
+  probe file); a failure means no window (`failed`). `webviewWindow.Open`
+  waits at most 20 s (`windowCreateTimeout`); `Embed` false, the probe or
+  the timeout mark the window failed for good: the app drops it
+  (`app.windowFailed`, logged once) and opens the browser for the rest
+  of the run. A window shown blank by a failed `Embed` is destroyed
+  (its handle comes from the placement hook); a window that becomes
+  ready after the timeout, or after quit began, is destroyed too.
+  `/api/app` `window` and the new `windowReason` (`ok`, `no-runtime`,
+  `browser-flag`, `failed`, `unsupported` on Linux and macOS) come from
+  `AppHooks.Window func() (bool, string)` per request. Not fixed:
+  go-webview2 still calls `log.Fatal` in its environment and controller
+  callbacks and when it cannot set its settings; the text reaches
+  `picmover-app.log` (the standard logger writes there) and the process
+  ends without the quit sequence. It is not forked: the probe covers the
+  likely cause (an unwritable data folder), the rest (a broken or
+  updating runtime, policy blocks) is rare, and a fork would have to
+  follow upstream's COM bindings.
+- **7 (window off screen)**: `placeWindow` fits the saved size into the
+  primary monitor's work area (`SPI_GETWORKAREA`, else the screen size),
+  minimum 640×480, centred on the area. go-webview2 can only centre on
+  the whole screen, so a thread-local `WH_CBT` hook sets the position and
+  size in the window's `CREATESTRUCT` before it appears (the size is
+  passed clamped as well, so a missing hook still keeps it on screen).
+- **8 (logoff/shutdown)**: `watchSessionEnd` creates a hidden window on
+  its own locked thread in every mode (`--browser` included): it answers
+  `WM_QUERYENDSESSION` with TRUE and, on `WM_ENDSESSION` with
+  `wParam != 0`, runs the quit sequence with a 5 s shutdown deadline and
+  waits up to 5 s before returning. Deviation: a hidden top-level window
+  (`WS_POPUP`, `WS_EX_TOOLWINDOW`, never shown), not a message-only one:
+  message-only windows (`HWND_MESSAGE`) do not receive these broadcasts.
+- **10 (workspace inside a library)**: `checkWorkspacePath` walks up the
+  cleaned path (not following links) to the volume root and refuses a
+  folder whose parent has `media.db`: "That folder is inside the library
+  <parent>; choose the library itself or the folder that holds your
+  libraries."
+- **12 (dirty version in the .syso)**: `make winres` is documented as a
+  release step (Makefile comment, here): run on a clean tree, the
+  committed `.syso` names the commit it was made on, so the exe's file
+  version is one commit behind by construction unless it is run on a
+  tag. The `.syso` was regenerated as the last commit of this pass.
+- **13 (second instance and the log)**: `Run` takes the single-instance
+  lock before it opens or rotates the log; a second instance writes
+  nothing to the log file and reports on stderr only (nothing on
+  Windows, which has no console).
+- **14 (repeated message)**: the busy switch answer is "The library is in
+  use by another picmover process (pid …, …)." (from `ErrLocked`).
+- **15 (tests)**: `internal/shell`: `TestRunPortFallback` (busy saved
+  port falls back and the new one is saved; busy `--port` fails, which
+  `main` turns into exit 1; `windowReason` `browser-flag`),
+  `TestWindowFailureFallsBack`, `TestTrayQuitOneQuestion`,
+  `TestPlaceWindow`, `TestProbeDataDir`, and `TestRunSingleInstance` now
+  checks `windowReason` and that the second instance left the log alone.
+  `internal/server`: `TestSwitchToHeldSingleLibrary` and
+  `TestSwitchToHeldLibraryInWorkspace` (hand-over with a request in
+  flight: 200, lock never dropped, the request's catalog still usable,
+  no 5 s wait), `TestSwitchFailureKeepsPrevious` (single library kept,
+  locked and open, no `OnWorkspaceChanged`),
+  `TestSwitchRetiredEntryRefused` (open, rebuild, job start, old listing,
+  the open route's 409, create without a root),
+  `TestSwitchInsideLibraryRefused`; `TestAppWorkspaceSwitch` now expects
+  a workspace library to stay locked when the workspace is chosen again
+  (hand-over) and released on a switch elsewhere.
+- **16 (left click)**: the tray's left click opens the window on Windows
+  and Linux alike (`SetOnTapped`); the right click shows the menu.
+  Documented in `tray.go`, here and in the README.
+- **Unverified items**: Chrome-style app mode adds `--no-first-run
+  --no-default-browser-check`; `writeFileAtomic` retries the rename up to
+  3 times, 50 ms apart, on a Windows sharing, lock or access violation
+  (`app.json`, `instance.json`). The other unverified items (Ctrl+C
+  reaching the app-mode Chrome child, large-thumbnail derivations after a
+  switch) are unchanged.

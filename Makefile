@@ -62,7 +62,11 @@ app-binaries:
 # winres regenerates the Windows resources of picmover-app (icon, manifest,
 # version info) as cmd/picmover-app/rsrc_windows_amd64.syso, which is
 # committed so that builds need only Go. The version strings come from
-# VERSION at the time it is run. icons redraws the icon PNGs first.
+# VERSION at the time it is run. It is a release step: run it on a clean
+# tree and commit the .syso; the file then names the commit it was made
+# on, so the exe's file version is one commit behind by construction
+# (unless it is run on a tag, which then names the tag). icons redraws
+# the icon PNGs.
 winres:
 	$(WINRES) make --in winres/winres.json --out cmd/picmover-app/rsrc --arch amd64 \
 		--product-version=$(VERSION) --file-version=$(VERSION)
