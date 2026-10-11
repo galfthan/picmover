@@ -22,6 +22,11 @@ type appJSON struct {
 	CloseToTray bool   `json:"closeToTray"`
 	Platform    string `json:"platform"`
 	Window      bool   `json:"window"`
+	// WindowReason says why Window is what it is: "ok", "no-runtime"
+	// (Windows without WebView2), "browser-flag" (--browser), "failed"
+	// (the window could not be created; the browser is used for the rest
+	// of the run) or "unsupported" (Linux, macOS).
+	WindowReason string `json:"windowReason"`
 }
 
 // jobsBusyJSON is the 409 body of the app endpoints while a job runs.
@@ -72,8 +77,12 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 	if a.CloseToTray != nil {
 		closeToTray = a.CloseToTray()
 	}
+	window, reason := false, WindowUnsupported
+	if a.Window != nil {
+		window, reason = a.Window()
+	}
 	writeJSON(w, http.StatusOK, appJSON{App: true, Version: a.Version, Workspace: s.ws.root(),
-		CloseToTray: closeToTray, Platform: a.Platform, Window: a.Window})
+		CloseToTray: closeToTray, Platform: a.Platform, Window: window, WindowReason: reason})
 }
 
 // handleAppOpen is POST /api/app/open {}: opens or focuses the window.
@@ -178,7 +187,26 @@ func checkWorkspacePath(p string) (string, error) {
 			}
 		}
 	}
+	if lib := enclosingLibrary(p); lib != "" {
+		return "", errors.New("That folder is inside the library " + lib + "; choose the library itself or the folder that holds your libraries.")
+	}
 	return resolved, nil
+}
+
+// enclosingLibrary returns the nearest parent directory of p (walking up
+// the cleaned path to the volume root, not following links) that has a
+// media.db, or "".
+func enclosingLibrary(p string) string {
+	for dir := filepath.Clean(p); ; {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+		if _, err := os.Lstat(filepath.Join(dir, library.DBName)); err == nil {
+			return dir
+		}
+	}
 }
 
 func exampleAbsPath() string {
@@ -216,6 +244,10 @@ func (s *Server) handleAppWorkspace(w http.ResponseWriter, r *http.Request) {
 	defer s.jobs.resume()
 	if err := s.switchWorkspace(r.Context(), root); err != nil {
 		s.log.Info("cannot switch the workspace", "path", root, "err", err)
+		if errors.Is(err, errClosed) {
+			writeError(w, http.StatusServiceUnavailable, errClosed.Error())
+			return
+		}
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -231,65 +263,123 @@ func (s *Server) handleAppWorkspace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// switchWorkspace closes every library and serves root: as one library
-// when it has media.db (opened and locked here), else as a workspace.
-// When the library cannot be opened the previous folder is served again
-// (best effort) and the error, a sentence for the user, is returned.
+// switchWorkspace serves root: as one library when it has media.db, else
+// as a workspace. The new configuration is prepared first (the library
+// opened and locked, or handed over when this process already serves
+// it), then published in one step; only then are the previous
+// configuration's libraries retired, after the requests still using them
+// had up to retireWait to end. On failure nothing was published, so the
+// previous configuration is still served untouched; the error is a
+// sentence for the user (or errClosed). The caller holds switchMu and has
+// paused the job manager.
 func (s *Server) switchWorkspace(ctx context.Context, root string) error {
-	prev := *s.ws.cfg()
 	if !IsLibraryFolder(root) {
-		s.ws.replace(&wsConf{root: root})
+		// Libraries of the new workspace this process has open are handed
+		// over (kept open and locked) instead of being closed and locked
+		// again.
+		old, err := s.ws.publish(&wsConf{root: root}, map[string]*libEntry{}, func(old []*libEntry, libs map[string]*libEntry) error {
+			for _, e := range old {
+				id := filepath.Base(e.path)
+				if !validLibID(id) || libs[id] != nil || !sameDir(filepath.Dir(e.path), root) {
+					continue
+				}
+				if n, ok := e.handOver(id, filepath.Join(root, id), false); ok {
+					libs[id] = n
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		retireAll(old, retireWait)
 		return nil
 	}
-	s.ws.replace(&wsConf{})
-	if err := s.openSingle(ctx, root); err != nil {
-		switch {
-		case prev.root == "":
-		case prev.single:
-			if rerr := s.openSingle(ctx, prev.root); rerr != nil {
-				s.log.Info("cannot reopen the previous library", "root", prev.root, "err", rerr)
-			}
-		default:
-			s.ws.replace(&wsConf{root: prev.root})
+
+	// One library. When this process already serves it, its entry is
+	// handed over; else it is opened and locked here.
+	var held *libEntry
+	for _, e := range s.ws.entries() {
+		if sameDir(e.path, root) && e.isOpen() {
+			held = e
+			break
 		}
-		var locked *library.ErrLocked
-		if errors.As(err, &locked) {
-			return errors.New("The library is in use by another picmover process: " + err.Error())
-		}
-		return errors.New("The library cannot be opened: " + publicLibError(err))
 	}
+	var fresh *libEntry
+	if held == nil {
+		e, err := s.openSingle(ctx, root)
+		if err != nil {
+			return switchError(err)
+		}
+		fresh = e
+	}
+	old, err := s.ws.publish(&wsConf{root: root, single: true}, map[string]*libEntry{}, func(_ []*libEntry, libs map[string]*libEntry) error {
+		if fresh != nil {
+			libs[fresh.id] = fresh
+			return nil
+		}
+		n, ok := held.handOver(singleID(root), root, true)
+		if !ok {
+			// Closed or replaced since it was found: try again.
+			return errors.New("The library was closed while the workspace was being changed; try again.")
+		}
+		libs[n.id] = n
+		return nil
+	})
+	if err != nil {
+		if fresh != nil {
+			fresh.closeAll()
+		}
+		return err
+	}
+	retireAll(old, retireWait)
 	return nil
 }
 
-// openSingle opens, locks and serves the library at root in single mode
-// (the lock is the server's: closing the library releases it).
-func (s *Server) openSingle(ctx context.Context, root string) error {
+// switchError is the sentence for a library a switch cannot open.
+func switchError(err error) error {
+	var locked *library.ErrLocked
+	if errors.As(err, &locked) {
+		if ownLock(locked) {
+			return errors.New("The library is still in use in this app (a request on it has not finished); try again in a moment.")
+		}
+		// "The library is in use by another picmover process (pid …)."
+		return errors.New("The " + locked.Error() + ".")
+	}
+	return errors.New("The library cannot be opened: " + publicLibError(err))
+}
+
+// openSingle opens and locks the library at root as a single-mode entry,
+// not registered yet (the lock is the server's: closing the entry
+// releases it).
+func (s *Server) openSingle(ctx context.Context, root string) (*libEntry, error) {
 	lib, err := library.Attach(root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	unlock, err := LockLibrary(ctx, lib, "serve", logWriter{s})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	db, err := catalog.OpenExisting(ctx, lib.DBPath(), s.log)
 	if err != nil {
 		unlock()
-		return err
+		return nil, err
 	}
 	store, err := openReadStore(lib)
 	if err != nil {
 		db.Close()
 		unlock()
-		return err
+		return nil, err
 	}
-	if err := s.ws.installSingle(lib, db, store, nil, unlock); err != nil {
+	e, err := s.ws.newSingleEntry(lib, db, store, nil, unlock)
+	if err != nil {
 		store.Close()
 		db.Close()
 		unlock()
-		return err
+		return nil, err
 	}
-	return nil
+	return e, nil
 }
 
 // logWriter turns LockLibrary's warning into a log line.

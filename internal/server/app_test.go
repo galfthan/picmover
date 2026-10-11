@@ -35,7 +35,7 @@ func startApp(t *testing.T, path string) *appRun {
 	t.Helper()
 	a := &appRun{t: t}
 	hooks := &AppHooks{
-		Token: testToken, Version: "v-test", Platform: "linux", Window: false,
+		Token: testToken, Version: "v-test", Platform: "linux",
 		CloseToTray: func() bool { return true },
 		OnOpen:      func() { a.mu.Lock(); a.opened++; a.mu.Unlock() },
 		OnQuit: func(force bool) error {
@@ -210,7 +210,7 @@ func TestAppUnsetMode(t *testing.T) {
 	a.want(http.MethodGet, "/api/fs?path="+t.TempDir(), "", http.StatusOK)
 	a.want(http.MethodGet, "/api/jobs", "", http.StatusOK)
 	app := decodeJSON[appJSON](t, a.want(http.MethodGet, "/api/app", "", http.StatusOK))
-	if app != (appJSON{App: true, Version: "v-test", Workspace: "", CloseToTray: true, Platform: "linux", Window: false}) {
+	if app != (appJSON{App: true, Version: "v-test", Workspace: "", CloseToTray: true, Platform: "linux", Window: false, WindowReason: WindowUnsupported}) {
 		t.Fatalf("app %+v", app)
 	}
 }
@@ -362,16 +362,26 @@ func TestAppWorkspaceSwitch(t *testing.T) {
 	a.want(http.MethodGet, "/api/l/peter/library", "", http.StatusNotFound)
 	a.want(http.MethodGet, "/api/l/penny/library", "", http.StatusOK)
 
-	// Back to the workspace: penny's lock is released.
+	// Back to the workspace: penny is part of it, so it is handed over
+	// (still open and locked, nothing reopened); peter is listed, not open.
 	a.want(http.MethodPost, "/api/app/workspace", `{"path":`+jsonString(ws)+`}`, http.StatusOK)
+	if lockFree(t, penny) {
+		t.Fatal("penny released although the new workspace holds it")
+	}
+	a.want(http.MethodGet, "/api/l/penny/library", "", http.StatusOK)
+	a.want(http.MethodGet, "/api/l/peter/library", "", http.StatusConflict) // listed, not open
+
+	// To another folder: every library of the workspace is released.
+	other := filepath.Join(base, "other")
+	os.MkdirAll(other, 0o755)
+	a.want(http.MethodPost, "/api/app/workspace", `{"path":`+jsonString(other)+`}`, http.StatusOK)
 	if !lockFree(t, penny) {
 		t.Fatal("penny still locked")
 	}
-	a.want(http.MethodGet, "/api/l/penny/library", "", http.StatusConflict) // listed, not open
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.changed) != 3 || a.changed[0] != ws || a.changed[1] != penny || a.changed[2] != ws {
+	if len(a.changed) != 4 || a.changed[0] != ws || a.changed[1] != penny || a.changed[2] != ws || a.changed[3] != other {
 		t.Fatalf("OnWorkspaceChanged %v", a.changed)
 	}
 }

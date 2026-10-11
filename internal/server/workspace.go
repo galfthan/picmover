@@ -56,6 +56,14 @@ var errReplaced = errors.New("the library folder was replaced or moved while it 
 // the old handles.
 var errReplacedBusy = errors.New("the library folder was replaced; requests on the old folder are still running, try again")
 
+// errRetired: the entry belongs to a workspace that is no longer served
+// (the app switched the workspace while the request ran).
+var errRetired = errors.New("the workspace was changed; this library is no longer served here: reload the page")
+
+// errOwnLock: the library lock is held by this process (a library being
+// closed by a workspace switch while a request still uses it).
+var errOwnLock = errors.New("the library is still in use in this app (a request on it has not finished); try again in a moment")
+
 // errViaSymlink: a library is never created through a symbolic link.
 var errViaSymlink = errors.New("this entry is a symbolic link; a library is never created through a link: rebuild the folder it points to")
 
@@ -89,6 +97,12 @@ type libEntry struct {
 	lockInfo os.FileInfo // the lock file as it was when the lock was taken
 	stale    bool        // the folder was replaced: close the handles once inflight drops to 0
 	inflight int         // requests using the handles
+
+	// retired is set (under mu) when the entry left the registry in a
+	// workspace switch, or was never registered because its listing came
+	// from the previous workspace: open, rebuild and job starts refuse it
+	// (errRetired). Atomic so the job manager reads it without mu.
+	retired atomic.Bool
 
 	// planMu guards plans, the cached backup plans by target id.
 	planMu sync.Mutex
@@ -366,6 +380,10 @@ type listed struct {
 	path    string
 	library bool // has a regular media.db
 	link    bool // the entry is a symbolic link (to a plain folder)
+	// conf is the configuration the entry was listed under (nil: the
+	// current one); a listing of a workspace that is no longer served
+	// never registers an entry.
+	conf *wsConf
 }
 
 // discover lists the workspace: one ReadDir of the root. Hidden entries
@@ -378,7 +396,7 @@ func (ws *workspace) discover() ([]listed, error) {
 	case c.root == "":
 		return nil, nil
 	case c.single:
-		return []listed{{id: singleID(c.root), path: c.root, library: true}}, nil
+		return []listed{{id: singleID(c.root), path: c.root, library: true, conf: c}}, nil
 	}
 	ents, err := os.ReadDir(c.root)
 	if err != nil {
@@ -403,7 +421,7 @@ func (ws *workspace) discover() ([]listed, error) {
 			continue
 		}
 		fi, err := os.Lstat(filepath.Join(p, library.DBName))
-		out = append(out, listed{id: name, path: p, library: err == nil && fi.Mode().IsRegular(), link: link})
+		out = append(out, listed{id: name, path: p, library: err == nil && fi.Mode().IsRegular(), link: link, conf: c})
 	}
 	slices.SortFunc(out, func(a, b listed) int { return cmp.Compare(a.id, b.id) })
 	return out, nil
@@ -473,10 +491,28 @@ func (ws *workspace) entry(id string) *libEntry {
 func (ws *workspace) entryFor(l listed) *libEntry {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	if ws.outdatedLocked(l) {
+		return retiredEntry(l)
+	}
 	if e := ws.libs[l.id]; e != nil {
 		return e
 	}
 	return ws.registerLocked(l)
+}
+
+// outdatedLocked reports that l was listed under a configuration that is
+// no longer served (a workspace switch happened since).
+func (ws *workspace) outdatedLocked(l listed) bool {
+	return l.conf != nil && l.conf != ws.cfg()
+}
+
+// retiredEntry is an unregistered entry for a listing of a previous
+// workspace: every open, rebuild and job start on it fails with
+// errRetired.
+func retiredEntry(l listed) *libEntry {
+	e := &libEntry{id: l.id, path: l.path, state: libClosed}
+	e.retired.Store(true)
+	return e
 }
 
 func (ws *workspace) registerLocked(l listed) *libEntry {
@@ -495,6 +531,9 @@ func (ws *workspace) registerLocked(l listed) *libEntry {
 func (ws *workspace) freshEntry(l listed) *libEntry {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	if ws.outdatedLocked(l) {
+		return retiredEntry(l)
+	}
 	if old := ws.libs[l.id]; old != nil {
 		old.mu.Lock()
 		if old.unlock != nil || old.db != nil || old.user != nil {
@@ -549,6 +588,9 @@ func (ws *workspace) open(ctx context.Context, e *libEntry) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.retired.Load() {
+		return errRetired
+	}
 	switch e.state {
 	case libRebuilding:
 		return nil
@@ -683,6 +725,10 @@ func openReadStore(lib *library.Library) (*thumbs.Store, error) {
 // beginRebuild must be followed by exactly one endRebuild.
 func (ws *workspace) beginRebuild(ctx context.Context, e *libEntry) (lib *library.Library, user *userdata.DB, err error) {
 	e.mu.Lock()
+	if e.retired.Load() {
+		e.mu.Unlock()
+		return nil, nil, errRetired
+	}
 	switch e.state {
 	case libRebuilding:
 		e.mu.Unlock()
@@ -792,11 +838,15 @@ func (ws *workspace) closeAll() {
 	}
 }
 
-// createLibrary creates <root>/<name> with an empty catalog and returns
-// its listing entry. The name must be a valid, non-reserved id that does
-// not exist yet (errExists).
-func (ws *workspace) createLibrary(ctx context.Context, name string) (listed, error) {
-	p := filepath.Join(ws.root(), name)
+// createLibrary creates <c.root>/<name> with an empty catalog and returns
+// its listing entry (listed under c). The name must be a valid,
+// non-reserved id that does not exist yet (errExists). c is the request's
+// one snapshot of the configuration and must be a workspace.
+func (ws *workspace) createLibrary(ctx context.Context, c *wsConf, name string) (listed, error) {
+	if c.root == "" || c.single {
+		return listed{}, errors.New("no workspace to create a library in")
+	}
+	p := filepath.Join(c.root, name)
 	if err := os.Mkdir(p, 0o755); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return listed{}, errExists
@@ -812,7 +862,7 @@ func (ws *workspace) createLibrary(ctx context.Context, name string) (listed, er
 		return listed{}, err
 	}
 	db.Close()
-	return listed{id: name, path: p, library: true}, nil
+	return listed{id: name, path: p, library: true, conf: c}, nil
 }
 
 var errExists = errors.New("a folder with this name already exists")
@@ -833,9 +883,13 @@ func publicLibError(err error) string {
 	case err == nil:
 		return ""
 	case errors.As(err, &locked):
+		if ownLock(locked) {
+			return errOwnLock.Error()
+		}
 		return locked.Error()
 	case errors.Is(err, errReplaced), errors.Is(err, errReplacedBusy), errors.Is(err, errViaSymlink),
-		errors.Is(err, errNotRegularCatalog), errors.Is(err, errClosed):
+		errors.Is(err, errNotRegularCatalog), errors.Is(err, errClosed), errors.Is(err, errRetired),
+		errors.Is(err, errOwnLock):
 		return err.Error()
 	case errors.As(err, &ve):
 		return ve.Error()
@@ -861,33 +915,3 @@ func publicLibError(err error) string {
 
 // genericLibError is publicLibError's text for an error it does not know.
 const genericLibError = "the catalog could not be read (see the server log)"
-
-// replace points the workspace at c (the desktop app's workspace
-// switch): every registered library is retired, and the registry and
-// the peek cache start empty. The caller makes sure no job runs.
-func (ws *workspace) replace(c *wsConf) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	for _, e := range ws.libs {
-		e.retire()
-	}
-	ws.libs = map[string]*libEntry{}
-	ws.peeks = map[string]peekEntry{}
-	ws.conf.Store(c)
-}
-
-// retire closes a library that leaves the registry: its handles close
-// and its lock is released now, or when the last request using them
-// ends. A lock handed to the server in single mode is released too.
-func (e *libEntry) retire() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.external = false // closeHandlesLocked releases every lock
-	if e.state == libOpen || e.state == libRebuilding {
-		e.state = libClosed
-	}
-	e.stale = true
-	if e.inflight == 0 {
-		e.closeHandlesLocked()
-	}
-}

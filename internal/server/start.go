@@ -57,10 +57,13 @@ type StartOptions struct {
 // callbacks run on request goroutines (OnQuit on its own goroutine after
 // the response is sent).
 type AppHooks struct {
-	Token       string // per-run secret of POST /api/app/show and /quit
-	Version     string
-	Platform    string // "windows", "linux" or "darwin"
-	Window      bool   // a native window is available
+	Token    string // per-run secret of POST /api/app/show and /quit
+	Version  string
+	Platform string // "windows", "linux" or "darwin"
+	// Window reports, per request, whether the native window is in use
+	// and why (WindowOK, WindowNoRuntime, WindowBrowserFlag,
+	// WindowFailed, WindowUnsupported); nil: false, WindowUnsupported.
+	Window      func() (ok bool, reason string)
 	CloseToTray func() bool
 	// OnOpen opens or focuses the window (the browser where there is none).
 	OnOpen func()
@@ -71,6 +74,15 @@ type AppHooks struct {
 	// the new root (the "root" of /api/libraries).
 	OnWorkspaceChanged func(path string)
 }
+
+// The windowReason values of GET /api/app.
+const (
+	WindowOK          = "ok"           // the native window is used
+	WindowNoRuntime   = "no-runtime"   // Windows without the WebView2 runtime
+	WindowBrowserFlag = "browser-flag" // --browser
+	WindowFailed      = "failed"       // creating the window failed; the browser is used for the rest of the run
+	WindowUnsupported = "unsupported"  // no native window on this OS (Linux, macOS)
+)
 
 // ModeError is a Start failure caused by the folder and the Workspace
 // flag (serve turns it into a usage error under --workspace).

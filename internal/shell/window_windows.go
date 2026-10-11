@@ -13,6 +13,8 @@ import (
 	"github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"picmover/internal/server"
 )
 
 // iconResourceID is the RT_GROUP_ICON id of the application icon in
@@ -20,31 +22,42 @@ import (
 const iconResourceID = 1
 
 var (
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procShowWindow          = user32.NewProc("ShowWindow")
-	procIsIconic            = user32.NewProc("IsIconic")
-	procIsZoomed            = user32.NewProc("IsZoomed")
-	procIsWindowVisible     = user32.NewProc("IsWindowVisible")
-	procGetWindowRect       = user32.NewProc("GetWindowRect")
-	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
-	procCallWindowProcW     = user32.NewProc("CallWindowProcW")
-	procPostMessageW        = user32.NewProc("PostMessageW")
-	procFlashWindow         = user32.NewProc("FlashWindow")
-	procMessageBoxW         = user32.NewProc("MessageBoxW")
-	procBringWindowToTop    = user32.NewProc("BringWindowToTop")
+	procSetForegroundWindow   = user32.NewProc("SetForegroundWindow")
+	procShowWindow            = user32.NewProc("ShowWindow")
+	procIsIconic              = user32.NewProc("IsIconic")
+	procIsZoomed              = user32.NewProc("IsZoomed")
+	procIsWindowVisible       = user32.NewProc("IsWindowVisible")
+	procGetWindowRect         = user32.NewProc("GetWindowRect")
+	procSetWindowLongPtrW     = user32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW       = user32.NewProc("CallWindowProcW")
+	procPostMessageW          = user32.NewProc("PostMessageW")
+	procFlashWindow           = user32.NewProc("FlashWindow")
+	procMessageBoxW           = user32.NewProc("MessageBoxW")
+	procBringWindowToTop      = user32.NewProc("BringWindowToTop")
+	procDestroyWindow         = user32.NewProc("DestroyWindow")
+	procSystemParametersInfoW = user32.NewProc("SystemParametersInfoW")
+	procGetSystemMetrics      = user32.NewProc("GetSystemMetrics")
+	procSetWindowsHookExW     = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx   = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx        = user32.NewProc("CallNextHookEx")
 )
 
 const (
-	wmClose       = 0x0010
-	swHide        = 0
-	swShow        = 5
-	swRestore     = 9
-	gwlpWndProc   = ^uintptr(3) // GWLP_WNDPROC = -4
-	mbYesNo       = 0x00000004
-	mbIconWarning = 0x00000030
-	mbIconInfo    = 0x00000040
-	mbSetFg       = 0x00010000
-	idYes         = 6
+	wmClose        = 0x0010
+	swHide         = 0
+	swShow         = 5
+	swRestore      = 9
+	gwlpWndProc    = ^uintptr(3) // GWLP_WNDPROC = -4
+	mbYesNo        = 0x00000004
+	mbIconWarning  = 0x00000030
+	mbIconInfo     = 0x00000040
+	mbSetFg        = 0x00010000
+	idYes          = 6
+	spiGetWorkArea = 0x0030
+	smCxScreen     = 0
+	smCyScreen     = 1
+	whCBT          = 5
+	hcbtCreateWnd  = 3
 )
 
 // webView2ClientKey is the EdgeUpdate client id of the WebView2 runtime.
@@ -78,7 +91,17 @@ func webView2Version() string {
 
 // webviewWindow is the WebView2 window. There is at most one per process:
 // closing it hides it (the page keeps running), Open shows it again; it
-// is destroyed only at quit.
+// is destroyed only at quit. When its creation fails (Embed false, or no
+// answer within windowCreateTimeout) it stays failed: Open returns that
+// error and the app uses the browser for the rest of the run.
+//
+// go-webview2 still calls log.Fatal in a few of its own paths (a failed
+// environment or controller creation callback, settings it cannot set);
+// that text goes to the log file (the standard logger writes there) and
+// the process ends. The data folder is checked first (probeDataDir), the
+// most likely cause; the library is not forked for the rest because the
+// remaining causes (a broken runtime, policy blocks) are rare and a fork
+// would have to be kept up to date with its COM bindings.
 type webviewWindow struct {
 	cfg windowConfig
 
@@ -87,6 +110,7 @@ type webviewWindow struct {
 	hwnd     uintptr
 	starting bool
 	quitting bool          // Close was called: WM_CLOSE destroys the window
+	failed   error         // creation failed: never tried again
 	ended    chan struct{} // closed when the window's thread has ended
 }
 
@@ -97,15 +121,18 @@ var (
 	subclassProc = windows.NewCallback(windowProc)
 )
 
-func newNativeWindow(cfg windowConfig) (nativeWindow, bool, string) {
+func newNativeWindow(cfg windowConfig) (nativeWindow, string, string) {
 	v := webView2Version()
 	if v == "" {
-		return nil, false, "the WebView2 runtime is not installed (https://go.microsoft.com/fwlink/p/?LinkId=2124703)"
+		return nil, server.WindowNoRuntime, "the WebView2 runtime is not installed (https://go.microsoft.com/fwlink/p/?LinkId=2124703)"
 	}
 	cfg.log.Info("WebView2 runtime found", "version", v)
+	if err := probeDataDir(cfg.dataPath); err != nil {
+		return nil, server.WindowFailed, err.Error()
+	}
 	w := &webviewWindow{cfg: cfg}
 	theWindow = w
-	return w, true, ""
+	return w, server.WindowOK, ""
 }
 
 func (w *webviewWindow) IsOpen() bool {
@@ -125,10 +152,14 @@ func (w *webviewWindow) Handle() uintptr {
 }
 
 // Open shows the window, creating it on its own locked OS thread the
-// first time.
+// first time; it waits at most windowCreateTimeout for the creation.
 func (w *webviewWindow) Open(url, nav string) error {
 	w.mu.Lock()
 	switch {
+	case w.failed != nil:
+		err := w.failed
+		w.mu.Unlock()
+		return err
 	case w.quitting:
 		w.mu.Unlock()
 		return nil
@@ -150,7 +181,20 @@ func (w *webviewWindow) Open(url, nav string) error {
 	w.mu.Unlock()
 	errc := make(chan error, 1)
 	go w.loop(url, errc, ended)
-	return <-errc
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(windowCreateTimeout):
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.wv != nil {
+		return nil // ready just now
+	}
+	// The loop may still finish later: it then sees failed and destroys
+	// the window.
+	w.failed = fmt.Errorf("the WebView2 window was not ready within %v", windowCreateTimeout)
+	return w.failed
 }
 
 // loop creates the window and runs its message loop until it is
@@ -162,23 +206,47 @@ func (w *webviewWindow) loop(url string, errc chan<- error, ended chan struct{})
 	if err := windows.CoInitializeEx(0, windows.COINIT_APARTMENTTHREADED); err != nil {
 		w.cfg.log.Warn("CoInitializeEx", "err", err)
 	}
-	size := w.cfg.size()
+	defer windows.CoUninitialize()
+	x, y, cw, ch := placeWindow(w.cfg.size(), workArea())
+	placed := placeNextWindow(x, y, cw, ch)
 	wv := webview2.NewWithOptions(webview2.WebViewOptions{
 		AutoFocus: true,
 		DataPath:  w.cfg.dataPath,
 		WindowOptions: webview2.WindowOptions{
-			Title: "picmover", Width: uint(size.Width), Height: uint(size.Height),
+			// Center is the fallback when the placement hook is missing:
+			// the size is clamped either way.
+			Title: "picmover", Width: uint(cw), Height: uint(ch),
 			IconId: iconResourceID, Center: true,
 		},
 	})
+	created := placed()
 	if wv == nil {
+		// CreateWithOptions showed the window before Embed failed: do not
+		// leave it blank on the screen.
+		if created != 0 {
+			procDestroyWindow.Call(created)
+		}
+		err := errors.New("the WebView2 window could not be created")
 		w.mu.Lock()
 		w.starting = false
+		if w.failed == nil {
+			w.failed = err
+		}
 		w.mu.Unlock()
-		errc <- errors.New("the WebView2 window could not be created")
+		errc <- err
 		return
 	}
 	hwnd := uintptr(wv.Window())
+	w.mu.Lock()
+	if w.failed != nil || w.quitting {
+		// Open gave up waiting, or the app quit meanwhile.
+		w.starting = false
+		w.mu.Unlock()
+		wv.Destroy()
+		wv.Run() // until the window is destroyed
+		return
+	}
+	w.mu.Unlock()
 	// Ctrl+W closes the window, as in a browser.
 	_ = wv.Bind("picmoverCloseWindow", func() {
 		procPostMessageW.Call(hwnd, wmClose, 0, 0)
@@ -200,8 +268,75 @@ func (w *webviewWindow) loop(url string, errc chan<- error, ended chan struct{})
 	w.mu.Lock()
 	w.wv, w.hwnd = nil, 0
 	w.mu.Unlock()
-	windows.CoUninitialize()
 }
+
+// workArea is the primary monitor's work area (the screen without the
+// taskbar), where the window is placed (go-webview2 centres on the
+// primary monitor too).
+func workArea() rect {
+	var r rect
+	if ok, _, _ := procSystemParametersInfoW.Call(spiGetWorkArea, 0, uintptr(unsafe.Pointer(&r)), 0); ok != 0 && r.Right > r.Left && r.Bottom > r.Top {
+		return r
+	}
+	cx, _, _ := procGetSystemMetrics.Call(smCxScreen)
+	cy, _, _ := procGetSystemMetrics.Call(smCyScreen)
+	return rect{Right: int32(cx), Bottom: int32(cy)}
+}
+
+// cbtCreateWnd and createStruct are CBT_CREATEWNDW and CREATESTRUCTW.
+type cbtCreateWnd struct {
+	cs          *createStruct
+	insertAfter uintptr
+}
+
+type createStruct struct {
+	createParams, instance, menu, parent uintptr
+	cy, cx, y, x                         int32
+	style                                int32
+	name, class                          *uint16
+	exStyle                              uint32
+}
+
+// The placement of the next top-level window created on the window
+// thread (placeNextWindow); only that thread touches these.
+var (
+	placeHook    uintptr
+	placeAt      [4]int32 // x, y, width, height
+	placeCreated uintptr
+	placeProc    = windows.NewCallback(cbtProc)
+)
+
+// placeNextWindow sets the position and size of the next top-level
+// window this thread creates (go-webview2's, which can only centre on
+// the whole screen), through a thread-local CBT hook that edits its
+// CREATESTRUCT before it appears. The returned function removes the hook
+// and returns that window's handle (0 when none was created).
+func placeNextWindow(x, y, w, h int32) (done func() uintptr) {
+	placeAt, placeCreated = [4]int32{x, y, w, h}, 0
+	placeHook, _, _ = procSetWindowsHookExW.Call(whCBT, placeProc, 0, uintptr(windows.GetCurrentThreadId()))
+	return func() uintptr {
+		if placeHook != 0 {
+			procUnhookWindowsHookEx.Call(placeHook)
+			placeHook = 0
+		}
+		return placeCreated
+	}
+}
+
+func cbtProc(code, wp, lp uintptr) uintptr {
+	if int32(code) == hcbtCreateWnd && placeCreated == 0 {
+		if c := (*cbtCreateWnd)(pointerOf(lp)); c != nil && c.cs != nil && c.cs.parent == 0 {
+			c.cs.x, c.cs.y, c.cs.cx, c.cs.cy = placeAt[0], placeAt[1], placeAt[2], placeAt[3]
+			placeCreated = wp
+		}
+	}
+	r, _, _ := procCallNextHookEx.Call(placeHook, code, wp, lp)
+	return r
+}
+
+// pointerOf turns an address Windows passed in a message parameter into
+// a pointer.
+func pointerOf(p uintptr) unsafe.Pointer { return *(*unsafe.Pointer)(unsafe.Pointer(&p)) }
 
 // windowProc subclasses the WebView2 window: a close by the user (the
 // close button, Alt+F4, Ctrl+W) hides it and tells the app, which keeps
@@ -232,11 +367,11 @@ func windowSize(hwnd uintptr) WindowSize {
 	if r, _, _ := procIsZoomed.Call(hwnd); r != 0 {
 		return WindowSize{}
 	}
-	var rect struct{ Left, Top, Right, Bottom int32 }
-	if r, _, _ := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect))); r == 0 {
+	var r rect
+	if ok, _, _ := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r))); ok == 0 {
 		return WindowSize{}
 	}
-	return WindowSize{Width: int(rect.Right - rect.Left), Height: int(rect.Bottom - rect.Top)}
+	return WindowSize{Width: int(r.Right - r.Left), Height: int(r.Bottom - r.Top)}
 }
 
 // Close destroys the window (at quit) and waits up to 5 s for its thread.
@@ -279,9 +414,12 @@ func focusWindow(hwnd uintptr) {
 	}
 }
 
-// confirmQuit asks whether to quit while jobs run (a message box owned by
-// the window).
-func confirmQuit(owner uintptr, jobs int) bool {
+// confirmQuit asks whether to quit while jobs run, in a message box owned
+// by the window. The window is restored and raised first: a box owned by
+// a minimised window would be hidden with it.
+func confirmQuit(win nativeWindow, jobs int) bool {
+	owner := win.Handle()
+	focusWindow(owner)
 	what := "A job is running"
 	if jobs > 1 {
 		what = fmt.Sprintf("%d jobs are running", jobs)

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // ConfigName is the app's settings file in the config directory.
@@ -115,9 +116,28 @@ func writeFileAtomic(p string, data []byte, perm os.FileMode) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, p); err != nil {
+	if err := renameRetry(tmp, p); err != nil {
 		return err
 	}
 	ok = true
 	return nil
+}
+
+// Retries of the rename in writeFileAtomic on Windows, where an
+// antivirus or indexer that holds the target open without
+// FILE_SHARE_DELETE makes it fail for a moment.
+const (
+	renameRetries = 3
+	renamePause   = 50 * time.Millisecond
+)
+
+// renameRetry renames tmp over p, retrying up to renameRetries times
+// after a sharing-violation style error (Windows only).
+func renameRetry(tmp, p string) error {
+	err := os.Rename(tmp, p)
+	for i := 0; i < renameRetries && err != nil && isSharingViolation(err); i++ {
+		time.Sleep(renamePause)
+		err = os.Rename(tmp, p)
+	}
+	return err
 }
