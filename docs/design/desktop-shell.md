@@ -191,3 +191,307 @@ show a small message box. Everything else goes to the log file.
 Installer, auto-start on login, code signing, a native window on Linux or
 macOS, native file dialogs, notifications, auto-update, a `picmover app`
 subcommand in the CLI binary.
+
+## As implemented (backend)
+
+### Server (`internal/server`)
+
+- `start.go`: `server.Start(ctx, StartOptions) (*Running, error)` holds
+  what `runServe` did: `ServeMode` (moved from cmd, exported; cmd keeps
+  `serveMode` as a thin wrapper for its tests), the single-library open
+  and lock (`openStartLibrary`, `checkCreatable`, `LockLibrary`,
+  `CatalogError`/`RebuildError`, moved from cmd with identical messages),
+  the read-only thumbnail store, ffmpeg detection, the listener with the
+  busy-port fallback (`AddrGiven`), the non-loopback warning, the HTTP
+  server (same timeouts and error log). `StartOptions`: `Path` ("" =
+  unset), `Workspace` (the `--workspace` flag), `Addr`, `AddrGiven`,
+  `CORSOrigins`, `Version`, `ErrOut` (the notices serve prints),
+  `Logger`, `CatalogLogger` (serve: stderr without timestamps), `App`.
+  A `--workspace` error is a `*ModeError` (serve turns it into the usage
+  error). `Running`: `URL()`, `Addr()`, `Banner()` (serve prints
+  `Banner() + " at " + URL()`), `Done()` (closed when serving ends),
+  `JobCount()`, `Workspace()`, `Shutdown(ctx)` (idempotent: StopJobs with
+  ctx, then HTTP drain 5 s, then Close, then the store, catalog and lock
+  Start opened; returns the serve error, not `ErrServerClosed`).
+  `cmd/serve.go` now only parses flags, calls `Start`, prints the banner,
+  opens the browser and waits for Ctrl+C; all `cmd/serve*_test.go` pass
+  unchanged. One internal difference: the single library's lock is
+  handed to the server (released by `Server.Close`, then again, as a
+  no-op, by `Running`), instead of being released by a `defer` in cmd.
+- With `App` set, a folder without `media.db` is always served as a
+  workspace (as if `--workspace`), one with `media.db` as a library; the
+  app never creates a library at start. The shell checks that a saved
+  workspace still exists before passing it (an unplugged drive is not
+  re-created by `MkdirAll`).
+- Unset mode (`Options.Unset`): `workspace.conf` is now an
+  `atomic.Pointer[wsConf]{root, single}` (root "" = unset) read through
+  `ws.root()`, `ws.single()`, `ws.unset()`, so a switch is race-free.
+- Job manager: `count()` (0 or 1) and `pause()`/`resume()` (a switch
+  refuses to start while a job runs and blocks job starts meanwhile; a
+  job start during a switch answers 409 "the workspace is being changed").
+- Workspace switch: `ws.replace(conf)` retires every registered library
+  (handles closed and lock released now, or when the last request using
+  them ends) and starts with an empty registry and peek cache; a single
+  library is then opened and locked by the server (`openSingle`) and its
+  lock released by a later switch or `Close`. When that open fails the
+  previous folder is served again (best effort) and the answer is 409.
+
+### API (as the frontend relies on it)
+
+All POSTs follow step 3: `Content-Type: application/json`,
+`X-Picmover: 1`, 64 KiB cap, Origin/Sec-Fetch checks. Without `App`
+every `/api/app` route answers 404 `{"error":"no such endpoint"}` (GET and
+POST).
+
+```
+GET  /api/app
+  200 {"app":true,"version":"…","workspace":"<root of /api/libraries, \"\" while unset>",
+       "closeToTray":true,"platform":"windows"|"linux"|"darwin","window":false}
+POST /api/app/open       {}                → 204, empty body (opens/focuses the window or the browser)
+POST /api/app/show       {"token":"…"}     → 204 | 403 {"error":"invalid token"}
+POST /api/app/quit       {"token":"…","force":false}
+                                           → 204 (sent first; the app then quits)
+                                           | 403 {"error":"invalid token"}
+                                           | 409 {"error":"a job is running","jobs":1}   (unless force)
+POST /api/app/workspace  {"path":"…"}      → 200 the /api/libraries body for the new folder
+                                           | 400 {"error":"<a sentence for the user>"}
+                                           | 409 {"error":"a job is running","jobs":1}
+                                           | 409 {"error":"The library is in use by another picmover process: …"}
+                                           | 409 {"error":"The library cannot be opened: …"}
+                                           | 503 {"error":"the server is shutting down"}
+```
+
+The 400 texts: "Choose a folder.", "Use an absolute path (a full path
+such as D:\Photos)." (`/home/you/Pictures` elsewhere), "Network (UNC) and
+device paths cannot be used; choose a folder on a local or mapped
+drive.", "The path contains an invalid character.", "The folder does not
+exist.", "The folder cannot be read (permission denied).", "The folder
+cannot be read.", "That is a file, not a folder.", "That folder is inside
+a library's .picmover directory; choose the folder that holds your
+libraries." (any path component `.picmover`, case-insensitive, lexical
+and resolved). A folder with `media.db` is accepted and served as one
+library (mode `single`); the frontend's fake refuses it with 400, the
+real server does not. The new root is the path with symbolic links
+resolved, which is also what `/api/app` reports and `app.json` stores.
+
+Unset mode: `GET /api/libraries` → `{"root":"","mode":"unset","libraries":[],"folders":[]}`;
+every `/api/l/{lib}/…` route and `POST /api/libraries`,
+`POST /api/libraries/{lib}/open`, `GET /api/libraries/{lib}/cover`,
+`POST /api/libraries/{lib}/jobs` → 409 `{"error":"no workspace","state":"unset"}`;
+`/api/fs`, `/api/jobs` and the app routes work.
+
+The token is 32 random bytes as 64 hex digits, compared with
+`subtle.ConstantTimeCompare`. The second instance sends `POST
+http://127.0.0.1:<port>/api/app/show` with exactly `Content-Type:
+application/json` and `X-Picmover: 1`, no `Origin` and no `Sec-Fetch-*`
+(Go's client sends neither), and Host `127.0.0.1:<port>`: the
+security middleware passes a mutation without Origin when the content
+type and header are right (the same path `curl` takes).
+
+### Shell (`internal/shell`)
+
+- `shell.Run(ctx, Options)` (Options: `Workspace`, `Hidden`, `NoTray`,
+  `Browser`, `Port`, `Version`, and `ConfigDir`/`CacheDir`/`Stderr` for
+  tests). Sequence: config dir, log, single-instance lock (hand-off and
+  return nil when taken), `app.json`, `--workspace` (must exist; saved),
+  native window check, tray check, `server.Start` (if the saved
+  workspace cannot be served, for example a library locked by another
+  picmover, it logs that and starts unset, keeping the saved path),
+  `app.json` saved (port, workspace, lastOpened), `instance.json`
+  written, window/browser opened unless `--hidden`, tray loop on the
+  calling (main) goroutine or a wait. SIGINT/SIGTERM and an unexpected
+  end of serving quit too.
+- `app.json` in `os.UserConfigDir()/picmover` (`%APPDATA%\picmover`,
+  `~/.config/picmover`, `~/Library/Application Support/picmover`),
+  written atomically (temp file + rename):
+
+  ```json
+  {"workspace": "", "port": 0, "closeToTray": true,
+   "window": {"width": 1280, "height": 800}, "lastOpened": ""}
+  ```
+
+  Absent fields keep these defaults; a damaged file is logged and the
+  defaults used (it is rewritten at start). `port` 0 means 7440 (not
+  serve's 7439, so both can run); a busy remembered port falls back to a
+  free one, which is saved; `--port` is strict (busy = exit 1) and saved.
+  `window` is the outer size in physical pixels (sizes below 480×360 or
+  above 16384 reset to the default).
+- `instance.json` (same dir, mode 0600): `{"pid":N,"port":N,"token":"<64 hex>"}`,
+  written after the server listens, removed at quit. A stale file (the
+  lock is free) is simply overwritten.
+- Single instance: Windows named mutex
+  `Local\picmover-app-<sha1 hex of the lower-cased config dir>`; Linux and
+  macOS `flock` on `$XDG_RUNTIME_DIR/picmover-app-<first 12 hex>.lock`, or
+  `<config dir>/picmover-app.lock` without `XDG_RUNTIME_DIR` (deviation:
+  the hash in the name, so test and real config dirs never collide). The
+  second instance waits up to 5 s for `instance.json`, calls
+  `AllowSetForegroundWindow(pid)` on Windows, posts `show`, exits 0; if
+  that fails, exit 1 with the reason in the log and on stderr.
+- Log: `picmover-app.log` in the config dir, slog text, 5 MiB, `.1` and
+  `.2` kept. The server's request log and notices, systray's and
+  WebView2's standard-library `log` output all go there.
+- Browser: `rundll32 url.dll,FileProtocolHandler`, `open`, `xdg-open`;
+  Linux app mode: the first of `google-chrome`, `google-chrome-stable`,
+  `chromium`, `chromium-browser`, `microsoft-edge`,
+  `microsoft-edge-stable` on PATH with `--app=<url>
+  --user-data-dir=<cache>/picmover/app-profile`, else `xdg-open`. "Open"
+  in the tray uses app mode (each click opens another app window: Chrome
+  cannot focus an existing one from outside); "Open in browser" the
+  default browser.
+- Tray (`fyne.io/systray`, `windows || linux`): icon (ICO / PNG embedded
+  from `internal/shell/assets`), tooltip "picmover", Open, Open in
+  browser, separator, disabled "Workspace: <name>" (full path as tooltip;
+  "No workspace chosen" while unset; updated on a switch), Change
+  workspace… (window on `<url>#/?setup=1`), separator, Quit (relabelled
+  "Quit (1 job running)" on a 5 s ticker). On Linux a left click on the
+  icon opens the window. Linux: systray v1.12.2 calls onReady before it
+  touches D-Bus and only logs registration failures (and its shutdown
+  would crash without a session bus), so the shell first connects to the
+  session bus itself: no bus → no tray (logged), the app runs on; bus but
+  no `org.kde.StatusNotifierWatcher` → logged, the tray runs anyway and
+  appears when a host starts. macOS: stub, logged.
+- Quit (`app.quit`, once): close the window, `Running.Shutdown` with a
+  30 s deadline (cancels a job like Ctrl+C), remove `instance.json`, end
+  the tray loop; `Run` then releases the lock and returns. Tray Quit with
+  a job running: on Windows with the window visible a Yes/No message box
+  owned by the window asks first ("asks through the window"); elsewhere
+  it quits at once. If the tray loop does not return within 5 s after
+  `systray.Quit` (it never started on Windows), the process exits 0.
+- Window (Windows, `jchv/go-webview2` pseudo-version 20260205): only when
+  the registry shows the runtime (`pv` under
+  `HKLM\SOFTWARE\WOW6432Node\…\{F3017226-…}`, then HKCU, then both
+  without `WOW6432Node`; not empty, not `0.0.0.0`) and `--browser` is not
+  given. One window per process, created on its own goroutine with
+  `runtime.LockOSThread` and `CoInitializeEx(COINIT_APARTMENTTHREADED)`
+  (deviation: needed because go-webview2's `edge` package initialises
+  COM only on the main thread in its `init`, and that thread runs the
+  tray). Title "picmover", icon resource 1, saved size, centred, user
+  data `os.UserCacheDir()/picmover/WebView2`, dev tools and context menus
+  off. The window procedure is subclassed: a user close (button, Alt+F4,
+  Ctrl+W through a bound script) hides the window instead of destroying
+  it (the page and its event streams keep running; deviation: the
+  contract says the window is closed; hiding avoids recreating WebView2
+  and leaking its browser processes, since go-webview2 has no controller
+  Close), saves the normal size, and quits when `closeToTray` is false or
+  there is no tray. Open shows, restores and raises it
+  (`BringWindowToTop`, `SetForegroundWindow`, else `FlashWindow`); with a
+  fragment (Change workspace…) it navigates. Quit destroys it.
+- `--version`/`--help` on Windows: `AttachConsole(ATTACH_PARENT_PROCESS)`
+  and write to `CONOUT$` (the prompt has already returned, so the text
+  appears after it), else `MessageBoxW`. Usage errors exit 1 (not 2: the
+  contract allows 0 and 1).
+
+### Executable, resources, Makefile
+
+- `cmd/picmover-app/main.go`: standard `flag` (`--workspace`, `--hidden`,
+  `--no-tray`, `--browser`, `--port`, `--version`, `--help`/`-h`),
+  version from `-X main.version=…`. Exit 0 normally and after a hand-off,
+  1 on failure.
+- `winres/gen` (`make icons`) draws the icon (rounded blue square, amber
+  sun, white and pale-blue mountains) at 16, 32, 48 and 256 px into
+  `winres/icon*.png`, and `internal/shell/assets/tray.png` (32 px) and
+  `tray.ico` (16/32/48, PNG-compressed). `winres/winres.json`: icon group
+  `#1`, manifest (`as invoker`, `per monitor v2`, `long-path-aware`,
+  common controls v6, minimum OS win10), version info with empty version
+  strings. `make winres` runs `go run
+  github.com/tc-hib/go-winres@v0.3.3 make --in winres/winres.json --out
+  cmd/picmover-app/rsrc --arch amd64 --product-version=$(VERSION)
+  --file-version=$(VERSION)`; the resulting
+  `cmd/picmover-app/rsrc_windows_amd64.syso` is committed, so the version
+  in the file properties is the one of the last `make winres` (regenerate
+  it on a clean tagged tree before a release; a non-numeric version such
+  as a commit hash gives fixed version 0.0.0.0 with the string shown as
+  is). go-winres is not in go.mod.
+- Makefile: `build-app` (after `web`) → `dist/picmover-app.exe`
+  (`-H windowsgui`), `dist/picmover-app` (linux amd64),
+  `dist/picmover-app-darwin-arm64`; `build-all` includes them; `vet` runs
+  for linux, windows and darwin; `winres`, `icons`. Sizes at this commit
+  (frontend not embedded): 22.7 MB (exe), 25.0 MB (linux).
+- Dependencies: `fyne.io/systray v1.12.2`, `github.com/jchv/go-webview2
+  v0.0.0-20260205173254-56598839c808` (+ `go-winloader`, indirect),
+  `github.com/godbus/dbus/v5 v5.1.0` (systray's, used directly for the
+  tray-host check). `GOOS=darwin CGO_ENABLED=0 go build ./...` passes:
+  systray is imported only from `windows || linux` files.
+
+### Tests (Go)
+
+- `internal/server/app_test.go`: `TestStartSingleShutdown` (Start on a
+  new library, lock held while serving and released by Shutdown, Done,
+  idempotent Shutdown, every app route 404 without App, busy given
+  address), `TestStartModeError`, `TestAppUnsetMode` (listing, 409
+  `unset` on library and workspace routes, `/api/fs`, `/api/app` body),
+  `TestAppTokenEndpoints` (open 204 empty, show 403/204, missing
+  X-Picmover and foreign Origin refused, no-Origin client accepted, quit
+  409 with jobs / 204 with force / 204 idle, OnQuit called),
+  `TestAppWorkspaceSwitch` (the 400 sentences, 409 during a job,
+  workspace → single library → workspace with locks released and taken,
+  `/api/app` workspace = listing root, OnWorkspaceChanged),
+  `TestAppWorkspaceSwitchBusyLibrary` (409, previous workspace kept; a
+  folder of photos is served as a workspace in app mode, nothing
+  created). All existing server and `cmd/serve*` tests pass unchanged.
+- `internal/shell`: config defaults, partial and damaged files and round
+  trip; log rotation; browser commands per OS and the app-mode search
+  (PATH stubbed); instance lock; the show hand-off against a real server
+  (no file, bad token, good token, file mode 0600); the quit sequence
+  with and without a running job (fake server: one Shutdown with the
+  30 s deadline, instance file removed) and window close with and
+  without `closeToTray`; `TestRunBusySavedLibrary`; and
+  `TestRunSingleInstance`, a real two-process test on Linux (stale
+  instance file replaced, `--hidden` opens nothing, `/api/app`, the test
+  binary started again as a second instance posts show and exits 0, the
+  first opens the browser (stubbed), quit over HTTP, config saved,
+  instance file removed, lock free); tray labels.
+- Windows-only code (window, registry, mutex, console, message boxes) is
+  vetted and built with `GOOS=windows` only; it has not run.
+
+## Manual checklist
+
+Windows (a recent Windows 10/11 with Edge, so the WebView2 runtime is
+present):
+
+1. `make build-app` and copy `dist/picmover-app.exe`. Delete
+   `%APPDATA%\picmover` first for a first run. Double-click: one window
+   "picmover" with the sun-and-mountains icon (title bar, taskbar, Alt+Tab,
+   file properties show the version), centred, 1280×800; the tray icon
+   appears. The setup card asks for a folder; choose your libraries'
+   folder; the libraries are listed; `app.json` holds it.
+2. Close the window (X, Alt+F4, Ctrl+W): the tray icon stays; the tray's
+   Open brings the same page back (state kept). Resize, close, quit,
+   start: the size is restored.
+3. Start the exe again (Start menu, Explorer): no second tray icon; the
+   existing window comes to the front (or its taskbar button flashes).
+   Also after it was minimised and after it was closed to the tray.
+4. Tray: Open in browser opens the default browser on the same URL;
+   Change workspace… shows the setup card in the window; the workspace
+   item shows the new folder name after a change.
+5. Start an import, then tray Quit: the label says "Quit (1 job
+   running)" (within 5 s); with the window open a Yes/No box asks; Yes
+   stops the import safely (its log says cancelled) and the app exits
+   within 30 s; `instance.json` is gone. Repeat with the window closed:
+   no question, same result.
+6. `picmover-app.exe --version` and `--help` in cmd and PowerShell print
+   there; from the Run dialog (Win+R) they show a message box.
+7. Task Manager: after several close/open cycles there is still one set
+   of `msedgewebview2.exe` processes; after Quit none remain.
+8. Optional, in a VM: rename the WebView2 `pv` registry value (or start
+   with `--browser`): the default browser opens instead and the UI shows
+   the WebView2 notice once (with `--browser` it shows too: `window` is
+   false).
+9. Check `%APPDATA%\picmover\picmover-app.log` for errors; high-DPI
+   monitor: the window is crisp (per-monitor v2) when moved between
+   monitors.
+
+Linux:
+
+1. `dist/picmover-app` on KDE: tray icon with the menu; left click opens
+   the window. With Chrome or Chromium installed the UI opens as an app
+   window (own profile under `~/.cache/picmover/app-profile`); without
+   them (Firefox only) in the default browser.
+2. GNOME with the AppIndicator extension: the icon appears; without it
+   the log says no tray host and the app keeps running (start it again
+   to open the UI; quit with Ctrl+C or `kill`).
+3. Start it again: the running one opens another app window and the
+   second process exits 0. Tray Quit with an import running cancels it
+   and exits.
+4. `--no-tray`, `--hidden`, `--port 7500`, `--workspace <dir>`: behave as
+   described; `~/.config/picmover/app.json` and `picmover-app.log`.

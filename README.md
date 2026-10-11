@@ -124,6 +124,16 @@ Flags:
 
 Frontend development: run `picmover serve /path/to/library --no-open --cors-origin http://localhost:5173` and, in `web/`, `npm run dev`; Vite serves the app on `http://localhost:5173` with hot reload and proxies `/api` to `127.0.0.1:7439` (the proxy rewrites the `Host` header, `changeOrigin: true`, so the server's host check passes). The `--cors-origin` flag accepts the dev page's `Origin` header, which browsers send on every POST even through the proxy, and also lets the page call `http://127.0.0.1:7439/api/...` directly, bypassing the proxy. `make check` runs the Go vet and tests plus the frontend checks and tests.
 
+### Desktop app: picmover-app
+
+`picmover-app` (`picmover-app.exe` on Windows; `make build-app` builds it into `dist/`) is the same server and UI as a desktop application. It listens on `127.0.0.1` only (port 7440 on the first run, then the port it last used, so bookmarks keep working), shows the UI in its own window on Windows (WebView2; without the WebView2 runtime it uses the default browser) and in the browser elsewhere (on Linux a Chrome, Chromium or Edge `--app` window when one is installed), and runs once per user: starting it again shows the running one.
+
+- **First run:** the window opens on a setup card: choose the folder that holds your libraries (a workspace), or one library. It is remembered; the tray's **Change workspace…** opens the card again.
+- **Tray:** an icon in the notification area (Linux: needs a StatusNotifier host, for example KDE or GNOME with the AppIndicator extension) with Open, Open in browser, the workspace folder, Change workspace… and Quit. Quit says how many jobs run; a running job is cancelled safely (on Windows with the window open it asks first) and the app waits up to 30 s for it. macOS has no tray: quit with Ctrl+C.
+- **Close to tray:** closing the window (or Ctrl+W) keeps the app, its imports and backups running in the tray; set `"closeToTray": false` in `app.json` to quit instead.
+- **Settings** are in `app.json` and the log in `picmover-app.log` (5 MiB, two old files kept), both in the user config folder: `%APPDATA%\picmover` on Windows, `~/.config/picmover` on Linux, `~/Library/Application Support/picmover` on macOS. The window's WebView2 data is in `%LOCALAPPDATA%\picmover\WebView2`.
+- **Flags:** `--workspace <dir>` (serve this folder and remember it), `--hidden` (do not open the window), `--no-tray`, `--browser` (never the native window), `--port <n>`, `--version`, `--help`. On Windows `--version` and `--help` print to the console they were started from, else show a message box.
+
 ### Thumbnails
 
 To generate the thumbnails and previews that are still pending (after `import --no-thumbs` or a cancelled import), retry the files whose thumbnails failed before, regenerate stale ones, and fill in the 640 px large thumbnails that libraries made by earlier versions lack:
