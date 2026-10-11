@@ -12,6 +12,7 @@
   import { statusLine, summaryFromLib } from '../lib/backupinfo';
   import { navigate, route } from '../lib/router';
   import { libHref, libPath, SETUP } from '../lib/routes';
+  import { viewMemory } from '../lib/viewmemory.svelte';
   import { app } from '../lib/app.svelte';
   import WorkspaceSetup from '../components/WorkspaceSetup.svelte';
   import CopyButton from '../components/CopyButton.svelte';
@@ -202,7 +203,7 @@
           {@const coverUrl = libraryCoverUrl(l.id, l.cover)}
           {@const bl = backupLine(l)}
           <li class="card libcard state-{l.state}">
-            <a class="main" href={libHref(l.id, '')} aria-label="Open {l.name}, {l.path}">
+            <a class="main" href={viewMemory.withMemory(libHref(l.id, ''))} aria-label="Open {l.name}, {l.path}">
               <span class="cover">
                 {#if !noCover[coverUrl]}
                   <img

@@ -1186,3 +1186,43 @@ similar groups are paginated and ignored by group.
   `createTag`, `renameTag`, `deleteTag`, and their tests.
 - Album counts and covers that include trashed members (review L6) are a
   backend fix; the client shows what the server answers.
+
+## View memory (web)
+
+Filters live in the route query, so leaving a page (Import, Library, ...)
+used to lose them: the main nav linked to the bare page. The web UI now
+remembers, per page path, the last filter query and the place in the grid
+(`web/src/lib/viewmemory.svelte.ts`).
+
+- **What is remembered**: for the Photos grid (`/l/<id>/`), the Map
+  (`/l/<id>/map`), the trash, each album (`/l/<id>/albums/<aid>`) and each
+  import record (`/l/<id>/imports/<rid>`): the canonical filter query
+  (`filtersToQuery`; the map's `at`/`z` are not part of it) and, for grid
+  pages, an anchor: the bucket at the top of the view (`{year, month}`, or
+  `{undated: true}`) and the pixel offset into it.
+- **Recording**: the shell records the query of every visit to one of these
+  pages; a different query than the remembered one drops the anchor. The
+  grid saves its anchor when it unmounts (route change) and when its
+  filters change; an anchor for a query the page has moved on from is
+  ignored.
+- **Nav links**: the main nav (Photos, Map, Trash), the library switcher,
+  the Libraries page's library links, the album's "Go to Photos" and the
+  single-mode redirect from `#/` go to the remembered query. Links that
+  carry their own query ("Show imported", the Library page's stats, tag and
+  session links) and the Imports page's record links are unchanged.
+- **Clear**: the filter bar's Clear navigates to the bare path, which is
+  recorded like any visit and so replaces the remembered query.
+- **Scroll restore**: a grid that mounts with the remembered query (nav
+  link, browser Back/Forward) scrolls to the anchor's bucket top plus the
+  offset as soon as the first timeline is laid out and the scroller
+  measured; the scroll state is set before the rows render, so the top is
+  not painted or fetched first, and no second timeline load happens. A
+  bucket that no longer exists, or another query, starts at the top.
+- **Storage**: in memory plus `sessionStorage` under
+  `picmover.view.<path>` (for example `picmover.view./l/peter/`), JSON
+  `{query, anchor?, savedAt}`, validated on load. A reload within the tab
+  keeps it; a new tab starts fresh. The map's viewport stays in
+  localStorage (`picmover.map.view`) as before.
+- **Tests**: `src/lib/viewmemory.test.ts` (store, keys, validation) and
+  `src/ViewMemory.test.ts` (nav hrefs, Clear, reload, scroll restore, other
+  query and a vanished bucket start at the top).

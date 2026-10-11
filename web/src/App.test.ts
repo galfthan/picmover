@@ -339,9 +339,10 @@ describe('App smoke test', () => {
     expect(requests.some((r) => r.startsWith('GET /api/l/Photos/geo?bbox='))).toBe(true);
     expect(document.querySelectorAll('.pm-cluster, .pm-single').length).toBe(2);
 
+    // Single mode sends #/ to the library's grid with its remembered filters (view memory).
     location.hash = '#/';
     await new Promise((r) => setTimeout(r, 100));
-    expect(location.hash).toBe('#/l/Photos/');
+    expect(location.hash).toBe('#/l/Photos/?type=image_raw');
     expect(document.querySelector('.leaflet-container')).toBeNull();
     expect(errors).toEqual([]);
   });

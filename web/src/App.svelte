@@ -6,7 +6,8 @@
   import { library } from './lib/library.svelte';
   import { libraries } from './lib/libraries.svelte';
   import { jobs } from './lib/jobs.svelte';
-  import { filtersFromQuery } from './lib/filters';
+  import { filtersFromQuery, filtersToQuery } from './lib/filters';
+  import { memoryPath, viewMemory } from './lib/viewmemory.svelte';
   import { formatCount } from './lib/format';
   import { viewerClosed } from './lib/viewer';
   import { libApi, setUnavailableHandler, type LibApi } from './lib/api';
@@ -50,7 +51,17 @@
   // Single mode sends #/ to its library; old step 3 links get the prefix.
   $effect(() => {
     const target = redirectFor(app, current, { mode: libraries.mode, singleId: libraries.singleId });
-    if (target !== null) untrack(() => navigate(target, { replace: true }));
+    // A redirect to a bare library page (#/ in single mode) goes to its remembered filters.
+    if (target !== null) untrack(() => navigate(target.startsWith('#/l/') ? viewMemory.withMemory(target) : target, { replace: true }));
+  });
+
+  // Remember each filterable page's query, so the nav links can go back to
+  // it (lib/viewmemory.svelte.ts). The bare path (Clear) is remembered too.
+  $effect(() => {
+    const path = memoryPath(app);
+    if (path === null) return;
+    const q = filtersToQuery(filtersFromQuery(current.query)).toString();
+    untrack(() => viewMemory.remember(path, q));
   });
 
   const libId = $derived(app.kind === 'lib' ? app.lib : null);
@@ -155,7 +166,7 @@
         <nav aria-label="Main">
           {#each nav as n (n.sub)}
             {@const active = page !== null && n.pages.includes(page)}
-            <a href={libHref(libId, n.sub)} class:active aria-current={active ? 'page' : undefined}>
+            <a href={viewMemory.href(libPath(libId, n.sub))} class:active aria-current={active ? 'page' : undefined}>
               {n.label}{#if n.count}<span class="count" aria-label="({n.count} items)">{formatCount(n.count)}</span>{/if}
             </a>
           {/each}

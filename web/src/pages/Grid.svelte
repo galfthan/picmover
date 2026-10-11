@@ -13,6 +13,7 @@
   import { onChange, type Change } from '../lib/changes';
   import { setSequenceProvider, type Neighbours } from '../lib/viewer';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
+  import { viewMemory, type ViewAnchor } from '../lib/viewmemory.svelte';
   import Tile from '../components/Tile.svelte';
   import { aspectOf, pixelRatio, renditionFor, watchPixelRatio } from '../lib/rendition';
   import Scrubber from '../components/Scrubber.svelte';
@@ -165,6 +166,7 @@
         scroller.scrollTop = 0;
         scrollTop = 0;
       }
+      restoreAnchor();
     } catch (e) {
       if (g !== gen) return;
       tlError = errorMessage(e);
@@ -178,6 +180,11 @@
   $effect(() => {
     const k = fkey;
     untrack(() => {
+      // Leaving a filter set: remember its place (view memory), and do not
+      // restore the mount's anchor into the new one.
+      if (shownQuery !== null && pendingAnchor === null) rememberPlace(shownQuery);
+      if (shownQuery !== null) pendingAnchor = null;
+      shownQuery = filtersToQuery(filters).toString();
       selection.setScope(k);
       void loadTimeline(true);
     });
@@ -382,6 +389,60 @@
       void tick().then(() => scrollToY(target));
     };
   }
+
+  // ---- View memory (lib/viewmemory.svelte.ts) ----
+
+  /** The filter query of the loaded view, as the view memory keys it; null before the first load. */
+  let shownQuery: string | null = null;
+  /**
+   * The place to go back to: the remembered anchor of this page when it
+   * mounts with the remembered query, until the first timeline is laid out.
+   */
+  let pendingAnchor: ViewAnchor | null = untrack(() => {
+    const e = viewMemory.get(basePath);
+    return e?.anchor && e.query === filtersToQuery(filters).toString() ? e.anchor : null;
+  });
+
+  /** Saves the bucket at the top of the view and the offset into it for `query`. */
+  function rememberPlace(query: string) {
+    if (tlStatus !== 'ready') return;
+    const tl = timeline;
+    const b = tl.buckets[tl.indexAtOffset(scrollTop)];
+    if (!b) return;
+    const offset = Math.max(0, Math.round(scrollTop - b.top));
+    viewMemory.saveAnchor(basePath, query, b.year === 0 && b.month === 0 ? { undated: true, offset } : { year: b.year, month: b.month, offset });
+  }
+
+  /**
+   * Scrolls to the pending anchor once the timeline is loaded and the
+   * scroller measured. The scrollTop state is set first so the rows of the
+   * target render in this update (no paint at the top, no fetch for the
+   * top buckets); the DOM follows after it. A bucket that is gone (the
+   * data changed) leaves the view at the top.
+   */
+  function restoreAnchor() {
+    const a = pendingAnchor;
+    if (!a || tlStatus !== 'ready' || width <= 0 || height <= 0) return;
+    pendingAnchor = null;
+    const tl = timeline;
+    const nb = tl.buckets.find((b) => ('undated' in a ? b.year === 0 && b.month === 0 : b.year === a.year && b.month === a.month));
+    if (!nb) return;
+    const max = Math.max(0, tl.totalHeight + padBottom - height);
+    const target = Math.max(0, Math.min(max, nb.top + Math.min(a.offset, nb.height)));
+    if (target === 0) return;
+    scrollTop = target;
+    void tick().then(() => scrollToY(target));
+  }
+  // The scroller is measured after the first timeline arrived (or before).
+  $effect(() => {
+    if (width > 0 && height > 0 && tlStatus === 'ready') untrack(restoreAnchor);
+  });
+  // Leaving the page (another route): remember the place.
+  $effect(() => () => {
+    untrack(() => {
+      if (shownQuery !== null && pendingAnchor === null) rememberPlace(shownQuery);
+    });
+  });
 
   /** Changes the tile size keeping the same place in the timeline in view. */
   function setTileSize(n: number) {
@@ -588,7 +649,7 @@
           {:else if mode === 'album' && !filtered}
             <h2>This album is empty</h2>
             <p>Select photos in Photos and add them with the Album button.</p>
-            <a class="btn" href={libHref(api.id, '')}>Go to Photos</a>
+            <a class="btn" href={viewMemory.withMemory(libHref(api.id, ''))}>Go to Photos</a>
           {:else if mode === 'import' && !filtered}
             <h2>Nothing from this import is in the library</h2>
             <p>Its photos and videos were removed or are in the trash.</p>

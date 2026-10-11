@@ -56,6 +56,7 @@ describe('desktop app mode', () => {
     vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => void errors.push(a));
     vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => void errors.push(a));
     localStorage.clear();
+    sessionStorage.clear();
   });
 
   afterEach(() => {
