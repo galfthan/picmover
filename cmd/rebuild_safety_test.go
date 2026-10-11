@@ -81,11 +81,16 @@ func TestRebuildUnreadableUserDBKeepsCatalog(t *testing.T) {
 // previous catalog instead of leaving the partial one live.
 func TestRebuildCancelledRestoresBackup(t *testing.T) {
 	dir, lib := rebuildLib(t)
+	// Without user.db (the import made one for its record): a cancelled
+	// context would stop the rebuild at reading it, before the backup.
+	for _, s := range []string{"", "-wal", "-shm"} {
+		os.Remove(filepath.Join(dir, userdata.FileName+s))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	out, _ := runCtx(t, ctx, "rebuild", "--quiet", "--no-thumbs", dir)
+	out, err := runCtx(t, ctx, "rebuild", "--quiet", "--no-thumbs", dir)
 	if !strings.Contains(out, "previous catalog was restored") {
-		t.Fatalf("output:\n%s", out)
+		t.Fatalf("output: %v\n%s", err, out)
 	}
 	if n := catalogRows(t, lib); n != 2 {
 		t.Fatalf("catalog has %d rows after the rollback", n)
@@ -119,9 +124,9 @@ func TestRebuildCancelledFolderRemovesCatalog(t *testing.T) {
 	writeJPEG(t, filepath.Join(dir, "x.jpg"), 3)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	out, _ := runCtx(t, ctx, "rebuild", "--quiet", "--no-thumbs", dir)
+	out, err := runCtx(t, ctx, "rebuild", "--quiet", "--no-thumbs", dir)
 	if !strings.Contains(out, "incomplete catalog was removed") {
-		t.Fatalf("output:\n%s", out)
+		t.Fatalf("output: %v\n%s", err, out)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, library.DBName)); !os.IsNotExist(err) {
 		t.Fatalf("media.db left: %v", err)

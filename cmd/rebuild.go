@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/userdata"
 )
@@ -37,7 +38,9 @@ left in place. Zip archives are not extracted. To move files into the
 <type>/YYYY/MM layout use 'picmover import <library> <library>' instead.
 Files in the trash (<library>/.picmover/trash) are recorded as trashed, with
 the time they were trashed from user.db (else their modification time);
-user.db itself (ratings, tags, albums) is never changed by a rebuild.
+user.db's ratings, tags and albums are never changed by a rebuild; the
+rebuild is recorded in its import history (mode rebuild), after the old
+catalog's import sessions are copied there the first time.
 Finally the thumbnail stage runs (skip it with --no-thumbs and run
 'picmover thumbs' later); thumbnails and previews are cached by content
 hash in <library>/.picmover and are reused.
@@ -100,6 +103,11 @@ Exit status as for import.`,
 				return err
 			}
 			if hasCatalog {
+				// The old catalog's import sessions go into the import
+				// history before the catalog is renamed away.
+				backfillBeforeRebuild(ctx, root, dbPath)
+			}
+			if hasCatalog {
 				backup, err := backupCatalog(dbPath, time.Now())
 				if err != nil {
 					return err
@@ -138,6 +146,21 @@ func trashTimes(ctx context.Context, root string) (map[uint64]time.Time, error) 
 	}
 	defer u.Close()
 	return u.TrashedAt(ctx, nil)
+}
+
+// backfillBeforeRebuild copies the import sessions of the catalog at
+// dbPath into the import history of the library's user.db the first time
+// (importrec.Backfill), before a rebuild replaces the catalog. It is best
+// effort: a catalog of another format or any failure only means no
+// backfill. A missing user.db is created (the rebuild's record would
+// create it anyway).
+func backfillBeforeRebuild(ctx context.Context, root, dbPath string) {
+	u, err := userdata.Open(ctx, filepath.Join(root, userdata.FileName))
+	if err != nil {
+		return
+	}
+	defer u.Close()
+	importrec.BackfillFile(ctx, dbPath, u) // the catalog is read only, never written
 }
 
 // missingCatalogNote describes a rebuild of a library that has no media.db

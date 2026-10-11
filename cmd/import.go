@@ -18,6 +18,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 	"picmover/internal/userdata"
@@ -40,6 +41,10 @@ With --move the sources are deleted once they are safely recorded.
 After the copy stage a thumbnail (256 px) and a preview (1600 px) of every
 imported file are generated into <library>/.picmover (skip with
 --no-thumbs; 'picmover thumbs' generates them later).
+
+Every import is recorded in the library's import history in user.db
+(created when missing); the summary prints the record's id, and
+'picmover imports <library>' lists them.
 
 A detailed log is written to <library>/.picmover/logs/.`,
 		Args: exactArgs(2),
@@ -195,10 +200,39 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if status != nil {
 			opts.OnProgress = func(s importer.Stats) { status.show(formatStatus(s)) }
 		}
+		// The import history (user.db, created when missing). A user.db
+		// that cannot be opened only costs the record.
+		user, userErr := userdata.Open(ctx, filepath.Join(lib.Root(), userdata.FileName))
+		if userErr != nil {
+			logger.Error("open user.db", "err", userErr)
+		} else {
+			defer user.Close()
+			if from, bak := user.Migrated(); from != 0 {
+				fmt.Fprintf(out, "user.db upgraded from schema version %d to %d (the old file is kept as %s)\n",
+					from, userdata.SchemaVersion, filepath.Base(bak))
+			}
+			if !p.recordInPlace {
+				// A rebuild backfills from the old catalog before its
+				// backup (cmd/rebuild.go); this catalog is the live one.
+				backfill(ctx, db, user, logger)
+			}
+		}
+		mode := userdata.ImportModeCopy
+		switch {
+		case p.recordInPlace:
+			mode = userdata.ImportModeRebuild
+		case p.move:
+			mode = userdata.ImportModeMove
+		}
+		rec := importrec.Begin(ctx, user, userErr, p.source, mode, logger)
+		opts.OnResult = rec.OnResult
 		if !p.recordInPlace {
 			// Content found in the trash is restored; its user.db trash
 			// row is removed when there is a user.db.
 			opts.OnRestored = func(ctx context.Context, hash uint64) error {
+				if user != nil {
+					return user.Untrash(ctx, []uint64{hash})
+				}
 				return untrashUserDB(ctx, lib.Root(), hash)
 			}
 		}
@@ -208,6 +242,12 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if status != nil {
 			status.done()
 		}
+		outcome := importrec.Outcome(runErr)
+		if p.recordInPlace && !recorded && outcome == userdata.ImportDone {
+			outcome = userdata.ImportFailed // rolled back below
+		}
+		rec.Finish(ctx, outcome, stats, im.SessionID())
+		sum.importID, sum.recordErr = rec.ID(), rec.Err()
 		if p.recordInPlace && !recorded {
 			closeDB()
 		}
@@ -349,6 +389,8 @@ type importSummary struct {
 	libRoot, logPath string
 	isNew            bool
 	thumbs           bool // print the thumbnail counters
+	importID         int64
+	recordErr        error
 }
 
 func (is importSummary) print(w io.Writer, s importer.Stats) {
@@ -369,7 +411,27 @@ func (is importSummary) print(w io.Writer, s importer.Stats) {
 	} else {
 		fmt.Fprintf(w, "Library: %s\n", is.libRoot)
 	}
+	switch {
+	case is.importID != 0 && is.recordErr == nil:
+		fmt.Fprintf(w, "Import record: #%d\n", is.importID)
+	case is.importID != 0:
+		fmt.Fprintf(w, "Import record: #%d (incomplete: %v; see the log)\n", is.importID, is.recordErr)
+	case is.recordErr != nil:
+		fmt.Fprintf(w, "Import record: could not be written (%v; see the log)\n", is.recordErr)
+	}
 	fmt.Fprintf(w, "Log: %s\n", is.logPath)
+}
+
+// backfill copies the catalog's import sessions into the import history
+// of user.db the first time (importrec.Backfill); a failure is logged.
+func backfill(ctx context.Context, db *catalog.DB, user *userdata.DB, logger *slog.Logger) {
+	n, err := importrec.Backfill(ctx, db, user)
+	switch {
+	case err != nil:
+		logger.Error("import history backfill", "err", err)
+	case n > 0:
+		logger.Info("import history backfilled from the catalog", "records", n)
+	}
 }
 
 // untrashUserDB removes hash's trash row from the library's user.db, when
