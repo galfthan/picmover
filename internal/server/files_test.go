@@ -29,7 +29,7 @@ func TestThumbAndPreview(t *testing.T) {
 		t.Fatal(ok, err)
 	}
 	h := w.Header()
-	if !bytes.Equal(w.Body.Bytes(), data) || h.Get("Content-Type") != "image/jpeg" || h.Get("ETag") != etag ||
+	if !bytes.Equal(w.Body.Bytes(), data) || h.Get("Content-Type") != "image/webp" || h.Get("ETag") != etag ||
 		h.Get("Cache-Control") != "private, max-age=604800" || h.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("thumb: %d bytes %v", w.Body.Len(), h)
 	}
@@ -47,7 +47,7 @@ func TestThumbAndPreview(t *testing.T) {
 		t.Fatal(err)
 	}
 	h = w.Header()
-	if !bytes.Equal(w.Body.Bytes(), pdata) || h.Get("Content-Type") != "image/jpeg" || h.Get("ETag") != etag ||
+	if !bytes.Equal(w.Body.Bytes(), pdata) || h.Get("Content-Type") != "image/webp" || h.Get("ETag") != etag ||
 		h.Get("Cache-Control") != "private, max-age=604800" {
 		t.Fatalf("preview: %d bytes %v", w.Body.Len(), h)
 	}

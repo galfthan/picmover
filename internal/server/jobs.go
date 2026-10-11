@@ -98,6 +98,7 @@ type statsJSON struct {
 	ThumbsDone        int64 `json:"thumbsDone"`
 	ThumbsUnsupported int64 `json:"thumbsUnsupported"`
 	ThumbsFailed      int64 `json:"thumbsFailed"`
+	LargeDone         int64 `json:"largeDone"` // large thumbnails filled from previews
 }
 
 func newStats(s importer.Stats) statsJSON {
@@ -106,6 +107,7 @@ func newStats(s importer.Stats) statsJSON {
 		SkippedSmall: s.SkippedSmall, NonMedia: s.NonMedia, Errors: s.Errors, BytesCopied: s.BytesCopied,
 		Rate:       s.Rate,
 		ThumbsDone: s.ThumbsDone, ThumbsUnsupported: s.ThumbsUnsupported, ThumbsFailed: s.ThumbsFailed,
+		LargeDone: s.LargeDone,
 	}
 }
 
@@ -757,6 +759,10 @@ func (m *jobManager) run(j *job) {
 	defer m.wg.Done()
 	defer j.cancel()
 	state, code, stats, sessionID, msg := m.execute(j)
+	// Any job may have changed which large thumbnails are missing.
+	if j.entry != nil {
+		j.entry.invalidateLargeMissing()
+	}
 	m.mu.Lock()
 	if m.running == j {
 		m.running = nil
