@@ -70,24 +70,47 @@ func encJPEG(img image.Image) []byte {
 	return b.Bytes()
 }
 
-// stored decodes the stored preview and thumbnail of hash.
+// stored decodes the stored preview and thumbnail of hash, which must be
+// WebP (the preview named .webp).
 func stored(t *testing.T, s *Store, hash uint64) (preview, thumb image.Image) {
 	t.Helper()
-	pb, err := os.ReadFile(s.PreviewPath(hash))
+	p := s.PreviewPath(hash)
+	if !strings.HasSuffix(p, ".webp") {
+		t.Errorf("preview path %s, want .webp", p)
+	}
+	pb, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatalf("preview: %v", err)
 	}
-	if preview, err = jpeg.Decode(bytes.NewReader(pb)); err != nil {
-		t.Fatalf("preview decode: %v", err)
-	}
+	preview = decodeWebP(t, "preview", pb)
 	tb, _, _, ok, err := s.Thumb(context.Background(), hash)
 	if err != nil || !ok {
 		t.Fatalf("thumb: ok=%v err=%v", ok, err)
 	}
-	if thumb, err = jpeg.Decode(bytes.NewReader(tb)); err != nil {
-		t.Fatalf("thumb decode: %v", err)
+	return preview, decodeWebP(t, "thumb", tb)
+}
+
+// storedLarge decodes the stored large thumbnail of hash (WebP).
+func storedLarge(t *testing.T, s *Store, hash uint64) image.Image {
+	t.Helper()
+	b, err := os.ReadFile(s.LargePath(hash))
+	if err != nil {
+		t.Fatalf("large: %v", err)
 	}
-	return preview, thumb
+	return decodeWebP(t, "large", b)
+}
+
+// decodeWebP checks that data sniffs as WebP and decodes it.
+func decodeWebP(t *testing.T, what string, data []byte) image.Image {
+	t.Helper()
+	if f := imaging.Sniff(bytes.NewReader(data)); f != imaging.FormatWebP {
+		t.Fatalf("%s is %q, want webp", what, f)
+	}
+	img, _, err := imaging.Decode(context.Background(), bytes.NewReader(data), int64(len(data)), imaging.Options{})
+	if err != nil {
+		t.Fatalf("%s decode: %v", what, err)
+	}
+	return img
 }
 
 func size(img image.Image) string { return fmt.Sprintf("%dx%d", img.Bounds().Dx(), img.Bounds().Dy()) }
@@ -144,6 +167,9 @@ func TestGenerateScalesAndPHash(t *testing.T) {
 	if size(p) != "1600x800" || size(th) != "256x128" {
 		t.Errorf("preview %s thumb %s", size(p), size(th))
 	}
+	if l := storedLarge(t, g.Store, 7); size(l) != "640x320" {
+		t.Errorf("large %s", size(l))
+	}
 	want := imaging.PHash(src)
 	if d := imaging.Distance(res.PHash, want); d > 6 {
 		t.Errorf("pHash of preview differs from source by %d bits", d)
@@ -163,6 +189,9 @@ func TestGenerateScalesAndPHash(t *testing.T) {
 	}
 	if p, _ := stored(t, g.Store, 8); size(p) != "800x1600" {
 		t.Errorf("oriented preview %s", size(p))
+	}
+	if l := storedLarge(t, g.Store, 8); size(l) != "320x640" {
+		t.Errorf("oriented large %s", size(l))
 	}
 }
 
@@ -220,8 +249,13 @@ func TestGenerateRawPreview(t *testing.T) {
 	if res.Width != 4000 || res.Height != 6000 || res.ThumbW != 120 || res.ThumbH != 160 {
 		t.Errorf("result %+v", res)
 	}
+	// The embedded JPEG is decoded, oriented and stored as WebP like any
+	// other image (it is not copied: it is stored unrotated).
 	if p, _ := stored(t, g.Store, 10); size(p) != "120x160" {
 		t.Errorf("preview %s, want oriented 120x160", size(p))
+	}
+	if l := storedLarge(t, g.Store, 10); size(l) != "120x160" {
+		t.Errorf("large %s, want oriented 120x160", size(l))
 	}
 
 	// No previews at all.
@@ -238,7 +272,7 @@ func TestGenerateRawPreview(t *testing.T) {
 	if res.State != StateUnsupported || !strings.Contains(res.Message, "1 embedded") {
 		t.Errorf("broken-preview raw: %+v", res)
 	}
-	if th, pv, _ := g.Store.Has(context.Background(), 12); th || pv {
+	if th, _, pv, _ := g.Store.Has(context.Background(), 12); th || pv {
 		t.Error("unsupported raw left renditions")
 	}
 }
@@ -397,7 +431,7 @@ func TestGenerateSourceChanged(t *testing.T) {
 		if res.State != StateError || res.Message != "file changed since import; run verify or rebuild" {
 			t.Errorf("%s: %+v", name, res)
 		}
-		if th, pv, _ := g.Store.Has(ctx, 46); th || pv {
+		if th, _, pv, _ := g.Store.Has(ctx, 46); th || pv {
 			t.Errorf("%s: renditions stored for a changed file", name)
 		}
 	}

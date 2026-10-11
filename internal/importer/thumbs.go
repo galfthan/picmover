@@ -25,6 +25,9 @@ type thumbJob struct {
 	rel   string
 	src   thumbs.Source
 	force bool // regenerate even when the cache has renditions (force pass or stale row)
+	// large: only derive the missing large thumbnail from the stored
+	// preview (a row whose thumbnail is ok); nothing is recorded.
+	large bool
 }
 
 // thumbDone is the outcome for one row, written by the thumb writer.
@@ -42,13 +45,19 @@ func (im *Importer) thumbWorkers() int {
 	return min(n, maxWorkers)
 }
 
-// RunThumbs runs the thumbnail stage: it generates the thumbnail, preview
-// and perceptual hash of every non-deleted catalog row whose thumb_state is
-// pending, stale or error (every non-deleted row when force is set,
-// regenerating renditions already in the cache; stale rows are always
-// regenerated), limited to import session sessionID when it is > 0 and to
+// RunThumbs runs the thumbnail stage: it generates the thumbnail, large
+// thumbnail, preview and perceptual hash of every non-deleted catalog row
+// whose thumb_state is pending, stale or error (every non-deleted row when
+// force is set, regenerating renditions already in the cache from the
+// originals; stale rows are always regenerated). Without force it then
+// fills the missing large thumbnails of rows whose thumbnail is ok and
+// whose preview exists, from the stored preview (never the original;
+// Stats.LargeDone); those rows are found by listing the cache's fan-out
+// directories (thumbs.Presence), not by one stat per row. Both passes are
+// limited to import session sessionID when it is > 0 and together to
 // Options.ThumbLimit rows when that is > 0. Results are recorded with
-// SetThumb by a single writer in transactions of up to 256 rows.
+// SetThumb by a single writer in transactions of up to 256 rows; a large
+// fill records nothing in the catalog.
 //
 // On cancellation the stage stops: rows not yet processed, and every
 // result that reaches the writer after the cancellation, keep their state. It returns the stats (including
@@ -85,14 +94,21 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 				if runCtx.Err() != nil {
 					continue // drain; the row stays pending
 				}
+				if j.large {
+					im.fillLarge(runCtx, gen, j)
+					continue
+				}
 				// Generate computes the perceptual hash from the stored
-				// preview, also when it reuses cached renditions.
-				done <- thumbDone{job: j, res: gen.Generate(runCtx, j.src, j.force)}
+				// preview, also when it reuses cached renditions (and then
+				// derives a missing large thumbnail from that preview).
+				res := gen.Generate(runCtx, j.src, j.force)
+				im.countLarge(j, res.LargeFilled, res.LargeError)
+				done <- thumbDone{job: j, res: res}
 			}
 		})
 	}
 
-	listErr := im.feedThumbs(runCtx, sessionID, force, jobs)
+	listErr := im.feedThumbs(runCtx, store, sessionID, force, jobs)
 	close(jobs)
 	wg.Wait()
 	close(done)
@@ -104,7 +120,8 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 
 	stats := im.Stats()
 	im.log.Info("thumbnails finished", "library", im.lib.Root(), "session", sessionID,
-		"ok", stats.ThumbsDone, "unsupported", stats.ThumbsUnsupported, "failed", stats.ThumbsFailed)
+		"ok", stats.ThumbsDone, "unsupported", stats.ThumbsUnsupported, "failed", stats.ThumbsFailed,
+		"large_filled", stats.LargeDone)
 	if fatal != nil {
 		return stats, fatal
 	}
@@ -114,21 +131,64 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 	return stats, nil
 }
 
+// fillLarge derives the missing large thumbnail of a large job's row from
+// its stored preview and counts it.
+func (im *Importer) fillLarge(ctx context.Context, gen *thumbs.Generator, j thumbJob) {
+	filled, err := gen.FillLarge(ctx, j.src.Hash)
+	if ctx.Err() != nil {
+		return
+	}
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	im.countLarge(j, filled, msg)
+}
+
+// countLarge counts a large thumbnail filled from the stored preview and
+// logs a failed fill (not a failure of the stage: the server derives the
+// large thumbnail on demand, and the next pass retries).
+func (im *Importer) countLarge(j thumbJob, filled bool, errMsg string) {
+	if filled {
+		im.largeDone.Add(1)
+	}
+	if errMsg != "" {
+		im.log.Warn("large thumbnail not filled", "file", j.rel, "message", errMsg)
+	}
+}
+
 // feedThumbs pages through the catalog rows to process and sends them to
-// jobs until done, cancelled or Options.ThumbLimit rows were sent.
-func (im *Importer) feedThumbs(ctx context.Context, sessionID int64, all bool, jobs chan<- thumbJob) error {
-	var afterID int64
+// jobs until done, cancelled or Options.ThumbLimit rows were sent: first
+// the rows that need renditions, then (unless all is set, which
+// regenerates every row anyway) the ok rows whose preview exists and
+// whose large thumbnail is missing, found with one directory listing per
+// fan-out directory (store.NewPresence) while walking the rows.
+func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, sessionID int64, all bool, jobs chan<- thumbJob) error {
 	sent := 0
 	limit := im.opts.ThumbLimit
-	for {
-		page := thumbPageSize
-		if limit > 0 {
-			page = min(page, limit-sent)
-			if page <= 0 {
-				return nil
-			}
+	send := func(j thumbJob) error {
+		select {
+		case jobs <- j:
+			sent++
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		rows, err := im.db.ListForThumbs(ctx, afterID, page, sessionID, all)
+	}
+	// page returns the next page size, 0 when the limit is reached.
+	page := func() int {
+		if limit > 0 {
+			return max(0, min(thumbPageSize, limit-sent))
+		}
+		return thumbPageSize
+	}
+	var afterID int64
+	for {
+		n := page()
+		if n == 0 {
+			return nil
+		}
+		rows, err := im.db.ListForThumbs(ctx, afterID, n, sessionID, all)
 		if err != nil {
 			return err
 		}
@@ -136,26 +196,60 @@ func (im *Importer) feedThumbs(ctx context.Context, sessionID int64, all bool, j
 			// Size and MTime let Generate refuse a file changed since it
 			// was recorded (its content no longer matches the hash).
 			j := thumbJob{id: m.ID, rel: m.RelPath, force: all || m.ThumbState == catalog.ThumbStateStale,
-				src: thumbs.Source{
-					Path:        im.lib.Abs(m.RelPath),
-					Kind:        metadata.Kind(m.FileType),
-					Hash:        m.Hash,
-					Orientation: m.Orientation,
-					DurationMS:  m.DurationMS,
-					Size:        m.Size,
-					MTime:       m.OriginalMTime,
-				}}
-			select {
-			case jobs <- j:
-				sent++
-			case <-ctx.Done():
-				return ctx.Err()
+				src: im.thumbSource(m)}
+			if err := send(j); err != nil {
+				return err
 			}
 			afterID = m.ID
 		}
-		if len(rows) < page {
+		if len(rows) < n {
+			break
+		}
+	}
+	if all {
+		return nil
+	}
+	presence := store.NewPresence()
+	afterID = 0
+	for {
+		n := page()
+		if n == 0 {
 			return nil
 		}
+		// Pages are fetched at the full size: most rows already have
+		// their large thumbnail, and only those sent count to the limit.
+		rows, err := im.db.ListThumbOK(ctx, afterID, thumbPageSize, sessionID)
+		if err != nil {
+			return err
+		}
+		for _, m := range rows {
+			afterID = m.ID
+			if !presence.Preview(m.Hash) || presence.Large(m.Hash) {
+				continue
+			}
+			if page() == 0 {
+				return nil
+			}
+			if err := send(thumbJob{id: m.ID, rel: m.RelPath, large: true, src: im.thumbSource(m)}); err != nil {
+				return err
+			}
+		}
+		if len(rows) < thumbPageSize {
+			return nil
+		}
+	}
+}
+
+// thumbSource is the thumbs.Source of a catalog row.
+func (im *Importer) thumbSource(m catalog.Media) thumbs.Source {
+	return thumbs.Source{
+		Path:        im.lib.Abs(m.RelPath),
+		Kind:        metadata.Kind(m.FileType),
+		Hash:        m.Hash,
+		Orientation: m.Orientation,
+		DurationMS:  m.DurationMS,
+		Size:        m.Size,
+		MTime:       m.OriginalMTime,
 	}
 }
 

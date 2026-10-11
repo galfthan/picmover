@@ -408,6 +408,54 @@ func (d *DB) ListForThumbs(ctx context.Context, afterID int64, limit int, sessio
 	return out, nil
 }
 
+// ListThumbOK returns up to limit rows (all when limit <= 0) with id >
+// afterID, thumb_state 'ok' and not soft-deleted, ordered by id: the rows
+// whose large thumbnail a thumbnail pass may fill from the stored preview.
+// When sessionID > 0 only rows of that import session are returned. Page
+// by id as with ListForThumbs.
+func (d *DB) ListThumbOK(ctx context.Context, afterID int64, limit int, sessionID int64) ([]Media, error) {
+	q := "SELECT " + mediaColumns + " FROM media WHERE id > ? AND deleted_at IS NULL AND thumb_state = 'ok'"
+	args := []any{afterID}
+	if sessionID > 0 {
+		q += " AND import_session_id = ?"
+		args = append(args, sessionID)
+	}
+	q += " ORDER BY id"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	out, err := d.queryMedia(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: list thumb ok: %w", err)
+	}
+	return out, nil
+}
+
+// ThumbOKHashes calls fn with the content hash of every row with
+// thumb_state 'ok' that is not soft-deleted (a hash shared by several rows
+// comes once), in no particular order, stopping at fn's first error.
+func (d *DB) ThumbOKHashes(ctx context.Context, fn func(hash uint64) error) error {
+	rows, err := d.QueryContext(ctx, "SELECT DISTINCT hash FROM media WHERE deleted_at IS NULL AND thumb_state = 'ok'")
+	if err != nil {
+		return fmt.Errorf("catalog: thumb ok hashes: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return fmt.Errorf("catalog: thumb ok hashes: %w", err)
+		}
+		if err := fn(uint64(h)); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("catalog: thumb ok hashes: %w", err)
+	}
+	return nil
+}
+
 // SetThumb records the outcome of a thumbnail attempt for row id: thumb_state
 // = state (one of the ThumbState* constants), thumb_error = msg, thumb_at = now and
 // phash (NULL when 0). width and height are set from w and h only when both

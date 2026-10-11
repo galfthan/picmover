@@ -40,8 +40,11 @@ import (
 // locking each on request.
 type Options struct {
 	Library *library.Library
-	Catalog *catalog.DB   // read-write: jobs write through it
-	Store   *thumbs.Store // read-only store renditions are served from
+	Catalog *catalog.DB // read-write: jobs write through it
+	// Store is the read-only store renditions are served from; the
+	// server writes only large thumbnails it derives on demand
+	// (thumbs.Store.PutLarge), never thumbs.db.
+	Store *thumbs.Store
 	// UserData is the library's user.db; nil opens <library>/user.db.
 	UserData *userdata.DB
 	// Workspace is the folder of libraries in workspace mode.
@@ -75,6 +78,7 @@ type Server struct {
 
 	guard   *guard
 	jobs    *jobManager
+	large   *largeDeriver // on-demand large thumbnails
 	handler http.Handler
 
 	// bodyTimeout bounds reading a request body (a client trickling a
@@ -142,6 +146,7 @@ func New(opts Options) (*Server, error) {
 		log:     log,
 		static:  opts.Static,
 		guard:   g,
+		large:   newLargeDeriver(),
 
 		bodyTimeout: bodyReadTimeout,
 	}
@@ -226,6 +231,7 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("GET /api/l/{lib}/media/{id}", s.handleMediaDetail)
 	scoped("GET /api/l/{lib}/thumb/{hash}", s.handleThumb)
 	scoped("GET /api/l/{lib}/preview/{hash}", s.handlePreview)
+	scoped("GET /api/l/{lib}/large/{hash}", s.handleLarge)
 	scoped("GET /api/l/{lib}/file/{id}", s.handleFile)
 	scoped("GET /api/l/{lib}/geo", s.handleGeo)
 	scoped("GET /api/l/{lib}/geo/items", s.handleGeoItems)
