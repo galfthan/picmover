@@ -257,6 +257,7 @@ All endpoints that accept filters (timeline, media, geo, geo/items) accept:
 |---|---|
 | `from`, `to` | unchanged: `YYYY-MM-DD` wall clock, `to` exclusive |
 | `recur` | `MM-DD` or `MM-DD..MM-DD`, inclusive, every year; the range may wrap the year end (`12-30..01-02`); `02-29` allowed |
+| `months` | month numbers 1–12 separated by commas (`1,2,3`, `1,7`), every year; any set, contiguous or not; repeats collapse; an empty item, a trailing comma or a value outside 1–12 is 400 |
 | `rating` | minimum rating 1–5 |
 | `tag` | tag id; repeatable; all must match (AND) |
 | `album` | album id |
@@ -268,8 +269,12 @@ All endpoints that accept filters (timeline, media, geo, geo/items) accept:
 compared with the bounds (`BETWEEN` or `OR` of two ranges when wrapping),
 inside the existing dated-range guard, so undated rows never match. It is
 a scan of the `media_taken_at` index (136k rows in a few ms). Buckets with
-`recur` return only the months that contain matches. Malformed values →
-400 `{"error": "..."}` naming the parameter.
+`recur` return only the months that contain matches. `months` is
+evaluated as `CAST(strftime('%m', taken_at, 'unixepoch') AS INTEGER) IN
+(?, …)` (one parameter per month) inside the same guard, so undated rows
+never match either; it combines with `recur`, `from`/`to` and the rest by
+AND, and Buckets return only the chosen months. Malformed values → 400
+`{"error": "..."}` naming the parameter.
 
 ## HTTP API
 
