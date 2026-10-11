@@ -27,12 +27,20 @@ import (
 var ErrUnavailable = errors.New("gio is not available")
 
 // Dir returns where gvfs mounts its FUSE file systems:
-// $XDG_RUNTIME_DIR/gvfs, else /run/user/<uid>/gvfs.
+// $XDG_RUNTIME_DIR/gvfs, else /run/user/<uid>/gvfs. When that directory
+// exists its symlinks are resolved (filepath.EvalSymlinks), as the
+// importer resolves the source it is given, so Mount and IsDevice match
+// paths below it even when XDG_RUNTIME_DIR contains a symlink; otherwise
+// the unresolved path is returned.
 func Dir() string {
-	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
-		return filepath.Join(d, "gvfs")
+	d := filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "gvfs")
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		d = filepath.Join(rt, "gvfs")
 	}
-	return filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "gvfs")
+	if r, err := filepath.EvalSymlinks(d); err == nil {
+		return r
+	}
+	return d
 }
 
 // parseMount is Mount for the gvfs directory dir; it works on slash paths

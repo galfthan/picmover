@@ -40,9 +40,9 @@ func URI(p string) (string, bool) {
 var (
 	gioOnce sync.Once
 	gioBin  string
-	// plainFirst is set once the URI form failed because the mount was
-	// not found and the plain FUSE path worked: later pulls try the
-	// plain path first.
+	// plainFirst is set once the URI form failed and the plain FUSE path
+	// worked: later pulls try the plain path first. It is cleared again
+	// when the plain path fails and the URI form works.
 	plainFirst atomic.Bool
 )
 
@@ -62,15 +62,20 @@ func Available() bool { return gio() != "" }
 //
 // which makes the gvfs daemon pull the whole object (for MTP,
 // LIBMTP_Get_File_To_File) instead of serving FUSE reads one request at a
-// time. The URI form (see URI) is tried first; when it fails with an
-// error saying the location is not mounted, src itself is tried once
-// more, and if that works later pulls start with it. gio copy overwrites
-// an existing dst. While gio runs, dst's size is polled every 200 ms and
-// reported through onProgress (when not nil) whenever it grew; onProgress
-// is called on the caller's goroutine. On failure the error carries the
-// last line gio printed; on cancellation gio is killed and ctx.Err()
-// returned. In both cases dst is removed. ErrUnavailable is returned when
-// gio is not installed.
+// time. dst should not exist: gio creates it (GIO replaces an existing
+// file through a hidden temp file renamed at the end). The URI form (see
+// URI) is tried first; when it fails for any reason other than
+// cancellation, src itself (the FUSE path, which GIO maps back to the
+// daemon) is tried once more, and the form that worked is tried first
+// by later pulls. gio's error messages come from the daemon in the
+// session's language, so the retry does not depend on them; gio itself
+// runs with LC_ALL=C. While gio runs, dst's size is polled every 200 ms
+// and reported through onProgress (when not nil) whenever it grew;
+// onProgress is called on the caller's goroutine. On failure the error
+// carries the last line gio printed (both attempts' errors when both
+// failed); on cancellation gio is killed and ctx.Err() returned. In both
+// cases dst is removed. ErrUnavailable is returned when gio is not
+// installed.
 func Pull(ctx context.Context, src, dst string, onProgress func(written int64)) error {
 	bin := gio()
 	if bin == "" {
@@ -88,11 +93,11 @@ func pull(ctx context.Context, bin, src, dst string, onProgress func(int64)) err
 	if plainFirst.Load() {
 		first, second = src, uri
 	}
-	last, err := gioCopy(ctx, bin, first, dst, onProgress)
-	if err == nil || ctx.Err() != nil || !mountNotFound(last) {
+	err := gioCopy(ctx, bin, first, dst, onProgress)
+	if err == nil || ctx.Err() != nil {
 		return err
 	}
-	if _, err2 := gioCopy(ctx, bin, second, dst, onProgress); err2 != nil {
+	if err2 := gioCopy(ctx, bin, second, dst, onProgress); err2 != nil {
 		if ctx.Err() != nil {
 			return err2
 		}
@@ -102,31 +107,20 @@ func pull(ctx context.Context, bin, src, dst string, onProgress func(int64)) err
 	return nil
 }
 
-// mountNotFound reports a gio message saying the location's mount is not
-// there (G_IO_ERROR_NOT_MOUNTED and its relatives).
-func mountNotFound(msg string) bool {
-	m := strings.ToLower(msg)
-	for _, s := range []string{"not mounted", "no such mount", "mount does not exist", "mount not found"} {
-		if strings.Contains(m, s) {
-			return true
-		}
-	}
-	return false
-}
-
 // pollInterval is how often Pull reports the size of the destination.
 const pollInterval = 200 * time.Millisecond
 
-// gioCopy runs gio copy once from from to dst. It returns the last line gio
-// printed (for errors) and the error; dst is removed on any error.
-func gioCopy(ctx context.Context, bin, from, dst string, onProgress func(int64)) (string, error) {
+// gioCopy runs gio copy once from from to dst, with LC_ALL=C. On any error
+// dst is removed; a failure's error ends with the last line gio printed.
+func gioCopy(ctx context.Context, bin, from, dst string, onProgress func(int64)) error {
 	out := &tailBuffer{max: 4096}
 	cmd := exec.CommandContext(ctx, bin, "copy", "--", from, dst)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Start(); err != nil {
 		os.Remove(dst)
-		return "", fmt.Errorf("gio copy %s: %w", from, err)
+		return fmt.Errorf("gio copy %s: %w", from, err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -147,18 +141,17 @@ func gioCopy(ctx context.Context, bin, from, dst string, onProgress func(int64))
 		case err := <-done:
 			if ctx.Err() != nil {
 				os.Remove(dst)
-				return "", ctx.Err()
+				return ctx.Err()
 			}
 			if err != nil {
 				os.Remove(dst)
-				last := out.lastLine()
-				if last == "" {
-					return "", fmt.Errorf("gio copy %s: %w", from, err)
+				if last := out.lastLine(); last != "" {
+					return fmt.Errorf("gio copy %s: %w: %s", from, err, last)
 				}
-				return last, fmt.Errorf("gio copy %s: %w: %s", from, err, last)
+				return fmt.Errorf("gio copy %s: %w", from, err)
 			}
 			report()
-			return "", nil
+			return nil
 		case <-tick.C:
 			report()
 		}
