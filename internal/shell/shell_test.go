@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"picmover/internal/catalog"
+	"picmover/internal/library"
 	"picmover/internal/server"
 )
 
@@ -304,6 +306,94 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+// waitInstance waits for Run to write its instance file.
+func waitInstance(t *testing.T, dir string, errc <-chan error) Instance {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if in, err := readInstance(dir); err == nil && in.PID == os.Getpid() {
+			return in
+		}
+		select {
+		case err := <-errc:
+			t.Fatalf("Run returned %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no instance file")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// postQuit quits the instance over HTTP and waits for Run.
+func postQuit(t *testing.T, in Instance, errc <-chan error) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+strconv.Itoa(in.Port)+"/api/app/quit",
+		strings.NewReader(`{"token":"`+in.Token+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Picmover", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("quit %d", resp.StatusCode)
+	}
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("Run did not return")
+	}
+}
+
+// A saved library that another process holds does not stop the app: it
+// starts without a workspace and keeps the saved one in app.json.
+func TestRunBusySavedLibrary(t *testing.T) {
+	dir := t.TempDir()
+	libDir := filepath.Join(t.TempDir(), "lib")
+	lib, err := library.Open(libDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := catalog.Open(context.Background(), lib.DBPath(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	unlock, err := lib.Lock(context.Background(), "import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	c := DefaultConfig()
+	c.Workspace = libDir
+	SaveConfig(dir, c)
+	errc := make(chan error, 1)
+	go func() {
+		errc <- Run(context.Background(), Options{ConfigDir: dir, CacheDir: dir, Hidden: true, NoTray: true, Stderr: io.Discard})
+	}()
+	in := waitInstance(t, dir, errc)
+	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(in.Port) + "/api/libraries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ls map[string]any
+	json.NewDecoder(resp.Body).Decode(&ls)
+	resp.Body.Close()
+	if ls["mode"] != "unset" {
+		t.Fatalf("listing %v", ls)
+	}
+	postQuit(t, in, errc)
+	if got, _ := LoadConfig(dir); got.Workspace != libDir {
+		t.Fatalf("saved workspace lost: %+v", got)
+	}
 }
 
 // The whole lifecycle on this OS without tray and window: start (a stale

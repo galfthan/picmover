@@ -214,16 +214,25 @@ func (a *app) main(ctx context.Context) error {
 			port = DefaultPort
 		}
 	}
-	errOut := &logLines{log: a.log}
-	run, err := server.Start(ctx, server.StartOptions{
-		Path:      workspace,
-		Addr:      net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
-		AddrGiven: given,
-		Version:   a.opts.Version,
-		ErrOut:    errOut,
-		Logger:    a.log,
-		App:       a.hooks(),
-	})
+	start := func(path string) (*server.Running, error) {
+		return server.Start(ctx, server.StartOptions{
+			Path:      path,
+			Addr:      net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+			AddrGiven: given,
+			Version:   a.opts.Version,
+			ErrOut:    &logLines{log: a.log},
+			Logger:    a.log,
+			App:       a.hooks(),
+		})
+	}
+	run, err := start(workspace)
+	if err != nil && workspace != "" && a.opts.Workspace == "" {
+		// The saved library is busy (another picmover holds its lock) or
+		// unreadable: start without a workspace so the user can choose.
+		a.log.Warn("cannot serve the saved workspace; starting without one", "workspace", workspace, "err", err)
+		workspace = ""
+		run, err = start("")
+	}
 	if err != nil {
 		return err
 	}
