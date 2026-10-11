@@ -15,9 +15,11 @@ import (
 	"picmover/internal/backup"
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 	"picmover/internal/similar"
+	"picmover/internal/userdata"
 )
 
 // Job kinds and states.
@@ -131,9 +133,12 @@ type jobJSON struct {
 	FinishedAt *string    `json:"finishedAt"`
 	Stats      statsJSON  `json:"stats"`
 	SessionID  *int64     `json:"sessionId"`
-	LogPath    string     `json:"logPath"`
-	Error      *string    `json:"error"`
-	ExitCode   int        `json:"exitCode"` // 0 until finished
+	// ImportID is the user.db import record of an import or rebuild job
+	// (null for other kinds, and when the record could not be written).
+	ImportID *int64  `json:"importId"`
+	LogPath  string  `json:"logPath"`
+	Error    *string `json:"error"`
+	ExitCode int     `json:"exitCode"` // 0 until finished
 	// Backup is the progress of a backup-kind job, sent as "progress"
 	// instead of Progress.
 	Backup *backupProgressJSON `json:"-"`
@@ -251,6 +256,7 @@ type job struct {
 	stats     importer.Stats
 	lastSent  importer.Stats
 	sessionID int64
+	importID  int64 // user.db import record
 	logPath   string
 	errMsg    string
 	exitCode  int
@@ -311,6 +317,10 @@ func (j *job) jsonLocked() jobJSON {
 		id := j.sessionID
 		out.SessionID = &id
 	}
+	if j.importID != 0 {
+		id := j.importID
+		out.ImportID = &id
+	}
 	if j.errMsg != "" {
 		e := j.errMsg
 		out.Error = &e
@@ -355,6 +365,40 @@ func (j *job) setState(state, logPath string) {
 		j.logPath = logPath
 	}
 	j.publishLocked(sseEvent{"state", mustJSON(j.jsonLocked())})
+}
+
+// setImportID records the job's import record id (set before the job's
+// running state is published).
+func (j *job) setImportID(id int64) {
+	j.mu.Lock()
+	j.importID = id
+	j.mu.Unlock()
+}
+
+// beginRecord starts the user.db import record of an import or rebuild
+// job; a failure is logged (job log and server log) and only costs the
+// record.
+func (m *jobManager) beginRecord(j *job, user *userdata.DB, source, mode string, logger *slog.Logger) *importrec.Recorder {
+	var openErr error
+	if user == nil {
+		openErr = errors.New("the library has no user.db open")
+	}
+	rec := importrec.Begin(j.ctx, user, openErr, source, mode, logger)
+	if err := rec.Err(); err != nil {
+		m.log.Error("import record could not be written", "id", j.id, "library", j.libID, "err", err)
+	}
+	j.setImportID(rec.ID())
+	return rec
+}
+
+// finishRecord ends the job's import record; a failure is logged.
+func (m *jobManager) finishRecord(j *job, rec *importrec.Recorder, outcome string, stats importer.Stats, sessionID int64) {
+	if rec.ID() == 0 {
+		return // the failure was logged by beginRecord
+	}
+	if err := rec.Finish(context.Background(), outcome, stats, sessionID); err != nil {
+		m.log.Error("import record could not be written", "id", j.id, "library", j.libID, "err", err)
+	}
 }
 
 // onResult records an importer result (called from pipeline goroutines).
@@ -726,6 +770,14 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 	}
 	defer logFile.Close()
 	logger := slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var rec *importrec.Recorder
+	if j.params.Kind == kindImport {
+		mode := userdata.ImportModeCopy
+		if j.params.Move {
+			mode = userdata.ImportModeMove
+		}
+		rec = m.beginRecord(j, h.user, j.params.Source, mode, logger)
+	}
 	j.setState(stateRunning, logPath)
 
 	var im *importer.Importer
@@ -744,6 +796,10 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		opts.MinDimension = j.params.MinDimension
 		opts.Extractor = metadata.Default{DefaultZone: j.zone}
 		opts.NoThumbs = j.params.NoThumbs
+		opts.OnResult = func(r importer.Result) {
+			rec.OnResult(r)
+			j.onResult(r)
+		}
 		// Content found in the trash is restored under the library's
 		// trash lock, and its user.db trash row removed.
 		opts.TrashLock = &j.entry.trashMu
@@ -769,6 +825,9 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		stats, runErr = im.RunThumbs(j.ctx, 0, j.params.Rebuild)
 	}
 	sessionID = im.SessionID()
+	if rec != nil {
+		m.finishRecord(j, rec, importrec.Outcome(runErr), stats, sessionID)
+	}
 	state, code, msg = outcome(j.params.Kind, stats, runErr, logPath, lib.Root())
 	switch {
 	case state == stateCancelled:
@@ -904,6 +963,13 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 		logger.Error("read trash times", "err", err)
 		return reopenOld(err)
 	}
+	// The old catalog's import sessions go into the import history (the
+	// first time) before it is renamed away; read-only, best effort.
+	if _, err := os.Stat(dbPath); err == nil {
+		if _, err := importrec.BackfillFile(ctx, dbPath, user); err != nil {
+			logger.Info("import history backfill from the old catalog", "err", err)
+		}
+	}
 	backup := ""
 	switch fi, err := os.Stat(dbPath); {
 	case err == nil && !fi.Mode().IsRegular():
@@ -950,16 +1016,20 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 		what := rollback(nil, err)
 		return stateFailed, 1, stats, 0, publicLibError(err) + "; " + what
 	}
+	rec := m.beginRecord(j, user, lib.Root(), userdata.ImportModeRebuild, logger)
 	var im *importer.Importer
 	opts := importer.Options{
-		Source:           lib.Root(),
-		RecordInPlace:    true,
-		TrashTimes:       times,
-		NoThumbs:         j.params.NoThumbs,
-		Extractor:        metadata.Default{DefaultZone: time.Local},
-		Logger:           logger,
-		FFmpeg:           m.ffmpeg,
-		OnResult:         j.onResult,
+		Source:        lib.Root(),
+		RecordInPlace: true,
+		TrashTimes:    times,
+		NoThumbs:      j.params.NoThumbs,
+		Extractor:     metadata.Default{DefaultZone: time.Local},
+		Logger:        logger,
+		FFmpeg:        m.ffmpeg,
+		OnResult: func(r importer.Result) {
+			rec.OnResult(r)
+			j.onResult(r)
+		},
 		ProgressInterval: progressInterval,
 		OnProgress: func(s importer.Stats) {
 			j.onProgress(s, im.SessionID())
@@ -971,6 +1041,11 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 	im = importer.New(lib, db, opts)
 	stats, runErr := im.Run(j.ctx)
 	sessionID = im.SessionID()
+	recOutcome := importrec.Outcome(runErr)
+	if !im.RecordStageDone() && recOutcome == userdata.ImportDone {
+		recOutcome = userdata.ImportFailed // rolled back below
+	}
+	m.finishRecord(j, rec, recOutcome, stats, sessionID)
 	if !im.RecordStageDone() {
 		if runErr == nil {
 			runErr = errors.New("the record stage did not finish")

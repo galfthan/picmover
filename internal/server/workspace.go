@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
 	"picmover/internal/userdata"
@@ -537,7 +538,21 @@ func (ws *workspace) open(ctx context.Context, e *libEntry) error {
 		return ws.failLocked(e, libError, err)
 	}
 	ws.log.Info("library opened", "id", e.id, "root", lib.Root())
+	backfillImports(ctx, db, e.user, ws.log)
 	return nil
+}
+
+// backfillImports copies the catalog's import sessions into the import
+// history of user.db the first time a library is opened
+// (importrec.Backfill); a failure is logged and never fails the open.
+func backfillImports(ctx context.Context, db *catalog.DB, user *userdata.DB, log *slog.Logger) {
+	n, err := importrec.Backfill(ctx, db, user)
+	switch {
+	case err != nil:
+		log.Error("import history backfill", "err", err)
+	case n > 0:
+		log.Debug("import history backfilled from the catalog", "records", n)
+	}
 }
 
 // releaseLocked closes user.db and releases the lock of an entry that is
