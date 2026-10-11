@@ -47,7 +47,7 @@ func TestMigrateV1(t *testing.T) {
 	}
 	var v int
 	d.db.QueryRow("PRAGMA user_version").Scan(&v)
-	if v != 2 {
+	if v != SchemaVersion {
 		t.Fatalf("user_version %d", v)
 	}
 	if r, err := d.Rating(ctx, uint64(1<<64-5)); err != nil || r != 4 {

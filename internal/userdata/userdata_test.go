@@ -50,12 +50,12 @@ func TestOpenSchemaAndVersion(t *testing.T) {
 	if r, err := d.Rating(ctx, 1); err != nil || r != 3 {
 		t.Fatalf("rating after reopen %d %v", r, err)
 	}
-	if _, err := d.db.Exec("PRAGMA user_version = 3"); err != nil {
+	if _, err := d.db.Exec("PRAGMA user_version = 4"); err != nil {
 		t.Fatal(err)
 	}
 	d.Close()
-	if _, err := Open(ctx, p); err == nil || !strings.Contains(err.Error(), p) || !strings.Contains(err.Error(), "version 3") {
-		t.Fatalf("version 3 not refused with the file name: %v", err)
+	if _, err := Open(ctx, p); err == nil || !strings.Contains(err.Error(), p) || !strings.Contains(err.Error(), "version 4") {
+		t.Fatalf("version 4 not refused with the file name: %v", err)
 	}
 
 	// A version-0 database with foreign tables is refused too.

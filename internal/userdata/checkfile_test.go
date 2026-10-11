@@ -31,16 +31,16 @@ func TestCheckFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec("PRAGMA user_version = 3"); err != nil {
+	if _, err := raw.Exec("PRAGMA user_version = 4"); err != nil {
 		t.Fatal(err)
 	}
 	raw.Close()
 	err = CheckFile(ctx, p)
 	var ve *VersionError
-	if !errors.Is(err, ErrUnsupportedVersion) || !errors.As(err, &ve) || ve.Version != 3 {
-		t.Fatalf("version 3: %v", err)
+	if !errors.Is(err, ErrUnsupportedVersion) || !errors.As(err, &ve) || ve.Version != 4 {
+		t.Fatalf("version 4: %v", err)
 	}
-	if got, want := ve.Error(), "user.db has schema version 3; this picmover supports 2: upgrade picmover"; got != want {
+	if got, want := ve.Error(), "user.db has schema version 4; this picmover supports 3: upgrade picmover"; got != want {
 		t.Errorf("message %q, want %q", got, want)
 	}
 	if _, err := Open(ctx, p); !errors.As(err, &ve) {
