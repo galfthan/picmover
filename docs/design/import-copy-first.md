@@ -49,7 +49,7 @@ The copy-first path in `process`:
    bytes as they are written (xxhash64, identical to `HashFile`). It
    returns the temp path, hash and size. The size written must equal the
    size from the source `Stat`; otherwise the error is
-   `"<origin>: changed while it was read"` and the temp is removed. The
+   `"<origin>: size changed while it was read"` and the temp is removed. The
    source mtime is set on the temp (`Chtimes`), so the final file keeps
    it as `CopyVerified` does today. No fsync yet. Bytes are added to
    `Stats.BytesCopied` as they are written, per buffer, so the status line
@@ -152,8 +152,8 @@ Built as specified, in three code commits on `fix/import-copy-first`
 - `internal/library/stage.go`: `Stage(ctx, src, tmpDir, onWrite)`, its
   core `StageFile(ctx, *os.File, tmpDir, onWrite)` (reads an already
   opened source, so the importer's test hook sees every source open),
-  the `Staged{Path, Hash, Size}` result, `ErrSourceChanged` (the message
-  is `"<path>: changed while it was read"`), and `Commit(tmpPath, dst)`.
+  the `Staged{Path, Hash, Size}` result, `ErrSizeChanged` (the message
+  is `"<path>: size changed while it was read"`), and `Commit(tmpPath, dst)`.
   `CopyVerified` now places its temp file through the same `commitFile`
   (chmod 0644, fsync, close, `MkdirAll`, `RenameNoReplace`, mtime, dir
   sync). `HashReader` was added next to `HashFile` for the importer's
@@ -209,7 +209,7 @@ Tests (`go test -tags nodynamic`):
   gone), `TestCommitFailureLeavesNothing` (existing destination kept,
   uncreatable directory; temp removed, nothing at `dst`),
   `TestStageCancelledAndChanged` (cancellation; a source growing during
-  the read gives `ErrSourceChanged`; temp removed).
+  the read gives `ErrSizeChanged`; temp removed).
 - `internal/importer/copyfirst_test.go`: `TestCopyFirstReadsSourceOnce`
   (new files, an in-flight duplicate and a catalogued duplicate are each
   opened once; metadata is only extracted from staged temp files; row
@@ -227,3 +227,83 @@ Tests (`go test -tags nodynamic`):
 - All existing tests pass unchanged; the importer and library packages
   also under `-race`. Vet passes for linux, windows and darwin/arm64.
   The Windows volume-serial code is vetted, not run.
+
+## Review fixes
+
+An adversarial review of the branch found the items below. Where this
+section differs from the rules above (one read per file under `--move`,
+the restore deleting its source "without opening it again"), this
+section is what the code does.
+
+1. **Move verifies before the source is deleted.** Copy is one read of
+   the source; move is two, the second one proving the bytes before the
+   original is deleted. In the copy-first path, when the item will delete
+   its source (`Move`: a cross-device or `ForceCopy` move, not in place),
+   the worker hashes the source again (`verifySource`, holding a
+   `readers` slot for that read only) after metadata extraction and
+   destination reservation and before `Commit`, and before an `identical`
+   file at the destination is accepted. If the hash differs from the
+   staged hash, or the source cannot be read, the staged temp is removed,
+   nothing is placed, and the file is an error result with message
+   `copy` whose error wraps `library.ErrHashMismatch` ("the source changed
+   or could not be read consistently"); the source is left untouched. A
+   restore from the trash of a staged move checks the source the same way
+   before deleting it; on a mismatch the restore stands (it is the
+   library's own copy) and the source is kept. The README no longer
+   presents the thumbnail stage as a safeguard: it runs after the copy
+   stage, when move sources are already gone.
+2. **In-place guard for `identical`.** When `reserveDest` reports
+   `identical`, the destination is stat'ed and, if `os.SameFile` with the
+   source, the file is in place: status existing, no `deleteSrc`, never
+   deleted (a library file reached through a path `Contains` does not
+   know, such as a hard link or bind mount). On Windows `volumeSerial`
+   now opens with `os.Open` (Go's long-path handling) and calls
+   `GetFileInformationByHandle` on its handle; the volume-name fallback
+   is unchanged.
+3. **Fallback capture date from the source.** When extraction of a staged
+   copy reports `Source == "mtime"`, `taken_at` is the source's mtime (the
+   `os.Stat` in `process`, in the extractor's zone), not the `.part`
+   file's. `StageFile` keeps `Chtimes` best effort; the date no longer
+   depends on it.
+4. **Source readers for every source read.** `sourceSlot` takes a
+   `readers` slot for a path outside the library and returns its release.
+   It is held around staging, the move verification, `hashSource`, the
+   hash-first `CopyVerified`, opening a zip archive and extracting each of
+   its entries, and released as soon as the read ends (never across
+   metadata extraction or catalog calls). Cancellation while waiting
+   returns `ctx.Err()`, which `process` turns into nil, nil (a zip stops
+   silently).
+5. **Error renamed.** `library.ErrSourceChanged` is now
+   `library.ErrSizeChanged` ("size changed while it was read"), so it does
+   not clash with the backup copy's `ErrSourceChanged` on `feat/backup`;
+   they should be unified once both branches are in master.
+6. **Phone mounts in the folder browser.** `roots()` on Unix also lists
+   the gvfs directory (`$XDG_RUNTIME_DIR/gvfs`, else
+   `/run/user/<uid>/gvfs`) when it exists.
+7. **Tests.** `TestCopyFirstCleanup/cancelled during staging` hands the
+   importer a pipe fed with a 3 MiB file and cancels after more than
+   1 MiB is staged (a partly written `.part` on disk, bytes counted); it
+   checks the `.part` is removed and `BytesCopied` is 0.
+   `TestStageCancelledAndChanged` cancels from `onWrite` after the first
+   buffer. `TestCopyFirstReadsSourceOnce` gates extraction until the
+   duplicate is reported, so it is always the in-flight duplicate. New:
+   `TestCopyFirstMoveVerifiesSource` (second open returns other content:
+   error, `ErrHashMismatch`, nothing placed, no row, no `.part`, source
+   kept), `TestCopyFirstIdenticalAtDestinationMove`,
+   `TestCopyFirstIdenticalIsSourceItself` (hard link outside the library
+   to the library file, move, `sameDev` false: existing, nothing
+   deleted), `TestCopyFirstMoveRestoresTrashed` (verified and changed
+   source), `TestCopyFirstMtimeFallbackUsesSource`, and
+   `TestFSRootsGvfs`. `TestCrossDeviceMoveStagesOnce` and
+   `TestForceCopyTakesCopyFirst` now expect two opens.
+
+Not changed in code:
+
+- A staged size that differs from the `Stat` size still fails that file
+  with a clear error (`ErrSizeChanged`) rather than falling back to the
+  hash-first path. It fails safe: nothing is placed or deleted. A FUSE
+  backend that reports an inexact size (for example a PTP size capped at
+  4 GiB) cannot import such files this way.
+- Duplicates are staged before the duplicate check, so an import needs
+  temp space in the library for up to `Workers` files at a time,
+  duplicates included (noted in the README).
