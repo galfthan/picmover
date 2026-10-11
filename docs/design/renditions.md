@@ -113,3 +113,56 @@ summary names the formats written (WebP).
 
 Regenerating existing renditions automatically; AVIF; changing the
 preview size; client-side format negotiation.
+
+## As implemented (frontend)
+
+- `web/src/lib/rendition.ts`: `renditionFor(tileCssPx, devicePixelRatio)`
+  returns `'thumb'` when `tile * dpr <= 256` (`THUMB_PX`), else `'large'`;
+  a missing, zero or NaN ratio counts as 1. `pixelRatio()` and
+  `watchPixelRatio(cb)` (a `matchMedia('(resolution: Ndppx)')` listener,
+  re-armed on every change; a no-op without `matchMedia`) follow browser
+  zoom and moves between screens.
+- `api.largeUrl(ref)` (`web/src/lib/api.ts`): `/api/l/{lib}/large/{hash}`
+  with the same `?v=<thumbAt>` versioning as `thumbUrl`/`previewUrl`.
+  Types: `ThumbCounts.largeMissing?` (optional: older servers omit it),
+  `JobStats.largeDone` (required in the type; `emptyStats()` defaults it
+  to 0, so a server that omits it reads as 0).
+- Grid (`pages/Grid.svelte`): `MAX_TILE` 480 (slider, Ctrl+wheel and the
+  stored `picmover.grid.tileSize` all go through the same clamp). The
+  grid computes one rendition from the laid-out tile size
+  (`timeline.tile`, the stretched size, not the requested one) and the
+  pixel ratio, and passes it to every `Tile` as `rendition`.
+- Tile (`components/Tile.svelte`): shows the large or the thumb URL. While
+  a new URL loads (threshold crossed either way, or a job versioned the
+  URL) the last loaded image is kept as a second `<img class="under">`
+  beneath it; that element exists only during the swap and is removed
+  when the new image fires `load`. A large that fails to load (404: no
+  preview) falls back to the thumb URL for that tile; a failed thumb
+  behaves as before (placeholder, one retry after a job).
+- Lightbox: the blurred placeholder is `largeUrl`; the full image and the
+  video poster stay `previewUrl`.
+- Library page: when `thumbs.largeMissing > 0` the Thumbnails card says
+  "N large thumbnails to fill" and the existing "Generate missing
+  thumbnails" button (the normal `thumbs` job, `rebuild: false`) fills
+  them. The Jobs table line of a thumbs job appends "N large filled" when
+  `stats.largeDone > 0`; `JobProgress` shows a "Large filled" stat while
+  running under the same condition.
+- Fake server (`web/src/testing/fakes.ts`): `GET thumb|large|preview/{hash}`
+  answers a tiny image for a known hash and 404 otherwise; the library
+  JSON `thumbs` comes from the exported `thumbCounts` (tests set
+  `largeMissing`); `ZERO_STATS.largeDone`.
+- Tests: `lib/rendition.test.ts` (sizes 100-480 at ratios 1, 1.25, 1.5,
+  2, 3, bogus ratios), `lib/api.test.ts` (large URL versioned, unversioned,
+  non-finite version, library id encoding), `Grid.test.ts` (src swaps
+  thumb to large and back across the threshold with the underlay present
+  only until `load`, large failure falls back to the thumb, ratio 2 picks
+  the large at the default zoom, stored zoom clamped to 480 and wheel zoom
+  stops there, a stored 400 is kept), `Renditions.test.ts` (Library page
+  count and button posting the thumbs job, nothing shown when 0 or
+  absent, the job line with and without `largeDone`).
+
+Assumptions for the backend: `thumbs.largeMissing` and `stats.largeDone`
+are plain JSON numbers with those exact names; the `large` route accepts
+the same `?v=` query as `thumb` and ignores it; a large that cannot be
+produced answers with an error status (404) or the thumb bytes, either of
+which the tile handles.

@@ -83,7 +83,7 @@ interface FakeTarget {
 }
 
 /** The importer counters every job object carries; zero for the backup kinds (their stats are in `result`). */
-export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
+export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0, largeDone: 0 };
 
 /** Run stats (`result`, and `stats` in runs) exactly as the step 5 server writes them, per kind. */
 export function runResult(kind: string, p: Record<string, unknown> = {}): Record<string, unknown> {
@@ -235,6 +235,8 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   const openErrors = new Map<string, string>();
   /** user.db counts that differ from the catalog's (null: the same). */
   const userdb: { trashed: number | null } = { trashed: null };
+  /** The library JSON `thumbs` counts (tests set `largeMissing`). */
+  const thumbCounts: { pending: number; ok: number; unsupported: number; error: number; largeMissing?: number } = { pending: 0, ok: 9, unsupported: 0, error: 0, largeMissing: 0 };
 
   /**
    * Backups of "peter" (docs/design/backups.md "HTTP API"): targets as
@@ -558,6 +560,12 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
       if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
     }
+    // Renditions (docs/design/renditions.md): any known hash answers with a tiny image.
+    const rm = /^(thumb|large|preview)\/([0-9a-f]+)$/.exec(path);
+    if (rm && method === 'GET') {
+      if (!items.some((x) => x.hash === rm[2])) return json({ error: 'no such rendition' }, 404);
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=31536000, immutable' } });
+    }
     if (path === 'imports' && method === 'GET') return json({ imports: imports.map((r) => importJSON(r, 'stored')) });
     const im = /^imports\/([^/]+)(\/delete)?$/.exec(path);
     if (im) {
@@ -583,7 +591,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         root: '/media/peter',
         version: 'test',
         summary: { ...summary(live().length), deleted: items.length - live().length },
-        thumbs: { pending: 0, ok: 9, unsupported: 0, error: 0 },
+        thumbs: { ...thumbCounts },
         cameras: [],
         ffmpeg: true,
         userdb: { ratings: items.filter((x) => x.rating).length, tags: tags.length, albums: albums.length, trashed: userdb.trashed ?? items.length - live().length, ignoredPairs: ignoredPairs.size },
@@ -807,7 +815,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, backup, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

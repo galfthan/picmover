@@ -7,7 +7,7 @@ import type { Job } from './api';
 
 type Store = (typeof import('./jobs.svelte'))['jobs'];
 
-const stats = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
+const stats = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0, largeDone: 0 };
 
 function job(id: number, state: string, startedAt = '2026-10-10T12:00:00+03:00'): Job {
   return { id, kind: 'import', state, source: '/src', move: false, startedAt, finishedAt: state === 'running' ? null : '2026-10-10T12:05:00+03:00', stats: { ...stats }, error: null };

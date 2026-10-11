@@ -3,6 +3,7 @@
   import type { LibApi, MediaItem } from '../lib/api';
   import { formatAgo, formatDuration, formatWallDate, parseLocalWallClock } from '../lib/format';
   import { openViewer, viewerHref } from '../lib/viewer';
+  import type { Rendition } from '../lib/rendition';
 
   interface Props {
     item: MediaItem;
@@ -19,18 +20,40 @@
     trash?: boolean;
     /** Current time for "deleted … ago" (the grid ticks it). */
     now?: number;
+    /** Which stored rendition to show (the grid picks it from the tile size and pixel ratio). */
+    rendition?: Rendition;
   }
-  let { item, left, top, size, api, selected = false, selecting = false, onselect, trash = false, now = 0 }: Props = $props();
+  let { item, left, top, size, api, selected = false, selecting = false, onselect, trash = false, now = 0, rendition = 'thumb' }: Props = $props();
 
   // Rows whose thumbnails cannot exist are not requested at all.
   const requestable = $derived(item.thumb !== 'unsupported' && item.thumb !== 'error');
   // The URL carries thumbAt, so a regenerated thumbnail is a new URL. A
   // failure is remembered per URL: when the grid refetches the bucket after
   // a job (new thumbAt), the tile simply tries the new URL.
-  const src = $derived(api.thumbUrl(item));
+  const thumbSrc = $derived(api.thumbUrl(item));
+  const largeSrc = $derived(api.largeUrl(item));
+  // A large that fails (no preview to derive it from) falls back to the thumb.
+  let largeFailedSrc = $state<string | null>(null);
+  const src = $derived(rendition === 'large' && largeFailedSrc !== largeSrc ? largeSrc : thumbSrc);
   let failedSrc = $state<string | null>(null);
   const failed = $derived(failedSrc !== null && failedSrc === src);
   let loaded = $state(false);
+  // The last URL that finished loading. While a new URL loads (zoom crossed
+  // the rendition threshold, or a job versioned the URL), that image stays
+  // underneath so the tile never goes blank; the extra <img> exists only
+  // during the swap.
+  let loadedSrc = $state<string | null>(null);
+  const under = $derived(loadedSrc !== null && loadedSrc !== src && !failed ? loadedSrc : null);
+
+  function onLoad(e: Event) {
+    loaded = true;
+    loadedSrc = (e.currentTarget as HTMLImageElement).getAttribute('src');
+  }
+  function onError(e: Event) {
+    const s = (e.currentTarget as HTMLImageElement).getAttribute('src');
+    if (s === largeSrc && s !== thumbSrc) largeFailedSrc = s;
+    else failedSrc = s;
+  }
   // One more try at an unchanged URL when a fresh copy of the item arrives
   // (the grid refetches buckets after a job), for a server that does not
   // send thumbAt.
@@ -84,15 +107,10 @@
     aria-label={label}
   >
     {#if requestable && !failed}
-      <img
-        {src}
-        alt=""
-        loading="lazy"
-        decoding="async"
-        draggable="false"
-        onload={() => (loaded = true)}
-        onerror={() => (failedSrc = src)}
-      />
+      {#if under}
+        <img class="under" src={under} alt="" draggable="false" />
+      {/if}
+      <img {src} alt="" loading="lazy" decoding="async" draggable="false" onload={onLoad} onerror={onError} />
     {:else}
       <span class="ph" aria-hidden="true">{isVideo ? '▶' : ''}</span>
     {/if}
@@ -144,6 +162,7 @@
     z-index: 1;
   }
   img {
+    position: relative;
     display: block;
     width: 100%;
     height: 100%;
@@ -154,6 +173,11 @@
       transform 0.12s;
   }
   .loaded img {
+    opacity: 1;
+  }
+  img.under {
+    position: absolute;
+    inset: 0;
     opacity: 1;
   }
   .ph {

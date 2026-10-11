@@ -282,6 +282,72 @@ describe('grid', () => {
     expect(Number(slider.value)).toBeLessThan(160);
   });
 
+  it('swaps tiles to the large rendition across the threshold, keeping the loaded thumb underneath', async () => {
+    await start();
+    const tile3 = () => document.querySelector<HTMLAnchorElement>('a.tile[href="#/l/Photos/view/3"]')!;
+    const main = () => tile3().querySelector<HTMLImageElement>('img:not(.under)')!;
+    const under = () => tile3().querySelector<HTMLImageElement>('img.under');
+    const slider = document.querySelector<HTMLInputElement>('.size input')!;
+    expect(slider.max).toBe('480');
+    // 160 requested, ~182 CSS px laid out at ratio 1: the thumb.
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(under()).toBeNull();
+    main().dispatchEvent(new Event('load'));
+    await settle();
+    expect(under()).toBeNull();
+
+    // Zoom past 256 px: the large is requested, the loaded thumb stays underneath until it loads.
+    slider.value = '300';
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/large/0000000000000003');
+    expect(under()?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(tile3().querySelectorAll('img')).toHaveLength(2);
+    main().dispatchEvent(new Event('load'));
+    await settle();
+    expect(under()).toBeNull();
+    expect(tile3().querySelectorAll('img')).toHaveLength(1);
+    // Tiles that never loaded anything get no underlay.
+    const tile2 = document.querySelector('a.tile[href="#/l/Photos/view/2"]')!;
+    expect(tile2.querySelectorAll('img')).toHaveLength(1);
+    expect(tile2.querySelector('img')?.getAttribute('src')).toBe('/api/l/Photos/large/0000000000000002');
+
+    // A large that fails (no preview) falls back to the thumb.
+    tile2.querySelector('img')!.dispatchEvent(new Event('error'));
+    await settle();
+    expect(tile2.querySelector('img')?.getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000002');
+
+    // Back below the threshold: the thumb again, the large shown underneath meanwhile.
+    slider.value = '100';
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    expect(main().getAttribute('src')).toBe('/api/l/Photos/thumb/0000000000000003');
+    expect(under()?.getAttribute('src')).toBe('/api/l/Photos/large/0000000000000003');
+    expect(requests.some((r) => r.includes('/large/') || r.includes('/thumb/'))).toBe(false); // images are not fetched
+  });
+
+  it('picks the large at a high pixel ratio and clamps the stored zoom to 480', async () => {
+    vi.stubGlobal('devicePixelRatio', 2);
+    localStorage.setItem('picmover.grid.tileSize', '1000');
+    await start();
+    const slider = document.querySelector<HTMLInputElement>('.size input')!;
+    expect(slider.value).toBe('480');
+    expect(document.querySelector('a.tile img')?.getAttribute('src')).toMatch(/^\/api\/l\/Photos\/large\//);
+    // Wheel zoom stops at the maximum too.
+    const scroller = document.querySelector<HTMLElement>('.scroller')!;
+    for (let i = 0; i < 20; i++) scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, ctrlKey: true, cancelable: true }));
+    await settle();
+    expect(slider.value).toBe('480');
+    expect(localStorage.getItem('picmover.grid.tileSize')).toBe('1000'); // unchanged: no size change was applied
+  });
+
+  it('keeps a stored zoom between the old and the new maximum', async () => {
+    localStorage.setItem('picmover.grid.tileSize', '400');
+    await start();
+    expect(document.querySelector<HTMLInputElement>('.size input')!.value).toBe('400');
+    expect(document.querySelector('a.tile img')?.getAttribute('src')).toMatch(/^\/api\/l\/Photos\/large\//);
+  });
+
   it('moves a year with the keyboard on the scrubber and keeps the place on resize', async () => {
     timeline = [
       { year: 2024, month: 7, count: 100 },

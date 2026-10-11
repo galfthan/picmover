@@ -74,7 +74,8 @@
     if (isBackupKind(j.kind)) return backupJobSummary(j);
     const st = j.stats;
     if (j.kind === 'thumbs') {
-      return `${formatCount(st.thumbsDone)} done, ${formatCount(st.thumbsUnsupported)} unsupported, ${formatCount(st.thumbsFailed)} failed`;
+      const line = `${formatCount(st.thumbsDone)} done, ${formatCount(st.thumbsUnsupported)} unsupported, ${formatCount(st.thumbsFailed)} failed`;
+      return st.largeDone > 0 ? `${line}, ${formatCount(st.largeDone)} large filled` : line;
     }
     const parts = [`${formatCount(st.imported)} imported`];
     if (st.duplicates) parts.push(`${formatCount(st.duplicates)} duplicates`);
@@ -163,6 +164,12 @@
             <div class="stat"><span class="v">{formatCount(t.stale)}</span><span class="k">Outdated</span></div>
           {/if}
         </div>
+        {#if (t.largeMissing ?? 0) > 0}
+          <p class="muted small large">
+            {formatCount(t.largeMissing ?? 0)} large {t.largeMissing === 1 ? 'thumbnail' : 'thumbnails'} to fill (from the stored previews; Generate missing
+            thumbnails fills them).
+          </p>
+        {/if}
         {#if !info.ffmpeg}
           <p class="muted small">ffmpeg was not found, so videos get no thumbnails. Install ffmpeg and generate the missing ones.</p>
         {/if}
@@ -307,6 +314,9 @@
   }
   .actions {
     margin-top: 14px;
+  }
+  .large {
+    margin: 12px 0 0;
   }
   .job {
     margin-top: 14px;

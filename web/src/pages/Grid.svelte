@@ -14,6 +14,7 @@
   import { setSequenceProvider, type Neighbours } from '../lib/viewer';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import Tile from '../components/Tile.svelte';
+  import { pixelRatio, renditionFor, watchPixelRatio } from '../lib/rendition';
   import Scrubber from '../components/Scrubber.svelte';
   import FiltersBar from '../components/Filters.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
@@ -49,7 +50,7 @@
   const SIDE = 16; // left padding of the content
   const SCRUB = 56; // right gutter for the scrubber
   const MIN_TILE = 100;
-  const MAX_TILE = 320;
+  const MAX_TILE = 480;
   const TILE_KEY = 'picmover.grid.tileSize';
 
   const clampTile = (n: number) => Math.round(Math.min(MAX_TILE, Math.max(MIN_TILE, n)));
@@ -82,6 +83,10 @@
   const timeline = $derived(
     layoutTimeline(buckets, { width: contentWidth, tileSize, gap: GAP, headerHeight: HEADER, bucketPadding: BUCKET_PAD }),
   );
+  // Tiles at most 256 device px use the thumb, larger ones the 640 px large.
+  let dpr = $state(pixelRatio());
+  $effect(() => watchPixelRatio((r) => (dpr = r)));
+  const rendition = $derived(renditionFor(timeline.tile, dpr));
   /** Height of the selection bar while shown; the canvas grows by it (plus its margin) so the last row can scroll clear of it. */
   let barHeight = $state(0);
   const BAR_MARGIN = 24;
@@ -629,6 +634,7 @@
                     onselect={onSelect}
                     trash={mode === 'trash'}
                     {now}
+                    {rendition}
                   />
                 {:else}
                   <div
