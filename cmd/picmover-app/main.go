@@ -36,6 +36,8 @@ Flags:
   --browser          use the browser, never the native window
   --port <n>         listen on this loopback port (default: the port of the
                      last run, first 7440)
+  --no-desktop-entry Linux: do not create or update the launcher entry
+                     (~/.local/share/applications/picmover.desktop)
   --version          print the version
   --help             print this help
 
@@ -55,6 +57,7 @@ func run(args []string) int {
 	fs.BoolVar(&opts.NoTray, "no-tray", false, "")
 	fs.BoolVar(&opts.Browser, "browser", false, "")
 	fs.IntVar(&opts.Port, "port", 0, "")
+	fs.BoolVar(&opts.NoDesktopEntry, "no-desktop-entry", false, "")
 	fs.BoolVar(&showVersion, "version", false, "")
 	fs.BoolVar(&help, "help", false, "")
 	fs.BoolVar(&help, "h", false, "")

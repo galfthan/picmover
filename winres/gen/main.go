@@ -1,6 +1,7 @@
 // Command gen draws picmover's application icon (a rounded square with a
 // sun over mountains) and writes the PNGs go-winres embeds, the tray
-// icons and the 256 px source:
+// icons, the 256 px source, the web favicon and manifest icons, and the
+// 256 px PNG the Linux desktop entry installs:
 //
 //	go run ./winres/gen
 //
@@ -135,15 +136,19 @@ func write(p string, data []byte) {
 }
 
 func main() {
-	sizes := []int{16, 32, 48, 256}
+	sizes := []int{16, 32, 48, 192, 256, 512}
 	pngs := map[int][]byte{}
 	for _, s := range sizes {
 		pngs[s] = encode(render(s))
-		if s != 256 {
+		if s <= 48 {
 			write(filepath.Join("winres", "icon"+strconv.Itoa(s)+".png"), pngs[s])
 		}
 	}
 	write(filepath.Join("winres", "icon.png"), pngs[256])
 	write(filepath.Join("internal", "shell", "assets", "tray.png"), pngs[32])
 	write(filepath.Join("internal", "shell", "assets", "tray.ico"), ico([]int{16, 32, 48}, [][]byte{pngs[16], pngs[32], pngs[48]}))
+	write(filepath.Join("internal", "shell", "assets", "icon256.png"), pngs[256])
+	write(filepath.Join("web", "public", "favicon.png"), pngs[32])
+	write(filepath.Join("web", "public", "icons", "icon-192.png"), pngs[192])
+	write(filepath.Join("web", "public", "icons", "icon-512.png"), pngs[512])
 }

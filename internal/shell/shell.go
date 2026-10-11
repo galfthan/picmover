@@ -32,7 +32,10 @@ type Options struct {
 	NoTray    bool   // --no-tray
 	Browser   bool   // --browser: never use the native window
 	Port      int    // --port: 0 = the saved port (else DefaultPort)
-	Version   string
+	// NoDesktopEntry (--no-desktop-entry): do not write the Linux
+	// launcher (~/.local/share/applications/picmover.desktop) and icons.
+	NoDesktopEntry bool
+	Version        string
 
 	// ConfigDir and CacheDir override os.UserConfigDir()/picmover and
 	// os.UserCacheDir()/picmover (tests).
@@ -276,6 +279,8 @@ func (a *app) main(ctx context.Context) error {
 		a.log.Error("cannot write the instance file; a second launch will not find this one", "err", err)
 	}
 
+	a.startDesktopEntry()
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -299,6 +304,21 @@ func (a *app) main(ctx context.Context) error {
 	<-a.done
 	a.log.Info("picmover-app stopped")
 	return nil
+}
+
+// startDesktopEntry writes the Linux launcher and icons in the
+// background (unless --no-desktop-entry), so startup does not wait for
+// it. The channel is closed when it is done; nil when skipped.
+func (a *app) startDesktopEntry() <-chan struct{} {
+	if a.opts.NoDesktopEntry {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		installDesktopEntry(a.log)
+	}()
+	return done
 }
 
 // logLines turns the server's notices (one line each) into log records.

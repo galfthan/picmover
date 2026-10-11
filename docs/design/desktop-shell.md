@@ -127,7 +127,8 @@ app-only controls (`GET /api/app` → 404).
 
 Flags of `picmover-app`: `--workspace <dir>` (overrides and saves),
 `--hidden`, `--no-tray`, `--browser` (never use the native window),
-`--port`, `--version`, `--help`. On Windows the executable is a GUI
+`--port`, `--no-desktop-entry` (Linux: do not write the launcher entry;
+see the follow-up below), `--version`, `--help`. On Windows the executable is a GUI
 program (`-H windowsgui`), so it has no console of its own: `--version`
 and `--help` attach to the parent console when there is one
 (`AttachConsole(ATTACH_PARENT_PROCESS)`) and print there, and otherwise
@@ -390,7 +391,8 @@ type and header are right (the same path `curl` takes).
 ### Executable, resources, Makefile
 
 - `cmd/picmover-app/main.go`: standard `flag` (`--workspace`, `--hidden`,
-  `--no-tray`, `--browser`, `--port`, `--version`, `--help`/`-h`),
+  `--no-tray`, `--browser`, `--port`, `--no-desktop-entry`, `--version`,
+  `--help`/`-h`),
   version from `-X main.version=…`. Exit 0 normally and after a hand-off,
   1 on failure.
 - `winres/gen` (`make icons`) draws the icon (rounded blue square, amber
@@ -755,3 +757,48 @@ and 9 are the frontend's).
 - The unset-409 test now opens the Trash page (four library requests at
   once, all 409 `unset`) and asserts exactly one listing reload and no
   toast, also after further time passes.
+
+## Review fixes (follow-up)
+
+The Linux app-mode window showed Chromium's icon in the dock and Alt-Tab.
+
+- **Favicon and manifest.** `winres/gen` (`make icons`) also writes
+  `web/public/favicon.png` (32 px), `web/public/icons/icon-192.png`,
+  `web/public/icons/icon-512.png` and `internal/shell/assets/icon256.png`
+  from the same drawing (it stays the single source). Vite copies
+  `web/public/` into `dist`. `web/public/manifest.webmanifest` names the
+  app (`display: standalone`, `background_color` `#0f1012` = `--bg`,
+  `theme_color` `#7cb2ff` = `--accent`, both of the default dark theme)
+  with the 192 and 512 px icons; `index.html` links the favicon, the
+  apple-touch-icon and the manifest and sets `theme-color`. The server
+  already served `.webmanifest` as `application/manifest+json` and `.png`
+  as `image/png`; the CSP (`default-src 'self'`) and the same-origin
+  checks allow the manifest fetch. Tested (`TestStaticManifestAndIcons`).
+- **Window class.** Chrome-style app mode adds `--class=picmover`, so the
+  X11 `WM_CLASS` class (and, where Chrome derives it from the class, the
+  Wayland app_id) is `picmover`. Unverified on a desktop: whether every
+  Chrome/Chromium/Edge version and GNOME/KDE on Wayland map the
+  `--app` window through it.
+- **Desktop entry (Linux, `internal/shell/desktop_linux.go`).** On every
+  start, in a goroutine after the server has started, picmover-app makes
+  sure `$XDG_DATA_HOME/applications/picmover.desktop` (default
+  `~/.local/share`) exists with `Exec="<os.Executable, symlinks
+  resolved>"` (Exec quoting and `%%`), `Icon=picmover`,
+  `StartupWMClass=picmover`, `Categories=Graphics;Photography;` and the
+  marker `X-Picmover=1`, plus the icons
+  `icons/hicolor/256x256/apps/picmover.png` (embedded `icon256.png`) and
+  `32x32/apps/picmover.png` (`tray.png`). A missing entry is created; an
+  entry with the marker is rewritten only when its content differs (the
+  executable moved); an entry without the marker is someone else's and is
+  left alone, icons included (one info line in the log). Files are
+  written atomically (temp + rename) and only when they differ; after the
+  entry is written `update-desktop-database <applications dir>` runs when
+  it is on PATH (errors ignored). Failures are logged and never stop the
+  app. `--no-desktop-entry` skips it; on Windows and macOS the flag is
+  accepted and does nothing. The package tests point `XDG_DATA_HOME` at a
+  temporary folder (also for the helper process). Tested: content and
+  icons, a second run writes nothing, a foreign entry is kept, a moved
+  executable is rewritten, the flag skips.
+- The `xdg-open` fallback (Firefox or another default browser, no
+  Chromium-family browser on PATH) keeps the browser's own icon: the page
+  is a tab of that browser.

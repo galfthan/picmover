@@ -124,7 +124,7 @@ func TestBrowserCommands(t *testing.T) {
 	path["chromium"] = "/usr/bin/chromium"
 	started = nil
 	if err := l.openApp(u); err != nil || len(started) != 1 ||
-		started[0] != "/usr/bin/chromium --app="+u+" --user-data-dir=/cache/picmover/app-profile --no-first-run --no-default-browser-check" {
+		started[0] != "/usr/bin/chromium --app="+u+" --class=picmover --user-data-dir=/cache/picmover/app-profile --no-first-run --no-default-browser-check" {
 		t.Fatalf("app mode %v %v", started, err)
 	}
 	// "Open in browser" always uses the default browser.
@@ -305,7 +305,17 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	// Run writes the Linux desktop entry under $XDG_DATA_HOME: keep it
+	// (and the helper process's) out of the real home.
+	data, err := os.MkdirTemp("", "picmover-shell-data-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_DATA_HOME", data)
+	code := m.Run()
+	os.RemoveAll(data)
+	os.Exit(code)
 }
 
 // waitInstance waits for Run to write its instance file.

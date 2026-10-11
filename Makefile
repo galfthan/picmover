@@ -66,7 +66,8 @@ app-binaries:
 # tree and commit the .syso; the file then names the commit it was made
 # on, so the exe's file version is one commit behind by construction
 # (unless it is run on a tag, which then names the tag). icons redraws
-# the icon PNGs.
+# the icon PNGs (Windows resources, tray, Linux desktop entry, web favicon
+# and manifest icons).
 winres:
 	$(WINRES) make --in winres/winres.json --out cmd/picmover-app/rsrc --arch amd64 \
 		--product-version=$(VERSION) --file-version=$(VERSION)

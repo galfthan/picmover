@@ -63,7 +63,10 @@ func (l launcher) appCommand(u string) (name string, args []string, ok bool) {
 	}
 	for _, b := range appModeBrowsers {
 		if p, err := l.lookPath(b); err == nil {
-			return p, []string{"--app=" + u, "--user-data-dir=" + l.profileDir, "--no-first-run", "--no-default-browser-check"}, true
+			// --class sets the X11 WM_CLASS and the Wayland app_id, which
+			// the desktop entry's StartupWMClass maps to picmover's icon.
+			return p, []string{"--app=" + u, "--class=picmover", "--user-data-dir=" + l.profileDir,
+				"--no-first-run", "--no-default-browser-check"}, true
 		}
 	}
 	return "", nil, false
