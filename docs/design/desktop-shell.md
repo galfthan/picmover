@@ -191,3 +191,99 @@ show a small message box. Everything else goes to the log file.
 Installer, auto-start on login, code signing, a native window on Linux or
 macOS, native file dialogs, notifications, auto-update, a `picmover app`
 subcommand in the CLI binary.
+
+## As implemented (frontend)
+
+What was built (all under `web/src/`):
+
+- `lib/api.ts`: `AppInfo` and `parseAppInfo` (tolerant: unknown platform
+  reads as `linux`, a missing `window` as `false`, a missing `closeToTray`
+  as `true`); `getApp()` (null on 404, other errors throw);
+  `setAppWorkspace(path)` (POST `/api/app/workspace`, returns the parsed
+  `/api/libraries` body; 400/409 surface as `ApiError` with `status` and
+  `body`); `appOpen()` (POST `/api/app/open {}`, not used by the UI: the
+  tray opens the window). `Workspace.mode` gains `'unset'`; the listing is
+  parsed by one `parseWorkspace` for both GET `/api/libraries` and the
+  workspace POST.
+- `lib/app.svelte.ts`: the app store. `App.svelte` calls `app.refresh()`
+  once at mount; `app.info` (null: `picmover serve`), `app.isApp`,
+  `app.workspace` (the listing's root once a workspace is listed, else
+  `info.workspace`), `app.workspaceName` (last path segment; POSIX, drive
+  and UNC; roots stay whole), `app.setWorkspace(path)` (posts, hands the
+  answer to `libraries.apply`, refreshes `/api/app`; returns the inline
+  message or null), the WebView2 notice flag and its dismissal
+  (localStorage `picmover.webview2notice` = `true` via `lib/storage.ts`).
+- `lib/libraries.svelte.ts`: `mode` may be `'unset'`; `apply(ws)` takes a
+  listing from the workspace POST and drops the old workspace's per-library
+  notes (opening, failures, rebuilding, reopen guard) and any listing
+  request in flight. A library-scoped 409 `{state:"unset"}` reloads the
+  listing once (shared with any request in flight, and not at all when the
+  store already says `unset`); no toast. An open request answered 409
+  `{state:"unset"}` reloads the listing too.
+- `lib/routes.ts`: `redirectFor` sends every route except the Libraries
+  page to `#/` in mode `unset`; `#/?setup=1` (`SETUP_HREF`) stays on the
+  Libraries page in every mode (single mode included, so Change works when
+  the saved workspace turned out to be a single library).
+- `components/WorkspaceSetup.svelte`: the setup card ("Choose the folder
+  that holds your libraries", one line of explanation, the current
+  workspace with a copy button when there is one, the existing
+  `FolderPicker` whose choose button reads "Use this folder"). Errors stay
+  inline under the picker (`role="alert"`): the server's 400 message as
+  sent; any 409 as "An import or backup is running; wait for it to
+  finish." Without app mode the button is disabled and the card says to
+  restart `picmover serve <folder>`. `FolderPicker` gained an optional
+  `disabled` prop for its choose button.
+- `pages/Libraries.svelte`: the WebView2 notice (app mode, `platform
+  "windows"` and `window false`, until dismissed) above the heading; the
+  setup card when the mode is `unset` (then it is the whole page: no list,
+  no "No libraries yet", no New library) or when the route has `?setup=1`
+  (then above the list, with Cancel). Success and Cancel replace the route
+  with `#/`.
+- `App.svelte`: loads `/api/app`; in app mode the top bar shows
+  "Workspace <name>" (full path as tooltip, "none" while unset) with a
+  Change link to `#/?setup=1`, next to the library chip on library pages
+  and next to the brand elsewhere (the brand then leaves out the root it
+  shows under `serve`, which the chip replaces). The library chip and the
+  Libraries page keep showing the library and workspace paths. The
+  Libraries page also renders in mode `unset`, and in single mode with
+  `?setup=1`. The shell keeps the last library's API client while the
+  route leaves a library, so a page request that finishes after the
+  redirect home does not read a null client (a race the unset redirect
+  made visible).
+
+Deviations and assumptions the backend must honour:
+
+- The setup page is `#/?setup=1`. The tray's **Change workspace…** should
+  open the window (or browser) on `<url>/#/?setup=1`; first run with no
+  workspace needs no fragment (`#/` shows the card in mode `unset`).
+- `/api/libraries` in mode `unset` may send `root: ""` or leave it out;
+  `libraries`/`folders` may be `[]` or `null`.
+- The 409 of `POST /api/app/workspace` is shown with a fixed text, whatever
+  its `error`; `jobs` is not read. A 400 shows `error` verbatim, so it
+  should be a sentence a user can act on.
+- `/api/libraries/<id>/open` (and the other workspace routes) in mode
+  `unset` may answer 409 `{state:"unset"}` or 404; both reload the listing.
+- `GET /api/app` → `workspace` should be `""` while unset. After a switch
+  the UI takes the root from the POST answer, then re-reads `/api/app`.
+- `POST /api/app/open` returning 204 with no body is handled (an empty body
+  parses as `{}`).
+
+Tests added: `AppMode.test.ts` (8 tests: `serve` shows no workspace name
+and no card; unset under `serve` shows the disabled card; unset in app mode
+sends a library route home, shows the card, posts the chosen folder and
+lists the libraries; 400 and 409 inline without toasts; header name,
+tooltip and Change with Cancel and a switch that closes the old library;
+the WebView2 notice and its remembered dismissal; hidden with the window
+and on Linux/macOS; a library view whose requests start answering 409
+`unset` goes home with at most two listing requests and no toast),
+`lib/app.test.ts` (folder names), and new cases in `lib/api.test.ts`
+(`/api/app` parsing and 404, the workspace POST and its errors, `open`,
+the unset listing) and `lib/routes.test.ts` (unset redirects, `?setup=1`).
+The fake server (`testing/fakes.ts`) gained `fakeServer('unset')`,
+`server.app.info` (null → the app routes answer 404; `appInfo()` builds
+one), `server.ws` (mode and root), `GET /api/app`, `POST
+/api/app/workspace` (400 for an empty, relative or library path, 409
+`{error:"a job is running", jobs:N}` while a job runs, else the new
+listing with the libraries under the new root and open libraries closed),
+`POST /api/app/open` → 204, and 409 `{error:"no workspace", state:"unset"}`
+for every `/api/libraries/...` and `/api/l/...` route while unset.

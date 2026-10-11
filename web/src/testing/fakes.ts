@@ -4,7 +4,7 @@
 // ResizeObserver fakes, and helpers to let effects and timers settle.
 
 import { vi } from 'vitest';
-import type { Job, Lib, MediaItem } from '../lib/api';
+import type { AppInfo, Job, Lib, MediaItem } from '../lib/api';
 
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -175,8 +175,23 @@ const cls = (count: number, bytes: number, paths: unknown[] = []): FakeClass => 
 
 const summary = (n: number) => ({ total: n, images: n, raw: 0, videos: 0, withGps: 0, deleted: 0, bytes: 1, earliest: '2024-06-01T10:00:00', latest: '2024-07-31T10:00:00' });
 
-/** A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver. */
-export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
+/** The desktop app's GET /api/app answer (docs/design/desktop-shell.md); tests override fields. */
+export function appInfo(p: Partial<AppInfo> = {}): AppInfo {
+  return { app: true, version: 'v0.6.0-test', workspace: '/media', closeToTray: true, platform: 'linux', window: true, ...p };
+}
+
+/**
+ * A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver.
+ * Mode "unset" is the desktop app without a workspace: the listing is empty,
+ * every library route answers 409 state "unset", and POST /api/app/workspace
+ * switches it to a workspace with the usual libraries. `app.info` set (see
+ * `appInfo`) makes it the desktop app; null (the default) answers the app
+ * routes 404 as `picmover serve` does.
+ */
+export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace') {
+  /** The listing's mode and root; POST /api/app/workspace changes them. */
+  const ws = { mode, root: mode === 'single' ? '/media/peter' : mode === 'unset' ? '' : '/media' };
+  const app: { info: AppInfo | null } = { info: null };
   const calls: Call[] = [];
   const items: Item[] = [];
   // July: ids 1..6 (newest first), June: 7..8, one trashed (9).
@@ -773,6 +788,35 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     return json({ error: 'not found' }, 404);
   }
 
+  /** The /api/libraries body; libraries and folders live under the current root. */
+  function listing() {
+    if (ws.mode === 'unset') return { root: '', mode: 'unset', libraries: [], folders: [] };
+    if (ws.mode === 'single') return { root: ws.root, mode: 'single', libraries: libs, folders };
+    const at = <T extends { id?: string; path: string }>(x: T): T => ({ ...x, path: `${ws.root === '/' ? '' : ws.root}/${x.id ?? ''}` });
+    return { root: ws.root, mode: ws.mode, libraries: ws.root === '/media' ? libs : libs.map(at), folders: ws.root === '/media' ? folders : folders.map(at) };
+  }
+
+  /** The desktop app routes (404 unless `app.info` is set), checked as the server does. */
+  function appRoute(p: string, method: string, body: Record<string, unknown>): Response {
+    const info = app.info;
+    if (!info) return json({ error: 'not found' }, 404);
+    if (p === '/api/app' && method === 'GET') return json(info);
+    if (p === '/api/app/open' && method === 'POST') return new Response(null, { status: 204 });
+    if (p === '/api/app/workspace' && method === 'POST') {
+      const path = body.path;
+      if (typeof path !== 'string' || path === '' || !validTargetPath(path)) return json({ error: 'path: expected an absolute folder path' }, 400);
+      if (path === '/media/peter') return json({ error: 'the folder is a library; choose the folder that holds it' }, 400);
+      const running = backup.jobs.filter((j) => j.state === 'running' || j.state === 'queued').length;
+      if (running) return json({ error: 'a job is running', jobs: running }, 409);
+      ws.mode = 'workspace';
+      ws.root = path;
+      for (const l of libs) if (l.state === 'open') l.state = 'closed';
+      app.info = { ...info, workspace: path };
+      return json(listing());
+    }
+    return json({ error: 'not found' }, 404);
+  }
+
   function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = new URL(String(input), 'http://127.0.0.1:7439');
     const method = init?.method ?? 'GET';
@@ -780,8 +824,13 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     calls.push({ method, path: url.pathname + url.search, body: method === 'POST' ? body : null });
     const p = url.pathname;
     let res: Response;
-    if (p === '/api/libraries' && method === 'GET') {
-      res = json({ root: mode === 'single' ? '/media/peter' : '/media', mode, libraries: libs, folders });
+    const unset = json({ error: 'no workspace', state: 'unset' }, 409);
+    if (p === '/api/app' || p.startsWith('/api/app/')) {
+      res = appRoute(p, method, body);
+    } else if (p === '/api/libraries' && method === 'GET') {
+      res = json(listing());
+    } else if (ws.mode === 'unset' && (p.startsWith('/api/libraries') || p.startsWith('/api/l/'))) {
+      res = unset;
     } else if (p === '/api/libraries' && method === 'POST') {
       const l: Lib = { id: String(body.name), name: String(body.name), path: `/media/${String(body.name)}`, state: 'open', summary: summary(0) };
       libs.push(l);
@@ -842,7 +891,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, ws, app, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

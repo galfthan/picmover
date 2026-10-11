@@ -95,4 +95,18 @@ describe('redirects', () => {
     expect(r('#/l/peter/map', ws)).toBeNull();
     expect(r('#/l/peter/map', single)).toBeNull();
   });
+  it('send everything but the Libraries page there while no workspace is set (desktop app)', () => {
+    const unset = { mode: 'unset' as const, singleId: null };
+    expect(r('#/', unset)).toBeNull();
+    expect(r('#/?setup=1', unset)).toBeNull();
+    expect(r('#/l/peter/', unset)).toBe('#/');
+    expect(r('#/l/peter/view/3', unset)).toBe('#/');
+    expect(r('#/map', unset)).toBe('#/');
+    expect(r('#/nope', unset)).toBe('#/');
+  });
+
+  it('keep the setup card (#/?setup=1) on the Libraries page in every mode', () => {
+    expect(r('#/?setup=1', single)).toBeNull();
+    expect(r('#/?setup=1', ws)).toBeNull();
+  });
 });

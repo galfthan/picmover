@@ -14,6 +14,8 @@
     countsNote?: string;
     /** The hint on the roots listing. */
     rootsHint?: string;
+    /** Disables the choose button (browsing still works). */
+    disabled?: boolean;
   }
   let {
     start = '',
@@ -21,6 +23,7 @@
     chooseLabel = 'Import from this folder',
     countsNote = 'subfolders are imported too.',
     rootsHint = 'Choose a drive or folder to import from.',
+    disabled = false,
   }: Props = $props();
 
   let listing = $state<FsListing | null>(null);
@@ -113,7 +116,7 @@
         <strong>{formatCount(listing.mediaFiles ?? 0)}</strong> media files and
         <strong>{formatCount(listing.otherFiles ?? 0)}</strong> other files directly in this folder{countsNote ? `; ${countsNote}` : '.'}
       </div>
-      <button class="primary" onclick={() => listing && onchoose(listing.path)}>{chooseLabel}</button>
+      <button class="primary" {disabled} onclick={() => listing && onchoose(listing.path)}>{chooseLabel}</button>
     </div>
   {:else if isRoots}
     <p class="muted small">{rootsHint}</p>

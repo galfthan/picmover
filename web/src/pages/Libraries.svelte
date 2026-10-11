@@ -1,14 +1,18 @@
 <script lang="ts">
   // The workspace's start page (#/): a card per library and per plain
   // folder, with New library, Record files in place, Rebuild and Retry.
+  // In the desktop app also the workspace setup card (no workspace yet, or
+  // #/?setup=1 from the header's Change) and the WebView2-missing notice.
   import { untrack } from 'svelte';
   import { errorMessage, libraryCoverUrl, type FolderEntry, type Lib } from '../lib/api';
   import { libraries, holderText, libraryNameProblem } from '../lib/libraries.svelte';
   import { jobs } from '../lib/jobs.svelte';
   import { formatCount, parseWallClock } from '../lib/format';
   import { statusLine, summaryFromLib } from '../lib/backupinfo';
-  import { navigate } from '../lib/router';
-  import { libHref, libPath } from '../lib/routes';
+  import { navigate, route } from '../lib/router';
+  import { libHref, libPath, SETUP } from '../lib/routes';
+  import { app } from '../lib/app.svelte';
+  import WorkspaceSetup from '../components/WorkspaceSetup.svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import Dialog from '../components/Dialog.svelte';
   import JobProgress from '../components/JobProgress.svelte';
@@ -125,12 +129,27 @@
     return b ? statusLine(b) : null;
   }
 
+  const unset = $derived(libraries.mode === 'unset');
+  const setup = $derived(unset || route.current.query.has(SETUP));
+  const closeSetup = () => navigate('#/', { replace: true });
+
   const jobFor = (id: string) => (jobs.active && jobs.active.library === id ? jobs.active : null);
   const folderLabel = (f: FolderEntry) => (libraries.rebuilding.has(f.name) ? 'Recording…' : 'Not a library yet');
 </script>
 
 <div class="page">
   <div class="page-inner">
+    {#if app.showWebView2Notice}
+      <div class="notice webview2" role="status">
+        <span>
+          The app opened in your browser because the WebView2 runtime is missing. Install it from
+          <a href="https://developer.microsoft.com/microsoft-edge/webview2/" target="_blank" rel="noopener noreferrer"
+            >https://developer.microsoft.com/microsoft-edge/webview2/</a
+          > for a native window.
+        </span>
+        <button class="ghost small" aria-label="Dismiss" onclick={() => app.dismissWebView2Notice()}>×</button>
+      </div>
+    {/if}
     <div class="head">
       <div>
         <h1>Libraries</h1>
@@ -155,8 +174,14 @@
       </div>
     {/if}
 
+    {#if libraries.loaded && setup}
+      <WorkspaceSetup current={unset ? '' : app.workspace || libraries.root} ondone={closeSetup} oncancel={unset ? undefined : closeSetup} />
+    {/if}
+
     {#if !libraries.loaded}
       {#if !libraries.error}<p class="muted">Loading…</p>{/if}
+    {:else if unset}
+      <!-- No workspace yet: the setup card above is the whole page. -->
     {:else if libraries.libraries.length === 0 && libraries.folders.length === 0}
       <div class="empty">
         <h2>No libraries yet</h2>
@@ -262,6 +287,16 @@
 {/if}
 
 <style>
+  .webview2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .webview2 span {
+    flex: 1;
+    word-break: break-word;
+  }
   .head {
     display: flex;
     align-items: flex-start;

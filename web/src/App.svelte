@@ -1,14 +1,15 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
   import { route, parseHash, navigate, type Route } from './lib/router';
-  import { libHref, libPath, parseAppRoute, redirectFor, type AppRoute, type LibPage } from './lib/routes';
+  import { libHref, libPath, parseAppRoute, redirectFor, SETUP, SETUP_HREF, type AppRoute, type LibPage } from './lib/routes';
+  import { app as desktop } from './lib/app.svelte';
   import { library } from './lib/library.svelte';
   import { libraries } from './lib/libraries.svelte';
   import { jobs } from './lib/jobs.svelte';
   import { filtersFromQuery } from './lib/filters';
   import { formatCount } from './lib/format';
   import { viewerClosed } from './lib/viewer';
-  import { libApi, setUnavailableHandler } from './lib/api';
+  import { libApi, setUnavailableHandler, type LibApi } from './lib/api';
   import JobPill from './components/JobPill.svelte';
   import Lightbox from './components/Lightbox.svelte';
   import LibrarySwitcher from './components/LibrarySwitcher.svelte';
@@ -32,6 +33,7 @@
   onMount(() => {
     setUnavailableHandler((id, status, state) => libraries.unavailable(id, status, state));
     void libraries.load();
+    void desktop.refresh();
     void jobs.init();
     return () => setUnavailableHandler(null);
   });
@@ -88,7 +90,14 @@
   const viewId = $derived(app.kind === 'lib' && app.page === 'view' ? app.viewId : null);
   const filters = $derived(filtersFromQuery(base ? base.route.query : new URLSearchParams()));
   const baseHash = $derived(base ? '#' + (base.route.raw || '/') : '#/');
-  const api = $derived(libId !== null ? libApi(libId) : null);
+  // The last library's client stays while the route leaves the library, so a
+  // page's request that finishes after the shell sent the route home (409
+  // state "unset", All libraries) still reads a client while it tears down.
+  let lastApi: LibApi | null = null;
+  const api = $derived.by(() => {
+    if (libId !== null) lastApi = libApi(libId);
+    return lastApi;
+  });
 
   $effect(() => {
     if (viewId === null) viewerClosed();
@@ -150,8 +159,15 @@
       <a class="brand" href="#/">
         <span class="logo" aria-hidden="true"></span>
         <span>picmover</span>
-        {#if libraries.root}<span class="root mono">{libraries.root}</span>{/if}
+        {#if libraries.root && !desktop.isApp}<span class="root mono">{libraries.root}</span>{/if}
       </a>
+    {/if}
+    {#if desktop.isApp}
+      <div class="workspace" title={desktop.workspace || 'No workspace folder chosen yet'}>
+        <span class="ws-label">Workspace</span>
+        <span class="ws-name" aria-label={desktop.workspace ? `Workspace ${desktop.workspace}` : 'No workspace'}>{desktop.workspaceName || 'none'}</span>
+        <a class="ws-change" href={SETUP_HREF}>Change</a>
+      </div>
     {/if}
     <div class="spacer"></div>
     <JobPill />
@@ -166,7 +182,7 @@
 
   <main inert={viewId !== null}>
     {#if app.kind === 'libraries' || app.kind === 'legacy' || app.kind === 'notfound'}
-      {#if libraries.mode === 'workspace' && app.kind === 'libraries'}
+      {#if app.kind === 'libraries' && (libraries.mode === 'workspace' || libraries.mode === 'unset' || (libraries.mode === 'single' && current.query.has(SETUP)))}
         <Libraries />
       {:else if !libraries.error}
         <div class="empty">Loading…</div>
@@ -287,6 +303,23 @@
     color: var(--faint);
     font-size: 0.8em;
   }
+  .workspace {
+    flex: 0 1 auto;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    white-space: nowrap;
+    font-size: 0.9em;
+  }
+  .ws-label {
+    color: var(--faint);
+  }
+  .ws-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .spacer {
     flex: 1 1 0;
     min-width: 0;
@@ -295,6 +328,11 @@
     flex: 1;
     min-height: 0;
     position: relative;
+  }
+  @media (max-width: 640px) {
+    .ws-label {
+      display: none;
+    }
   }
   @media (max-width: 900px) {
     .topbar {

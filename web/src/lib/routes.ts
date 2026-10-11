@@ -97,10 +97,16 @@ export function importedHref(lib: string, job: Pick<Job, 'importId' | 'sessionId
 
 export interface WorkspaceMode {
   /** null until the listing has loaded. */
-  mode: 'workspace' | 'single' | null;
+  mode: 'workspace' | 'single' | 'unset' | null;
   /** The library of single mode. */
   singleId: string | null;
 }
+
+/** Query flag of the Libraries page that opens the workspace setup card (desktop app "Change"). */
+export const SETUP = 'setup';
+
+/** The Libraries page with the workspace setup card open. */
+export const SETUP_HREF = `#/?${SETUP}=1`;
 
 /**
  * Where the shell must send a route instead of rendering it, or null.
@@ -109,6 +115,10 @@ export interface WorkspaceMode {
  */
 export function redirectFor(app: AppRoute, r: Route, ws: WorkspaceMode): string | null {
   if (ws.mode === null) return null;
+  // No workspace yet (desktop app): only the Libraries page, with its setup card, exists.
+  if (ws.mode === 'unset') return app.kind === 'libraries' ? null : '#/';
+  // The workspace setup card (#/?setup=1) stays on the Libraries page in every mode.
+  if (app.kind === 'libraries' && r.query.has(SETUP)) return null;
   const single = ws.mode === 'single' && ws.singleId !== null ? ws.singleId : null;
   switch (app.kind) {
     case 'libraries':

@@ -217,7 +217,8 @@ export interface FolderEntry {
 
 export interface Workspace {
   root: string;
-  mode: 'workspace' | 'single';
+  /** "unset": the desktop app runs without a workspace folder yet (docs/design/desktop-shell.md). */
+  mode: 'workspace' | 'single' | 'unset';
   libraries: Lib[];
   folders: FolderEntry[];
 }
@@ -1156,14 +1157,19 @@ export function libApi(id: string): LibApi {
 
 // ---- Workspace ----
 
-export async function getWorkspace(signal?: AbortSignal): Promise<Workspace> {
-  const r = await getJSON<Partial<Workspace>>('/api/libraries', signal);
+/** The `/api/libraries` body (also the answer of POST /api/app/workspace). */
+export function parseWorkspace(v: unknown): Workspace {
+  const r = isRecord(v) ? v : {};
   return {
     root: typeof r.root === 'string' ? r.root : '',
-    mode: r.mode === 'single' ? 'single' : 'workspace',
-    libraries: r.libraries ?? [],
-    folders: r.folders ?? [],
+    mode: r.mode === 'single' ? 'single' : r.mode === 'unset' ? 'unset' : 'workspace',
+    libraries: Array.isArray(r.libraries) ? (r.libraries as Lib[]) : [],
+    folders: Array.isArray(r.folders) ? (r.folders as FolderEntry[]) : [],
   };
+}
+
+export async function getWorkspace(signal?: AbortSignal): Promise<Workspace> {
+  return parseWorkspace(await getJSON<unknown>('/api/libraries', signal));
 }
 
 export function createLibrary(name: string): Promise<Lib> {
@@ -1192,6 +1198,59 @@ export function openLibrary(id: string): Promise<Lib> {
 /** Starts a job through the workspace route (also for folders and unreadable catalogs; rebuild only). */
 export async function startWorkspaceJob(id: string, req: RebuildJobRequest): Promise<Job> {
   return unwrapJob(await postJSON<unknown>(`/api/libraries/${enc(id)}/jobs`, req));
+}
+
+// ---- Desktop app (docs/design/desktop-shell.md "App endpoints") ----
+
+export type AppPlatform = 'windows' | 'linux' | 'darwin';
+
+/** GET /api/app: served only by picmover-app; 404 under `picmover serve`. */
+export interface AppInfo {
+  app: true;
+  version: string;
+  /** The workspace folder; "" while none is set (libraries mode "unset"). */
+  workspace: string;
+  closeToTray: boolean;
+  platform: AppPlatform;
+  /** Whether the UI runs in the native window (false: the browser fallback). */
+  window: boolean;
+}
+
+export function parseAppInfo(v: unknown): AppInfo | null {
+  if (!isRecord(v) || v.app !== true) return null;
+  const p = v.platform;
+  return {
+    app: true,
+    version: typeof v.version === 'string' ? v.version : '',
+    workspace: typeof v.workspace === 'string' ? v.workspace : '',
+    closeToTray: v.closeToTray !== false,
+    platform: p === 'windows' || p === 'darwin' ? p : 'linux',
+    window: v.window === true,
+  };
+}
+
+/** The app's description, or null when the server is not the desktop app (404). */
+export async function getApp(signal?: AbortSignal): Promise<AppInfo | null> {
+  try {
+    return parseAppInfo(await getJSON<unknown>('/api/app', signal));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+/**
+ * Switches the app to another workspace folder: the new `/api/libraries`
+ * body. ApiError 400 `{error}` for an invalid path, 409 `{error, jobs}`
+ * while a job runs.
+ */
+export async function setAppWorkspace(path: string): Promise<Workspace> {
+  return parseWorkspace(await postJSON<unknown>('/api/app/workspace', { path }));
+}
+
+/** Opens or focuses the app window (or the browser where there is none); 204. */
+export async function appOpen(): Promise<void> {
+  await postJSON<unknown>('/api/app/open', {});
 }
 
 // ---- Directory browser ----
