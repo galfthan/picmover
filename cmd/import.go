@@ -380,8 +380,12 @@ func thumbsProcessed(s importer.Stats) int64 {
 
 // formatThumbStatus is the status line of the thumbs command.
 func formatThumbStatus(s importer.Stats) string {
-	return fmt.Sprintf("Thumbs %d | Done %d | Unsupported %d | Failed %d",
+	line := fmt.Sprintf("Thumbs %d | Done %d | Unsupported %d | Failed %d",
 		thumbsProcessed(s), s.ThumbsDone, s.ThumbsUnsupported, s.ThumbsFailed)
+	if s.LargeDone > 0 {
+		line += fmt.Sprintf(" | Large filled %d", s.LargeDone)
+	}
+	return line
 }
 
 // printThumbSummary prints the thumbnail counters of a run.
@@ -390,6 +394,8 @@ func printThumbSummary(w io.Writer, s importer.Stats) {
 	fmt.Fprintf(w, "Done:              %d\n", s.ThumbsDone)
 	fmt.Fprintf(w, "Unsupported:       %d\n", s.ThumbsUnsupported)
 	fmt.Fprintf(w, "Failed:            %d\n", s.ThumbsFailed)
+	fmt.Fprintf(w, "Large filled:      %d\n", s.LargeDone)
+	fmt.Fprintf(w, "Written as:        WebP (thumbnail 256 px, large 640 px, preview 1600 px)\n")
 }
 
 // importSummary prints the end-of-import report.

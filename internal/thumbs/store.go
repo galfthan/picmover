@@ -1,13 +1,18 @@
-// Package thumbs generates thumbnails (256 px, stored in thumbs.db) and
-// previews (1600 px, stored as JPEG files) for media files, keyed by the
-// file's content hash, and computes a perceptual hash of each preview.
+// Package thumbs generates thumbnails (256 px, stored in thumbs.db), large
+// thumbnails (640 px) and previews (1600 px, both stored as files) for
+// media files, keyed by the file's content hash, and computes a perceptual
+// hash of each preview.
 //
-// The cache lives in <library>/.picmover: thumbs.db holds the thumbnails
-// and previews/<hh>/<hash>.jpg the previews. It is derived data: deleting
-// it only means the thumbnails are generated again.
+// The cache lives in <library>/.picmover: thumbs.db holds the thumbnails,
+// large/<hh>/<hash>.webp the large thumbnails and previews/<hh>/<hash>.webp
+// (or .jpg, written by older versions) the previews. New renditions are
+// WebP; existing JPEG ones stay valid and are read by sniffing their bytes.
+// It is derived data: deleting it only means the thumbnails are generated
+// again.
 package thumbs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -22,14 +27,17 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 
+	"picmover/internal/imaging"
 	"picmover/internal/library"
 )
 
-// Sizes (longer side, pixels) and JPEG qualities of the two renditions.
+// Sizes (longer side, pixels) and WebP qualities of the three renditions.
 const (
 	ThumbSize      = 256  // stored in thumbs.db
+	LargeSize      = 640  // stored on disk, derived from the preview
 	PreviewSize    = 1600 // stored on disk
 	ThumbQuality   = 80
+	LargeQuality   = 82
 	PreviewQuality = 85
 )
 
@@ -38,6 +46,8 @@ const (
 	DBName = "thumbs.db"
 	// PreviewDir is the preview directory inside library.MetaDir.
 	PreviewDir = "previews"
+	// LargeDir is the large thumbnail directory inside library.MetaDir.
+	LargeDir = "large"
 	// FormatVersion is thumbs.db's PRAGMA user_version.
 	FormatVersion = 1
 )
@@ -58,78 +68,126 @@ const schema = `CREATE TABLE thumbs (
     data       BLOB NOT NULL
 )`
 
-// Store is the thumbnail and preview cache of one library. It is safe for
-// concurrent use.
+// Store is the thumbnail, large thumbnail and preview cache of one
+// library. It is safe for concurrent use.
 type Store struct {
 	db       *sql.DB
 	path     string
 	previews string
+	large    string
 	tmp      string
 	readOnly bool
 }
 
-// oldSuffix marks the previous preview while Put replaces it.
+// File extensions. New previews are WebP; older ones (and any written from
+// JPEG bytes) JPEG. Preview lookups try previewExts in order.
+const (
+	extWebP = ".webp"
+	extJPEG = ".jpg"
+)
+
+var previewExts = [...]string{extWebP, extJPEG}
+
+// oldSuffix marks a previous preview while Put replaces it.
 const oldSuffix = ".old"
+
+// tmpSuffix ends the temp files of large thumbnails being written into a
+// fan-out directory of the large directory (see PutLarge).
+const tmpSuffix = ".tmp"
+
+// staleTmpAge is the age after which cleanOld removes a large thumbnail
+// temp file: younger ones may belong to a server deriving one right now.
+const staleTmpAge = time.Hour
 
 // maxCleanEntries bounds the directory entries cleanOld looks at.
 const maxCleanEntries = 1 << 20
 
-// cleanOld deals with <preview>.old files left by a Put that was
-// interrupted (crash, power loss) while replacing a preview: when the
-// preview itself is missing the .old file is the last good one and is
-// renamed back (its thumbs.db row was never replaced), otherwise it is
-// removed. Best effort: it only looks one fan-out level deep, stops after
-// maxCleanEntries entries and ignores errors. Only one process may write
-// a library at a time, so no Put of another process is in flight.
+// cleanOld deals with what interrupted writes (crash, power loss) leave
+// behind. A <preview>.old file is left by a Put that was replacing a
+// preview: when no preview of that hash exists (in either format) the .old
+// file is the last good one and is renamed back (its thumbs.db row was
+// never replaced), otherwise it is removed. In the large directory, temp
+// files older than staleTmpAge are removed. Best effort: it only looks one
+// fan-out level deep, stops after maxCleanEntries entries and ignores
+// errors. Only one process may write thumbs.db at a time, so no Put of
+// another process is in flight (a server deriving large thumbnails writes
+// only temp files younger than staleTmpAge).
 func (s *Store) cleanOld() {
-	fans, err := os.ReadDir(s.previews)
+	seen := 0
+	walkFans(s.previews, &seen, func(dir string, e fs.DirEntry) {
+		name := e.Name()
+		if !strings.HasSuffix(name, oldSuffix) || !e.Type().IsRegular() {
+			return
+		}
+		old := filepath.Join(dir, name)
+		cur := strings.TrimSuffix(old, oldSuffix)
+		stem := strings.TrimSuffix(cur, filepath.Ext(cur))
+		for _, ext := range previewExts {
+			if _, err := os.Lstat(stem + ext); err == nil {
+				_ = os.Remove(old)
+				return
+			}
+		}
+		_ = os.Rename(old, cur)
+	})
+	walkFans(s.large, &seen, func(dir string, e fs.DirEntry) {
+		if !strings.HasSuffix(e.Name(), tmpSuffix) || !e.Type().IsRegular() {
+			return
+		}
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > staleTmpAge {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	})
+}
+
+// walkFans calls fn for each entry of each fan-out directory under root,
+// counting entries in *seen and stopping after maxCleanEntries.
+func walkFans(root string, seen *int, fn func(dir string, e fs.DirEntry)) {
+	fans, err := os.ReadDir(root)
 	if err != nil {
 		return
 	}
-	seen := 0
 	for _, fan := range fans {
 		if !fan.IsDir() {
 			continue
 		}
-		dir := filepath.Join(s.previews, fan.Name())
+		dir := filepath.Join(root, fan.Name())
 		ents, err := os.ReadDir(dir)
 		if err != nil {
 			continue
 		}
 		for _, e := range ents {
-			if seen++; seen > maxCleanEntries {
+			if *seen++; *seen > maxCleanEntries {
 				return
 			}
-			name := e.Name()
-			if !strings.HasSuffix(name, oldSuffix) || !e.Type().IsRegular() {
-				continue
-			}
-			old := filepath.Join(dir, name)
-			cur := strings.TrimSuffix(old, oldSuffix)
-			if _, err := os.Lstat(cur); errors.Is(err, fs.ErrNotExist) {
-				_ = os.Rename(old, cur)
-			} else {
-				_ = os.Remove(old)
-			}
+			fn(dir, e)
 		}
 	}
 }
 
-// OpenStore opens (creating when needed) <root>/.picmover/thumbs.db and
-// <root>/.picmover/previews/. A thumbs.db with a user_version other than
-// FormatVersion is refused with an error wrapping ErrFormat.
-func OpenStore(lib *library.Library) (*Store, error) {
+// newStore returns a Store for lib's cache paths, without opening it.
+func newStore(lib *library.Library, readOnly bool) *Store {
 	meta := filepath.Join(lib.Root(), library.MetaDir)
-	s := &Store{
+	return &Store{
 		path:     filepath.Join(meta, DBName),
 		previews: filepath.Join(meta, PreviewDir),
+		large:    filepath.Join(meta, LargeDir),
 		tmp:      lib.TempDir(),
+		readOnly: readOnly,
 	}
+}
+
+// OpenStore opens (creating when needed) <root>/.picmover/thumbs.db,
+// <root>/.picmover/previews/ and <root>/.picmover/large/. A thumbs.db with
+// a user_version other than FormatVersion is refused with an error
+// wrapping ErrFormat.
+func OpenStore(lib *library.Library) (*Store, error) {
+	s := newStore(lib, false)
 	if strings.Contains(s.path, "?") {
 		// The driver splits the DSN at the first '?'.
 		return nil, fmt.Errorf("thumbs: database path %q contains '?', which is not supported", s.path)
 	}
-	for _, d := range []string{s.previews, s.tmp} {
+	for _, d := range []string{s.previews, s.large, s.tmp} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, fmt.Errorf("thumbs: %w", err)
 		}
@@ -152,15 +210,10 @@ func OpenStore(lib *library.Library) (*Store, error) {
 // journal mode and never takes a write lock (SQLite URI mode=ro plus
 // PRAGMA query_only). A missing database, or one with a format version
 // other than FormatVersion (wrapping ErrFormat), is an error. Put and
-// Delete on the returned Store fail.
+// Delete on the returned Store fail; PutLarge, which writes only the large
+// directory, works (the server derives large thumbnails on demand).
 func OpenStoreReadOnly(lib *library.Library) (*Store, error) {
-	meta := filepath.Join(lib.Root(), library.MetaDir)
-	s := &Store{
-		path:     filepath.Join(meta, DBName),
-		previews: filepath.Join(meta, PreviewDir),
-		tmp:      lib.TempDir(),
-		readOnly: true,
-	}
+	s := newStore(lib, true)
 	fi, err := os.Stat(s.path)
 	if err != nil {
 		return nil, fmt.Errorf("thumbs: %w", err)
@@ -238,23 +291,42 @@ func (s *Store) Close() error { return s.db.Close() }
 // key converts a content hash to SQLite's signed INTEGER.
 func key(hash uint64) int64 { return int64(hash) }
 
-// PreviewPath returns <previews>/<hh>/<hash-16hex>.jpg, where hh is the
-// first two hex digits of the hash.
-func (s *Store) PreviewPath(hash uint64) string {
-	return filepath.Join(s.previews, fmt.Sprintf("%02x", hash>>56), fmt.Sprintf("%016x.jpg", hash))
+// fanPath returns <dir>/<hh>/<hash-16hex><ext>, where hh is the first two
+// hex digits of the hash.
+func fanPath(dir string, hash uint64, ext string) string {
+	return filepath.Join(dir, fmt.Sprintf("%02x", hash>>56), fmt.Sprintf("%016x%s", hash, ext))
 }
 
-// Thumb returns the stored thumbnail JPEG and its size. ok is false when
-// there is none.
-func (s *Store) Thumb(ctx context.Context, hash uint64) (jpeg []byte, w, h int, ok bool, err error) {
-	err = s.db.QueryRowContext(ctx, "SELECT data, width, height FROM thumbs WHERE hash = ?", key(hash)).Scan(&jpeg, &w, &h)
+// PreviewPath returns the path of the stored preview of hash: the first of
+// <previews>/<hh>/<hash-16hex>.webp and .jpg that is a regular file (hh is
+// the first two hex digits of the hash), or the .webp path when neither
+// is. A <preview>.old file never counts.
+func (s *Store) PreviewPath(hash uint64) string {
+	for _, ext := range previewExts {
+		p := fanPath(s.previews, hash, ext)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			return p
+		}
+	}
+	return fanPath(s.previews, hash, extWebP)
+}
+
+// LargePath returns <large>/<hh>/<hash-16hex>.webp, the large thumbnail of
+// hash.
+func (s *Store) LargePath(hash uint64) string { return fanPath(s.large, hash, extWebP) }
+
+// Thumb returns the stored thumbnail (WebP, or JPEG when written by an
+// older version: sniff the bytes) and its size. ok is false when there is
+// none.
+func (s *Store) Thumb(ctx context.Context, hash uint64) (data []byte, w, h int, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, "SELECT data, width, height FROM thumbs WHERE hash = ?", key(hash)).Scan(&data, &w, &h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, 0, 0, false, nil
 	}
 	if err != nil {
 		return nil, 0, 0, false, fmt.Errorf("thumbs: read thumb %016x: %w", hash, err)
 	}
-	return jpeg, w, h, true, nil
+	return data, w, h, true, nil
 }
 
 // thumbSize returns the stored thumbnail size without reading its data.
@@ -269,97 +341,202 @@ func (s *Store) thumbSize(ctx context.Context, hash uint64) (w, h int, ok bool, 
 	return w, h, true, nil
 }
 
-// Has reports whether the thumbnail row and the preview file exist. A
-// <preview>.old file (a replace in progress or interrupted) never counts.
-func (s *Store) Has(ctx context.Context, hash uint64) (thumb, preview bool, err error) {
+// Has reports whether the thumbnail row, the large thumbnail file and the
+// preview file exist. A <preview>.old file (a replace in progress or
+// interrupted) never counts.
+func (s *Store) Has(ctx context.Context, hash uint64) (thumb, large, preview bool, err error) {
 	var one int
 	switch err := s.db.QueryRowContext(ctx, "SELECT 1 FROM thumbs WHERE hash = ?", key(hash)).Scan(&one); {
 	case err == nil:
 		thumb = true
 	case !errors.Is(err, sql.ErrNoRows):
-		return false, false, fmt.Errorf("thumbs: lookup %016x: %w", hash, err)
+		return false, false, false, fmt.Errorf("thumbs: lookup %016x: %w", hash, err)
 	}
 	// Any stat failure (missing, a file in place of the fan-out directory,
-	// an I/O error) counts as no preview: Generate then rewrites it, and
-	// Put reports a real problem.
-	if st, err := os.Stat(s.PreviewPath(hash)); err == nil {
-		preview = st.Mode().IsRegular() && st.Size() > 0
-	}
-	return thumb, preview, nil
+	// an I/O error) counts as missing: Generate then rewrites it, and Put
+	// reports a real problem.
+	return thumb, nonEmptyFile(s.LargePath(hash)), nonEmptyFile(s.PreviewPath(hash)), nil
 }
 
-// Put stores both renditions of hash, replacing any existing ones. The
-// preview is written to a temp file in the library's temp directory and
-// fsynced. An existing preview is first renamed to <preview>.old; the new
-// one is then renamed into place and only then is the thumbnail row
+// nonEmptyFile reports whether p is a non-empty regular file.
+func nonEmptyFile(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.Mode().IsRegular() && st.Size() > 0
+}
+
+// previewExt returns the file extension for preview bytes: .webp or .jpg
+// by their sniffed format.
+func previewExt(data []byte) (string, error) {
+	switch imaging.Sniff(bytes.NewReader(data)) {
+	case imaging.FormatWebP:
+		return extWebP, nil
+	case imaging.FormatJPEG:
+		return extJPEG, nil
+	}
+	return "", errors.New("preview is neither WebP nor JPEG")
+}
+
+// Put stores the renditions of hash, replacing any existing ones: the
+// thumbnail row, the preview (named .webp or .jpg after its sniffed
+// bytes) and the large thumbnail (nil: none; an existing one is removed,
+// since it was derived from the previous preview, and is filled again
+// later).
+//
+// The preview and the large thumbnail are first written to fsynced temp
+// files in the library's temp directory. Existing previews (either
+// format) are renamed to <preview>.old; the new preview is renamed into
+// place, then the large thumbnail, and only then is the thumbnail row
 // inserted (INSERT OR REPLACE), so a crash never leaves a row without its
-// preview. When a step fails the new preview is removed and the .old file
-// is renamed back, so a failed Put never destroys the previous renditions;
-// on success the .old file is removed. A .old file left by a crash is
-// restored or removed by the next OpenStore.
-func (s *Store) Put(ctx context.Context, hash uint64, thumb []byte, tw, th int, preview []byte) error {
+// preview. When a step fails the new preview and the large thumbnail are
+// removed and the .old files renamed back, so a failed Put never destroys
+// the previous thumbnail and preview; on success the .old files are
+// removed. A .old file left by a crash is restored or removed by the next
+// OpenStore.
+func (s *Store) Put(ctx context.Context, hash uint64, thumb []byte, tw, th int, large, preview []byte) error {
 	if s.readOnly {
 		return fmt.Errorf("thumbs: put %016x: store is read-only", hash)
 	}
 	if len(thumb) == 0 || len(preview) == 0 || tw <= 0 || th <= 0 {
 		return fmt.Errorf("thumbs: put %016x: empty rendition or invalid size %dx%d", hash, tw, th)
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	dst := s.PreviewPath(hash)
-	old := dst + oldSuffix
-	tmp, err := s.writeTemp(filepath.Dir(dst), preview)
+	ext, err := previewExt(preview)
 	if err != nil {
 		return fmt.Errorf("thumbs: put %016x: %w", hash, err)
 	}
-	hadOld := false
-	if fi, err := os.Lstat(dst); err == nil && fi.Mode().IsRegular() {
-		if err := renameRetry(os.Rename, dst, old); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("thumbs: put %016x: keep previous preview: %w", hash, err)
-		}
-		hadOld = true
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	restore := func() {
-		if hadOld {
-			_ = renameRetry(os.Rename, old, dst) // replaces a new preview still at dst
+	dst := fanPath(s.previews, hash, ext)
+	tmp, err := s.writeTemp(filepath.Dir(dst), "preview-*.tmp", preview)
+	if err != nil {
+		return fmt.Errorf("thumbs: put %016x: %w", hash, err)
+	}
+	largeDst := s.LargePath(hash)
+	var largeTmp string
+	if len(large) > 0 {
+		if largeTmp, err = s.writeTemp(filepath.Dir(largeDst), "large-*.tmp", large); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("thumbs: put %016x: %w", hash, err)
 		}
+	}
+	dropTemps := func() {
+		os.Remove(tmp)
+		if largeTmp != "" {
+			os.Remove(largeTmp)
+		}
+	}
+	// Keep every existing preview: a WebP one replaces a JPEG one too.
+	var olds []string
+	restore := func() {
+		for _, p := range olds {
+			_ = renameRetry(os.Rename, p+oldSuffix, p) // replaces a new preview still at p
+		}
+	}
+	replacedDst := false
+	for _, e := range previewExts {
+		p := fanPath(s.previews, hash, e)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			if err := renameRetry(os.Rename, p, p+oldSuffix); err != nil {
+				dropTemps()
+				restore()
+				return fmt.Errorf("thumbs: put %016x: keep previous preview: %w", hash, err)
+			}
+			olds = append(olds, p)
+			replacedDst = replacedDst || p == dst
+		}
+	}
+	// undo puts the previous previews back (removing the new one when it
+	// replaced none of the same name) and removes the large thumbnail: it
+	// is derived data, filled again from whichever preview remains.
+	undo := func() {
+		if !replacedDst {
+			os.Remove(dst)
+		}
+		restore()
+		os.Remove(largeDst)
+		syncDir(filepath.Dir(dst))
 	}
 	if err := renameRetry(os.Rename, tmp, dst); err != nil {
-		os.Remove(tmp)
+		dropTemps()
 		restore()
 		return fmt.Errorf("thumbs: put %016x: %w", hash, err)
 	}
+	if largeTmp != "" {
+		err = renameRetry(os.Rename, largeTmp, largeDst)
+	} else if err = renameRetry(removeFile, largeDst, ""); errors.Is(err, fs.ErrNotExist) {
+		err = nil
+	}
+	if err != nil {
+		if largeTmp != "" {
+			os.Remove(largeTmp)
+		}
+		undo()
+		return fmt.Errorf("thumbs: put %016x: large: %w", hash, err)
+	}
 	syncDir(filepath.Dir(dst))
+	syncDir(filepath.Dir(largeDst))
 	_, err = s.db.ExecContext(ctx,
 		"INSERT OR REPLACE INTO thumbs (hash, width, height, created_at, data) VALUES (?, ?, ?, ?, ?)",
 		key(hash), tw, th, time.Now().Unix(), thumb)
 	if err != nil {
-		// The row (if any) still describes the previous preview: put that
-		// back, or remove the new one when there was none.
-		if hadOld {
-			restore()
-		} else {
-			os.Remove(dst)
-		}
-		syncDir(filepath.Dir(dst))
+		// The row (if any) still describes the previous preview.
+		undo()
 		return fmt.Errorf("thumbs: put %016x: insert: %w", hash, err)
 	}
-	if hadOld {
-		_ = os.Remove(old)
+	for _, p := range olds {
+		_ = os.Remove(p + oldSuffix)
 	}
 	return nil
 }
 
-// writeTemp writes data to a fsynced temp file in the library's temp
-// directory and creates dir, the preview's fan-out directory. It returns
-// the temp file's path.
-func (s *Store) writeTemp(dir string, data []byte) (string, error) {
+// PutLarge stores data as the large thumbnail of hash unless one exists;
+// written reports whether it did. It writes a fsynced temp file into the
+// fan-out directory and renames it into place without replacing
+// (library.RenameNoReplace), so concurrent writers (a server deriving on
+// demand, a thumbs job) never clobber each other and readers never see a
+// partial file. It works on a read-only Store: the large directory is the
+// only thing a server writes.
+func (s *Store) PutLarge(hash uint64, data []byte) (written bool, err error) {
+	if len(data) == 0 {
+		return false, fmt.Errorf("thumbs: put large %016x: empty rendition", hash)
+	}
+	dst := s.LargePath(hash)
+	if nonEmptyFile(dst) {
+		return false, nil
+	}
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
+	}
+	tmp, err := writeSynced(dir, fmt.Sprintf(".%016x-*%s", hash, tmpSuffix), data)
+	if err != nil {
+		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
+	}
+	if err := library.RenameNoReplace(tmp, dst); err != nil {
+		os.Remove(tmp)
+		if errors.Is(err, fs.ErrExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("thumbs: put large %016x: %w", hash, err)
+	}
+	syncDir(dir)
+	return true, nil
+}
+
+// writeTemp writes data to a fsynced temp file (named after pattern) in
+// the library's temp directory and creates dir, the rendition's fan-out
+// directory. It returns the temp file's path.
+func (s *Store) writeTemp(dir, pattern string, data []byte) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp(s.tmp, "preview-*.tmp")
+	return writeSynced(s.tmp, pattern, data)
+}
+
+// writeSynced writes data to a new fsynced temp file in dir and returns its
+// path.
+func writeSynced(dir, pattern string, data []byte) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return "", err
 	}
@@ -387,8 +564,9 @@ func syncDir(dir string) {
 	}
 }
 
-// Delete removes both renditions of hash: the row first, then the preview,
-// so a row never outlives its preview. Missing entries are not an error.
+// Delete removes every rendition of hash: the row first, then the
+// previews (either format) and the large thumbnail, so a row never
+// outlives its preview. Missing entries are not an error.
 func (s *Store) Delete(ctx context.Context, hash uint64) error {
 	if s.readOnly {
 		return fmt.Errorf("thumbs: delete %016x: store is read-only", hash)
@@ -396,43 +574,52 @@ func (s *Store) Delete(ctx context.Context, hash uint64) error {
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM thumbs WHERE hash = ?", key(hash)); err != nil {
 		return fmt.Errorf("thumbs: delete %016x: %w", hash, err)
 	}
-	if err := os.Remove(s.PreviewPath(hash)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("thumbs: delete %016x: %w", hash, err)
+	paths := []string{s.LargePath(hash)}
+	for _, ext := range previewExts {
+		paths = append(paths, fanPath(s.previews, hash, ext))
+	}
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("thumbs: delete %016x: %w", hash, err)
+		}
 	}
 	return nil
 }
 
 // Stats returns the number of thumbnails and the bytes used: the sum of the
 // thumbnail blobs plus the sizes of all regular files under the previews
-// directory (except .old files of an interrupted replace), found by a
-// directory walk (one stat per preview; well under a second for 100k
-// previews on a local disk). The walk honours ctx.
-func (s *Store) Stats(ctx context.Context) (count int64, bytes int64, err error) {
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM thumbs").Scan(&count, &bytes)
+// and large directories (except .old and temp files of interrupted
+// writes), found by a directory walk (one stat per file; well under a
+// second for 100k previews on a local disk). The walk honours ctx.
+func (s *Store) Stats(ctx context.Context) (count int64, size int64, err error) {
+	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)), 0) FROM thumbs").Scan(&count, &size)
 	if err != nil {
 		return 0, 0, fmt.Errorf("thumbs: stats: %w", err)
 	}
-	err = filepath.WalkDir(s.previews, func(_ string, d fs.DirEntry, err error) error {
+	for _, root := range []string{s.previews, s.large} {
+		err = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := d.Name()
+			if d.Type().IsRegular() && !strings.HasSuffix(name, oldSuffix) && !strings.HasSuffix(name, tmpSuffix) {
+				if info, err := d.Info(); err == nil {
+					size += info.Size()
+				}
+			}
+			return nil
+		})
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
+			return 0, 0, fmt.Errorf("thumbs: stats: %w", err)
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if d.Type().IsRegular() && !strings.HasSuffix(d.Name(), oldSuffix) {
-			if info, err := d.Info(); err == nil {
-				bytes += info.Size()
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, 0, fmt.Errorf("thumbs: stats: %w", err)
 	}
-	return count, bytes, nil
+	return count, size, nil
 }
 
 // Rename retries: on Windows a preview that is being served is open
@@ -443,6 +630,9 @@ const (
 	renameAttempts = 5
 	renameBackoff  = 50 * time.Millisecond
 )
+
+// removeFile removes p; its signature fits renameRetry (to is unused).
+func removeFile(p, _ string) error { return os.Remove(p) }
 
 // renameRetry calls rename(from, to) up to renameAttempts times, sleeping
 // renameBackoff between attempts, and returns the last error. A missing

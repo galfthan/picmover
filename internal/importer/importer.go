@@ -112,6 +112,11 @@ type Stats struct {
 	// Thumbnail stage: rows that got renditions (ok), that cannot have
 	// any (unsupported), and that failed (error).
 	ThumbsDone, ThumbsUnsupported, ThumbsFailed int64
+	// LargeDone counts large thumbnails (640 px) the thumbnail stage
+	// filled from stored previews for rows whose thumbnail was already
+	// there (renditions generated before the large size existed). Large
+	// thumbnails written together with fresh renditions are not counted.
+	LargeDone int64
 }
 
 // Options configure an import.
@@ -212,7 +217,7 @@ type Importer struct {
 	gioOK      func() bool                                                              // gvfs.Available
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
-	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
+	thumbsDone, thumbsUnsupported, thumbsFailed, largeDone                             atomic.Int64
 	rate                                                                               atomic.Int64 // last computed Stats.Rate
 }
 
@@ -508,6 +513,7 @@ func (im *Importer) Stats() Stats {
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),
 		ThumbsFailed:      im.thumbsFailed.Load(),
+		LargeDone:         im.largeDone.Load(),
 	}
 }
 

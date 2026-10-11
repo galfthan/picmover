@@ -136,7 +136,7 @@ func TestFailedReplacePutKeepsPreview(t *testing.T) {
 	}
 	c := &lateCancel{Context: context.Background(), done: make(chan struct{})}
 	close(c.done)
-	if err := store.Put(c, m.Hash, []byte{1}, 1, 1, []byte{2}); err == nil {
+	if err := store.Put(c, m.Hash, []byte{1}, 1, 1, nil, []byte{2}); err == nil {
 		t.Fatal("Put with a late cancellation succeeded")
 	}
 	if got, err := os.ReadFile(store.PreviewPath(m.Hash)); err != nil || !bytes.Equal(got, prev) {

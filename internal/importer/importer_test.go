@@ -854,7 +854,7 @@ func assertThumbOK(t *testing.T, store *thumbs.Store, m catalog.Media) {
 	if m.ThumbState != catalog.ThumbStateOK || m.ThumbError != "" || m.PHash == 0 || m.ThumbAt.IsZero() {
 		t.Errorf("%s: state %q error %q phash %x at %v", m.RelPath, m.ThumbState, m.ThumbError, m.PHash, m.ThumbAt)
 	}
-	thumb, preview, err := store.Has(context.Background(), m.Hash)
+	thumb, _, preview, err := store.Has(context.Background(), m.Hash)
 	if err != nil || !thumb || !preview {
 		t.Errorf("%s: cache thumb=%v preview=%v err=%v", m.RelPath, thumb, preview, err)
 	}

@@ -65,7 +65,7 @@ func newWorkspaceWith(t *testing.T, adjust func(*Options)) (*fixture, string) {
 		t.Fatal(err)
 	}
 	thumb := testimg.JPEG(testimg.Options{Width: 32, Height: 24, Seed: 3})
-	if err := st.Put(context.Background(), 0xc0ffee, thumb, 32, 24, thumb); err != nil {
+	if err := st.Put(context.Background(), 0xc0ffee, thumb, 32, 24, nil, thumb); err != nil {
 		t.Fatal(err)
 	}
 	st.Close()
