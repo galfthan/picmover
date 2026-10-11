@@ -72,7 +72,7 @@
     set({ album: v > 0 ? v : undefined });
   }
   function onDates(v: DateValue) {
-    set({ from: v.from, to: v.to, recur: v.recur });
+    set({ from: v.from, to: v.to, recur: v.recur, months: v.months });
   }
   function onSize(v: SizeValue) {
     set({ minPx: v.minPx, maxPx: v.maxPx });
@@ -124,7 +124,7 @@
     {/if}
   </select>
 
-  <DateFilter from={filters.from} to={filters.to} recur={filters.recur} {years} onchange={onDates} />
+  <DateFilter from={filters.from} to={filters.to} recur={filters.recur} months={filters.months} {years} onchange={onDates} />
 
   <SizeFilter minPx={filters.minPx} maxPx={filters.maxPx} onchange={onSize} />
 

@@ -582,6 +582,8 @@ export interface Filters {
   to?: string;
   /** "MM-DD" or "MM-DD..MM-DD", every year (see dates.ts). */
   recur?: string;
+  /** Months 1..12 of any year (`months=1,2,7`), sorted and unique (see dates.ts). */
+  months?: number[];
   /** Longer edge, MAX(width, height), at least this many pixels (1..1 000 000; `minpx`). Unknown dimensions never match. */
   minPx?: number;
   /** Longer edge at most this many pixels (1..1 000 000; `maxpx`). Unknown dimensions never match. */
@@ -708,6 +710,7 @@ export function filterParams(f: Filters, extra?: Record<string, string | number>
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
   if (f.recur) q.set('recur', f.recur);
+  if (f.months?.length) q.set('months', f.months.join(','));
   if (f.minPx) q.set('minpx', String(f.minPx));
   if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (f.rating) q.set('rating', String(f.rating));

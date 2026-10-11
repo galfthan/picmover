@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   addDays,
   describeDates,
+  describeMonths,
+  monthRuns,
+  parseMonths,
   describeRecur,
   exclusiveEnd,
   formatRecur,
@@ -111,11 +114,38 @@ describe('day ranges', () => {
     expect(describeDates('2024-12-20', undefined, undefined)).toBe('20/12/2024 –');
     expect(describeDates(undefined, '2025-01-01', undefined)).toBe('– 2024');
     expect(describeDates('2024-05-03', '2024-05-10', undefined)).toBe('03/05/2024 – 09/05/2024');
-    expect(describeDates(undefined, undefined, '12-24..12-26', 'en-GB')).toBe('24 Dec – 26 Dec every year');
-    expect(describeDates('2010-01-01', undefined, '06-01..08-31', 'en-GB')).toBe('1 Jun – 31 Aug every year, 2010 –');
+    expect(describeDates(undefined, undefined, '12-24..12-26', undefined, 'en-GB')).toBe('24 Dec – 26 Dec every year');
+    expect(describeDates('2010-01-01', undefined, '06-01..08-31', undefined, 'en-GB')).toBe('1 Jun – 31 Aug every year, 2010 –');
     expect(describeDates(undefined, undefined, undefined)).toBe('');
     // A day on one side shows days on both, not "2020 – 2020-02-29".
     expect(describeDates('2020-01-01', '2020-03-01', undefined)).toBe('01/01/2020 – 29/02/2020');
     expect(describeDates('2020-03-05', '2021-01-01', undefined)).toBe('05/03/2020 – 31/12/2020');
+  });
+});
+
+describe('months every year', () => {
+  it('parses month lists', () => {
+    expect(parseMonths('3,1,3')).toEqual([1, 3]);
+    expect(parseMonths('12')).toEqual([12]);
+    for (const bad of ['', '0', '13', '1,', ',1', '1,,2', 'a', '1.0', ' 1']) expect(parseMonths(bad)).toBeNull();
+    expect(parseMonths(undefined)).toBeNull();
+  });
+  it('collapses runs, wrapping December into January', () => {
+    expect(monthRuns([1, 2, 3, 7])).toEqual([[1, 3], [7, 7]]);
+    expect(monthRuns([12, 1, 2])).toEqual([[12, 2]]);
+    expect(monthRuns([1, 2, 7, 12])).toEqual([[12, 2], [7, 7]]);
+    expect(monthRuns(Array.from({ length: 12 }, (_, i) => i + 1))).toEqual([[1, 12]]);
+    expect(monthRuns([])).toEqual([]);
+  });
+  it('describes months', () => {
+    expect(describeMonths([1, 2, 3], 'en-GB')).toBe('Jan–Mar every year');
+    expect(describeMonths([1, 2, 3, 7], 'en-GB')).toBe('Jan–Mar, Jul every year');
+    expect(describeMonths([12], 'en-GB')).toBe('Dec every year');
+    expect(describeMonths([12, 1, 2], 'en-GB')).toBe('Dec–Feb every year');
+    expect(describeMonths([1, 3], 'en-GB')).toBe('Jan, Mar every year');
+    expect(describeMonths([], 'en-GB')).toBe('');
+    expect(describeDates(undefined, undefined, undefined, [1, 2, 3], 'en-GB')).toBe('Jan–Mar every year');
+    expect(describeDates(undefined, undefined, '12-24..12-26', [7], 'en-GB')).toBe('Jul every year, 24 Dec – 26 Dec every year');
+    expect(describeDates('2010-01-01', undefined, undefined, [12, 1], 'en-GB')).toBe('Dec–Jan every year, 2010 –');
   });
 });

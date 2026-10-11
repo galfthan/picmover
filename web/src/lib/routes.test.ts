@@ -52,7 +52,7 @@ describe('app routes', () => {
   it('build prefixed hrefs with encoded ids', () => {
     expect(libPath('peter')).toBe('/l/peter/');
     expect(libPath('peter', '/albums/3')).toBe('/l/peter/albums/3');
-    expect(libHref('a b', 'map', { at: '1,2', z: 15 })).toBe('#/l/a%20b/map?at=1%2C2&z=15');
+    expect(libHref('a b', 'map', { at: '1,2', z: 15 })).toBe('#/l/a%20b/map?at=1,2&z=15');
     expect(libHref('peter', '', { session: 17 })).toBe('#/l/peter/?session=17');
     expect(app(libHref('a/b?c', 'trash'))).toEqual(lib('a/b?c', 'trash')); // the encoding round-trips
     expect(app(libHref('a?c#d', 'trash'))).toEqual(lib('a?c#d', 'trash'));
@@ -83,7 +83,7 @@ describe('redirects', () => {
   });
 
   it('prefix step 3 links in single mode and send them home in a workspace', () => {
-    expect(r('#/map?at=1,2&z=3', single)).toBe('#/l/Photos/map?at=1%2C2&z=3');
+    expect(r('#/map?at=1,2&z=3', single)).toBe('#/l/Photos/map?at=1,2&z=3');
     expect(r('#/view/9', single)).toBe('#/l/Photos/view/9');
     expect(r('#/map', ws)).toBe('#/');
     expect(r('#/nope', ws)).toBe('#/');

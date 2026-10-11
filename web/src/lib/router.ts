@@ -45,7 +45,8 @@ export function href(path: string, query?: URLSearchParams | Record<string, stri
       q.set(k, v === true ? '1' : String(v));
     }
   }
-  const s = q.toString();
+  // Commas stay readable (months=1,2,3); they need no escaping in a query.
+  const s = q.toString().replace(/%2C/gi, ',');
   return '#' + p + (s ? '?' + s : '');
 }
 

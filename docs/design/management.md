@@ -1297,8 +1297,9 @@ trailing days of the neighbouring months.
   border, one hint line) and not applied; emptying a field opens that
   side. Applying a typed day or a preset moves the view to show it.
 - The Dates panel still closes on Escape and outside click; calendar
-  clicks and presets apply at once as before. The Every year tab is
-  unchanged (its year selects show a day bound as dd/mm/yyyy); the Range
+  clicks and presets apply at once as before. The Every year tab keeps its
+  day range and year selects (a day bound shows as dd/mm/yyyy) under the
+  month grid ("Months every year" below); the Range
   tab never had year limits, the year select and the This year / Last
   year presets cover that.
 
@@ -1322,6 +1323,34 @@ and an `aria-label` with the full date ("Tuesday 5 March 2024"). A polite
 live region announces "Start 05/03/2024. Choose the end day." and
 "Selected 05/03/2024 to 10/03/2024".
 
+### Months every year
+
+The Every year tab opens with a month grid above the day-range controls:
+twelve toggle buttons (short names, 4 columns × 3 rows, `aria-pressed`)
+and "All" / "None" text buttons. Any set of months is allowed, Jan + Jul
+included; it goes to the URL and the requests as `months=1,7` (sorted,
+unique; commas stay literal in the hash).
+
+- Click toggles a month; Shift-click selects the run from the last clicked
+  month (in calendar order, no wrap). Keyboard: the grid is one Tab stop
+  (roving tabindex); arrows move by one month or one row, Home/End go to
+  Jan/Dec, Enter/Space toggle.
+- Look: chosen months are solid accent pills like the calendar's start and
+  end days; chosen neighbours in a row are joined by the calendar's lighter
+  band, so Jan–Mar reads as one stretch.
+- Picking months clears the `recur` day range, and editing the day range
+  or picking one of its presets clears the months. This is the UI only:
+  a URL with both keeps both, the tab shows both and the requests send
+  both (AND). The year limits keep both. Every change applies at once;
+  Clear dates clears months too. The panel opens on Every year when months
+  or a day range are set.
+- The summary (`describeDates`) names the months with runs collapsed:
+  "Jan–Mar every year", "Jan–Mar, Jul every year", "Dec every year"; a run
+  through New Year is one run, "Dec–Feb every year", listed first. With a
+  day range as well, both parts appear: "Jul every year, 24 Dec – 26 Dec
+  every year". `filtersFromQuery` drops `months` when any item is
+  malformed, as the server would reject it.
+
 Tests: `lib/format.test.ts` (the formats, strict `parseDay`),
 `lib/calendar.test.ts` (Feb 2024 and Feb 2023 cells, Monday alignment,
 December to January, month shifts, presets, year options),
@@ -1329,4 +1358,8 @@ December to January, month shifts, presets, year options),
 preview, keys, typed and invalid input, presets, month and year
 navigation; a `.svelte.test.ts` file so the props can be `$state`), and
 `Management.test.ts` (typed days and calendar clicks through the Dates
-filter into the URL).
+filter into the URL; the month grid: Jan, Feb, Mar to `months=1,2,3` and
+"Jan–Mar every year", a day preset clearing months, Shift-click runs,
+arrows, All and None), `lib/dates.test.ts` (`parseMonths`, `monthRuns`,
+`describeMonths`) and `lib/filters.test.ts` (months round trip, malformed
+dropped, sorted and unique).

@@ -24,6 +24,18 @@ describe('filters in the URL', () => {
     expect(s).toBe('type=video&recur=06-01..08-31&rating=2&tag=1&tag=5&album=3');
     expect(filtersFromQuery(q(s))).toEqual({ recur: '06-01..08-31', rating: 2, tags: [1, 5], album: 3, type: 'video' });
   });
+  it('read and write months: sorted, unique, malformed dropped', () => {
+    expect(filtersFromQuery(q('months=7,1,7,12'))).toEqual({ months: [1, 7, 12] });
+    expect(filtersToQuery({ months: [12, 1, 7, 7] }).get('months')).toBe('1,7,12');
+    const f = { months: [1, 2, 3], recur: '07-14' };
+    expect(filtersFromQuery(filtersToQuery(f))).toEqual(f);
+    for (const bad of ['0', '13', 'a', '1,,2', '1,', ',1', '1.5', '-1', '1,99']) {
+      expect(filtersFromQuery(q(`months=${bad}&rating=2`))).toEqual({ rating: 2 });
+    }
+    expect(filtersToQuery({ months: [] }).toString()).toBe('');
+    expect(hasFilters({ months: [7] })).toBe(true);
+    expect(hasFilters({ months: [] })).toBe(false);
+  });
   it('key every filter, including trashed', () => {
     expect(filtersKey({ tags: [2, 1] })).toBe('tag=1&tag=2');
     expect(filtersKey({ recur: '07-14' })).not.toBe(filtersKey({ recur: '07-15' }));

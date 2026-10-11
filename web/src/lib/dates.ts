@@ -6,6 +6,8 @@
 //   day, so the conversion lives here.
 // - Every year: `recur` is "MM-DD" or "MM-DD..MM-DD", inclusive, possibly
 //   wrapping the year end ("12-30..01-02"); "02-29" is allowed.
+// - Every year, by month: `months` is a set of months 1..12 ("1,2,7" in
+//   the URL), sorted and unique; it may be non-contiguous.
 
 import { formatDay, monthName, parseWallClock } from './format';
 
@@ -74,6 +76,65 @@ function mdLabel(md: MonthDay, locale?: string): string {
 export function describeRecur(r: Recur, locale?: string): string {
   const span = sameMonthDay(r.from, r.to) ? mdLabel(r.from, locale) : `${mdLabel(r.from, locale)} – ${mdLabel(r.to, locale)}`;
   return `${span} every year`;
+}
+
+// ---- Months every year ----
+
+/**
+ * Parses a `months` value "1,2,7": month numbers 1..12 separated by commas.
+ * Sorted and unique; null when absent, empty or any item is malformed.
+ */
+export function parseMonths(s: string | null | undefined): number[] | null {
+  if (!s) return null;
+  const out = new Set<number>();
+  for (const item of s.split(',')) {
+    if (!/^\d{1,2}$/.test(item)) return null;
+    const m = Number(item);
+    if (m < 1 || m > 12) return null;
+    out.add(m);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+/** Valid months 1..12, sorted and unique. */
+export function normalizeMonths(ms: readonly number[]): number[] {
+  return [...new Set(ms.filter((m) => Number.isInteger(m) && m >= 1 && m <= 12))].sort((a, b) => a - b);
+}
+
+/** "1,2,7" ("" for none). */
+export function formatMonths(ms: readonly number[]): string {
+  return normalizeMonths(ms).join(',');
+}
+
+/**
+ * Runs of consecutive months, as [first, last] pairs. A run through
+ * December into January is one run ([12, 2]) and comes first.
+ */
+export function monthRuns(ms: readonly number[]): [number, number][] {
+  const sorted = normalizeMonths(ms);
+  const runs: [number, number][] = [];
+  for (const m of sorted) {
+    const last = runs[runs.length - 1];
+    if (last && last[1] === m - 1) last[1] = m;
+    else runs.push([m, m]);
+  }
+  if (runs.length > 1) {
+    const first = runs[0]!;
+    const last = runs[runs.length - 1]!;
+    if (first[0] === 1 && last[1] === 12) {
+      runs.pop();
+      runs[0] = [last[0], first[1]];
+    }
+  }
+  return runs;
+}
+
+/** "Jan–Mar, Jul every year", "Dec–Feb every year"; "" for none. */
+export function describeMonths(ms: readonly number[], locale?: string): string {
+  const runs = monthRuns(ms);
+  if (!runs.length) return '';
+  const name = (m: number) => monthName(m, 'short', locale);
+  return `${runs.map(([a, b]) => (a === b ? name(a) : `${name(a)}–${name(b)}`)).join(', ')} every year`;
 }
 
 export interface Preset {
@@ -162,12 +223,21 @@ export function toYear(to: string | undefined): number | null {
 
 /**
  * Short text for the filter button: "2020 – 2024", "24 Dec – 26 Dec every
- * year, 2010 –", "". Years only when every given bound is a whole year,
- * else days on both sides ("01/01/2020 – 29/02/2020"). `locale` only picks
- * the month names of the every-year part.
+ * year, 2010 –", "Jan–Mar every year", "". Years only when every given
+ * bound is a whole year, else days on both sides ("01/01/2020 –
+ * 29/02/2020"). The months part comes first, then the day range, then the
+ * limits. `locale` only picks the month names of the every-year parts.
  */
-export function describeDates(from: string | undefined, to: string | undefined, recur: string | undefined, locale?: string): string {
+export function describeDates(
+  from: string | undefined,
+  to: string | undefined,
+  recur: string | undefined,
+  months?: readonly number[],
+  locale?: string,
+): string {
   const parts: string[] = [];
+  const ms = describeMonths(months ?? [], locale);
+  if (ms) parts.push(ms);
   const r = parseRecur(recur);
   if (r) parts.push(describeRecur(r, locale));
   if (from || to) {

@@ -422,6 +422,60 @@ describe('management flows', () => {
     expect(dates.textContent).toContain('01/01/2024 – 15/07/2024');
   });
 
+  it('picks months every year in the month grid', async () => {
+    await start();
+    const dates = [...document.querySelectorAll<HTMLButtonElement>('.datefilter > button')][0]!;
+    dates.click();
+    await settle();
+    const panel = () => document.querySelector('.datefilter .panel')!;
+    button(panel(), 'Every year')!.click();
+    await settle();
+    const month = (name: string) => panel().querySelector<HTMLButtonElement>(`.mgrid button[aria-label="${name}"]`)!;
+    const timelineMonths = () =>
+      server.calls.filter((c) => c.path.startsWith('/api/l/peter/timeline')).map((c) => new URLSearchParams(c.path.split('?')[1] ?? '').get('months'));
+    for (const m of ['January', 'February', 'March']) {
+      month(m).click();
+      await settle();
+    }
+    expect(location.hash).toBe('#/l/peter/?months=1,2,3');
+    expect(timelineMonths()).toContain('1,2,3');
+    expect(dates.textContent).toContain('Jan–Mar every year');
+    expect(month('February').getAttribute('aria-pressed')).toBe('true');
+    expect(month('April').getAttribute('aria-pressed')).toBe('false');
+    // Toggling off, then a day preset: the preset clears the months.
+    month('February').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=1,3');
+    expect(dates.textContent).toContain('Jan, Mar every year');
+    button(panel(), 'Christmas')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?recur=12-24..12-26');
+    expect(month('January').getAttribute('aria-pressed')).toBe('false');
+    // Picking a month clears the day range; Shift-click selects the run from the last clicked month.
+    month('July').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=7');
+    month('October').dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=7,8,9,10');
+    expect(dates.textContent).toContain('Jul–Oct every year');
+    // The fake library is July and June 2024: July only.
+    expect(timelineMonths()).toContain('7,8,9,10');
+    // Keyboard: arrows move the focus, Space/Enter toggle (native buttons).
+    month('October').focus();
+    key('ArrowRight', month('October'));
+    expect(document.activeElement).toBe(month('November'));
+    // All, then None.
+    button(panel(), 'All')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=1,2,3,4,5,6,7,8,9,10,11,12');
+    expect(dates.textContent).toContain('Jan–Dec every year');
+    button(panel(), 'None')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/');
+    expect(dates.textContent).not.toContain('every year');
+  });
+
   it('puts the new filters in the URL and the requests', async () => {
     await start();
     // Dates → Every year → Christmas preset.
