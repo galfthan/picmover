@@ -23,6 +23,7 @@
   import Album from './pages/Album.svelte';
   import Trash from './pages/Trash.svelte';
   import Similar from './pages/Similar.svelte';
+  import Backups from './pages/Backups.svelte';
 
   type LibRoute = Extract<AppRoute, { kind: 'lib' }>;
 
@@ -104,6 +105,7 @@
     { pages: ['trash'], label: 'Trash', sub: 'trash', count: library.trashed },
     { pages: ['similar'], label: 'Duplicates', sub: 'similar' },
     { pages: ['import'], label: 'Import', sub: 'import' },
+    { pages: ['backups'], label: 'Backups', sub: 'backups' },
     { pages: ['library'], label: 'Library', sub: 'library' },
   ]);
 
@@ -187,6 +189,8 @@
             <Trash {api} {filters} {viewId} />
           {:else if page === 'similar'}
             <Similar {api} />
+          {:else if page === 'backups'}
+            <Backups lib={libId} />
           {/if}
         {/key}
       {:else}

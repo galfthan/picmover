@@ -6,6 +6,7 @@
   import { libraries, holderText, libraryNameProblem } from '../lib/libraries.svelte';
   import { jobs } from '../lib/jobs.svelte';
   import { formatCount, parseWallClock } from '../lib/format';
+  import { statusLine, summaryFromLib } from '../lib/backupinfo';
   import { navigate } from '../lib/router';
   import { libHref, libPath } from '../lib/routes';
   import CopyButton from '../components/CopyButton.svelte';
@@ -118,6 +119,12 @@
     }
   }
 
+  /** The backup one-liner of a card ("No backup target yet" when the listing has no summary); null for a library in state error. */
+  function backupLine(l: Lib) {
+    const b = summaryFromLib(l);
+    return b ? statusLine(b) : null;
+  }
+
   const jobFor = (id: string) => (jobs.active && jobs.active.library === id ? jobs.active : null);
   const folderLabel = (f: FolderEntry) => (libraries.rebuilding.has(f.name) ? 'Recording…' : 'Not a library yet');
 </script>
@@ -161,6 +168,7 @@
         {#each libraries.libraries as l (l.id)}
           {@const job = jobFor(l.id)}
           {@const coverUrl = libraryCoverUrl(l.id, l.cover)}
+          {@const bl = backupLine(l)}
           <li class="card libcard state-{l.state}">
             <a class="main" href={libHref(l.id, '')} aria-label="Open {l.name}, {l.path}">
               <span class="cover">
@@ -183,6 +191,9 @@
                   <span class="counts muted small">
                     {formatCount(l.summary.images + l.summary.raw)} photos · {formatCount(l.summary.videos)} videos{span(l) ? ` · ${span(l)}` : ''}
                   </span>
+                {/if}
+                {#if bl}
+                  <span class="backup small tone-{bl.tone}">{bl.stale ? '⚠ ' : ''}{bl.text}</span>
                 {/if}
               </span>
             </a>
@@ -352,6 +363,15 @@
   }
   .progress {
     width: 100%;
+  }
+  .backup.tone-ok {
+    color: var(--muted);
+  }
+  .backup.tone-warn {
+    color: var(--warn);
+  }
+  .backup.tone-muted {
+    color: var(--muted);
   }
   .create label {
     display: flex;

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { errorMessage, type Job } from '../lib/api';
+  import { errorMessage, isBackupKind, type Job } from '../lib/api';
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed } from '../lib/format';
   import { exitCodeOf, outcome } from '../lib/jobtext';
@@ -249,7 +249,7 @@
           {:else}
             A {otherActive.kind === 'thumbs' ? 'thumbnail' : otherActive.kind === 'similar' ? 'duplicate search' : otherActive.kind} job is
             running; start the import when it has finished.
-            <a href={libHref(lib, otherActive.kind === 'similar' ? 'similar' : 'library')}>Show progress</a>
+            <a href={libHref(lib, otherActive.kind === 'similar' ? 'similar' : isBackupKind(otherActive.kind) ? 'backups' : 'library')}>Show progress</a>
           {/if}
         </div>
       {/if}

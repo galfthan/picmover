@@ -5,7 +5,7 @@
 
 import { href, type Route } from './router';
 
-export type LibPage = 'grid' | 'map' | 'import' | 'library' | 'albums' | 'album' | 'trash' | 'similar' | 'view';
+export type LibPage = 'grid' | 'map' | 'import' | 'library' | 'albums' | 'album' | 'trash' | 'similar' | 'backups' | 'view';
 
 export type AppRoute =
   | { kind: 'libraries' }
@@ -22,6 +22,7 @@ const SIMPLE: Record<string, LibPage> = {
   albums: 'albums',
   trash: 'trash',
   similar: 'similar',
+  backups: 'backups',
 };
 
 const LEGACY = new Set(['map', 'import', 'library', 'view', 'albums', 'trash', 'similar']);

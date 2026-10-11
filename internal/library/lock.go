@@ -29,7 +29,11 @@ type ErrLocked struct {
 	Path  string    // the lock file
 	PID   int       // 0 when unknown
 	Cmd   string    // the command holding the lock, e.g. "serve"
+	Host  string    // the holder's host name ("" when unknown)
 	Since time.Time // zero when unknown
+	// What is locked: "" for the library, else e.g. "backup set" (the
+	// message then names it instead of the library).
+	What string
 }
 
 func (e *ErrLocked) Error() string {
@@ -40,10 +44,20 @@ func (e *ErrLocked) Error() string {
 	if e.Cmd != "" {
 		parts = append(parts, e.Cmd)
 	}
+	if e.Host != "" && e.What != "" {
+		parts = append(parts, "on "+e.Host)
+	}
 	if !e.Since.IsZero() {
 		parts = append(parts, "since "+e.Since.Local().Format(time.DateTime))
 	}
-	msg := "library is in use by another picmover process"
+	what := e.What
+	if what == "" {
+		what = "library"
+	}
+	msg := what + " is in use by another picmover process"
+	if e.What != "" {
+		msg = "the " + msg
+	}
 	if len(parts) > 0 {
 		msg += " (" + strings.Join(parts, ", ") + ")"
 	}
@@ -70,7 +84,17 @@ func (l *Library) Lock(ctx context.Context, name string) (unlock func(), err err
 	if err := os.MkdirAll(filepath.Join(l.root, MetaDir), 0o755); err != nil {
 		return nil, fmt.Errorf("create %s: %w", filepath.Join(l.root, MetaDir), err)
 	}
-	p := l.LockPath()
+	return LockFile(l.LockPath(), name)
+}
+
+// LockFile takes the advisory, exclusive OS lock on the file at p
+// (created when missing; its folder must exist), as Library.Lock does:
+// non-blocking, an *ErrLocked naming the holder when it is held, a no-op
+// unlock and an error wrapping ErrLockUnsupported when the file system
+// cannot lock. The holder writes "pid=<pid> cmd=<name> since=<RFC3339>
+// host=<host>" into the file. Backup sets use it for
+// <set>/.picmover/lock.
+func LockFile(p, name string) (unlock func(), err error) {
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
@@ -87,8 +111,9 @@ func (l *Library) Lock(ctx context.Context, name string) (unlock func(), err err
 		f.Close()
 		return nil, fmt.Errorf("lock %s: %w", p, err)
 	}
-	info := fmt.Sprintf("pid=%d cmd=%s since=%s\n", os.Getpid(), strings.ReplaceAll(name, " ", "_"),
-		time.Now().Format(time.RFC3339))
+	host, _ := os.Hostname()
+	info := fmt.Sprintf("pid=%d cmd=%s since=%s host=%s\n", os.Getpid(), strings.ReplaceAll(name, " ", "_"),
+		time.Now().Format(time.RFC3339), strings.ReplaceAll(host, " ", "_"))
 	// The holder info is best effort: the lock itself is what counts.
 	if f.Truncate(0) == nil {
 		_, _ = f.WriteAt([]byte(info), 0)
@@ -128,6 +153,8 @@ func readHolder(p string) *ErrLocked {
 			}
 		case "cmd":
 			e.Cmd = v
+		case "host":
+			e.Host = v
 		case "since":
 			if t, err := time.Parse(time.RFC3339, v); err == nil {
 				e.Since = t

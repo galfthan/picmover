@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { errorMessage, type Job } from '../lib/api';
+  import { errorMessage, isBackupKind, type Job } from '../lib/api';
   import { library } from '../lib/library.svelte';
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed, formatInstant, formatWallDate } from '../lib/format';
-  import { jobTitle, outcome } from '../lib/jobtext';
+  import { backupJobSummary, jobTitle, outcome } from '../lib/jobtext';
   import { libHref } from '../lib/routes';
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import JobProgress from '../components/JobProgress.svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import { joinPath } from '../lib/paths';
+  import { backups } from '../lib/backups.svelte';
+  import { untrack } from 'svelte';
 
   interface Props {
     lib: string;
@@ -41,6 +43,17 @@
   // Discover jobs started elsewhere while idle.
   $effect(() => jobs.watch());
 
+  // The backup status line; loaded on arrival and after every job.
+  $effect(() => {
+    const id = lib;
+    void jobs.doneCount;
+    untrack(() => {
+      backups.select(id);
+      void backups.load();
+    });
+  });
+  const backupStatus = $derived(backups.status);
+
   // A running job's duration ticks once a second.
   let now = $state(Date.now());
   $effect(() => {
@@ -57,6 +70,8 @@
   }
 
   function jobSummary(j: Job): string {
+    // Backup kinds keep their run stats in `result`; `stats` is the importer's (zero) counters.
+    if (isBackupKind(j.kind)) return backupJobSummary(j);
     const st = j.stats;
     if (j.kind === 'thumbs') {
       return `${formatCount(st.thumbsDone)} done, ${formatCount(st.thumbsUnsupported)} unsupported, ${formatCount(st.thumbsFailed)} failed`;
@@ -108,6 +123,16 @@
         {#if s.earliest || s.latest}
           <p class="muted range">From {formatWallDate(s.earliest)} to {formatWallDate(s.latest)}</p>
         {/if}
+        <p class="backup small">
+          {#if backupStatus}
+            <span class="tone-{backupStatus.tone}" class:stale={backupStatus.stale}>{backupStatus.stale ? '⚠ ' : ''}{backupStatus.text}</span>
+          {:else if backups.error}
+            <span class="muted">Backup status unavailable: {backups.error}</span>
+          {:else}
+            <span class="muted">Backup status…</span>
+          {/if}
+          · <a href={libHref(lib, 'backups')}>{backupStatus && backupStatus.text.startsWith('No backup target') ? 'Add a backup target' : 'Backups'}</a>
+        </p>
       </section>
 
       <section class="card">
@@ -273,6 +298,12 @@
   .range {
     margin: 12px 0 0;
   }
+  .backup {
+    margin: 8px 0 0;
+  }
+  .stale {
+    font-weight: 600;
+  }
   .actions {
     margin-top: 14px;
   }
@@ -293,6 +324,9 @@
   }
   .tone-error {
     color: var(--danger);
+  }
+  .tone-muted {
+    color: var(--muted);
   }
   .about dl {
     display: grid;

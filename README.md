@@ -16,6 +16,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 - **Verified Copies**: Each copy goes through a temp file, is hash-checked, fsynced and renamed into place before it is recorded in the catalog.
 - **Safe Moves**: With `--move`, source files are deleted only after the catalog transaction that records them has committed.
 - **Parallel Import**: Hashing and copying run in a worker pool, and catalog writes are batched in transactions.
+- **Backups**: `backup` keeps verified, move-aware copies of a library on other drives or shares, `scrub` checks them for bit rot, `restore` brings files back. See [Backups](#backups).
 - **Verification**: A `verify` command checks the catalog against the files in the library, with optional re-hashing.
 - **Performance Optimized**: Designed to handle large collections with hundreds of thousands of files efficiently.
 
@@ -131,7 +132,7 @@ It exits with status 2 when thumbnails failed for some files (they are listed in
 
 ### One writer at a time
 
-Commands that change a library (`serve` for as long as it runs, `import`, `rebuild`, `thumbs`, `update-metadata`, and `verify --rehash`/`--fill-size`) hold a lock on `<library>/.picmover/lock`. A second such command on the same library stops at once with `library is in use by another picmover process (pid N, <command>, since <time>)`; stop that process first (for example the browser server) and try again. `db` and plain `verify` only read and work at any time. The lock belongs to the running process, so it disappears when that process ends, even after a crash: there is never a stale lock to delete. On a file system that cannot lock files (some network mounts) a warning is printed and the command runs without the lock.
+Commands that change a library (`serve` for as long as it runs, `import`, `rebuild`, `thumbs`, `update-metadata`, `verify --rehash`/`--fill-size`, and `backup`, `prune`, `restore` and `scrub --library`) hold a lock on `<library>/.picmover/lock`. A second such command on the same library stops at once with `library is in use by another picmover process (pid N, <command>, since <time>)`; stop that process first (for example the browser server) and try again. `db` and plain `verify` only read and work at any time. The lock belongs to the running process, so it disappears when that process ends, even after a crash: there is never a stale lock to delete. On a file system that cannot lock files (some network mounts) a warning is printed and the command runs without the lock.
 
 ### Rebuild
 
@@ -194,6 +195,38 @@ Flags:
 
 - `--fill-size`: record the file size for rows whose size is unknown (not for rows whose hash does not match with `--rehash`). Catalogs created by this version always record sizes.
 - `--rehash`: re-hash every file and compare with the catalog (slow).
+
+### Backups
+
+A backup target is a folder on another drive or a network share. Attach one to a library (an empty folder becomes a target; it gets a `picmover-backup.json` marker with a random id, so the drive is recognised wherever it is mounted):
+
+```
+./picmover targets add --label "Red WD drive" /path/to/library /media/me/RedWD/backups
+./picmover targets /path/to/library                 # id, label, last backup and scrub, reachable, folder
+./picmover targets forget /path/to/library <id>     # the target's files are left alone
+```
+
+Back up (to the folder given, `--target <id>`, `--all-targets`, or the library's only target):
+
+```
+./picmover backup /path/to/library [<target-folder>] [--dry-run] [--partial] [--workers N] [--prune [--yes] [--force]] [--scrub 30m] [--take-over]
+```
+
+The library's copy is `<target>/<library-name>/`, a plain mirror of the library tree (the trash included) plus `user.db` and `media.db` snapshots, so it can be browsed with any file manager. Files are matched by content hash: a photo moved in the library is renamed on the target, a changed file keeps its earlier content in `<set>/.picmover/previous/`, and only new content is copied, newest first, each copy verified by reading it back. Nothing in the library is changed and nothing on the target is removed by a backup; an interrupted backup is continued by the next one. When the target is too small the backup refuses with the numbers; `--partial` copies the newest files until it is full. Symbolic links are skipped and listed, and so are folders of the library that cannot be read and files whose names differ from another file's only in upper/lower case or Unicode form (a backup cannot hold both: rename one); either makes the backup exit 1. `--dry-run` prints the plan and writes nothing (not even to `user.db`). A backup, scrub, prune or restore holds a lock on the backup set (`<set>/.picmover/lock`), so a second one on the same set, from this or another computer, stops at once naming the process that holds it. Unchanged `user.db` and `media.db` snapshots are not written again. An existing folder `<target>/<library-name>/` that is not a backup set (another library copied there, or any other folder) is never taken over, and a file the set does not know at a path the backup needs is reported and left alone. Logs go to `<library>/.picmover/logs/` and `<set>/.picmover/logs/`.
+
+A backup set belongs to one library, and remembers which copy of it wrote it last (its folder and host). A copy of the library folder (or the library after it was moved, or used from another computer) is refused with `this backup set was last written by the library at <folder> on <host>`; if this copy is the one to keep backing up, run the backup again with `--take-over` (`prune` and `scrub --library` take it too).
+
+```
+./picmover scrub <target-folder> [<set>] [--budget 30m|--all] [--library /path/to/library] [--no-repair] [--take-over]
+./picmover prune /path/to/library <target-folder-or-id> [--keep 30d] [--yes] [--force] [--take-over]
+./picmover restore <target-folder> <set> /path/to/library [--mode missing|user-data] [--force] [--dry-run] [--thumbs]
+```
+
+`scrub` re-reads the backed-up files and compares them with the hashes recorded when they were copied, least recently checked first; with `--budget` it stops after that long and the next scrub continues. Damaged and missing files are copied again from the library given with `--library` when it still has the right content. `prune` lists the files the library no longer has (neither the path nor the content, live or trashed) and earlier versions older than `--keep` (`--keep 0d` keeps none), and removes them only with `--yes`. While the library cannot be read completely (an unreadable folder) or catalog files are missing in it, files it still has could look deleted: `--yes` then refuses unless `--force`. `restore` (which also works from a write-protected drive or share) copies back the files a library lacks (never overwriting anything) and `user.db` when it has none; into a library without `media.db` the files are then recorded into a new catalog. `--mode user-data` restores only `user.db` (`--force` replaces an existing one, which is kept as `user.db.bak-<time>`; the snapshot is checked first, against the hash recorded at backup time and with SQLite's integrity check, and the current file is put back if anything fails).
+
+Exit status of `backup`, `scrub`, `prune`, `restore` and `targets`: 0 when everything was verified; 1 when some files failed (listed), a scrub found damage, `--partial` left files, or a backup could not read a library folder or found catalog files missing; 2 when the target or the library could not be used (including usage errors); 130 when cancelled. That makes them suitable for cron or Task Scheduler. In the browser, the Backups page does the same as jobs.
+
+The first command of this version that opens a library's `user.db` upgrades it to schema version 2 (backup targets and a library id); a copy of the old file is kept as `user.db.bak-<time>`. Older picmover versions refuse the upgraded file.
 
 Usage errors (a missing argument, an unknown flag) end with a hint such as `see 'picmover import --help'`. Empty arguments (for example an unset shell variable) are rejected.
 

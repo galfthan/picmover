@@ -8,8 +8,20 @@
     /** Directory to start in ("" = the roots). */
     start?: string;
     onchoose: (path: string) => void;
+    /** The choose button's label. */
+    chooseLabel?: string;
+    /** What the counts line ends with (the import says subfolders are imported too). */
+    countsNote?: string;
+    /** The hint on the roots listing. */
+    rootsHint?: string;
   }
-  let { start = '', onchoose }: Props = $props();
+  let {
+    start = '',
+    onchoose,
+    chooseLabel = 'Import from this folder',
+    countsNote = 'subfolders are imported too.',
+    rootsHint = 'Choose a drive or folder to import from.',
+  }: Props = $props();
 
   let listing = $state<FsListing | null>(null);
   let error = $state('');
@@ -99,13 +111,12 @@
     <div class="choose">
       <div class="counts">
         <strong>{formatCount(listing.mediaFiles ?? 0)}</strong> media files and
-        <strong>{formatCount(listing.otherFiles ?? 0)}</strong> other files directly in this folder;
-        subfolders are imported too.
+        <strong>{formatCount(listing.otherFiles ?? 0)}</strong> other files directly in this folder{countsNote ? `; ${countsNote}` : '.'}
       </div>
-      <button class="primary" onclick={() => listing && onchoose(listing.path)}>Import from this folder</button>
+      <button class="primary" onclick={() => listing && onchoose(listing.path)}>{chooseLabel}</button>
     </div>
   {:else if isRoots}
-    <p class="muted small">Choose a drive or folder to import from.</p>
+    <p class="muted small">{rootsHint}</p>
   {/if}
 </div>
 

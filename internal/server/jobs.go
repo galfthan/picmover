@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"picmover/internal/backup"
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
 	"picmover/internal/library"
@@ -24,6 +26,10 @@ const (
 	kindThumbs  = "thumbs"
 	kindSimilar = "similar"
 	kindRebuild = "rebuild"
+	kindBackup  = "backup"
+	kindScrub   = "scrub"
+	kindPrune   = "prune"
+	kindRestore = "restore"
 
 	stateQueued    = "queued"
 	stateRunning   = "running"
@@ -58,6 +64,23 @@ type jobParams struct {
 	Rebuild      bool   `json:"rebuild"`
 	Limit        int    `json:"limit"`
 	Distance     int    `json:"distance"` // similar: 1-7, 0 = default
+	// Backup kinds (backup, scrub, prune, restore).
+	Target   string `json:"target"`   // marker id
+	Partial  bool   `json:"partial"`  // backup
+	Workers  int    `json:"workers"`  // backup: 0 = default
+	Budget   int64  `json:"budget"`   // scrub: seconds, 0 = the whole set
+	Repair   *bool  `json:"repair"`   // scrub: default true
+	KeepDays *int   `json:"keepDays"` // prune: absent = 30, 0 = keep no earlier versions
+	Force    bool   `json:"force"`    // prune: even when the library scan was incomplete
+	TakeOver bool   `json:"takeOver"` // backup kinds: adopt a set last written by another copy of this library
+	Confirm  bool   `json:"confirm"`  // prune
+	Expected *int   `json:"expected"` // prune: the plan's extra.count
+	Mode     string `json:"mode"`     // restore: missing (default)
+}
+
+// isBackupKind reports the job kinds of step 5.
+func isBackupKind(kind string) bool {
+	return kind == kindBackup || kind == kindScrub || kind == kindPrune || kind == kindRestore
 }
 
 type statsJSON struct {
@@ -96,6 +119,9 @@ type jobJSON struct {
 	Rebuild      bool   `json:"rebuild,omitempty"`
 	Limit        int    `json:"limit,omitempty"`
 	Distance     int    `json:"distance,omitempty"` // similar jobs
+	Target       string `json:"target,omitempty"`   // backup kinds: the marker id
+	Mode         string `json:"mode,omitempty"`     // restore jobs
+	Budget       int64  `json:"budget,omitempty"`   // scrub jobs: seconds (omitted: the whole set)
 	// Progress is the phase of a similar job (omitted for other kinds and
 	// before the first phase).
 	Progress   *phaseJSON `json:"progress,omitempty"`
@@ -106,6 +132,63 @@ type jobJSON struct {
 	LogPath    string     `json:"logPath"`
 	Error      *string    `json:"error"`
 	ExitCode   int        `json:"exitCode"` // 0 until finished
+	// Backup is the progress of a backup-kind job, sent as "progress"
+	// instead of Progress.
+	Backup *backupProgressJSON `json:"-"`
+	// Result is the run stats of a finished backup-kind job.
+	Result any `json:"result,omitempty"`
+}
+
+// backupProgressJSON is the progress of a backup-kind job: the data of
+// its progress events and the job object's progress field.
+type backupProgressJSON struct {
+	Phase      string  `json:"phase"`
+	Files      int64   `json:"files"`
+	Bytes      int64   `json:"bytes"`
+	TotalFiles int64   `json:"totalFiles"`
+	TotalBytes int64   `json:"totalBytes"`
+	Current    string  `json:"current"`
+	Failed     int64   `json:"failed"`
+	Rate       float64 `json:"rate"`
+	ETA        int64   `json:"eta"`
+}
+
+// MarshalJSON sends a backup-kind job's progress as "progress".
+func (j jobJSON) MarshalJSON() ([]byte, error) {
+	type plain jobJSON
+	if j.Backup != nil {
+		return json.Marshal(struct {
+			plain
+			Progress *backupProgressJSON `json:"progress"`
+		}{plain(j), j.Backup})
+	}
+	return json.Marshal(plain(j))
+}
+
+// UnmarshalJSON reads a job object back (clients in tests): progress goes
+// to Backup for the backup kinds, else to Progress. Unknown fields are
+// refused, as the tests' strict decoder does.
+func (j *jobJSON) UnmarshalJSON(b []byte) error {
+	type plain jobJSON
+	var aux struct {
+		plain
+		Progress json.RawMessage `json:"progress"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&aux); err != nil {
+		return err
+	}
+	*j = jobJSON(aux.plain)
+	if len(aux.Progress) == 0 || string(aux.Progress) == "null" {
+		return nil
+	}
+	if isBackupKind(j.Kind) {
+		j.Backup = new(backupProgressJSON)
+		return json.Unmarshal(aux.Progress, j.Backup)
+	}
+	j.Progress = new(phaseJSON)
+	return json.Unmarshal(aux.Progress, j.Progress)
 }
 
 type progressJSON struct {
@@ -174,6 +257,8 @@ type job struct {
 	seq       int64
 	subs      map[*subscriber]struct{}
 	phase     *phaseJSON // similar jobs
+	bprog     *backupProgressJSON
+	result    any // backup kinds: the run stats once finished
 }
 
 func (j *job) finalLocked() bool {
@@ -202,6 +287,19 @@ func (j *job) jsonLocked() jobJSON {
 		}
 	case kindRebuild:
 		out.NoThumbs = j.params.NoThumbs
+	case kindBackup, kindScrub, kindPrune, kindRestore:
+		out.Target = j.params.Target
+		if j.params.Kind == kindRestore {
+			out.Mode = j.params.Mode
+		}
+		if j.params.Kind == kindScrub {
+			out.Budget = j.params.Budget
+		}
+		if j.bprog != nil {
+			bp := *j.bprog
+			out.Backup = &bp
+		}
+		out.Result = j.result
 	}
 	if !j.finished.IsZero() {
 		f := j.finished.Format(time.RFC3339)
@@ -323,6 +421,39 @@ func (j *job) onPhase(p similar.Progress) {
 		}
 		sub.progress <- data
 	}
+}
+
+// onBackupProgress records a backup-kind job's progress and sends it as
+// a coalesced progress event.
+func (j *job) onBackupProgress(p backup.Progress) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	bp := backupProgressJSON{Phase: p.Phase, Files: p.Files, Bytes: p.Bytes, TotalFiles: p.TotalFiles,
+		TotalBytes: p.TotalBytes, Current: p.Current, Failed: p.Failed, Rate: p.Rate, ETA: p.ETA}
+	j.bprog = &bp
+	if j.finalLocked() {
+		return
+	}
+	data := mustJSON(bp)
+	for sub := range j.subs {
+		select {
+		case <-sub.progress:
+		default:
+		}
+		sub.progress <- data
+	}
+}
+
+// onBackupFailure sends a file a backup-kind job could not handle as an
+// error result event (source: the relative path).
+func (j *job) onBackupFailure(f backup.Failure) {
+	j.onResult(importer.Result{Status: importer.StatusError, Source: f.Path, Message: f.Error})
+}
+
+func (j *job) setResult(v any) {
+	j.mu.Lock()
+	j.result = v
+	j.mu.Unlock()
 }
 
 // resultRing is a circular buffer of results; start is the oldest.
@@ -574,6 +705,8 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		return m.runSimilar(j)
 	case kindRebuild:
 		return m.runRebuild(j)
+	case kindBackup, kindScrub, kindPrune, kindRestore:
+		return m.runBackupJob(j)
 	}
 	libState, h := j.entry.snapshot()
 	if libState != libOpen {
