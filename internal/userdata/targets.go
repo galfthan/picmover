@@ -54,7 +54,7 @@ func (d *DB) LibraryID(ctx context.Context) (string, error) {
 	var id string
 	err := d.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'library_id'`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		// Written by create and migrateV1; repair a deleted row.
+		// Written by create and migrate; repair a deleted row.
 		if err := d.write(ctx, "library id", func(tx *sql.Tx, now int64) error { return d.writeIdentity(ctx, tx) }); err != nil {
 			return "", err
 		}

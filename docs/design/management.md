@@ -58,7 +58,7 @@ dependencies on either side.
 ## Layout
 
 ```
-internal/userdata/        user.db: schema v1, Open, ratings/tags/albums/trash/ignored
+internal/userdata/        user.db: schema v1-v3 and migrations, Open, ratings/tags/albums/trash/ignored, targets (v2), import history (v3)
 internal/similar/         pHash near-duplicate search (pure functions) + Run (job body)
 internal/library/trash.go TrashDir, TrashPath, MoveToTrash, Restore (rename-only, same volume)
 internal/catalog/         Filter additions (hash sets, recur, trashed), similar_pairs + meta tables,
@@ -80,6 +80,15 @@ web/src/lib/selection.svelte.ts, dates.ts, libraries.svelte.ts
 ## Data model
 
 ### `user.db` (schema version 1, `PRAGMA user_version = 1`)
+
+Versions since: 2 (step 5, `docs/design/backups.md`: `backup_targets`,
+`meta` with the library identity) and 3 (`docs/design/imports.md`:
+`imports`, `import_items`, meta `imports_backfilled`). `Open` migrates
+an older file in order (1 → 2 → 3) in one transaction after one
+`user.db.bak-<stamp>` copy, re-checking the version inside it and setting
+`user_version` last; a fresh file is created at the current version. A
+newer version is refused as described below (`VersionError`, "upgrade
+picmover"), with the file left untouched.
 
 Lives at `<library>/user.db`, next to `media.db`. Created on first open of
 the library by the server (an empty one is a few KiB). WAL, busy_timeout

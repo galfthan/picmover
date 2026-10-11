@@ -57,7 +57,7 @@ const runningJob = {
   move: false,
   startedAt: '2026-10-10T12:00:00+03:00',
   finishedAt: null,
-  stats: { scanned: 1234, imported: 100, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 1e6, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 },
+  stats: { scanned: 1234, imported: 100, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 1e6, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 },
   sessionId: 17,
   logPath: '/lib/.picmover/logs/import.log',
   error: null,
@@ -206,6 +206,7 @@ describe('App smoke test', () => {
       'Photos',
       'Map',
       'Albums',
+      'Imports',
       'Trash',
       'Duplicates',
       'Import',
@@ -235,7 +236,7 @@ describe('App smoke test', () => {
     const es = FakeEventSource.instances.at(-1)!;
     expect(es.url).toBe('/api/jobs/4/events');
     es.emit('state', runningJob);
-    es.emit('progress', { stats: { ...runningJob.stats, scanned: 2000 } });
+    es.emit('progress', { stats: { ...runningJob.stats, scanned: 2000, rate: Math.round(12.3 * 1024 * 1024) } });
     es.emit('result', { status: 'imported', source: '/media/card/a.jpg', dest: 'image/2024/07/a.jpg', seq: 1 });
     es.emit('result', { status: 'error', source: '/media/card/b.jpg', message: 'boom', seq: 2 });
     await settle();
@@ -286,13 +287,17 @@ describe('App smoke test', () => {
     await go('#/l/Photos/import');
     expect(document.body.textContent).toContain('Import running');
     expect(document.body.textContent).toContain('boom');
+    expect(document.body.textContent).toContain('976.6 KiB (12.3 MiB/s)');
     expect(document.querySelector('.dest')?.textContent).toContain('Importing into');
     expect(document.querySelector('.dest')?.textContent).toContain('/home/me/Photos/media.db');
     // Job finishes
-    es.emit('done', { ...runningJob, state: 'done', exitCode: 2, finishedAt: '2026-10-10T12:05:00+03:00', stats: { ...runningJob.stats, errors: 12 } });
+    es.emit('done', { ...runningJob, state: 'done', exitCode: 2, finishedAt: '2026-10-10T12:05:00+03:00', stats: { ...runningJob.stats, errors: 12 }, importId: 31 });
     await settle();
     expect(document.body.textContent).toContain('12 files could not be imported; see /lib/.picmover/logs/import.log');
-    expect(document.body.textContent).toContain('Show imported');
+    // "Show imported" goes to the import record when the job has one (else ?session=, see routes.test.ts).
+    const shown = [...document.querySelectorAll('a')].find((a) => a.textContent === 'Show imported');
+    expect(shown?.getAttribute('href')).toBe('#/l/Photos/?import=31');
+    expect(document.body.textContent).not.toContain('MiB/s');
     expect(document.querySelector('.dest')?.textContent).toContain('Imported into');
     const another = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Import another');
     another!.click();

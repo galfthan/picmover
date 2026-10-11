@@ -45,6 +45,7 @@ export function emptyStats(): JobStats {
     nonMedia: 0,
     errors: 0,
     bytesCopied: 0,
+    rate: 0,
     thumbsDone: 0,
     thumbsUnsupported: 0,
     thumbsFailed: 0,

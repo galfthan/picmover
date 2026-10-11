@@ -583,3 +583,183 @@ func (d *DB) FinishSession(ctx context.Context, id int64, s SessionStats) error 
 	}
 	return checkOneRow(res, id)
 }
+
+// Session is a recorded import session with its counters and the content
+// hashes of its rows.
+type Session struct {
+	ID                    int64
+	StartedAt, FinishedAt time.Time // FinishedAt zero: never finished
+	Source, Mode          string
+	SessionStats
+	// Hashes are the hashes of the rows recorded by the session (trashed
+	// rows included), in row id order.
+	Hashes []uint64
+	// Newest is the newest live row among them (taken_at DESC, id DESC,
+	// undated last, as NewestOf); 0 when none is live.
+	Newest uint64
+}
+
+// tableColumns returns the column names of table (none when it does not
+// exist).
+func tableColumns(ctx context.Context, q *sql.DB, table string) (map[string]bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[strings.ToLower(n)] = true
+	}
+	return out, rows.Err()
+}
+
+// colOr is the column name when cols has it, else fallback (an SQL
+// expression).
+func colOr(cols map[string]bool, name, fallback string) string {
+	if cols[name] {
+		return name
+	}
+	return fallback
+}
+
+// sessionRows are the rows of one session: their hashes in row id order
+// and the newest live one.
+type sessionRows struct {
+	hashes []uint64
+	newest uint64
+
+	bestDated bool
+	bestTaken int64
+}
+
+// add takes the next row (rows come in id order, so on a tie the later
+// one is newer).
+func (r *sessionRows) add(h int64, taken sql.NullInt64, live bool) {
+	r.hashes = append(r.hashes, uint64(h))
+	if !live {
+		return
+	}
+	switch {
+	case r.newest == 0,
+		taken.Valid && (!r.bestDated || taken.Int64 >= r.bestTaken),
+		!taken.Valid && !r.bestDated:
+		r.newest, r.bestDated, r.bestTaken = uint64(h), taken.Valid, taken.Int64
+	}
+}
+
+// readSessionRows returns the rows of the sessions (all of them when
+// session is 0), by session id. The query uses only the columns every
+// catalog version with sessions has (hash, import_session_id) and
+// tolerates missing taken_at and deleted_at.
+func readSessionRows(ctx context.Context, q *sql.DB, session int64) (map[int64]*sessionRows, error) {
+	cols, err := tableColumns(ctx, q, "media")
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]*sessionRows{}
+	if !cols["hash"] || !cols["import_session_id"] {
+		return out, nil
+	}
+	where, args := "import_session_id IS NOT NULL", []any{}
+	if session != 0 {
+		where, args = "import_session_id = ?", []any{session}
+	}
+	rows, err := q.QueryContext(ctx, `SELECT import_session_id, hash, `+colOr(cols, "taken_at", "NULL")+`, `+
+		colOr(cols, "deleted_at", "NULL")+` IS NULL FROM media WHERE `+where+` ORDER BY `+colOr(cols, "id", "rowid"), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			sid, h int64
+			taken  sql.NullInt64
+			live   bool
+		)
+		if err := rows.Scan(&sid, &h, &taken, &live); err != nil {
+			return nil, err
+		}
+		r := out[sid]
+		if r == nil {
+			r = &sessionRows{}
+			out[sid] = r
+		}
+		r.add(h, taken, live)
+	}
+	return out, rows.Err()
+}
+
+// Sessions returns every import session, oldest first, with the hashes
+// of its rows (the import history backfill of user.db). It reads the
+// columns schema versions 2 and 3 share, so it also works on an older
+// catalog (SessionsFile); a missing counter column reads as 0 and a
+// catalog without import_sessions has no sessions.
+func (d *DB) Sessions(ctx context.Context) ([]Session, error) {
+	cols, err := tableColumns(ctx, d.DB, "import_sessions")
+	if err != nil {
+		return nil, fmt.Errorf("catalog: sessions: %w", err)
+	}
+	out := []Session{}
+	if !cols["id"] || !cols["started_at"] {
+		return out, nil
+	}
+	sel := []string{"id", "started_at", colOr(cols, "finished_at", "NULL"), colOr(cols, "source", "''"),
+		colOr(cols, "mode", "''")}
+	for _, c := range []string{"imported", "existing", "duplicates", "skipped_small", "non_media", "errors"} {
+		sel = append(sel, colOr(cols, c, "0"))
+	}
+	rows, err := d.QueryContext(ctx, `SELECT `+strings.Join(sel, ", ")+` FROM import_sessions ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: sessions: %w", err)
+	}
+	for rows.Next() {
+		var (
+			s        Session
+			started  int64
+			finished sql.NullInt64
+		)
+		if err := rows.Scan(&s.ID, &started, &finished, &s.Source, &s.Mode, &s.Imported, &s.Existing,
+			&s.Duplicates, &s.SkippedSmall, &s.NonMedia, &s.Errors); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("catalog: sessions: %w", err)
+		}
+		s.StartedAt, s.FinishedAt = time.Unix(started, 0).UTC(), fromUnix(finished)
+		out = append(out, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: sessions: %w", err)
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+	byID, err := readSessionRows(ctx, d.DB, 0)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: session rows: %w", err)
+	}
+	for i := range out {
+		if r := byID[out[i].ID]; r != nil {
+			out[i].Hashes, out[i].Newest = r.hashes, r.newest
+		}
+	}
+	return out, nil
+}
+
+// SessionHashes returns the hashes of the rows of session (trashed ones
+// included, in row id order) and the newest live one (0: none): the items
+// of an import whose process died before it recorded them.
+func (d *DB) SessionHashes(ctx context.Context, session int64) (hashes []uint64, newest uint64, err error) {
+	byID, err := readSessionRows(ctx, d.DB, session)
+	if err != nil {
+		return nil, 0, fmt.Errorf("catalog: session rows: %w", err)
+	}
+	if r := byID[session]; r != nil {
+		return r.hashes, r.newest, nil
+	}
+	return []uint64{}, 0, nil
+}

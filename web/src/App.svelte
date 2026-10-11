@@ -21,6 +21,8 @@
   import Libraries from './pages/Libraries.svelte';
   import Albums from './pages/Albums.svelte';
   import Album from './pages/Album.svelte';
+  import Imports from './pages/Imports.svelte';
+  import ImportRecord from './pages/ImportRecord.svelte';
   import Trash from './pages/Trash.svelte';
   import Similar from './pages/Similar.svelte';
   import Backups from './pages/Backups.svelte';
@@ -80,7 +82,7 @@
       return viewBase;
     }
     if (viewBase && viewBase.app.lib === app.lib) return viewBase;
-    return { route: parseHash(libHref(app.lib, '')), app: { kind: 'lib', lib: app.lib, page: 'grid', albumId: null, viewId: null } };
+    return { route: parseHash(libHref(app.lib, '')), app: { kind: 'lib', lib: app.lib, page: 'grid', albumId: null, importId: null, viewId: null } };
   });
   const page = $derived<LibPage | null>(base ? base.app.page : null);
   const viewId = $derived(app.kind === 'lib' && app.page === 'view' ? app.viewId : null);
@@ -102,6 +104,7 @@
     { pages: ['grid'], label: 'Photos', sub: '' },
     { pages: ['map'], label: 'Map', sub: 'map' },
     { pages: ['albums', 'album'], label: 'Albums', sub: 'albums' },
+    { pages: ['imports', 'importrecord'], label: 'Imports', sub: 'imports' },
     { pages: ['trash'], label: 'Trash', sub: 'trash', count: library.trashed },
     { pages: ['similar'], label: 'Duplicates', sub: 'similar' },
     { pages: ['import'], label: 'Import', sub: 'import' },
@@ -184,6 +187,12 @@
           {:else if page === 'album' && base.app.albumId !== null}
             {#key base.app.albumId}
               <Album {api} albumId={base.app.albumId} {filters} {viewId} />
+            {/key}
+          {:else if page === 'imports'}
+            <Imports {api} />
+          {:else if page === 'importrecord' && base.app.importId !== null}
+            {#key base.app.importId}
+              <ImportRecord {api} importId={base.app.importId} {filters} {viewId} />
             {/key}
           {:else if page === 'trash'}
             <Trash {api} {filters} {viewId} />

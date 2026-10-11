@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { FileType, Filters } from '../lib/api';
   import { library } from '../lib/library.svelte';
+  import { untrack } from 'svelte';
   import { hasFilters } from '../lib/filters';
+  import { importTitle } from '../lib/imports';
   import { parseWallClock } from '../lib/format';
   import DateFilter, { type DateValue } from './DateFilter.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
@@ -13,8 +15,10 @@
     hideGps?: boolean;
     /** Hide the album select (the album page implies it). */
     hideAlbum?: boolean;
+    /** Hide the import chip (the import record page implies it). */
+    hideImport?: boolean;
   }
-  let { filters, onchange, hideGps = false, hideAlbum = false }: Props = $props();
+  let { filters, onchange, hideGps = false, hideAlbum = false, hideImport = false }: Props = $props();
 
   const types: { value: FileType | ''; label: string }[] = [
     { value: '', label: 'All types' },
@@ -78,6 +82,18 @@
     set({ tags: (filters.tags ?? []).filter((t) => t !== id) });
   }
   const tagName = (id: number) => tags.find((t) => t.id === id)?.name ?? `#${id}`;
+
+  // The import chip names the record; the list is loaded on demand, once
+  // per record id the store does not know yet.
+  const importRec = $derived(filters.import ? (library.imports.find((r) => r.id === filters.import) ?? null) : null);
+  const importName = $derived(importRec ? importTitle(importRec) : `#${filters.import ?? ''}`);
+  let askedImport = 0;
+  $effect(() => {
+    const iid = hideImport || library.id === null ? undefined : filters.import;
+    if (!iid || importRec || iid === askedImport) return;
+    askedImport = iid;
+    untrack(() => void library.loadImports());
+  });
 </script>
 
 <div class="filters" role="search" aria-label="Filters">
@@ -140,11 +156,18 @@
   {#if filters.session}
     <span class="chip">
       This import (#{filters.session})
-      <button class="ghost small" aria-label="Remove import filter" onclick={() => set({ session: undefined })}>×</button>
+      <button class="ghost small" aria-label="Remove import session filter" onclick={() => set({ session: undefined })}>×</button>
     </span>
   {/if}
 
-  {#if hasFilters(filters, { album: hideAlbum })}
+  {#if filters.import && !hideImport}
+    <span class="chip">
+      Import: {importName}
+      <button class="ghost small" aria-label="Remove import filter {importName}" onclick={() => set({ import: undefined })}>×</button>
+    </span>
+  {/if}
+
+  {#if hasFilters(filters, { album: hideAlbum, import: hideImport })}
     <button class="ghost small" onclick={() => onchange({})}>Clear</button>
   {/if}
 </div>

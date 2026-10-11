@@ -255,7 +255,7 @@ describe('target paths', () => {
 
 describe('backup job outcomes', () => {
   // As the server sends them: `stats` the importer's zero counters, the run stats in `result`.
-  const zero = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
+  const zero = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
   const base = { id: 1, startedAt: null, finishedAt: null, error: null, logPath: '/lib/.picmover/logs/backup.log', stats: zero, library: 'peter', target: 'a1b2c3d4e5f60718' };
   const j = (p: Partial<Job>): Job => ({ ...base, kind: 'backup', state: 'done', ...p });
   it('reads the run stats from `result`, not the importer counters', () => {

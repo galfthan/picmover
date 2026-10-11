@@ -1,6 +1,6 @@
 // Test doubles shared by the component tests: a stateful fake of the
 // step 4 API (a workspace with a few libraries; one of them, "peter", has
-// items, tags, albums, a trash and similar groups), EventSource and
+// items, tags, albums, import records, a trash and similar groups), EventSource and
 // ResizeObserver fakes, and helpers to let effects and timers settle.
 
 import { vi } from 'vitest';
@@ -83,7 +83,7 @@ interface FakeTarget {
 }
 
 /** The importer counters every job object carries; zero for the backup kinds (their stats are in `result`). */
-export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
+export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0 };
 
 /** Run stats (`result`, and `stats` in runs) exactly as the step 5 server writes them, per kind. */
 export function runResult(kind: string, p: Record<string, unknown> = {}): Record<string, unknown> {
@@ -134,6 +134,33 @@ export function backupJobJSON(p: { id: number; kind: string; target: string; lib
   } as Job;
 }
 
+export interface FakeImport {
+  id: number;
+  name: string;
+  startedAt: string;
+  finishedAt: string | null;
+  source: string;
+  sourceName: string;
+  mode: string;
+  host: string;
+  outcome: string;
+  imported: number;
+  existing: number;
+  duplicates: number;
+  skipped: number;
+  errors: number;
+  bytes: number;
+  /** Item hashes (import_items); none for the modes that keep no items (rebuild, record). */
+  hashes: string[];
+  /**
+   * The stored summary GET imports lists (user.db imports.items/cover,
+   * written when the record was finished): undefined computes it from the
+   * items when the fake starts; null for a record without items.
+   */
+  items?: number | null;
+  cover?: string | null;
+}
+
 interface FakeClass {
   count: number;
   bytes: number;
@@ -156,6 +183,49 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   const albums: { id: number; name: string; hashes: string[]; cover: string | null }[] = [{ id: 2, name: 'Summer', hashes: [hashOf(1), hashOf(2)], cover: null }];
   let nextTag = 10;
   let nextAlbum = 10;
+  /**
+   * Import records of user.db (docs/design/imports.md), newest first: a
+   * named recent copy that brought in 1..3 and found 4 in place, and an
+   * older move from a card (7, 8).
+   */
+  const imports: FakeImport[] = [
+    {
+      id: 5,
+      name: 'Phone dump',
+      startedAt: '2026-10-10T09:00:00Z',
+      finishedAt: '2026-10-10T09:05:00Z',
+      source: '/mnt/phone/DCIM/Camera',
+      sourceName: 'Camera',
+      mode: 'copy',
+      host: 'laptop',
+      outcome: 'done',
+      imported: 3,
+      existing: 1,
+      duplicates: 2,
+      skipped: 0,
+      errors: 1,
+      bytes: 3 * 1024 * 1024,
+      hashes: [hashOf(1), hashOf(2), hashOf(3), hashOf(4)],
+    },
+    {
+      id: 2,
+      name: '',
+      startedAt: '2026-08-01T10:00:00Z',
+      finishedAt: null,
+      source: '/media/card/DCIM',
+      sourceName: 'DCIM',
+      mode: 'move',
+      host: 'laptop',
+      outcome: 'cancelled',
+      imported: 2,
+      existing: 0,
+      duplicates: 0,
+      skipped: 0,
+      errors: 0,
+      bytes: 2048,
+      hashes: [hashOf(7), hashOf(8)],
+    },
+  ];
   /** Near-duplicate groups as hash lists, before trash and ignore; tests may replace them. */
   const similar: { groups: string[][] } = { groups: [[hashOf(7), hashOf(8)]] };
   /** Ignored pairs "a|b" (a < b), as user.db similar_ignored. */
@@ -442,8 +512,36 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     return m ? [Number(m[1]), Number(m[2])] : [0, 0];
   };
 
+  /** As the server (docs/design/imports.md): rebuild and record runs keep no items. */
+  const keepsItems = (r: FakeImport) => r.mode !== 'rebuild' && r.mode !== 'record';
+  /** The live rows among hashes and the newest of them (taken_at DESC, id DESC, undated last), as catalog.LiveSummary. */
+  const liveSummary = (hashes: string[]) => {
+    const rows = live().filter((x) => hashes.includes(x.hash));
+    const newest = [...rows].sort((a, b) => {
+      if (!a.takenAt !== !b.takenAt) return a.takenAt ? -1 : 1;
+      if (a.takenAt && b.takenAt && a.takenAt !== b.takenAt) return a.takenAt < b.takenAt ? 1 : -1;
+      return b.id - a.id;
+    })[0];
+    return { items: rows.length, cover: newest?.hash ?? null };
+  };
+  /** The record object: the stored summary (list) or the live one (one record), null for a record without items. */
+  const importJSON = (r: FakeImport, how: 'stored' | 'live') => {
+    const { hashes, items: _i, cover: _c, ...rest } = r;
+    if (!keepsItems(r)) return { ...rest, items: null, cover: null };
+    if (how === 'live') return { ...rest, ...liveSummary(hashes) };
+    return { ...rest, items: r.items ?? null, cover: r.cover ?? null };
+  };
+  // The stored summary, as FinishImport wrote it: the item count and the newest item.
+  for (const r of imports) {
+    if (r.items !== undefined) continue;
+    r.items = keepsItems(r) ? r.hashes.length : null;
+    r.cover = keepsItems(r) ? liveSummary(r.hashes).cover : null;
+  }
+
   function select(q: URLSearchParams): Item[] {
     let list = q.get('trashed') === '1' ? items.filter((x) => !!x.deletedAt) : live();
+    const imp = Number(q.get('import'));
+    if (imp) list = list.filter((x) => imports.find((r) => r.id === imp)?.hashes.includes(x.hash));
     const album = Number(q.get('album'));
     if (album) list = list.filter((x) => albums.find((a) => a.id === album)?.hashes.includes(x.hash));
     const rating = Number(q.get('rating'));
@@ -454,6 +552,32 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
 
   function lib(path: string, q: URLSearchParams, method: string, body: Record<string, unknown>): Response {
     const hs = (body.hashes as string[] | undefined) ?? [];
+    // The import filter as the server: a malformed id is 400, an unknown one 404, empty is no filter.
+    const imp = q.get('import');
+    if (imp) {
+      if (!/^[1-9]\d*$/.test(imp)) return json({ error: `invalid import "${imp}": want an import id` }, 400);
+      if (!imports.some((r) => String(r.id) === imp)) return json({ error: 'no such import' }, 404);
+    }
+    if (path === 'imports' && method === 'GET') return json({ imports: imports.map((r) => importJSON(r, 'stored')) });
+    const im = /^imports\/([^/]+)(\/delete)?$/.exec(path);
+    if (im) {
+      // A malformed id is 404 like an unknown one (pathID, as for albums).
+      if (!/^[1-9]\d*$/.test(im[1] ?? '')) return json({ error: 'no such import' }, 404);
+      const r = imports.find((x) => x.id === Number(im[1]));
+      if (!r) return json({ error: `not found: import ${im[1]}` }, 404);
+      if (method === 'GET' && !im[2]) return json(importJSON(r, 'live'));
+      if (method !== 'POST') return json({ error: 'not found' }, 404);
+      if (im[2]) {
+        imports.splice(imports.indexOf(r), 1);
+        return json({});
+      }
+      if (typeof body.name !== 'string') return json({ error: 'name is required' }, 400);
+      const name = body.name.trim();
+      if (/[\p{Cc}\u2028\u2029\uFFFD]/u.test(name)) return json({ error: 'invalid name: control characters are not allowed' }, 400);
+      if ([...name].length > 200) return json({ error: 'invalid name: want 1-200 characters' }, 400);
+      r.name = name;
+      return json(importJSON(r, 'live'));
+    }
     if (method === 'GET' && path === 'library') {
       return json({
         root: '/media/peter',
@@ -507,6 +631,9 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
         displayable: true,
         tags: tags.filter((t) => x.tagIds.includes(t.id)),
         albums: albums.filter((a) => a.hashes.includes(x.hash)).map((a) => ({ id: a.id, name: a.name })),
+        imports: imports
+          .filter((r) => r.hashes.includes(x.hash))
+          .map((r) => ({ id: r.id, name: r.name, startedAt: r.startedAt, mode: r.mode, sourceName: r.sourceName })),
         deletedAt: x.deletedAt ?? null,
       });
     }
@@ -680,7 +807,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, libs, folders, similar, openErrors, userdb, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, backup, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

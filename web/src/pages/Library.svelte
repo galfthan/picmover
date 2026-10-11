@@ -4,7 +4,7 @@
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed, formatInstant, formatWallDate } from '../lib/format';
   import { backupJobSummary, jobTitle, outcome } from '../lib/jobtext';
-  import { libHref } from '../lib/routes';
+  import { importedHref, libHref } from '../lib/routes';
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import JobProgress from '../components/JobProgress.svelte';
   import CopyButton from '../components/CopyButton.svelte';
@@ -230,8 +230,9 @@
                     <td>{duration(j)}</td>
                     <td>
                       {jobSummary(j)}
-                      {#if j.kind === 'import' && j.sessionId && !isActive(j)}
-                        <div><a class="small" href={libHref(lib, '', { session: j.sessionId })}>Show imported</a></div>
+                      {#if j.kind === 'import' && !isActive(j)}
+                        {@const shown = importedHref(lib, j)}
+                        {#if shown}<div><a class="small" href={shown}>Show imported</a></div>{/if}
                       {/if}
                     </td>
                     <td class="tone-{o.tone}">{isActive(j) ? j.state : o.text}</td>

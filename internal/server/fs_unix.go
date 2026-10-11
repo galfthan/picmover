@@ -8,29 +8,22 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"strconv"
 	"syscall"
+
+	"picmover/internal/gvfs"
 )
 
 // roots returns the directory browser's starting points: /, the home
 // directory, /media/<user>, /mnt, /Volumes and the gvfs mount directory
-// (phones over MTP, see gvfsDir) when they exist.
+// (phones and cameras over MTP or gphoto2: $XDG_RUNTIME_DIR/gvfs, else
+// /run/user/<uid>/gvfs; see gvfs.Dir) when they exist.
 func roots() []dirJSON {
 	home, _ := os.UserHomeDir()
 	media := ""
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		media = filepath.Join("/media", u.Username)
 	}
-	return existingDirs("/", home, media, "/mnt", "/Volumes", gvfsDir())
-}
-
-// gvfsDir returns where gvfs mounts phones and cameras (MTP, gphoto2):
-// $XDG_RUNTIME_DIR/gvfs, else /run/user/<uid>/gvfs.
-func gvfsDir() string {
-	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
-		return filepath.Join(d, "gvfs")
-	}
-	return filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "gvfs")
+	return existingDirs("/", home, media, "/mnt", "/Volumes", gvfs.Dir())
 }
 
 // isHidden reports hidden entries beyond dot names; none on Unix.

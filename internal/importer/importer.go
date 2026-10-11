@@ -30,7 +30,14 @@
 //
 // Every read of a source file outside the library (staging, the move
 // verification, hashing, CopyVerified, zip archives) holds one of the
-// SourceReaders slots for the read only. Every staged temp file not placed
+// SourceReaders slots for the read only. On Linux a file on a phone mount
+// (gvfs mtp or gphoto2, internal/gvfs) is not read through FUSE for staging
+// or hashing: the gvfs daemon pulls it into a library temp file with
+// `gio copy` (library.StagePulled, library.HashPulled), which runs at USB
+// speed. If gio is missing, the run reads through FUSE. A file whose pull
+// fails is read through FUSE; after maxPullFailures failed pulls in a row
+// (one warning) the rest of the run reads through FUSE. Every staged temp
+// file not placed
 // is removed. A single writer batches the finished files into catalog
 // transactions. Only after a transaction has committed are move sources
 // deleted; if an insert loses a hash race or the commit fails, the file
@@ -59,6 +66,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/gvfs"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 )
@@ -83,12 +91,24 @@ type Result struct {
 	Dest    string // catalog rel path when applicable
 	Message string
 	Err     error
+	// Hash is the content hash for imported (restored included), existing
+	// and duplicate results; 0 for the others. An imported or existing
+	// result is reported only after its catalog row committed.
+	Hash uint64
+	// Restored marks an imported result whose content was in the trash
+	// and was restored instead of imported again.
+	Restored bool
 }
 
 // Stats are the counters of an import run.
 type Stats struct {
 	Scanned, Imported, Existing, Duplicates, SkippedSmall, NonMedia, Errors int64
 	BytesCopied                                                             int64
+	// Rate is the transfer rate in bytes per second, BytesCopied's growth
+	// smoothed over about the last two seconds of progress ticks; 0 when
+	// nothing is moving, before the first tick, without OnProgress, and in
+	// the final OnProgress call.
+	Rate int64
 	// Thumbnail stage: rows that got renditions (ok), that cannot have
 	// any (unsupported), and that failed (error).
 	ThumbsDone, ThumbsUnsupported, ThumbsFailed int64
@@ -175,13 +195,25 @@ type Importer struct {
 
 	readers chan struct{} // semaphore of the staging reads, cap SourceReaders
 
+	// usePull: files on a phone mount (gvfs mtp or gphoto2) are read by
+	// pulling them through the gvfs daemon (gio copy) rather than through
+	// FUSE. Set in Run when gio is available; cleared for the rest of the
+	// run after maxPullFailures failed pulls in a row (see pullFailed).
+	usePull atomic.Bool
+	// pullFails counts the failed pulls since the last one that worked.
+	pullFails atomic.Int32
+
 	// Test hooks; New sets the real functions.
-	openSource func(string) (*os.File, error)  // opens a source file for reading
-	sameDev    func(src, dir string) bool      // sameDevice
-	place      func(tmpPath, dst string) error // library.Commit
+	openSource func(string) (*os.File, error)                                           // opens a source file for reading
+	sameDev    func(src, dir string) bool                                               // sameDevice
+	place      func(tmpPath, dst string) error                                          // library.Commit
+	pull       func(ctx context.Context, src, dst string, onProgress func(int64)) error // gvfs.Pull
+	isDevice   func(string) bool                                                        // gvfs.IsDevice
+	gioOK      func() bool                                                              // gvfs.Available
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed                                        atomic.Int64
+	rate                                                                               atomic.Int64 // last computed Stats.Rate
 }
 
 // pending is a file that is fully on disk in the library and waits for the
@@ -222,6 +254,9 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		openSource: os.Open,
 		sameDev:    sameDevice,
 		place:      library.Commit,
+		pull:       gvfs.Pull,
+		isDevice:   gvfs.IsDevice,
+		gioOK:      gvfs.Available,
 	}
 }
 
@@ -278,8 +313,14 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	im.session.Store(im.sessionID)
 	im.opts.SourceReaders = sourceReaders(im.opts.SourceReaders, im.opts.Workers, src)
 	im.readers = make(chan struct{}, im.opts.SourceReaders)
+	im.usePull.Store(!im.opts.RecordInPlace && im.gioOK())
+	im.pullFails.Store(0)
+	// gio=true: the files below src are pulled through the gvfs daemon
+	// (src is on a phone mount, or is the gvfs directory itself, whose
+	// mounts it then walks).
 	im.log.Info("import started", "source", src, "library", im.lib.Root(), "mode", mode,
-		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders, "session", im.sessionID)
+		"workers", im.opts.Workers, "source_readers", im.opts.SourceReaders,
+		"gio", im.usePull.Load() && (im.isDevice(src) || src == gvfs.Dir()), "session", im.sessionID)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -377,9 +418,11 @@ func (im *Importer) startProgress() (stop func()) {
 		defer close(done)
 		t := time.NewTicker(im.opts.ProgressInterval)
 		defer t.Stop()
+		w := rateWindow{span: rateSpan, prevBytes: im.bytesCopied.Load(), prevAt: time.Now()}
 		for {
 			select {
-			case <-t.C:
+			case now := <-t.C:
+				im.rate.Store(w.add(now, im.bytesCopied.Load()))
 				im.opts.OnProgress(im.Stats())
 			case <-stopc:
 				return
@@ -389,8 +432,53 @@ func (im *Importer) startProgress() (stop func()) {
 	return func() {
 		close(stopc)
 		<-done
+		im.rate.Store(0)
 		im.opts.OnProgress(im.Stats())
 	}
+}
+
+// rateSpan is about how far back the transfer rate looks.
+const rateSpan = 2 * time.Second
+
+// rateWindow computes the transfer rate from the BytesCopied of
+// successive progress ticks: the bytes added over the ticks of about the
+// last span, divided by the time those ticks cover. A tick whose
+// BytesCopied went down (a discarded staged file was subtracted) adds 0.
+type rateWindow struct {
+	span      time.Duration
+	prevBytes int64
+	prevAt    time.Time
+	ticks     []rateTick
+}
+
+type rateTick struct {
+	start time.Time     // the previous tick
+	dur   time.Duration // since the previous tick
+	bytes int64         // bytes added since the previous tick, >= 0
+}
+
+// add records a tick at now with the counter at bytes and returns the
+// rate in bytes per second.
+func (w *rateWindow) add(now time.Time, bytes int64) int64 {
+	d := max(bytes-w.prevBytes, 0)
+	w.ticks = append(w.ticks, rateTick{start: w.prevAt, dur: now.Sub(w.prevAt), bytes: d})
+	w.prevBytes, w.prevAt = bytes, now
+	// Keep the ticks that start within span (always the newest one).
+	i := 0
+	for i < len(w.ticks)-1 && now.Sub(w.ticks[i].start) > w.span {
+		i++
+	}
+	w.ticks = append(w.ticks[:0], w.ticks[i:]...)
+	var sum int64
+	var dur time.Duration
+	for _, t := range w.ticks {
+		sum += t.bytes
+		dur += t.dur
+	}
+	if sum <= 0 || dur <= 0 {
+		return 0
+	}
+	return int64(float64(sum) / dur.Seconds())
 }
 
 // RecordStageDone reports whether Run finished its copy (or record) stage:
@@ -415,6 +503,7 @@ func (im *Importer) Stats() Stats {
 		NonMedia:     im.nonMedia.Load(),
 		Errors:       im.errs.Load(),
 		BytesCopied:  im.bytesCopied.Load(),
+		Rate:         im.rate.Load(),
 
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),
@@ -543,10 +632,10 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 				return nil, im.restoreTrashed(ctx, hash, srcPath, origin, fromZip, copyFirst)
 			}
 		}
-		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog"}
+		return nil, &Result{Status: StatusDuplicate, Source: origin, Dest: rel, Message: "already in catalog", Hash: hash}
 	}
 	if _, loaded := im.inflight.LoadOrStore(hash, origin); loaded {
-		return nil, &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import"}
+		return nil, &Result{Status: StatusDuplicate, Source: origin, Message: "duplicate of another file in this import", Hash: hash}
 	}
 	keep := false
 	claim := ""
@@ -737,21 +826,91 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 // stage copies the source file src into a library temp file
 // (library.StageFile), holding one of the SourceReaders slots while it
 // reads. Every buffer written is added to bytesCopied and to *counted.
+// A file on a phone mount is pulled through the gvfs daemon instead
+// (library.StagePulled with gvfs.Pull) while that works; see pullFailed.
 func (im *Importer) stage(ctx context.Context, src string, counted *int64) (library.Staged, error) {
 	release, err := im.sourceSlot(ctx, src)
 	if err != nil {
 		return library.Staged{}, err
 	}
 	defer release()
+	onWrite := func(n int64) {
+		*counted += n
+		im.bytesCopied.Add(n)
+	}
+	if im.devicePull(src) {
+		before := *counted
+		pull, pullErr := im.pullFunc(src)
+		st, err := library.StagePulled(ctx, src, im.lib.TempDir(), pull, onWrite)
+		if err == nil {
+			im.log.Debug("pulled through gvfs", "file", src, "bytes", st.Size)
+			return st, nil
+		}
+		if ctx.Err() != nil {
+			return library.Staged{}, err
+		}
+		// Read it again through FUSE: take back what the pull counted.
+		im.bytesCopied.Add(before - *counted)
+		*counted = before
+		im.pullFailed(src, *pullErr, err)
+	}
 	in, err := im.openSource(src)
 	if err != nil {
 		return library.Staged{}, err
 	}
 	defer in.Close()
-	return library.StageFile(ctx, in, im.lib.TempDir(), func(n int64) {
-		*counted += n
-		im.bytesCopied.Add(n)
-	})
+	return library.StageFile(ctx, in, im.lib.TempDir(), onWrite)
+}
+
+// devicePull reports whether the source file p is read by pulling it
+// through the gvfs daemon (gio copy) instead of through its FUSE mount.
+func (im *Importer) devicePull(p string) bool {
+	return im.usePull.Load() && im.isDevice(p)
+}
+
+// pullFunc returns im.pull for src as a library.PullFunc, and where the
+// pull's own error is kept (nil when the pull succeeded or did not run).
+// A pull that works resets the count of failed pulls in a row.
+func (im *Importer) pullFunc(src string) (library.PullFunc, *error) {
+	var pullErr error
+	return func(ctx context.Context, dst string, onProgress func(int64)) error {
+		pullErr = im.pull(ctx, src, dst, onProgress)
+		if pullErr == nil {
+			im.pullFails.Store(0)
+		}
+		return pullErr
+	}, &pullErr
+}
+
+// maxPullFailures is how many pulls in a row may fail before pulling is
+// turned off for the rest of the run. A single failure is often the
+// file's (deleted from the phone since the scan, refused by the phone,
+// the local disk full), and reading the rest of a large import through
+// FUSE is slow; failures in a row mean gio or the daemon is broken.
+const maxPullFailures = 3
+
+// pullFailed handles a failed pull of src, before the file is read through
+// FUSE instead. pullErr is the pull's own error: gio missing
+// (gvfs.ErrUnavailable) turns pulling off silently. Any other pull error
+// reads only this file through FUSE (a debug line per file) and counts as
+// a failure; after maxPullFailures failures in a row (a pull that works
+// resets the count) pulling is turned off for the rest of the run with one
+// warning. Without a pull error (the pulled copy had the wrong size or
+// could not be hashed) only this file is read through FUSE and nothing is
+// counted.
+func (im *Importer) pullFailed(src string, pullErr, err error) {
+	switch {
+	case pullErr == nil:
+		im.log.Debug("pulled copy not used, reading through FUSE", "file", src, "err", err)
+	case errors.Is(pullErr, gvfs.ErrUnavailable):
+		im.usePull.Store(false)
+	default:
+		im.log.Debug("gio copy failed, reading this file through FUSE", "file", src, "err", pullErr)
+		if im.pullFails.Add(1) >= maxPullFailures && im.usePull.Swap(false) {
+			im.log.Warn("gio copy failed repeatedly, reading the rest through FUSE",
+				"in_a_row", maxPullFailures, "file", src, "err", pullErr)
+		}
+	}
 }
 
 // sourceSlot takes one of the SourceReaders slots for a read of p, a
@@ -794,13 +953,29 @@ func (im *Importer) verifySource(ctx context.Context, src string, want uint64) e
 
 // hashSource hashes the file at p (the hash-first path, and the second read
 // of a copy-first move), holding a SourceReaders slot when p is outside the
-// library.
+// library. A file on a phone mount is pulled through the gvfs daemon into
+// a second temp file, hashed and removed (library.HashPulled), while that
+// works; see pullFailed. A pulled copy whose size differs from the
+// source's is not used: p is read through FUSE (as stage does), so a
+// device whose pulls come back short does not block a move.
 func (im *Importer) hashSource(ctx context.Context, p string) (uint64, int64, error) {
 	release, err := im.sourceSlot(ctx, p)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer release()
+	if im.devicePull(p) {
+		pull, pullErr := im.pullFunc(p)
+		h, n, err := library.HashPulled(ctx, p, im.lib.TempDir(), pull)
+		if err == nil {
+			im.log.Debug("hashed a pull through gvfs", "file", p, "bytes", n)
+			return h, n, nil
+		}
+		if ctx.Err() != nil {
+			return 0, 0, err
+		}
+		im.pullFailed(p, *pullErr, err)
+	}
 	f, err := im.openSource(p)
 	if err != nil {
 		return 0, 0, err
@@ -1072,7 +1247,7 @@ func (im *Importer) commit(batch []*pending) error {
 		if !inserted[i] {
 			im.undo(p)
 			im.release(p)
-			r := Result{Status: StatusDuplicate, Source: p.origin, Message: "duplicate of a file recorded concurrently"}
+			r := Result{Status: StatusDuplicate, Source: p.origin, Message: "duplicate of a file recorded concurrently", Hash: p.hash}
 			if rel, found, err := im.db.LookupHash(ctx, p.hash); err == nil && found {
 				r.Dest = rel
 			}
@@ -1080,7 +1255,7 @@ func (im *Importer) commit(batch []*pending) error {
 			continue
 		}
 		im.release(p)
-		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath}
+		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath, Hash: p.hash}
 		if p.trash {
 			r.Message = "in trash"
 		} else if p.moved {

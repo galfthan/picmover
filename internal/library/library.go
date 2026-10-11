@@ -229,8 +229,11 @@ func IsDatabaseName(base string) bool {
 }
 
 // IsUserDBBackup reports whether base is a copy of user.db made before a
-// schema migration: user.db.bak-YYYYMMDD-HHMMSS, optionally followed by
-// -wal, -shm or -journal (compared case-insensitively).
+// schema migration: user.db.bak-YYYYMMDD-HHMMSS, optionally with a -N
+// counter (a second copy in the same second) and followed by -wal, -shm
+// or -journal, or its in-progress temp file
+// user.db.bak-YYYYMMDD-HHMMSS.<pid>-<hex>.tmp (compared
+// case-insensitively).
 func IsUserDBBackup(base string) bool {
 	ts, ok := strings.CutPrefix(strings.ToLower(base), UserDBName+".bak-")
 	if !ok {
@@ -242,7 +245,32 @@ func IsUserDBBackup(base string) bool {
 			break
 		}
 	}
-	return isBackupStamp(ts)
+	if len(ts) < len(BackupStampLayout) || !isBackupStamp(ts[:len(BackupStampLayout)]) {
+		return false
+	}
+	rest := ts[len(BackupStampLayout):]
+	switch {
+	case rest == "":
+		return true
+	case strings.HasPrefix(rest, "-"):
+		return allOf(rest[1:], "0123456789")
+	case strings.HasPrefix(rest, ".") && strings.HasSuffix(rest, ".tmp"):
+		return allOf(rest[1:len(rest)-len(".tmp")], "0123456789abcdef-")
+	}
+	return false
+}
+
+// allOf reports whether s is not empty and has only bytes of set.
+func allOf(s, set string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !strings.ContainsRune(set, rune(s[i])) {
+			return false
+		}
+	}
+	return true
 }
 
 // isBackupName matches the catalog backups written by "picmover rebuild",
@@ -304,8 +332,10 @@ func isBackupStamp(s string) bool {
 	return true
 }
 
-// CleanTemp removes everything in the temp directory. Only one importer may
-// use a library at a time.
+// CleanTemp removes everything in the temp directory: copy-*.part files
+// and the pull-* directories of pulls (see pullTemp), including any file a
+// gvfs daemon wrote there after its gio client was killed. Only one
+// importer may use a library at a time.
 func (l *Library) CleanTemp() error {
 	entries, err := os.ReadDir(l.TempDir())
 	if err != nil {

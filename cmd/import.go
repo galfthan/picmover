@@ -18,6 +18,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/metadata"
 	"picmover/internal/userdata"
@@ -40,6 +41,10 @@ With --move the sources are deleted once they are safely recorded.
 After the copy stage a thumbnail (256 px) and a preview (1600 px) of every
 imported file are generated into <library>/.picmover (skip with
 --no-thumbs; 'picmover thumbs' generates them later).
+
+Every import is recorded in the library's import history in user.db
+(created when missing); the summary prints the record's id, and
+'picmover imports <library>' lists them.
 
 A detailed log is written to <library>/.picmover/logs/.`,
 		Args: exactArgs(2),
@@ -192,29 +197,65 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		if !p.quiet {
 			status = newStatusLine(out)
 		}
-		if status != nil {
-			// The transfer rate is measured between two ticks.
-			prevBytes, prevAt := int64(0), time.Now()
-			opts.OnProgress = func(s importer.Stats) {
-				now := time.Now()
-				rate := transferRate(s.BytesCopied-prevBytes, now.Sub(prevAt))
-				prevBytes, prevAt = s.BytesCopied, now
-				status.show(formatStatus(s, rate))
+		// The import history (user.db, created when missing). A user.db
+		// that cannot be opened only costs the record.
+		user, userErr := userdata.Open(ctx, filepath.Join(lib.Root(), userdata.FileName))
+		if userErr != nil {
+			logger.Error("open user.db", "err", userErr)
+		} else {
+			defer user.Close()
+			if from, bak := user.Migrated(); from != 0 {
+				fmt.Fprintln(out, migrationNotice(from, bak))
 			}
+			if !p.recordInPlace {
+				// A rebuild backfills from the old catalog before its
+				// backup (cmd/rebuild.go); this catalog is the live one.
+				backfill(ctx, db, user, logger)
+				// Holding the library lock, no other run can own a
+				// running record: each is a crashed run's.
+				closeCrashed(ctx, user, db.SessionHashes, logger)
+			}
+		}
+		mode := userdata.ImportModeCopy
+		switch {
+		case p.recordInPlace:
+			mode = userdata.ImportModeRebuild
+		case p.move:
+			mode = userdata.ImportModeMove
+		}
+		rec := importrec.Begin(ctx, user, userErr, p.source, mode, logger)
+		opts.OnResult = rec.OnResult
+		var im *importer.Importer
+		opts.OnProgress = func(s importer.Stats) {
+			if status != nil {
+				status.show(formatStatus(s))
+			}
+			// The record links to its catalog session while it runs, so
+			// a crash leaves it findable (FinishImport writes it too).
+			rec.SetSession(ctx, im.SessionID())
 		}
 		if !p.recordInPlace {
 			// Content found in the trash is restored; its user.db trash
 			// row is removed when there is a user.db.
 			opts.OnRestored = func(ctx context.Context, hash uint64) error {
+				if user != nil {
+					return user.Untrash(ctx, []uint64{hash})
+				}
 				return untrashUserDB(ctx, lib.Root(), hash)
 			}
 		}
-		im := importer.New(lib, db, opts)
+		im = importer.New(lib, db, opts)
 		stats, runErr = im.Run(ctx)
 		recorded = im.RecordStageDone()
 		if status != nil {
 			status.done()
 		}
+		outcome := importrec.Outcome(runErr)
+		if p.recordInPlace && !recorded && outcome == userdata.ImportDone {
+			outcome = userdata.ImportFailed // rolled back below
+		}
+		rec.Finish(ctx, outcome, stats, im.SessionID(), db)
+		sum.importID, sum.recordErr = rec.ID(), rec.Err()
 		if p.recordInPlace && !recorded {
 			closeDB()
 		}
@@ -318,27 +359,18 @@ func redrawLine(line string, width int, vt bool) string {
 	return "\r" + strings.Repeat(" ", width) + "\r" + line
 }
 
-// formatStatus is the live status line of an import; rate is the current
-// transfer rate in bytes per second, shown only while bytes are moving.
-func formatStatus(s importer.Stats, rate int64) string {
+// formatStatus is the live status line of an import; the transfer rate
+// is shown only while bytes are moving.
+func formatStatus(s importer.Stats) string {
 	line := fmt.Sprintf("Scanned %d | Imported %d | Existing %d | Duplicates %d | Small %d | Non-media %d | Errors %d | Copied %s",
 		s.Scanned, s.Imported, s.Existing, s.Duplicates, s.SkippedSmall, s.NonMedia, s.Errors, humanSize(s.BytesCopied))
-	if rate > 0 {
-		line += " (" + humanSize(rate) + "/s)"
+	if s.Rate > 0 {
+		line += " (" + humanSize(s.Rate) + "/s)"
 	}
 	if n := thumbsProcessed(s); n > 0 {
 		line += fmt.Sprintf(" | Thumbs %d", n)
 	}
 	return line
-}
-
-// transferRate returns delta bytes over elapsed in bytes per second; 0
-// when nothing was copied (or a discarded copy was taken back).
-func transferRate(delta int64, elapsed time.Duration) int64 {
-	if delta <= 0 || elapsed <= 0 {
-		return 0
-	}
-	return int64(float64(delta) / elapsed.Seconds())
 }
 
 // thumbsProcessed is the number of rows the thumbnail stage has finished.
@@ -365,6 +397,8 @@ type importSummary struct {
 	libRoot, logPath string
 	isNew            bool
 	thumbs           bool // print the thumbnail counters
+	importID         int64
+	recordErr        error
 }
 
 func (is importSummary) print(w io.Writer, s importer.Stats) {
@@ -385,7 +419,41 @@ func (is importSummary) print(w io.Writer, s importer.Stats) {
 	} else {
 		fmt.Fprintf(w, "Library: %s\n", is.libRoot)
 	}
+	switch {
+	case is.importID != 0 && is.recordErr == nil:
+		fmt.Fprintf(w, "Import record: #%d\n", is.importID)
+	case is.importID != 0:
+		fmt.Fprintf(w, "Import record: #%d (incomplete: %v; see the log)\n", is.importID, is.recordErr)
+	case is.recordErr != nil:
+		fmt.Fprintf(w, "Import record: could not be written (%v; see the log)\n", is.recordErr)
+	}
 	fmt.Fprintf(w, "Log: %s\n", is.logPath)
+}
+
+// backfill copies the catalog's import sessions into the import history
+// of user.db the first time (importrec.Backfill); a failure is logged.
+func backfill(ctx context.Context, db *catalog.DB, user *userdata.DB, logger *slog.Logger) {
+	n, err := importrec.Backfill(ctx, db, user)
+	switch {
+	case err != nil:
+		logger.Error("import history backfill", "err", err)
+	case n > 0:
+		logger.Info("import history backfilled from the catalog", "records", n)
+	}
+}
+
+// closeCrashed closes the import records left running by a process that
+// died (importrec.CloseCrashed: outcome failed, items from the catalog
+// rows of their session, rows nil: none); the caller holds the library
+// lock, so no record is a live run's. A failure is logged.
+func closeCrashed(ctx context.Context, user *userdata.DB, rows importrec.SessionRows, logger *slog.Logger) {
+	n, err := importrec.CloseCrashed(ctx, user, rows, nil, logger)
+	switch {
+	case err != nil:
+		logger.Error("close crashed import records", "err", err)
+	case n > 0:
+		logger.Info("crashed import records closed", "records", n)
+	}
 }
 
 // untrashUserDB removes hash's trash row from the library's user.db, when

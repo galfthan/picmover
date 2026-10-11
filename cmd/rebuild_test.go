@@ -12,6 +12,7 @@ import (
 	"picmover/internal/catalog"
 	"picmover/internal/library"
 	"picmover/internal/testimg"
+	"picmover/internal/userdata"
 )
 
 // Rebuild through a library path that contains a symlink records the same
@@ -85,7 +86,7 @@ func TestRebuildRecordsInPlace(t *testing.T) {
 		if d.IsDir() && d.Name() == library.MetaDir {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() && !strings.HasPrefix(d.Name(), library.DBName) {
+		if !d.IsDir() && !strings.HasPrefix(d.Name(), library.DBName) && !strings.HasPrefix(d.Name(), userdata.FileName) {
 			rel, _ := filepath.Rel(dir, p)
 			files = append(files, filepath.ToSlash(rel))
 		}

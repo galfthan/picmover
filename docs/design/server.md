@@ -268,7 +268,7 @@ Job object:
  "startedAt":"2026-10-10T12:00:00+03:00","finishedAt":null,
  "stats":{"scanned":120,"imported":80,"existing":3,"duplicates":10,"skippedSmall":2,
           "nonMedia":5,"errors":0,"bytesCopied":123456789,
-          "thumbsDone":40,"thumbsUnsupported":0,"thumbsFailed":0},
+          "rate":12897485,"thumbsDone":40,"thumbsUnsupported":0,"thumbsFailed":0},
  "sessionId":17,"logPath":"/lib/.picmover/logs/import_2026-10-10_12-00-00.log",
  "error":null,"exitCode":0}
 ```
@@ -308,6 +308,12 @@ then live events. Slow subscribers are dropped (closed) rather than blocking
 the importer: the per-subscriber channel has a buffer of 1024 and a full
 buffer closes the stream (the client reconnects and gets the ring). A
 `progress` event is coalesced: only the latest stats are sent.
+
+`stats.rate` is the import transfer rate in bytes per second, computed in
+the importer (`importer.Stats.Rate`, the growth of `bytesCopied` over about
+the last two seconds of progress ticks); it is 0 while nothing is moving
+and in the final stats of `done`. The web UI shows it after the copied
+size as `(12.3 MiB/s)` only while it is positive.
 
 Cancel: `POST /api/jobs/{id}/cancel` cancels the job context; the importer
 already handles that safely (batch commit or undo). Shutting the server

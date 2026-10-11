@@ -24,20 +24,24 @@
     filters: Filters;
     /** Item open in the lightbox, null when closed. */
     viewId: number | null;
-    /** grid: all photos; album: one album (albumId); trash: trashed items. */
-    mode?: 'grid' | 'album' | 'trash';
+    /** grid: all photos; album: one album (albumId); import: one import record (importId); trash: trashed items. */
+    mode?: 'grid' | 'album' | 'import' | 'trash';
     albumId?: number | null;
+    importId?: number | null;
     /** Router path of this page, for filter links ("/l/peter/albums/3"). */
     basePath: string;
     /** Page header above the toolbar (album name, Empty trash). */
     header?: Snippet;
   }
-  let { api, filters, viewId, mode = 'grid', albumId = null, basePath, header }: Props = $props();
+  let { api, filters, viewId, mode = 'grid', albumId = null, importId = null, basePath, header }: Props = $props();
 
   /** The filters sent to the server: the URL's plus what the page implies. */
-  const effective = $derived<Filters>(
-    mode === 'trash' ? { ...filters, trashed: true } : mode === 'album' && albumId !== null ? { ...filters, album: albumId } : filters,
-  );
+  const effective = $derived.by<Filters>(() => {
+    if (mode === 'trash') return { ...filters, trashed: true };
+    if (mode === 'album' && albumId !== null) return { ...filters, album: albumId };
+    if (mode === 'import' && importId !== null) return { ...filters, import: importId };
+    return filters;
+  });
 
   const GAP = 4;
   const HEADER = 44;
@@ -165,7 +169,7 @@
 
   // Filters changed (or first mount): reload and go to the top, and start
   // a new selection.
-  const fkey = $derived(`${api.id}|${mode}|${albumId ?? ''}|${filtersKey(effective)}`);
+  const fkey = $derived(`${api.id}|${mode}|${albumId ?? ''}|${importId ?? ''}|${filtersKey(effective)}`);
   $effect(() => {
     const k = fkey;
     untrack(() => {
@@ -533,7 +537,7 @@
   }
 
   const libraryEmpty = $derived(library.info !== null && library.info.summary.total === 0);
-  const filtered = $derived(hasFilters(filters, { album: mode === 'album' }));
+  const filtered = $derived(hasFilters(filters, { album: mode === 'album', import: mode === 'import' }));
 </script>
 
 <svelte:window onkeydown={onKeydown} />
@@ -541,7 +545,7 @@
 <div class="grid-page">
   {@render header?.()}
   <div class="toolbar">
-    <FiltersBar {filters} onchange={applyFilters} hideAlbum={mode === 'album'} />
+    <FiltersBar {filters} onchange={applyFilters} hideAlbum={mode === 'album'} hideImport={mode === 'import'} />
     <div class="spacer"></div>
     {#if tlStatus === 'ready'}
       <span class="muted small count">{formatCount(totalCount)} items</span>
@@ -580,6 +584,9 @@
             <h2>This album is empty</h2>
             <p>Select photos in Photos and add them with the Album button.</p>
             <a class="btn" href={libHref(api.id, '')}>Go to Photos</a>
+          {:else if mode === 'import' && !filtered}
+            <h2>Nothing from this import is in the library</h2>
+            <p>Its photos and videos were removed or are in the trash.</p>
           {:else if libraryEmpty && !filtered}
             <h2>Your library is empty</h2>
             <p>Import photos and videos from a camera card, phone backup or folder.</p>
@@ -641,7 +648,7 @@
     {#if tlStatus === 'ready' && buckets.length > 0}
       <Scrubber {timeline} {scrollTop} viewportHeight={height} onjump={scrollToY} />
     {/if}
-    <SelectionBar {api} mode={mode} {albumId} currentRating={commonRating} bind:height={barHeight} />
+    <SelectionBar {api} mode={mode === 'import' ? 'grid' : mode} {albumId} currentRating={commonRating} bind:height={barHeight} />
   </div>
 </div>
 

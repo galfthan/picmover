@@ -1,7 +1,7 @@
 // Library-scoped URLs and chunked mutations, against a recording fake fetch.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, chunks, filterParams, libApi, libraryCoverUrl, setUnavailableHandler } from './api';
+import { ApiError, chunks, filterParams, libApi, libraryCoverUrl, setUnavailableHandler, toImport, toImportRefs } from './api';
 
 interface Call {
   method: string;
@@ -312,5 +312,115 @@ describe('backups', () => {
       { kind: 'backup', target: T, takeOver: true },
     ]);
     expect(calls.every((c) => c.path === '/api/l/peter/jobs')).toBe(true);
+  });
+});
+
+describe('import records', () => {
+  const api = libApi('peter');
+  const H = '00000000000000a1';
+  const rec = {
+    id: 12,
+    name: 'Summer',
+    startedAt: '2026-10-09T10:00:00+03:00',
+    finishedAt: '2026-10-09T10:05:00+03:00',
+    source: '/media/card/DCIM',
+    sourceName: 'DCIM',
+    mode: 'copy',
+    host: 'laptop',
+    outcome: 'done',
+    imported: 12,
+    existing: 3,
+    duplicates: 2,
+    skipped: 1,
+    errors: 1,
+    bytes: 123456,
+    items: 15,
+    cover: H,
+  };
+
+  it('lists records and fills missing fields', async () => {
+    reply = () => json({ imports: [rec, { id: 3, startedAt: '2026-01-01T00:00:00Z', finishedAt: null, cover: 0 }, 'junk'] });
+    const list = await api.getImports();
+    expect(calls.map((c) => c.path)).toEqual(['/api/l/peter/imports']);
+    expect(list[0]).toEqual(rec);
+    expect(list[1]).toEqual({
+      id: 3,
+      name: '',
+      startedAt: '2026-01-01T00:00:00Z',
+      finishedAt: null,
+      source: '',
+      sourceName: '',
+      mode: '',
+      host: '',
+      outcome: '',
+      imported: 0,
+      existing: 0,
+      duplicates: 0,
+      skipped: 0,
+      errors: 0,
+      bytes: 0,
+      items: null,
+      cover: null,
+    });
+    expect(list).toHaveLength(2);
+    reply = () => json({ imports: null });
+    expect(await api.getImports()).toEqual([]);
+  });
+
+  it('keeps a rebuild record without items', () => {
+    expect(toImport({ ...rec, mode: 'rebuild', items: null, cover: null })).toMatchObject({ mode: 'rebuild', items: null, cover: null });
+    expect(toImport({ ...rec, items: 0 }).items).toBe(0);
+    expect(toImport({ ...rec, items: 'x' }).items).toBeNull();
+  });
+
+  it('reads a cover only as a hash', () => {
+    expect(toImport({ ...rec, cover: '' }).cover).toBeNull();
+    expect(toImport({ ...rec, cover: 'A1' }).cover).toBeNull();
+    expect(toImport({ ...rec, cover: null }).cover).toBeNull();
+    // A wrapped answer works too.
+    expect(toImport({ import: rec })).toEqual(rec);
+  });
+
+  it('gets, renames and deletes one record by id', async () => {
+    reply = (c) => json(c.method === 'GET' ? rec : {});
+    expect(await api.getImport(12)).toEqual(rec);
+    await api.renameImport(12, '');
+    await api.deleteImport(12);
+    expect(calls.map((c) => [c.method, c.path, c.body])).toEqual([
+      ['GET', '/api/l/peter/imports/12', null],
+      ['POST', '/api/l/peter/imports/12', { name: '' }],
+      ['POST', '/api/l/peter/imports/12/delete', {}],
+    ]);
+  });
+
+  it('never puts an invalid id into a URL', async () => {
+    await expect(api.getImport(0)).rejects.toBeInstanceOf(ApiError);
+    await expect(api.deleteImport(-1)).rejects.toBeInstanceOf(ApiError);
+    await expect(api.renameImport(1.5, 'x')).rejects.toBeInstanceOf(ApiError);
+    expect(calls).toEqual([]);
+  });
+
+  it('passes the import filter to every listing', async () => {
+    expect(filterParams({ album: 2, import: 7 }).toString()).toBe('album=2&import=7');
+    reply = () => json({ buckets: [] });
+    await api.getTimeline({ import: 7 });
+    expect(calls[0]?.path).toBe('/api/l/peter/timeline?import=7');
+  });
+
+  it('reads the records in the media detail', async () => {
+    reply = () =>
+      json({
+        id: 1,
+        hash: H,
+        imports: [{ id: 4, name: '', startedAt: '2026-10-09T10:00:00Z', mode: 'move', sourceName: 'DCIM' }, { id: 0 }, { id: 5, startedAt: '' }],
+      });
+    const d = await api.getMedia(1);
+    expect(d.imports).toEqual([
+      { id: 4, name: '', startedAt: '2026-10-09T10:00:00Z', mode: 'move', sourceName: 'DCIM' },
+      { id: 5, name: '', startedAt: null, mode: '' },
+    ]);
+    reply = () => json({ id: 1, hash: H });
+    expect(await api.getMedia(1)).not.toHaveProperty('imports');
+    expect(toImportRefs(null)).toEqual([]);
   });
 });

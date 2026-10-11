@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"picmover/internal/catalog"
+	"picmover/internal/importrec"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
 	"picmover/internal/userdata"
@@ -244,6 +245,10 @@ type workspace struct {
 	root   string // absolute; the workspace folder, or the library root in single mode
 	single bool
 	log    *slog.Logger
+
+	// ownedImports reports the import records the live job on a library
+	// owns (jobManager.ownedImports); nil until the job manager exists.
+	ownedImports func(e *libEntry) (owned func(id int64) bool, ok bool)
 
 	mu     sync.Mutex
 	closed bool                 // shut down: nothing opens any more
@@ -537,7 +542,43 @@ func (ws *workspace) open(ctx context.Context, e *libEntry) error {
 		return ws.failLocked(e, libError, err)
 	}
 	ws.log.Info("library opened", "id", e.id, "root", lib.Root())
+	backfillImports(ctx, db, e.user, ws.log)
+	if ws.ownedImports != nil {
+		if owned, ok := ws.ownedImports(e); ok {
+			closeCrashedImports(ctx, db, e.user, owned, ws.log)
+		}
+	}
 	return nil
+}
+
+// backfillImports copies the catalog's import sessions into the import
+// history of user.db the first time a library is opened
+// (importrec.Backfill); a failure is logged and never fails the open.
+func backfillImports(ctx context.Context, db *catalog.DB, user *userdata.DB, log *slog.Logger) {
+	n, err := importrec.Backfill(ctx, db, user)
+	switch {
+	case err != nil:
+		log.Error("import history backfill", "err", err)
+	case n > 0:
+		log.Debug("import history backfilled from the catalog", "records", n)
+	}
+}
+
+// closeCrashedImports closes the import records left running by a
+// process that died (importrec.CloseCrashed), filling their items from
+// the catalog rows of their session; records owned (nil: none) by a live
+// job are kept. A failure is logged and never fails the open.
+func closeCrashedImports(ctx context.Context, db *catalog.DB, user *userdata.DB, owned func(int64) bool, log *slog.Logger) {
+	if user == nil {
+		return
+	}
+	n, err := importrec.CloseCrashed(ctx, user, db.SessionHashes, owned, log)
+	switch {
+	case err != nil:
+		log.Error("close crashed import records", "err", err)
+	case n > 0:
+		log.Info("crashed import records closed", "records", n)
+	}
 }
 
 // releaseLocked closes user.db and releases the lock of an entry that is
