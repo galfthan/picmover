@@ -230,7 +230,16 @@ as `import`: 0, 2 when some files failed, 130 cancelled, 1 otherwise.
 
 Job progress: `{phase: "plan"|"move"|"recover", files, totalFiles,
 bytes, totalBytes, current}`. Result: `{moved, existing, restored,
-failed: [{hash, error}], record: importId, targetLibrary}`. A plan or a
+failed: [{hash, error}], record: importId, targetLibrary}`.
+
+The job object of a transfer: `library` is the source id, `kind:
+"transfer"`, `to` the target id, `progress` the progress object above
+(null before the first event, sent in `progress` events like the backup
+kinds), `result` the result above once finished (null before), `importId`
+the B record id; `state`, `exitCode`, `error` as for every job.
+`GET /api/l/{lib}/jobs` lists a transfer under both its libraries.
+`failed` in the result holds at most 200 entries; `failedCount` the
+total. A plan or a
 job with `to` equal to `{lib}`, or naming a library outside the
 workspace, is 400; single-library mode has no target and is 400.
 
