@@ -485,9 +485,16 @@ on Escape. The root path is shown in the page header.
 
 - Tiles get a checkbox that appears on hover and stays visible while any
   selection exists. Clicking the checkbox, or Ctrl/Cmd-clicking a tile,
-  toggles; Shift-click selects the range from the last toggled tile in
-  display order (within loaded months; unloaded gaps are skipped and the
-  bar says so). Escape clears. Selection is a `Set<hash>` in
+  toggles and sets the anchor; Shift-click (on the tile or its checkbox)
+  applies the range from the anchor to the clicked tile, inclusive, in
+  display order and across months: it selects the range when the clicked
+  tile was not selected and deselects it when it was (the anchor's own
+  state does not matter), and the clicked tile becomes the anchor. Months
+  in the range that were never on screen are fetched first (the same
+  filtered bucket requests as scrolling there, four at a time), so the
+  range is exact; a month whose fetch fails is skipped and the bar says
+  so. Shift-click does not open the lightbox or select page text. Escape
+  clears. Selection is a `Set<hash>` in
   `selection.svelte.ts`, cleared on library or filter change, kept across
   scrolling and the lightbox.
 - The bar (sticky bottom) shows "N selected", Rate (five stars, click
@@ -1053,8 +1060,13 @@ Escape, focus return), `Toasts`; pages `Libraries`, `Albums`, `Album`,
 - The selection's scope key is library + page + album + filters; changing
   any of them clears it. A plain click on a tile still opens the lightbox
   while selecting; the checkbox, Ctrl/Cmd-click and Shift-click select.
-  The bar shows "(N in months not loaded were skipped)" after a range over
-  unloaded months. While the bar is shown, the grid (also on the album and
+  The bar shows "(N in months that could not be loaded were skipped)"
+  after a range over a month whose fetch failed; months that were merely
+  not loaded yet are fetched before the range is applied. A range whose
+  months are still loading when the timeline reloads (filter change, a
+  finished job) is dropped. Changing the scope also forgets the anchor,
+  so the next Shift-click toggles one tile. There is no keyboard
+  navigation between tiles, so there is no Shift+Arrow range either. While the bar is shown, the grid (also on the album and
   trash pages, which reuse it) grows at the bottom by the bar's measured
   height plus its 24 px margin, so the last row can be scrolled clear of
   the bar; the padding goes away with the selection.

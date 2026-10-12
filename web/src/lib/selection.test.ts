@@ -50,6 +50,21 @@ describe('Selection', () => {
     expect(s.skipped).toBe(5);
   });
 
+  it('deselects the range when the Shift-clicked item was selected', () => {
+    const s = new Selection();
+    const segs = [seg('a', 'b', 'c'), seg('d', 'e')];
+    s.toggle('a');
+    s.selectRange(segs, 'e');
+    expect(s.size).toBe(5);
+    // Anchor e; c is selected, so c..e are deselected whatever the anchor's state.
+    s.selectRange(segs, 'c');
+    expect(s.list()).toEqual(['a', 'b']);
+    expect(s.anchor).toBe('c');
+    // From c (not selected now) to d (not selected): selected again.
+    s.selectRange(segs, 'd');
+    expect(s.list().sort()).toEqual(['a', 'b', 'c', 'd']);
+  });
+
   it('toggles alone without an anchor', () => {
     const s = new Selection();
     s.selectRange([seg('a', 'b')], 'b');
@@ -78,5 +93,11 @@ describe('Selection', () => {
     expect(s.list()).toEqual(['a']);
     expect(s.anchor).toBeNull();
     expect(s.peek('a')).toBe(true);
+    // A deselected anchor survives the removal of other items.
+    s.toggle('a');
+    s.toggle('c');
+    s.toggle('a');
+    s.remove(['c']);
+    expect(s.anchor).toBe('a');
   });
 });

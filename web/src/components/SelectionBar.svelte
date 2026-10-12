@@ -153,7 +153,7 @@
     <span class="count" aria-live="polite">
       <strong>{formatCount(n)}</strong> selected
       {#if selection.skipped > 0}
-        <span class="muted small">({formatCount(selection.skipped)} in months not loaded were skipped)</span>
+        <span class="muted small">({formatCount(selection.skipped)} in months that could not be loaded were skipped)</span>
       {/if}
     </span>
 

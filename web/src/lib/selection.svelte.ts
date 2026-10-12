@@ -1,9 +1,11 @@
 // Multi-select in the grid (docs/design/management.md "Selection and the
 // selection bar"). The selection is a set of content hashes, kept across
 // scrolling and the lightbox, cleared when the library, the page or the
-// filters change (`scope`). Shift-click selects the range from the last
-// toggled tile in display order; only loaded months take part (an unloaded
-// month in between is skipped and counted in `skipped`).
+// filters change (`scope`). Shift-click applies a range from the anchor
+// (the last clicked tile) to the clicked tile in display order: it selects
+// the range when the clicked tile was not selected and deselects it when it
+// was. The grid loads the months in between first; a month that still
+// could not be loaded is skipped and counted in `skipped`.
 
 import { SvelteSet } from 'svelte/reactivity';
 
@@ -58,7 +60,7 @@ export function rangeBetween(segments: readonly OrderSegment[], a: string, b: st
 export class Selection {
   #set = new SvelteSet<string>();
   #scope = '';
-  /** The last toggled hash: one end of a Shift-click range. */
+  /** The last clicked hash: one end of a Shift-click range. */
   anchor = $state<string | null>(null);
   /** Items skipped by the last range because their month was not loaded. */
   skipped = $state(0);
@@ -89,8 +91,10 @@ export class Selection {
   }
 
   /**
-   * Shift-click on `target`: selects the range from the anchor. Without an
-   * anchor in the loaded months it toggles `target` alone.
+   * Shift-click on `target`: the range from the anchor takes the state
+   * `target` toggles to (selected when it was not, deselected when it was),
+   * whatever the anchor's own state, and `target` becomes the anchor.
+   * Without an anchor in the loaded months it toggles `target` alone.
    */
   selectRange(segments: readonly OrderSegment[], target: string): void {
     const a = this.anchor;
@@ -99,7 +103,11 @@ export class Selection {
       this.toggle(target);
       return;
     }
-    for (const h of r.hashes) this.#set.add(h);
+    const select = !this.#set.has(target);
+    for (const h of r.hashes) {
+      if (select) this.#set.add(h);
+      else this.#set.delete(h);
+    }
     this.skipped = r.skipped;
     this.anchor = target;
   }
@@ -110,8 +118,12 @@ export class Selection {
 
   /** Drops hashes that left the view (trashed, restored, removed from the album). */
   remove(hashes: Iterable<string>): void {
-    for (const h of hashes) this.#set.delete(h);
-    if (this.anchor !== null && !this.#set.has(this.anchor)) this.anchor = null;
+    let gone = false;
+    for (const h of hashes) {
+      this.#set.delete(h);
+      if (h === this.anchor) gone = true;
+    }
+    if (gone) this.anchor = null;
     if (this.#set.size === 0) this.skipped = 0;
   }
 
