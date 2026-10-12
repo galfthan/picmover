@@ -262,11 +262,20 @@ type Interrupted struct {
 }
 
 // ListInterrupted returns the unfinished moves whose target is lib,
-// oldest first, and removes finished journals older than 30 days. An
-// unreadable journal is returned with ID 0 and Open -1 (it needs a
-// person: the move cannot be finished automatically).
+// oldest first, and removes finished journals older than 30 days (lib is
+// locked by the caller). An unreadable journal is returned with ID 0 and
+// Open -1 (it needs a person: the move cannot be finished automatically).
 func ListInterrupted(lib *library.Library, now time.Time) ([]Interrupted, error) {
-	dir := journalDir(lib)
+	return listInterrupted(journalDir(lib), now, true)
+}
+
+// ListInterruptedAt is ListInterrupted for the library folder root that
+// this process may not hold: it only reads.
+func ListInterruptedAt(root string) ([]Interrupted, error) {
+	return listInterrupted(filepath.Join(root, library.MetaDir, JournalDir), time.Time{}, false)
+}
+
+func listInterrupted(dir string, now time.Time, prune bool) ([]Interrupted, error) {
 	des, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -286,7 +295,7 @@ func ListInterrupted(lib *library.Library, now time.Time) ([]Interrupted, error)
 			continue
 		}
 		if j.ended {
-			if fi, err := de.Info(); err == nil && now.Sub(fi.ModTime()) > keepJournals {
+			if fi, err := de.Info(); prune && err == nil && now.Sub(fi.ModTime()) > keepJournals {
 				os.Remove(p)
 			}
 			continue

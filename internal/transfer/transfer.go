@@ -78,6 +78,9 @@ type Options struct {
 	Logger     *slog.Logger
 	OnProgress func(Progress)
 	OnItem     func(Item)
+	// OnRecord is called with the target's import record id once it is
+	// written (Run only).
+	OnRecord func(id int64)
 	// BatchSize and BatchTime bound the target catalog transactions
 	// (0: 200 files, 10 s).
 	BatchSize int
@@ -339,6 +342,9 @@ func Run(ctx context.Context, from, to Side, hashes []uint64, opts Options) (Res
 		return Result{}, err
 	}
 	r.res.RecordID = id
+	if opts.OnRecord != nil {
+		opts.OnRecord(id)
+	}
 	if r.j, err = createJournal(to.Lib, Header{ID: id, Source: srcRef, Target: dstRef, StartedAt: r.now.Unix()}); err != nil {
 		r.finishRecord(bg, userdata.ImportFailed)
 		return r.res, err

@@ -289,6 +289,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/libraries/{lib}/open", s.needWorkspace(s.handleLibraryOpen))
 	mux.HandleFunc("GET /api/libraries/{lib}/cover", s.needWorkspace(s.handleLibraryCover))
 	mux.HandleFunc("POST /api/libraries/{lib}/jobs", s.needWorkspace(s.handleLibraryJobStart))
+	mux.HandleFunc("POST /api/libraries/{lib}/transfer/resume", s.needWorkspace(s.handleTransferResume))
 
 	scoped := func(pattern string, h func(http.ResponseWriter, *http.Request, *libHandles)) {
 		mux.HandleFunc(pattern, s.needWorkspace(s.scoped(h)))
@@ -324,6 +325,7 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("POST /api/l/{lib}/trash", s.handleTrash)
 	scoped("POST /api/l/{lib}/trash/restore", s.handleRestore)
 	scoped("POST /api/l/{lib}/trash/delete", s.handleTrashDelete)
+	scoped("POST /api/l/{lib}/transfer/plan", s.handleTransferPlan)
 	scoped("GET /api/l/{lib}/similar", s.handleSimilar)
 	scoped("POST /api/l/{lib}/similar/ignore", s.handleSimilarIgnore)
 	scoped("GET /api/l/{lib}/backups", s.handleBackups)

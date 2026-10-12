@@ -27,6 +27,9 @@ type libJSON struct {
 	// Backup is the library's backup status; omitted when it has no
 	// backup targets.
 	Backup *libBackupJSON `json:"backup,omitempty"`
+	// InterruptedMoves are the unfinished moves from or into the library
+	// (docs/design/library-move.md); omitted when none.
+	InterruptedMoves []interruptedJSON `json:"interruptedMoves,omitempty"`
 }
 
 // libBackupJSON is the backup one-liner of a library: targets and the
@@ -113,6 +116,9 @@ func (s *Server) describe(ctx context.Context, l listed, e *libEntry) libJSON {
 	}
 	if out.State != libError {
 		out.Backup = s.libBackup(ctx, l, e)
+	}
+	if moves := s.interruptedInvolving(ctx, l.id); len(moves) > 0 {
+		out.InterruptedMoves = moves
 	}
 	return out
 }
