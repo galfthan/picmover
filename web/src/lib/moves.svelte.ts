@@ -96,6 +96,8 @@ class MoveStore {
     const parts = chunks(hashes, TRANSFER_CHUNK);
     this.run = { from, to, resume: false, total: hashes.length, parts: parts.length, part: 0, jobId: null, state: 'running', error: '', totals: emptyTotals(), origin };
     const run = this.run;
+    /** Hashes of the jobs that started: they leave the selection (failed ones too, as the result lists them). */
+    const sent: string[] = [];
     for (const [i, part] of parts.entries()) {
       run.part = i + 1;
       run.jobId = null;
@@ -108,6 +110,7 @@ class MoveStore {
         break;
       }
       run.jobId = job.id;
+      sent.push(...part);
       const end = await jobs.waitFor(job.id);
       const res = toTransferResult(end.result);
       if (res) {
@@ -134,7 +137,7 @@ class MoveStore {
       }
     }
     if (run.state === 'running') run.state = 'done';
-    selection.remove(hashes);
+    selection.remove(sent);
     this.#after(run);
   }
 

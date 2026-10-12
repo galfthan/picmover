@@ -228,6 +228,18 @@ describe('move to library', () => {
     expect(tile(2)).not.toBeNull();
   });
 
+  it('keeps the selection when the job cannot start', async () => {
+    await start('#/l/peter/');
+    await select(1);
+    await moveTo('kids');
+    server.libs.find((l) => l.id === 'kids')!.state = 'busy';
+    click(button(dialog(), 'Move')!);
+    await settle();
+    expect(text(dialog())).toContain('The move failed: kids is in use by another picmover process');
+    expect(text(bar())).toContain('1 selected');
+    expect(tile(1)).not.toBeNull();
+  });
+
   it('blocks on an interrupted move until Finish moving has run', async () => {
     server.transfer.interrupted = [{ from: 'peter', to: 'kids', id: 7 }];
     await start('#/l/peter/');
