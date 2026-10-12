@@ -83,8 +83,9 @@ func newHolder(e *library.ErrLocked) *holderJSON {
 
 // describe returns the lib object of a listed library: the registry's
 // state when it has one, and the summary from a (cached) read-only peek
-// of media.db. A peek failure makes a closed library an error.
-func (s *Server) describe(ctx context.Context, l listed, e *libEntry) libJSON {
+// of media.db. A peek failure makes a closed library an error. moves
+// are the workspace's unfinished moves (allInterrupted).
+func (s *Server) describe(ctx context.Context, l listed, e *libEntry, moves []listedInterrupted) libJSON {
 	out := libJSON{ID: l.id, Name: l.id, Path: l.path, State: libClosed}
 	if e != nil {
 		e.mu.Lock()
@@ -117,8 +118,8 @@ func (s *Server) describe(ctx context.Context, l listed, e *libEntry) libJSON {
 	if out.State != libError {
 		out.Backup = s.libBackup(ctx, l, e)
 	}
-	if moves := s.interruptedInvolving(ctx, l.id); len(moves) > 0 {
-		out.InterruptedMoves = moves
+	if mine := interruptedInvolving(moves, l.id); len(mine) > 0 {
+		out.InterruptedMoves = mine
 	}
 	return out
 }
@@ -179,6 +180,7 @@ func (s *Server) listLibraries(ctx context.Context) (librariesJSON, error) {
 	out := librariesJSON{Root: c.root, Mode: c.mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
 	// The peeks a listing needs run concurrently, at most peekWorkers at
 	// a time; unchanged catalogs come from the cache.
+	moves := allInterrupted(ctx, s.ws, s.log) // once for the listing
 	var described []*libJSON
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, peekWorkers)
@@ -199,7 +201,7 @@ func (s *Server) listLibraries(ctx context.Context) (librariesJSON, error) {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			*d = s.describe(ctx, l, e)
+			*d = s.describe(ctx, l, e, moves)
 		})
 	}
 	wg.Wait()
@@ -260,7 +262,7 @@ func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
 		s.openFailed(w, r, l, e, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.describe(r.Context(), l, e))
+	writeJSON(w, http.StatusCreated, s.describe(r.Context(), l, e, allInterrupted(r.Context(), s.ws, s.log)))
 }
 
 // libEntry returns the registry entry of a listed library or folder, or
@@ -329,7 +331,7 @@ func (s *Server) handleLibraryOpen(w http.ResponseWriter, r *http.Request) {
 		s.openFailed(w, r, l, e, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.describe(r.Context(), l, e))
+	writeJSON(w, http.StatusOK, s.describe(r.Context(), l, e, allInterrupted(r.Context(), s.ws, s.log)))
 }
 
 // openBusyJSON is the 409 body when another process holds the library.

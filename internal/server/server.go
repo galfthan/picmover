@@ -294,6 +294,12 @@ func (s *Server) routes() *http.ServeMux {
 	scoped := func(pattern string, h func(http.ResponseWriter, *http.Request, *libHandles)) {
 		mux.HandleFunc(pattern, s.needWorkspace(s.scoped(h)))
 	}
+	// Changes of photos' user data: refused while a move runs on the
+	// library (it merges them into the target per batch; a change after
+	// a photo's batch would be lost).
+	edit := func(pattern string, h func(http.ResponseWriter, *http.Request, *libHandles)) {
+		scoped(pattern, notMoving(h))
+	}
 	scoped("GET /api/l/{lib}/library", s.handleLibrary)
 	scoped("GET /api/l/{lib}/timeline", s.handleTimeline)
 	scoped("GET /api/l/{lib}/media", s.handleMediaList)
@@ -307,17 +313,17 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("GET /api/l/{lib}/jobs", s.handleLibJobList)
 	scoped("POST /api/l/{lib}/jobs", s.handleJobStart)
 
-	scoped("POST /api/l/{lib}/ratings", s.handleRatings)
+	edit("POST /api/l/{lib}/ratings", s.handleRatings)
 	scoped("GET /api/l/{lib}/tags", s.handleTags)
-	scoped("POST /api/l/{lib}/tags", s.handleTagCreate)
-	scoped("POST /api/l/{lib}/tags/{tid}", s.handleTagRename)
-	scoped("POST /api/l/{lib}/tags/{tid}/delete", s.handleTagDelete)
-	scoped("POST /api/l/{lib}/media/tags", s.handleMediaTags)
+	edit("POST /api/l/{lib}/tags", s.handleTagCreate)
+	edit("POST /api/l/{lib}/tags/{tid}", s.handleTagRename)
+	edit("POST /api/l/{lib}/tags/{tid}/delete", s.handleTagDelete)
+	edit("POST /api/l/{lib}/media/tags", s.handleMediaTags)
 	scoped("GET /api/l/{lib}/albums", s.handleAlbums)
-	scoped("POST /api/l/{lib}/albums", s.handleAlbumCreate)
-	scoped("POST /api/l/{lib}/albums/{aid}", s.handleAlbumUpdate)
-	scoped("POST /api/l/{lib}/albums/{aid}/delete", s.handleAlbumDelete)
-	scoped("POST /api/l/{lib}/albums/{aid}/items", s.handleAlbumItems)
+	edit("POST /api/l/{lib}/albums", s.handleAlbumCreate)
+	edit("POST /api/l/{lib}/albums/{aid}", s.handleAlbumUpdate)
+	edit("POST /api/l/{lib}/albums/{aid}/delete", s.handleAlbumDelete)
+	edit("POST /api/l/{lib}/albums/{aid}/items", s.handleAlbumItems)
 	scoped("GET /api/l/{lib}/imports", s.handleImports)
 	scoped("GET /api/l/{lib}/imports/{iid}", s.handleImport)
 	scoped("POST /api/l/{lib}/imports/{iid}", s.handleImportRename)
@@ -327,7 +333,7 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("POST /api/l/{lib}/trash/delete", s.handleTrashDelete)
 	scoped("POST /api/l/{lib}/transfer/plan", s.handleTransferPlan)
 	scoped("GET /api/l/{lib}/similar", s.handleSimilar)
-	scoped("POST /api/l/{lib}/similar/ignore", s.handleSimilarIgnore)
+	edit("POST /api/l/{lib}/similar/ignore", s.handleSimilarIgnore)
 	scoped("GET /api/l/{lib}/backups", s.handleBackups)
 	scoped("POST /api/l/{lib}/backups/targets", s.handleTargetAdd)
 	scoped("POST /api/l/{lib}/backups/targets/{id}", s.handleTargetUpdate)
@@ -360,6 +366,18 @@ func (s *Server) scoped(h func(http.ResponseWriter, *http.Request, *libHandles))
 			return
 		}
 		defer l.entry.release()
+		h(w, r, l)
+	}
+}
+
+// notMoving answers 409 errMoving, without a state (the library is
+// open), while a move between libraries runs on the request's library.
+func notMoving(h func(http.ResponseWriter, *http.Request, *libHandles)) func(http.ResponseWriter, *http.Request, *libHandles) {
+	return func(w http.ResponseWriter, r *http.Request, l *libHandles) {
+		if l.entry.moving.Load() > 0 {
+			writeError(w, http.StatusConflict, errMoving.Error())
+			return
+		}
 		h(w, r, l)
 	}
 }

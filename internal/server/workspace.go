@@ -80,6 +80,10 @@ type libEntry struct {
 	// update the catalog: trash, restore, delete, an import's restore of
 	// trashed content, and a whole rebuild (beginRebuild to endRebuild).
 	trashMu sync.Mutex
+	// moving counts the moves between libraries (transfer jobs) holding
+	// trashMu: trash and user data requests are refused meanwhile
+	// (lockTrash, errMoving) instead of waiting for the whole move.
+	moving atomic.Int32
 
 	mu     sync.Mutex
 	state  string
