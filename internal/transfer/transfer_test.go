@@ -394,6 +394,220 @@ func TestCancelled(t *testing.T) {
 	}
 }
 
+// failInserts makes the target catalog refuse rows whose path contains
+// "bad"; the returned func lifts it.
+func failInserts(t *testing.T, s Side) func() {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.DB.ExecContext(ctx, `CREATE TRIGGER failbad BEFORE INSERT ON media WHEN NEW.rel_path LIKE '%bad%'
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if _, err := s.DB.ExecContext(ctx, "DROP TRIGGER IF EXISTS failbad"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A journal write that fails in a flush (the fail line of an undone
+// placement) stops the run, but the batch is never flushed again: the
+// undone file stays in the source with its row, and every file of the
+// batch is reported.
+func TestJournalErrorInFlush(t *testing.T) {
+	ctx := context.Background()
+	for _, cross := range []bool{false, true} {
+		if cross {
+			crossVolume(t)
+		}
+		a, b := newSide(t, "a"), newSide(t, "b")
+		good := photo(t, a, "image/2024/06/good.jpg", content("g"), false)
+		bad := photo(t, a, "image/2024/06/bad.jpg", content("b"), false)
+		lift := failInserts(t, b)
+		once := false
+		journalFail = func(bs []byte) error {
+			if !once && strings.HasPrefix(string(bs), `{"op":"fail"`) {
+				once = true
+				lift() // the catalog error was transient
+				return os.ErrPermission
+			}
+			return nil
+		}
+		t.Cleanup(func() { journalFail = func([]byte) error { return nil } })
+		var items []Item
+		res, err := Run(ctx, a, b, []uint64{good.Hash, bad.Hash}, Options{BatchSize: 2,
+			OnItem: func(it Item) { items = append(items, it) }})
+		journalFail = func([]byte) error { return nil }
+		if err == nil || res.Moved != 1 || res.Failed != 1 || len(items) != 2 {
+			t.Fatalf("cross=%v: result %+v %v items %+v", cross, res, err, items)
+		}
+		if _, ok := getRow(t, b.DB, bad.Hash); ok {
+			t.Fatalf("cross=%v: the undone file was recorded in the target", cross)
+		}
+		if row, ok := getRow(t, a.DB, bad.Hash); !ok || !row.DeletedAt.IsZero() || !exists(a.Lib.Abs(bad.RelPath)) {
+			t.Fatalf("cross=%v: the undone file must stay live in the source: %+v", cross, row)
+		}
+		if exists(b.Lib.Abs(bad.RelPath)) {
+			t.Fatalf("cross=%v: the undone file is in the target", cross)
+		}
+		// Its entry stays open (no fail line): recovery finds nothing placed.
+		res, err = Run(ctx, a, b, nil, Options{})
+		if err != nil || res.Recovered != 0 {
+			t.Fatalf("cross=%v: recovering run %+v %v", cross, res, err)
+		}
+		if list, _ := ListInterrupted(b.Lib, time.Now()); len(list) != 0 {
+			t.Fatalf("cross=%v: interrupted %+v", cross, list)
+		}
+		if row, ok := getRow(t, a.DB, bad.Hash); !ok || !row.DeletedAt.IsZero() || !exists(a.Lib.Abs(bad.RelPath)) {
+			t.Fatalf("cross=%v: after recovery the file must stay live in the source: %+v", cross, row)
+		}
+	}
+}
+
+// A row the batch fallback does not insert because the target catalog
+// got another row of the content meanwhile is not recorded: the placement
+// is undone.
+func TestInsertNotDoneIsUndone(t *testing.T) {
+	ctx := context.Background()
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/i.jpg", content("i"), false)
+	old := crashAt
+	crashAt = func(p string) {
+		if p == "before-insert" {
+			other := m
+			other.ID, other.RelPath = 0, "image/elsewhere/i.jpg"
+			if _, err := b.DB.InsertMedia(ctx, nil, &other); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Cleanup(func() { crashAt = old })
+	res, items := doMove(t, a, b, m.Hash)
+	if res.Failed != 1 || res.Moved != 0 {
+		t.Fatalf("result %+v items %+v", res, items)
+	}
+	if !exists(a.Lib.Abs(m.RelPath)) || exists(b.Lib.Abs(m.RelPath)) {
+		t.Fatal("the placement should be undone")
+	}
+	if row, ok := getRow(t, a.DB, m.Hash); !ok || !row.DeletedAt.IsZero() {
+		t.Fatalf("source row %+v", row)
+	}
+	if !journalEnded(t, b, res.RecordID) {
+		t.Error("journal not ended")
+	}
+}
+
+// When a row is not inserted and its placement cannot be undone, the
+// journal stays open and recovery records the file.
+func TestUndoFailedLeavesJournalOpen(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permissions do not apply to root")
+	}
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/bad.jpg", content("u"), false)
+	lift := failInserts(t, b)
+	dir := a.Lib.Abs("image/2024/06")
+	old := crashAt
+	crashAt = func(p string) {
+		if p == "before-insert" {
+			os.Chmod(dir, 0o555) // the rename back fails
+		}
+	}
+	t.Cleanup(func() { crashAt = old; os.Chmod(dir, 0o755) })
+	res, _ := doMove(t, a, b, m.Hash)
+	crashAt = old
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lift()
+	if res.Failed != 1 || journalEnded(t, b, res.RecordID) {
+		t.Fatalf("result %+v: want failed with the journal open", res)
+	}
+	rec, _ := recoverAll(t, a, b)
+	if rec.Recovered != 1 {
+		t.Fatalf("recovery %+v", rec)
+	}
+	if row, ok := getRow(t, b.DB, m.Hash); !ok || !exists(b.Lib.Abs(row.RelPath)) {
+		t.Fatalf("target row %+v", row)
+	}
+}
+
+// A trashed copy in the target that does not hash to the content is not
+// restored, and the source is left alone.
+func TestRestoreChecksTrashedCopy(t *testing.T) {
+	ctx := context.Background()
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/s.jpg", content("s"), false)
+	bm := photo(t, b, "image/2024/06/s.jpg", content("s"), false)
+	if err := b.Lib.MoveToTrash(bm.RelPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DB.SetDeleted(ctx, bm.Hash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.Lib.TrashPath(bm.RelPath), content("damaged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, items := doMove(t, a, b, m.Hash)
+	if res.Failed != 1 || res.Restored != 0 || !errors.Is(items[0].Err, ErrTargetTrashMismatch) {
+		t.Fatalf("result %+v items %+v", res, items)
+	}
+	if Message(items[0].Err) != ErrTargetTrashMismatch.Error() {
+		t.Errorf("message %q", Message(items[0].Err))
+	}
+	if !exists(a.Lib.Abs(m.RelPath)) || exists(a.Lib.TrashPath(m.RelPath)) || exists(b.Lib.Abs(bm.RelPath)) {
+		t.Fatal("nothing should move")
+	}
+	if row, _ := getRow(t, b.DB, bm.Hash); row.DeletedAt.IsZero() {
+		t.Fatal("target row restored")
+	}
+	if !journalEnded(t, b, res.RecordID) {
+		t.Error("journal not ended")
+	}
+}
+
+// Content already in the target whose source file is gone: the source
+// row is forgotten, nothing stays pending.
+func TestExistingSourceMissing(t *testing.T) {
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/gone.jpg", content("gone"), false)
+	photo(t, b, "image/2024/06/gone.jpg", content("gone"), false)
+	if err := os.Remove(a.Lib.Abs(m.RelPath)); err != nil {
+		t.Fatal(err)
+	}
+	res, items := doMove(t, a, b, m.Hash)
+	if res.Existing != 1 || res.SourcePending != 0 || items[0].SourceErr != nil {
+		t.Fatalf("result %+v items %+v", res, items)
+	}
+	if _, ok := getRow(t, a.DB, m.Hash); ok {
+		t.Error("source row kept")
+	}
+	if !journalEnded(t, b, res.RecordID) {
+		t.Error("journal not ended")
+	}
+}
+
+// A plan only reads: an old finished journal is not pruned.
+func TestPlanDoesNotPrune(t *testing.T) {
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/k.jpg", content("k"), false)
+	res, _ := doMove(t, a, b, m.Hash)
+	p := JournalPath(b.Lib.Root(), res.RecordID)
+	old := time.Now().Add(-2 * keepJournals)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MakePlan(context.Background(), a, b, []uint64{1}); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(p) {
+		t.Fatal("the plan pruned a journal")
+	}
+	if _, err := ListInterrupted(b.Lib, time.Now()); err != nil || exists(p) {
+		t.Fatalf("ListInterrupted should prune it: %v", err)
+	}
+}
+
 func TestMergeFromAlbumsAndTags(t *testing.T) {
 	ctx := context.Background()
 	a, b := newSide(t, "a"), newSide(t, "b")

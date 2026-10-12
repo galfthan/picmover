@@ -112,6 +112,9 @@ var (
 	ErrSourceMismatch = errors.New("the file does not match the catalog (it changed since it was imported)")
 	// ErrTargetCopyMissing: the target's row of the content has no file.
 	ErrTargetCopyMissing = errors.New("the target library's copy of this photo is missing; run verify there")
+	// ErrTargetTrashMismatch: the target's trashed copy of the content
+	// does not hash to it, so it is not restored.
+	ErrTargetTrashMismatch = errors.New("the target library's trashed copy of this photo does not match the catalog; restore or delete it in the target's trash first")
 	// ErrNoUserData: a library has no user.db open.
 	ErrNoUserData = errors.New("the library's user data (user.db) is not open")
 )
@@ -132,6 +135,10 @@ var (
 	freeSpace    = diskFree
 )
 
+// crashAt is called at the named points of the protocol; a test panics
+// there to leave the state of a crash.
+var crashAt = func(string) {}
+
 // spaceMargin is kept free on the target volume.
 const spaceMargin = 1 << 30
 
@@ -146,7 +153,7 @@ func Message(err error) string {
 	case err == nil:
 		return ""
 	case errors.Is(err, ErrNotInSource), errors.Is(err, ErrTrashedInSource), errors.Is(err, ErrSourceMismatch),
-		errors.Is(err, ErrTargetCopyMissing):
+		errors.Is(err, ErrTargetCopyMissing), errors.Is(err, ErrTargetTrashMismatch):
 		return unwrapText(err)
 	case errors.Is(err, library.ErrHashMismatch):
 		return ErrSourceMismatch.Error()
@@ -177,7 +184,7 @@ func Message(err error) string {
 }
 
 func unwrapText(err error) string {
-	for _, s := range []error{ErrNotInSource, ErrTrashedInSource, ErrSourceMismatch, ErrTargetCopyMissing} {
+	for _, s := range []error{ErrNotInSource, ErrTrashedInSource, ErrSourceMismatch, ErrTargetCopyMissing, ErrTargetTrashMismatch} {
 		if errors.Is(err, s) {
 			return s.Error()
 		}
@@ -208,9 +215,11 @@ type run struct {
 
 	res      Result
 	items    []userdata.ImportItem
-	merge    []uint64 // hashes whose user data is merged at the next flush
-	trashed  []uint64 // source hashes trashed since the last flush (user.db trash rows)
-	all      []uint64 // every hash now in the target (ignored pairs)
+	merge    []uint64              // hashes whose user data is merged at the next flush
+	trashed  []userdata.TrashEntry // source rows trashed since the last flush (user.db trash rows)
+	untrash  []uint64              // target rows restored since the last flush (user.db trash rows)
+	finished []uint64              // hashes whose done line is written at the next flush
+	all      []uint64              // every hash now in the target (ignored pairs)
 	pending  []placed
 	dirs     map[string]bool // target folders of unsynced copies
 	reserved map[string]bool // target names chosen in this run (lower case)
@@ -292,6 +301,9 @@ func Run(ctx context.Context, from, to Side, hashes []uint64, opts Options) (Res
 	if err != nil {
 		return Result{}, err
 	}
+	if ctx.Err() != nil {
+		return Result{Recovered: recovered, Cancelled: true}, nil
+	}
 	r := newRun(from, to, opts)
 	r.res.Recovered = recovered
 	hashes = dedupe(hashes)
@@ -345,6 +357,9 @@ func Run(ctx context.Context, from, to Side, hashes []uint64, opts Options) (Res
 	if opts.OnRecord != nil {
 		opts.OnRecord(id)
 	}
+	// A crash before the journal exists leaves a running record without
+	// one: importrec.CloseCrashed closes it.
+	crashAt("before-journal")
 	if r.j, err = createJournal(to.Lib, Header{ID: id, Source: srcRef, Target: dstRef, StartedAt: r.now.Unix()}); err != nil {
 		r.finishRecord(bg, userdata.ImportFailed)
 		return r.res, err
@@ -414,7 +429,7 @@ func (r *run) finish(ctx context.Context, fatal error) {
 		outcome = userdata.ImportCancelled
 	}
 	r.finishRecord(ctx, outcome)
-	if fatal == nil && r.res.SourcePending == 0 && r.j != nil {
+	if fatal == nil && r.j != nil && r.j.settled() {
 		if err := r.j.end(); err != nil {
 			r.log.Warn("journal not ended", "err", err)
 		}
@@ -474,7 +489,9 @@ func (r *run) failed(it Item, err error) {
 	r.report(it)
 }
 
-// succeeded counts a photo now in the target and reports it.
+// succeeded counts a photo now in the target and reports it. Its user
+// data, the user.db trash rows and its done line follow at the next flush
+// (commit); without a source step its entry stays open.
 func (r *run) succeeded(it Item) {
 	switch it.Status {
 	case StatusMoved:
@@ -486,6 +503,7 @@ func (r *run) succeeded(it Item) {
 	case StatusRestored:
 		r.res.Restored++
 		r.items = append(r.items, userdata.ImportItem{Hash: it.Hash, Status: userdata.ItemRestored})
+		r.untrash = append(r.untrash, it.Hash)
 	}
 	r.merge = append(r.merge, it.Hash)
 	r.all = append(r.all, it.Hash)
@@ -493,8 +511,8 @@ func (r *run) succeeded(it Item) {
 		r.res.SourcePending++
 		r.log.Warn("photo moved, but its source copy was not moved to the trash", "hash", hexHash(it.Hash),
 			"rel_path", it.RelPath, "err", it.SourceErr)
-	} else if err := r.j.done(it.Hash); err != nil {
-		r.log.Warn("journal", "err", err)
+	} else {
+		r.finished = append(r.finished, it.Hash)
 	}
 	r.log.Info("file moved", "hash", hexHash(it.Hash), "status", it.Status, "rel_path", it.RelPath, "dest", it.Dest)
 	r.report(it)
@@ -518,23 +536,37 @@ func (r *run) existing(ctx context.Context, m, b catalog.Media) error {
 }
 
 // restore handles content in the target's trash: the trashed copy is
-// restored there (the one restore path), then the source copy goes to
-// the source's trash.
+// hashed (as the importer does before a restore) and restored there (the
+// one restore path), then the source copy goes to the source's trash.
+// The target's user.db trash row goes at the next flush.
 func (r *run) restore(ctx context.Context, m, b catalog.Media) error {
 	it := Item{Hash: m.Hash, RelPath: m.RelPath, Status: StatusRestored}
+	got, _, err := library.HashFileContext(ctx, r.to.Lib.TrashPath(b.RelPath))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		r.failed(it, ErrTargetCopyMissing)
+		return nil
+	case err != nil:
+		r.failed(it, err)
+		return nil
+	case got != m.Hash:
+		r.failed(it, ErrTargetTrashMismatch)
+		return nil
+	}
 	if err := r.j.begin(m.Hash, kindRestore, m.RelPath, b.RelPath, ""); err != nil {
 		return err
 	}
 	rel, err := importer.RestoreFromTrash(ctx, r.to.Lib, r.to.DB, b, nil)
 	if err != nil {
-		if jerr := r.j.fail(m.Hash); jerr != nil {
-			return jerr
+		// When the file left the trash and could not be put back, the line
+		// stays open: recovery finishes the restore.
+		if _, lerr := os.Lstat(r.to.Lib.TrashPath(b.RelPath)); lerr == nil {
+			if jerr := r.j.fail(m.Hash); jerr != nil {
+				return jerr
+			}
 		}
 		r.failed(it, err)
 		return nil
-	}
-	if err := r.to.User.Untrash(ctx, []uint64{m.Hash}); err != nil {
-		r.log.Warn("restore not recorded in the target's user.db", "hash", hexHash(m.Hash), "err", err)
 	}
 	it.Dest = rel
 	it.SourceErr = r.trashSource(ctx, m)
@@ -663,23 +695,30 @@ func (r *run) targetRow(m catalog.Media, rel string, renditions bool) catalog.Me
 
 // flush commits the placed files of the batch: their folders synced,
 // renditions copied, rows inserted (one transaction; one by one when it
-// fails, undoing the placement of a row that cannot be inserted), then
-// the source step of each, and the user data of every photo now in the
-// target. Only an error that stops the run is returned.
+// fails, undoing the placement of a row that is not inserted), then the
+// source step of each, and the user data of every photo now in the
+// target (commit). The batch is taken out of pending first, so it is
+// never flushed twice, and every file of it is reported even when a
+// journal write fails; that error, which stops the run, is returned at
+// the end.
 func (r *run) flush(ctx context.Context) error {
 	defer func() { r.batchAt = time.Now() }()
+	batch := r.pending
+	r.pending = nil
+	seen := map[string]bool{}
 	for d := range r.dirs {
-		library.SyncDir(d)
+		syncParents(r.to.Lib.Root(), d, seen)
 	}
 	clear(r.dirs)
-	rows := make([]catalog.Media, len(r.pending))
-	for i, p := range r.pending {
+	rows := make([]catalog.Media, len(batch))
+	for i, p := range batch {
 		ok, err := r.to.Store.CopyFrom(ctx, r.from.Store, p.m.Hash)
 		if err != nil {
 			r.log.Warn("renditions not copied; they will be generated", "hash", hexHash(p.m.Hash), "err", err)
 		}
 		rows[i] = r.targetRow(p.m, p.rel, ok)
 	}
+	crashAt("before-insert")
 	inserted := make([]bool, len(rows))
 	if len(rows) > 0 {
 		if err := r.insertBatch(ctx, rows); err == nil {
@@ -689,22 +728,31 @@ func (r *run) flush(ctx context.Context) error {
 		} else {
 			r.log.Warn("batch insert failed; inserting one by one", "files", len(rows), "err", err)
 			for i := range rows {
-				if _, err := r.to.DB.InsertMedia(ctx, nil, &rows[i]); err == nil {
-					inserted[i] = true
-				} else {
+				ok, err := r.to.DB.InsertMedia(ctx, nil, &rows[i])
+				if err == nil && !ok && r.recordedAt(ctx, rows[i].Hash, rows[i].RelPath) {
+					ok = true // recorded before (not by another row)
+				}
+				switch {
+				case err != nil:
 					r.log.Error("target row not inserted", "hash", hexHash(rows[i].Hash), "err", err)
+				case !ok:
+					r.log.Error("target row not inserted: the target catalog has another row of this content",
+						"hash", hexHash(rows[i].Hash))
+				default:
+					inserted[i] = true
 				}
 			}
 		}
 	}
-	for i, p := range r.pending {
+	var jerr error
+	for i, p := range batch {
 		it := Item{Hash: p.m.Hash, RelPath: p.m.RelPath}
 		if !inserted[i] {
 			if err := r.undo(p); err != nil {
 				// The journal line stays open: recovery inserts the row.
 				r.log.Error("placement not undone", "hash", hexHash(p.m.Hash), "dest", p.rel, "err", err)
-			} else if err := r.j.fail(p.m.Hash); err != nil {
-				return err
+			} else if err := r.j.fail(p.m.Hash); err != nil && jerr == nil {
+				jerr = err // the line stays open: recovery finds nothing placed
 			}
 			r.failed(it, importer.ErrRecordRestore)
 			continue
@@ -717,23 +765,83 @@ func (r *run) flush(ctx context.Context) error {
 		}
 		r.succeeded(it)
 	}
-	r.pending = r.pending[:0]
+	if err := r.commit(ctx); err != nil && jerr == nil {
+		jerr = err
+	}
+	return jerr
+}
+
+// commit writes what follows the source steps since the last flush: the
+// user.db trash rows of the source rows trashed, those of the target rows
+// restored removed, the user data merged, and only then the done lines,
+// so a crash before them leaves the entries open and recovery does it
+// all again (each step is idempotent). When one of the user.db steps
+// fails the entries stay open too. A journal error is returned.
+func (r *run) commit(ctx context.Context) error {
+	ok := true
 	if len(r.trashed) > 0 {
-		if err := r.from.User.Trash(ctx, r.trashed, r.now); err != nil {
-			r.log.Warn("source trash not recorded in user.db", "err", err)
+		at := map[int64][]uint64{}
+		for _, t := range r.trashed {
+			at[t.DeletedAt.Unix()] = append(at[t.DeletedAt.Unix()], t.Hash)
+		}
+		for sec, hashes := range at {
+			if err := r.from.User.Trash(ctx, hashes, time.Unix(sec, 0)); err != nil {
+				r.log.Error("source trash not recorded in user.db", "err", err)
+				ok = false
+			}
 		}
 		r.trashed = r.trashed[:0]
 	}
+	if len(r.untrash) > 0 {
+		if err := r.to.User.Untrash(ctx, r.untrash); err != nil {
+			r.log.Error("restore not recorded in the target's user.db", "err", err)
+			ok = false
+		}
+		r.untrash = r.untrash[:0]
+	}
+	crashAt("before-merge")
 	if len(r.merge) > 0 {
 		if res, err := r.to.User.MergeFrom(ctx, r.from.User, r.merge); err != nil {
 			r.log.Error("user data not merged", "files", len(r.merge), "err", err)
+			ok = false
 		} else {
 			r.log.Info("user data merged", "ratings", res.Ratings, "tags", res.Tags, "albums", res.Albums,
 				"tags_created", res.TagsCreated, "albums_created", res.AlbumsCreated)
 		}
 		r.merge = r.merge[:0]
 	}
+	finished := r.finished
+	r.finished = nil
+	if !ok {
+		return nil // the entries stay open: recovery merges again
+	}
+	for _, h := range finished {
+		if err := r.j.done(h); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// recordedAt reports whether the target's row of h is live at rel.
+func (r *run) recordedAt(ctx context.Context, h uint64, rel string) bool {
+	b, ok, err := row(ctx, r.to.DB, h)
+	return err == nil && ok && b.DeletedAt.IsZero() && strings.EqualFold(b.RelPath, rel)
+}
+
+// syncParents syncs dir and its parents up to root, the folders a
+// placement may have created, each once per seen.
+func syncParents(root, dir string, seen map[string]bool) {
+	root = filepath.Clean(root)
+	for d := filepath.Clean(dir); !seen[d]; {
+		seen[d] = true
+		library.SyncDir(d)
+		p := filepath.Dir(d)
+		if d == root || p == d || !strings.HasPrefix(p, root) {
+			return
+		}
+		d = p
+	}
 }
 
 // insertBatch inserts rows in one transaction; any row that is not
@@ -791,18 +899,26 @@ func (r *run) forgetSource(ctx context.Context, m catalog.Media) error {
 // the trash endpoint does: one rename, then deleted_at in the catalog (the
 // rename is undone when that fails); the user.db trash row is written at
 // the next flush. When the trash already holds another file at the
-// photo's path, a free variant of the path is used and recorded.
+// photo's path, a free variant of the path is journalled, used and
+// recorded, so recovery finds the file after a crash between the rename
+// and the catalog update. A source file that is gone already (removed
+// outside picmover; the photo is in the target) has its row forgotten.
 func (r *run) trashSource(ctx context.Context, m catalog.Media) error {
 	err := r.from.Lib.MoveToTrash(m.RelPath)
 	if err == nil {
+		crashAt("after-movetotrash")
 		if err := r.from.DB.SetDeleted(ctx, m.Hash, r.now); err != nil {
-			if _, rerr := r.from.Lib.Restore(m.RelPath, nil); rerr != nil {
+			if rerr := r.from.Lib.RestoreTo(m.RelPath, m.RelPath); rerr != nil {
 				r.log.Error("undo move to trash", "hash", hexHash(m.Hash), "err", rerr)
 			}
 			return err
 		}
-		r.trashed = append(r.trashed, m.Hash)
+		r.trashed = append(r.trashed, userdata.TrashEntry{Hash: m.Hash, DeletedAt: r.now})
 		return nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		r.log.Warn("source copy missing; its row is removed", "hash", hexHash(m.Hash), "rel_path", m.RelPath)
+		return r.forgetSource(ctx, m)
 	}
 	if !errors.Is(err, library.ErrTrashTargetExists) {
 		return err
@@ -822,16 +938,37 @@ func (r *run) trashSource(ctx context.Context, m catalog.Media) error {
 	if err != nil {
 		return err
 	}
+	if err := r.j.trash(m.Hash, alt); err != nil {
+		return err
+	}
 	if err := r.from.Lib.MoveToTrashAs(m.RelPath, alt); err != nil {
 		return err
 	}
+	crashAt("after-movetotrash")
 	if err := r.from.DB.SetDeletedAs(ctx, m.Hash, r.now, alt); err != nil {
 		if rerr := r.from.Lib.RestoreTo(alt, m.RelPath); rerr != nil {
 			r.log.Error("undo move to trash", "hash", hexHash(m.Hash), "err", rerr)
 		}
 		return err
 	}
-	r.trashed = append(r.trashed, m.Hash)
+	r.trashed = append(r.trashed, userdata.TrashEntry{Hash: m.Hash, DeletedAt: r.now})
+	return nil
+}
+
+// markTrashed finishes a source step whose rename reached the source
+// trash (at the catalog path trashRel) before a crash: the row is marked
+// trashed there.
+func (r *run) markTrashed(ctx context.Context, m catalog.Media, trashRel string) error {
+	var err error
+	if trashRel == m.RelPath {
+		err = r.from.DB.SetDeleted(ctx, m.Hash, r.now)
+	} else {
+		err = r.from.DB.SetDeletedAs(ctx, m.Hash, r.now, trashRel)
+	}
+	if err != nil {
+		return err
+	}
+	r.trashed = append(r.trashed, userdata.TrashEntry{Hash: m.Hash, DeletedAt: r.now})
 	return nil
 }
 

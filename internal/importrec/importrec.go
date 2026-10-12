@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
+	"picmover/internal/transfer"
 	"picmover/internal/userdata"
 )
 
@@ -228,8 +230,10 @@ type SessionRows func(ctx context.Context, session int64) (hashes []uint64, newe
 // failed, finished now, and the rows of its catalog session (when it is
 // known and rows is not nil) as its imported items. A session whose rows
 // cannot be read closes the record without items (logged). Records of
-// mode transfer are left to the move's recovery. It returns the number of
-// records closed.
+// mode transfer are left to the move's recovery, which closes them from
+// their journal; one whose journal does not exist (the process died
+// between writing the record and creating the journal: nothing was
+// moved) is closed here. It returns the number of records closed.
 func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owned func(id int64) bool, log *slog.Logger) (int, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -243,7 +247,7 @@ func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owne
 		if owned != nil && owned(rec.ID) {
 			continue
 		}
-		if rec.Mode == userdata.ImportModeTransfer {
+		if rec.Mode == userdata.ImportModeTransfer && !journalMissing(user, rec.ID) {
 			continue // closed by the move's recovery, from its journal
 		}
 		var (
@@ -266,6 +270,17 @@ func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owne
 		}
 	}
 	return n, nil
+}
+
+// journalMissing reports whether the move journal of the transfer record
+// id is certainly not there: user.db is at the library root, the journal
+// in its transfers folder. Anything but "does not exist" counts as there.
+func journalMissing(user *userdata.DB, id int64) bool {
+	if user.Path() == "" {
+		return false
+	}
+	_, err := os.Lstat(transfer.JournalPath(filepath.Dir(user.Path()), id))
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // Backfill copies the catalog's import sessions into user's import

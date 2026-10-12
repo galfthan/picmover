@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -286,5 +287,451 @@ func TestIsSource(t *testing.T) {
 	in.Source.Root = t.TempDir() + "/moved-away"
 	if !IsSource(in, "abc", "/new/place") {
 		t.Fatal("a moved library should match by id")
+	}
+}
+
+type crashSig struct{ at string }
+
+// crashOn makes the protocol panic at the crashAt point named.
+func crashOn(t *testing.T, point string) {
+	t.Helper()
+	old := crashAt
+	crashAt = func(p string) {
+		if p == point {
+			panic(crashSig{p})
+		}
+	}
+	t.Cleanup(func() { crashAt = old })
+}
+
+// runCrash runs a move expected to "crash" at the point set by crashOn;
+// the crash hook is cleared afterwards.
+func runCrash(t *testing.T, from, to Side, hashes ...uint64) {
+	t.Helper()
+	defer func() {
+		crashAt = func(string) {}
+		r := recover()
+		if _, ok := r.(crashSig); !ok {
+			if r != nil {
+				panic(r)
+			}
+			t.Fatal("the run did not crash")
+		}
+	}()
+	Run(context.Background(), from, to, hashes, Options{})
+}
+
+// recoverAll recovers every interrupted move into b and sums the results.
+func recoverAll(t *testing.T, a, b Side) (Result, []Item) {
+	t.Helper()
+	list, err := ListInterrupted(b.Lib, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tot Result
+	var items []Item
+	for _, in := range list {
+		res, err := Recover(context.Background(), a, b, in.Path, Options{OnItem: func(it Item) { items = append(items, it) }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tot.Recovered += res.Recovered
+		tot.Moved += res.Moved
+		tot.Existing += res.Existing
+		tot.Restored += res.Restored
+		tot.Failed += res.Failed
+		tot.SourcePending += res.SourcePending
+	}
+	return tot, items
+}
+
+func noInterrupted(t *testing.T, s Side) {
+	t.Helper()
+	if list, err := ListInterrupted(s.Lib, time.Now()); err != nil || len(list) != 0 {
+		t.Fatalf("interrupted %+v %v", list, err)
+	}
+}
+
+// A crash after the batch's rows and source steps, before the user data
+// merge: the entries are still open (done follows the merge), so
+// recovery merges.
+func TestCrashBeforeMerge(t *testing.T) {
+	ctx := context.Background()
+	for _, cross := range []bool{false, true} {
+		a, b := newSide(t, "a"), newSide(t, "b")
+		if cross {
+			crossVolume(t)
+		}
+		m := photo(t, a, "image/2024/06/u.jpg", content("u"), true)
+		if _, err := a.User.SetRating(ctx, []uint64{m.Hash}, 5); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.User.TagMedia(ctx, []uint64{m.Hash}, nil, nil, []string{"Keep"}); err != nil {
+			t.Fatal(err)
+		}
+		crashOn(t, "before-merge")
+		runCrash(t, a, b, m.Hash)
+		if _, ok := getRow(t, b.DB, m.Hash); !ok {
+			t.Fatal("the crash point should be after the target row")
+		}
+		res, _ := recoverAll(t, a, b)
+		if res.Recovered != 1 || res.Failed != 0 {
+			t.Fatalf("cross=%v: result %+v", cross, res)
+		}
+		if r, _ := b.User.Rating(ctx, m.Hash); r != 5 {
+			t.Errorf("cross=%v: rating %d after recovery, want 5", cross, r)
+		}
+		if tags, _ := b.User.TagsOf(ctx, m.Hash); len(tags) != 1 {
+			t.Errorf("cross=%v: tags %+v", cross, tags)
+		}
+		if cross {
+			// The source's user.db trash row too.
+			if at, _ := a.User.TrashedAt(ctx, []uint64{m.Hash}); len(at) != 1 {
+				t.Error("source user.db trash row missing after recovery")
+			}
+		}
+		noInterrupted(t, b)
+	}
+}
+
+// A crash right after a file is reported (its done line follows the
+// merge): recovery merges its user data.
+func TestCrashAfterReportBeforeMerge(t *testing.T) {
+	ctx := context.Background()
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/x.jpg", content("x"), true)
+	if _, err := a.User.SetRating(ctx, []uint64{m.Hash}, 4); err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { recover() }()
+		Run(ctx, a, b, []uint64{m.Hash}, Options{OnItem: func(it Item) {
+			if it.Status == StatusMoved {
+				panic("crash")
+			}
+		}})
+	}()
+	list, _ := ListInterrupted(b.Lib, time.Now())
+	if len(list) != 1 || list[0].Open != 1 {
+		t.Fatalf("the entry should still be open: %+v", list)
+	}
+	recoverAll(t, a, b)
+	if r, _ := b.User.Rating(ctx, m.Hash); r != 4 {
+		t.Errorf("rating %d, want 4", r)
+	}
+}
+
+// A crash between the source copy's rename to the source trash and its
+// catalog update: recovery finds it in the trash and marks the row
+// trashed, for a copy, a duplicate, and a taken trash name.
+func TestCrashAfterMoveToTrash(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range []string{"copy", "existing", "taken"} {
+		a, b := newSide(t, "a"), newSide(t, "b")
+		m := photo(t, a, "image/2024/06/t.jpg", content("t"+kind), true)
+		switch kind {
+		case "copy":
+			crossVolume(t)
+		case "existing":
+			photo(t, b, "image/2024/06/t.jpg", content("t"+kind), true)
+		case "taken":
+			crossVolume(t)
+			tp := a.Lib.TrashPath(m.RelPath)
+			if err := os.MkdirAll(filepath.Dir(tp), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(tp, content("older"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		crashOn(t, "after-movetotrash")
+		runCrash(t, a, b, m.Hash)
+		if exists(a.Lib.Abs(m.RelPath)) {
+			t.Fatalf("%s: the crash point should be after the rename", kind)
+		}
+		res, items := recoverAll(t, a, b)
+		if res.Recovered != 1 || res.SourcePending != 0 || res.Failed != 0 {
+			t.Fatalf("%s: result %+v items %+v", kind, res, items)
+		}
+		row, ok := getRow(t, a.DB, m.Hash)
+		if !ok || row.DeletedAt.IsZero() || !exists(a.Lib.TrashPath(row.RelPath)) {
+			t.Fatalf("%s: source row %+v (ok %v): want trashed, with its file in the trash", kind, row, ok)
+		}
+		if got, _, _ := library.HashFile(a.Lib.TrashPath(row.RelPath)); got != m.Hash {
+			t.Errorf("%s: the source row names another trash file", kind)
+		}
+		if th, _, _, _ := a.Store.Has(ctx, m.Hash); !th {
+			t.Errorf("%s: source renditions deleted", kind)
+		}
+		if at, _ := a.User.TrashedAt(ctx, []uint64{m.Hash}); len(at) != 1 {
+			t.Errorf("%s: source user.db trash row missing", kind)
+		}
+		noInterrupted(t, b)
+	}
+}
+
+// The same crash for a duplicate whose copy in the target is gone by
+// recovery time: the source file comes back from the trash to its place.
+func TestCrashAfterMoveToTrashTargetGone(t *testing.T) {
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/e.jpg", content("e"), false)
+	c := startCrashed(t, a, b)
+	c.begin(t, m, kindExisting, m.RelPath, "")
+	if err := a.Lib.MoveToTrash(m.RelPath); err != nil {
+		t.Fatal(err)
+	}
+	res, items := c.recover(t)
+	if res.Failed != 1 || !errors.Is(items[0].Err, ErrInterrupted) {
+		t.Fatalf("result %+v items %+v", res, items)
+	}
+	row, ok := getRow(t, a.DB, m.Hash)
+	if !ok || !row.DeletedAt.IsZero() || !exists(a.Lib.Abs(m.RelPath)) || exists(a.Lib.TrashPath(m.RelPath)) {
+		t.Fatalf("source row %+v: want live with its file back in place", row)
+	}
+	noInterrupted(t, b)
+}
+
+// An entry whose step fails in recovery stays open: the journal is not
+// ended, the record stays running, and a later Recover finishes it.
+func TestRecoverLeavesFailedStepOpen(t *testing.T) {
+	ctx := context.Background()
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/r.jpg", content("r"), true)
+	c := startCrashed(t, a, b)
+	c.begin(t, m, kindMove, m.RelPath, modeRename)
+	if err := a.Lib.MoveFileTo(m.RelPath, b.Lib, m.RelPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.DB.ExecContext(ctx, `CREATE TRIGGER failall BEFORE INSERT ON media
+		BEGIN SELECT RAISE(ABORT, 'transient'); END`); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := c.recover(t)
+	if res.Failed != 1 || res.Recovered != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	if journalEnded(t, b, c.id) {
+		t.Fatal("journal ended with an open entry")
+	}
+	if rec := c.record(t); rec.Outcome != userdata.ImportRunning {
+		t.Fatalf("record closed with an open entry: %+v", rec)
+	}
+	if _, err := b.DB.ExecContext(ctx, "DROP TRIGGER failall"); err != nil {
+		t.Fatal(err)
+	}
+	res, _ = recoverAll(t, a, b)
+	if res.Recovered != 1 {
+		t.Fatalf("second recovery %+v", res)
+	}
+	if _, ok := getRow(t, b.DB, m.Hash); !ok {
+		t.Fatal("target row missing")
+	}
+	if rec := c.record(t); rec.Outcome != userdata.ImportFailed || rec.Imported != 1 {
+		t.Errorf("record %+v", rec)
+	}
+	noInterrupted(t, b)
+}
+
+// A placed file that cannot be read is not the lost-track case: the
+// entry stays open and is finished once it can be read.
+func TestRecoverPlacedFileUnreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permissions do not apply to root")
+	}
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/p.jpg", content("p"), false)
+	c := startCrashed(t, a, b)
+	c.begin(t, m, kindMove, m.RelPath, modeRename)
+	if err := a.Lib.MoveFileTo(m.RelPath, b.Lib, m.RelPath); err != nil {
+		t.Fatal(err)
+	}
+	p := b.Lib.Abs(m.RelPath)
+	if err := os.Chmod(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(p, 0o644) })
+	res, items := c.recover(t)
+	if res.Failed != 1 || errors.Is(items[0].Err, ErrLostTrack) {
+		t.Fatalf("result %+v items %+v", res, items)
+	}
+	if journalEnded(t, b, c.id) {
+		t.Fatal("journal ended")
+	}
+	if _, ok := getRow(t, a.DB, m.Hash); !ok {
+		t.Fatal("source row changed")
+	}
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := recoverAll(t, a, b); res.Recovered != 1 {
+		t.Fatalf("second recovery %+v", res)
+	}
+	noInterrupted(t, b)
+}
+
+// Cancelling a recovery stops between entries; the rest stay open.
+func TestRecoverCancelled(t *testing.T) {
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m1 := photo(t, a, "image/2024/06/c1.jpg", content("c1"), false)
+	m2 := photo(t, a, "image/2024/06/c2.jpg", content("c2"), false)
+	c := startCrashed(t, a, b)
+	for _, m := range []catalog.Media{m1, m2} {
+		c.begin(t, m, kindMove, m.RelPath, modeRename)
+		if err := a.Lib.MoveFileTo(m.RelPath, b.Lib, m.RelPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.j.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	list, _ := ListInterrupted(b.Lib, time.Now())
+	res, err := Recover(ctx, a, b, list[0].Path, Options{OnProgress: func(Progress) { cancel() }})
+	if err != nil || !res.Cancelled || res.Recovered != 1 {
+		t.Fatalf("result %+v %v", res, err)
+	}
+	if _, ok := getRow(t, b.DB, m1.Hash); !ok {
+		t.Fatal("the first entry should be finished")
+	}
+	if _, ok := getRow(t, b.DB, m2.Hash); ok {
+		t.Fatal("the second entry should not be started")
+	}
+	if journalEnded(t, b, c.id) || c.record(t).Outcome != userdata.ImportRunning {
+		t.Fatal("journal ended or record closed while an entry is open")
+	}
+	if res, _ := recoverAll(t, a, b); res.Recovered != 1 {
+		t.Fatalf("resume %+v", res)
+	}
+	if rec := c.record(t); rec.Imported != 2 {
+		t.Errorf("record %+v", rec)
+	}
+	noInterrupted(t, b)
+}
+
+// A journal that came along with a copy of the target's folder is not
+// listed there and not recovered into another library.
+func TestJournalOfAnotherTarget(t *testing.T) {
+	a, b, other := newSide(t, "a"), newSide(t, "b"), newSide(t, "other")
+	m := photo(t, a, "image/2024/06/o.jpg", content("o"), false)
+	c := startCrashed(t, a, b)
+	c.begin(t, m, kindMove, m.RelPath, modeCopy)
+	c.j.close()
+	dst := JournalPath(other.Lib.Root(), c.id)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(c.j.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := ListInterrupted(other.Lib, time.Now()); len(list) != 0 {
+		t.Fatalf("listed in the copy: %+v", list)
+	}
+	if list, _ := ListInterruptedAt(other.Lib.Root()); len(list) != 0 {
+		t.Fatalf("listed in the copy (read only): %+v", list)
+	}
+	if _, err := Recover(context.Background(), a, other, dst, Options{}); !errors.Is(err, ErrOtherTarget) {
+		t.Fatalf("Recover into the copy: %v", err)
+	}
+	// A target library folder that moved keeps its journals.
+	if !addressedTo(LibraryRef{Root: filepath.Join(t.TempDir(), "moved-away")}, other.Lib.Root()) {
+		t.Fatal("a moved target should match")
+	}
+	if list, _ := ListInterrupted(b.Lib, time.Now()); len(list) != 1 {
+		t.Fatalf("the original's journal: %+v", list)
+	}
+}
+
+// A crash after the target's restore committed, before its user.db trash
+// row went: recovery removes it.
+func TestCrashAfterRestoreBeforeUntrash(t *testing.T) {
+	ctx := context.Background()
+	a, b := newSide(t, "a"), newSide(t, "b")
+	m := photo(t, a, "image/2024/06/g.jpg", content("g"), false)
+	bm := photo(t, b, "image/2024/06/g.jpg", content("g"), false)
+	if err := b.Lib.MoveToTrash(bm.RelPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DB.SetDeleted(ctx, bm.Hash, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.User.Trash(ctx, []uint64{bm.Hash}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	crashOn(t, "before-merge")
+	runCrash(t, a, b, m.Hash)
+	res, _ := recoverAll(t, a, b)
+	if res.Restored != 1 || res.Recovered != 1 {
+		t.Fatalf("result %+v", res)
+	}
+	if at, _ := b.User.TrashedAt(ctx, []uint64{m.Hash}); len(at) != 0 {
+		t.Error("target user.db trash row kept")
+	}
+	if row, _ := getRow(t, a.DB, m.Hash); row.DeletedAt.IsZero() {
+		t.Error("source not trashed")
+	}
+	noInterrupted(t, b)
+}
+
+// A crash inside the target's restore, after its rename out of the trash
+// and before the catalog update (at the trashed path or at a variant):
+// recovery finishes the restore.
+func TestCrashInsideRestore(t *testing.T) {
+	ctx := context.Background()
+	for _, variant := range []bool{false, true} {
+		a, b := newSide(t, "a"), newSide(t, "b")
+		m := photo(t, a, "image/2024/06/h.jpg", content("h"), false)
+		bm := photo(t, b, "image/2024/06/h.jpg", content("h"), false)
+		if err := b.Lib.MoveToTrash(bm.RelPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.DB.SetDeleted(ctx, bm.Hash, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		c := startCrashed(t, a, b)
+		c.begin(t, m, kindRestore, bm.RelPath, "")
+		want := bm.RelPath
+		if variant {
+			// Another file took the path: the restore picked a variant.
+			if err := os.WriteFile(b.Lib.Abs(bm.RelPath), content("in the way"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			want = "image/2024/06/h_1.jpg"
+		}
+		if err := b.Lib.RestoreTo(bm.RelPath, want); err != nil {
+			t.Fatal(err)
+		}
+		res, items := c.recover(t)
+		if res.Restored != 1 || res.Recovered != 1 {
+			t.Fatalf("variant=%v: result %+v items %+v", variant, res, items)
+		}
+		if row, _ := getRow(t, b.DB, m.Hash); !row.DeletedAt.IsZero() || row.RelPath != want {
+			t.Errorf("variant=%v: target row %+v", variant, row)
+		}
+		if row, _ := getRow(t, a.DB, m.Hash); row.DeletedAt.IsZero() || !exists(a.Lib.TrashPath(m.RelPath)) {
+			t.Errorf("variant=%v: source not trashed", variant)
+		}
+	}
+}
+
+// The folders a recovery relies on are synced up to the library root
+// and no further.
+func TestSyncParents(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "image", "2024", "06")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	syncParents(root, dir, seen)
+	for _, d := range []string{dir, filepath.Dir(dir), filepath.Join(root, "image"), root} {
+		if !seen[d] {
+			t.Errorf("%s not synced", d)
+		}
+	}
+	if len(seen) != 4 {
+		t.Errorf("synced %v", seen)
 	}
 }
