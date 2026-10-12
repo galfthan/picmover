@@ -227,8 +227,9 @@ type SessionRows func(ctx context.Context, session int64) (hashes []uint64, newe
 // every running record for which owned (nil: none) is false gets outcome
 // failed, finished now, and the rows of its catalog session (when it is
 // known and rows is not nil) as its imported items. A session whose rows
-// cannot be read closes the record without items (logged). It returns
-// the number of records closed.
+// cannot be read closes the record without items (logged). Records of
+// mode transfer are left to the move's recovery. It returns the number of
+// records closed.
 func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owned func(id int64) bool, log *slog.Logger) (int, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -241,6 +242,9 @@ func CloseCrashed(ctx context.Context, user *userdata.DB, rows SessionRows, owne
 	for _, rec := range running {
 		if owned != nil && owned(rec.ID) {
 			continue
+		}
+		if rec.Mode == userdata.ImportModeTransfer {
+			continue // closed by the move's recovery, from its journal
 		}
 		var (
 			hashes []uint64

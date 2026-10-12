@@ -66,6 +66,21 @@ func (d *DB) SetDeleted(ctx context.Context, hash uint64, at time.Time) error {
 	return checkOneRow(res, 0)
 }
 
+// SetDeletedAs marks the row with this hash as trashed at at and sets its
+// rel_path to rel in one statement: the file went to the trash under
+// another catalog path (TrashPath(rel)) because its own was taken there.
+// sql.ErrNoRows when no row has the hash.
+func (d *DB) SetDeletedAs(ctx context.Context, hash uint64, at time.Time, rel string) error {
+	if rel == "" {
+		return fmt.Errorf("catalog: set deleted %016x: empty path", hash)
+	}
+	res, err := d.ExecContext(ctx, "UPDATE media SET deleted_at = ?, rel_path = ? WHERE hash = ?", at.Unix(), rel, int64(hash))
+	if err != nil {
+		return fmt.Errorf("catalog: set deleted %016x: %w", hash, err)
+	}
+	return checkOneRow(res, 0)
+}
+
 // ClearDeleted marks the row with this hash as live again, at rel_path
 // rel (the path it was restored to; "" keeps the current one).
 // sql.ErrNoRows when no row has the hash.
