@@ -21,7 +21,7 @@
     trashItems,
     undoTrash,
   } from '../lib/actions';
-  import { canMove, moves } from '../lib/moves.svelte';
+  import { canMove, moves, movingOn, MOVING_TEXT } from '../lib/moves.svelte';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
   import AlbumPicker from './AlbumPicker.svelte';
@@ -49,6 +49,8 @@
   let error = $state('');
 
   const n = $derived(selection.size);
+  /** A move runs on this library: its trash and user data cannot change until it has finished. */
+  const locked = $derived(movingOn(api.id));
   // The message belongs to the selection it was about; a new selection starts clean.
   $effect(() => {
     if (n === 0) error = '';
@@ -57,6 +59,10 @@
 
   async function run(label: string, fn: (hashes: string[]) => Promise<void>) {
     if (busy) return;
+    if (locked) {
+      error = MOVING_TEXT;
+      return;
+    }
     const hashes = selection.list();
     if (!hashes.length) return;
     busy = label;
@@ -167,31 +173,33 @@
     <span class="spacer"></span>
 
     {#if mode === 'trash'}
-      <button class="primary" disabled={!!busy} onclick={restore}>Restore</button>
+      <button class="primary" disabled={!!busy || locked} onclick={restore}>Restore</button>
       <ConfirmButton
         label="Delete permanently"
         question={`Delete ${items(n)} permanently? This cannot be undone.`}
         confirmLabel="Delete"
         cancelLabel="Cancel"
         danger
-        disabled={!!busy}
+        disabled={!!busy || locked}
         onconfirm={deleteForever}
       />
     {:else}
-      <RatingStars value={currentRating} onchange={rate} label="Rate selected" disabled={!!busy} />
-      <TagInput options={library.tags} label="Tag selected" up disabled={!!busy} onpick={tag} />
-      <AlbumPicker albums={library.albums} exclude={albumId !== null ? [albumId] : []} label="Album" disabled={!!busy} onpick={album} />
+      <RatingStars value={currentRating} onchange={rate} label="Rate selected" disabled={!!busy || locked} />
+      <TagInput options={library.tags} label="Tag selected" up disabled={!!busy || locked} onpick={tag} />
+      <AlbumPicker albums={library.albums} exclude={albumId !== null ? [albumId] : []} label="Album" disabled={!!busy || locked} onpick={album} />
       {#if mode === 'album'}
-        <button disabled={!!busy} onclick={removeAlbum}>Remove from album</button>
+        <button disabled={!!busy || locked} onclick={removeAlbum}>Remove from album</button>
       {/if}
       {#if canMove()}
         <button disabled={!!busy} onclick={() => moves.open(api.id, selection.list(), 'selection')} title="Move the selected items to another library">Move to…</button>
       {/if}
-      <button class="danger" disabled={!!busy} onclick={trash}>Trash</button>
+      <button class="danger" disabled={!!busy || locked} onclick={trash}>Trash</button>
     {/if}
     <button class="ghost" onclick={() => selection.clear()} title="Clear the selection (Esc)">Clear</button>
     {#if error}
       <div class="err" role="alert">{error}</div>
+    {:else if locked}
+      <div class="muted small">{MOVING_TEXT}</div>
     {/if}
   </div>
 {/if}

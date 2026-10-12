@@ -3,8 +3,9 @@
 // plans and results (movetext.ts).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { libApi, resumeTransfer, sumPlans, toInterrupted, toTransferPlan, toTransferProgress, toTransferResult, TRANSFER_CHUNK, type TransferPlan } from './api';
-import { continues, failedHeading, interruptedFor, movable, planLines, reasons, refusedHeading, resultLines, spaceProblem, SPACE_MARGIN, emptyTotals } from './movetext';
+import { libApi, resumeTransfer, sumPlans, toInterrupted, toTransferPlan, toTransferProgress, toTransferResult, TRANSFER_CHUNK, type Job, type TransferPlan } from './api';
+import { outcome } from './jobtext';
+import { blocking, continues, failedHeading, interruptedFor, movable, sentence, planLines, reasons, refusedHeading, resultLines, spaceProblem, SPACE_MARGIN, emptyTotals } from './movetext';
 
 const H = (n: number) => n.toString(16).padStart(16, '0');
 const GiB = 1024 * 1024 * 1024;
@@ -63,12 +64,51 @@ describe('transfer shapes', () => {
       refused: [{ hash: H(9), error: 'already in the trash in peter' }],
       sameVolume: false,
       free: 5000,
-      interrupted: [{ from: 'peter', to: 'kids', id: 7 }],
+      interrupted: [{ from: 'peter', to: 'kids', id: 7, problem: '' }],
     });
     // Missing or malformed: zero, false, null, empty.
     expect(toTransferPlan({ move: { count: -1, bytes: 'x' }, sameVolume: 'yes', free: -3 })).toEqual(plan({ sameVolume: false }));
     expect(toTransferPlan(null)).toEqual(plan({ sameVolume: false }));
     expect(toInterrupted('x')).toEqual([]);
+  });
+
+  it('reads interrupted moves that cannot be finished, and sourcePending', () => {
+    expect(
+      toInterrupted([
+        { from: '', to: 'kids', id: 7, problem: 'its journal cannot be read' },
+        { to: 'kids', id: 'x', problem: 'its journal cannot be read' },
+        { from: 'gone', to: 'kids', id: 8, problem: 'the library it came from (gone) is not in this workspace' },
+        { from: '', to: 'kids', id: 9 },
+      ]),
+    ).toEqual([
+      { from: '', to: 'kids', id: 7, problem: 'its journal cannot be read' },
+      { from: '', to: 'kids', id: 0, problem: 'its journal cannot be read' },
+      { from: 'gone', to: 'kids', id: 8, problem: 'the library it came from (gone) is not in this workspace' },
+    ]);
+    expect(toTransferResult({ moved: 2, sourcePending: 2 })).toMatchObject({ moved: 2, sourcePending: 2 });
+    expect(toTransferResult({ moved: 2 })).toMatchObject({ sourcePending: 0 });
+    const stuck = { from: 'gone', to: 'kids', id: 8, problem: 'the library it came from (gone) is not in this workspace; put it back to finish the move' };
+    const ok = { from: 'peter', to: 'kids', id: 9, problem: '' };
+    expect(blocking([stuck, ok])).toEqual([ok]);
+    expect(interruptedFor('kids', stuck, (id) => id)).toBe(
+      'A move from gone was interrupted. It cannot be finished now: the library it came from (gone) is not in this workspace; put it back to finish the move.',
+    );
+    expect(interruptedFor('kids', { from: '', to: 'kids', id: 7, problem: 'its journal cannot be read' }, (id) => id)).toBe(
+      'A move into this library was interrupted. It cannot be finished now: its journal cannot be read.',
+    );
+    expect(sentence('2 photos were moved to kids, but their originals could not be moved to the trash in peter; finish the move from the Libraries page')).toBe(
+      '2 photos were moved to kids, but their originals could not be moved to the trash in peter; finish the move from the Libraries page.',
+    );
+  });
+
+  it('says what a finished move job left undone', () => {
+    const job = (o: Partial<Job>): Job => ({ id: 1, kind: 'transfer', state: 'done', exitCode: 0, logPath: '/x.log', stats: {} as Job['stats'], ...o }) as Job;
+    const msg = '2 photos were moved to kids, but their originals could not be moved to the trash in peter; finish the move from the Libraries page';
+    const o = outcome(job({ exitCode: 2, error: msg, result: { moved: 2, sourcePending: 2 } }));
+    expect(o.tone).toBe('warn');
+    expect(o.text).toBe(`Move to library finished with problems (2 moved, 2 still here too): ${msg}`);
+    expect(o.text).not.toContain('some files failed');
+    expect(outcome(job({ exitCode: 2, result: { moved: 1, failedCount: 1 } })).text).toContain('some files failed');
   });
 
   it('reads the progress and the result of a transfer job', () => {
@@ -85,14 +125,14 @@ describe('transfer shapes', () => {
     expect(toTransferResult(null)).toBeNull();
     expect(
       toTransferResult({ moved: 3, existing: 1, restored: 0, failed: [{ hash: H(1), error: 'the file does not match the catalog' }], failedCount: 250, record: 12, targetLibrary: 'kids' }),
-    ).toEqual({ moved: 3, existing: 1, restored: 0, failed: [{ hash: H(1), error: 'the file does not match the catalog' }], failedCount: 250, record: 12, targetLibrary: 'kids' });
+    ).toEqual({ moved: 3, existing: 1, restored: 0, failed: [{ hash: H(1), error: 'the file does not match the catalog' }], failedCount: 250, sourcePending: 0, record: 12, targetLibrary: 'kids' });
     // failedCount is at least the list; a bad record is null.
     expect(toTransferResult({ failed: [{ hash: H(1), error: 'x' }], record: 0 })).toMatchObject({ failedCount: 1, record: null, targetLibrary: '' });
   });
 
   it('sums chunked plans', () => {
-    const a = plan({ move: { count: 2, bytes: 20 }, existing: { count: 1 }, sameVolume: false, free: 100, refused: [{ hash: H(1), error: 'x' }], interrupted: [{ from: 'p', to: 'k', id: 1 }] });
-    const b = plan({ move: { count: 3, bytes: 30 }, restore: { count: 4 }, sameVolume: true, free: 7, refused: [{ hash: H(2), error: 'y' }], interrupted: [{ from: 'p', to: 'k', id: 1 }] });
+    const a = plan({ move: { count: 2, bytes: 20 }, existing: { count: 1 }, sameVolume: false, free: 100, refused: [{ hash: H(1), error: 'x' }], interrupted: [{ from: 'p', to: 'k', id: 1, problem: '' }] });
+    const b = plan({ move: { count: 3, bytes: 30 }, restore: { count: 4 }, sameVolume: true, free: 7, refused: [{ hash: H(2), error: 'y' }], interrupted: [{ from: 'p', to: 'k', id: 1, problem: '' }] });
     expect(sumPlans([a, b])).toEqual({
       move: { count: 5, bytes: 50 },
       existing: { count: 1 },
@@ -100,7 +140,7 @@ describe('transfer shapes', () => {
       refused: [{ hash: H(1), error: 'x' }, { hash: H(2), error: 'y' }],
       sameVolume: false,
       free: 100,
-      interrupted: [{ from: 'p', to: 'k', id: 1 }],
+      interrupted: [{ from: 'p', to: 'k', id: 1, problem: '' }],
     });
   });
 
@@ -144,7 +184,7 @@ describe('move wording', () => {
     expect(movable(p)).toBe(312);
     expect(planLines(p, 'Penny')).toEqual({
       headline: 'Move 312 photos (4.1 GiB) to Penny.',
-      lines: ['12 are already there; their copies here go to the trash.', 'Same drive: instant.'],
+      lines: ['12 are already there; their copies here go to the trash.', 'Same drive: no copying; each file is checked, then renamed.'],
     });
     expect(planLines(plan({ move: { count: 1, bytes: 2048 }, existing: { count: 1 }, restore: { count: 3 }, sameVolume: false, free: 10 * GiB }), 'Penny')).toEqual({
       headline: 'Move 5 photos (2.0 KiB) to Penny.',
@@ -189,7 +229,7 @@ describe('move wording', () => {
       "1 came back from Penny's trash.",
     ]);
     const name = (id: string) => id.toUpperCase();
-    const m = { from: 'peter', to: 'kids', id: 3 };
+    const m = { from: 'peter', to: 'kids', id: 3, problem: '' };
     expect(interruptedFor('kids', m, name)).toBe('A move from PETER was interrupted.');
     expect(interruptedFor('peter', m, name)).toBe('A move to KIDS was interrupted.');
     expect(continues('done', 0)).toBe(true);

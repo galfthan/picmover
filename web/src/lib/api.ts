@@ -1086,10 +1086,13 @@ export const TRANSFER_CHUNK = 2000;
 
 /** A move whose journal has no `end`: it must be finished (resumed in `to`) before another move involving either library. */
 export interface InterruptedMove {
+  /** The source library; '' when the journal cannot be read. */
   from: string;
   to: string;
   /** The target's import record of the move. */
   id: number;
+  /** Why it cannot be finished now (the source is not in the workspace, the journal cannot be read); '' when "Finish moving" can. */
+  problem: string;
 }
 
 export interface TransferPlan {
@@ -1124,6 +1127,8 @@ export interface TransferResult {
   /** At most 200 entries; `failedCount` is the total. */
   failed: Failure[];
   failedCount: number;
+  /** Photos now in the target whose original could not be moved to the trash here: they are still in this library too. */
+  sourcePending: number;
   /** The target's import record of the move; null when none. */
   record: number | null;
   targetLibrary: string;
@@ -1138,13 +1143,19 @@ function hashFailures(v: unknown): Failure[] {
   return v.filter(isRecord).flatMap((f) => (isHash(f.hash) ? [{ hash: f.hash, error: typeof f.error === 'string' ? f.error : '' }] : []));
 }
 
-/** Interrupted moves (plan `interrupted`, lib `interruptedMoves`); malformed entries are dropped. */
+/**
+ * Interrupted moves (plan `interrupted`, lib `interruptedMoves`); malformed
+ * entries are dropped. One with a `problem` may lack `from` (its journal
+ * cannot be read) and have the id 0.
+ */
 export function toInterrupted(v: unknown): InterruptedMove[] {
   if (!Array.isArray(v)) return [];
   return v.filter(isRecord).flatMap((m) => {
-    const id = positiveId(m.id);
-    if (typeof m.from !== 'string' || m.from === '' || typeof m.to !== 'string' || m.to === '' || id === null) return [];
-    return [{ from: m.from, to: m.to, id }];
+    const problem = typeof m.problem === 'string' ? m.problem : '';
+    const id = positiveId(m.id) ?? (problem ? 0 : null);
+    const from = typeof m.from === 'string' ? m.from : '';
+    if ((from === '' && !problem) || typeof m.to !== 'string' || m.to === '' || id === null) return [];
+    return [{ from, to: m.to, id, problem }];
   });
 }
 
@@ -1209,6 +1220,7 @@ export function toTransferResult(v: unknown): TransferResult | null {
     restored: count(v.restored),
     failed,
     failedCount: Math.max(count(v.failedCount), failed.length),
+    sourcePending: count(v.sourcePending),
     record: positiveId(v.record),
     targetLibrary: typeof v.targetLibrary === 'string' ? v.targetLibrary : '',
   };

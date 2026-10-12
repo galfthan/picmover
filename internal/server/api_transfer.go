@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"picmover/internal/importer"
@@ -36,12 +39,15 @@ type countBytesJSON struct {
 }
 
 // interruptedJSON is an unfinished move: the libraries by id (the
-// target's current id; the source's id when the move started) and the
-// target's import record id.
+// target's current id; the source's current id when it is in the
+// workspace, else its id when the move started, "" when the journal
+// cannot be read) and the target's import record id. Problem says why it
+// cannot be finished now ("" when "Finish moving" can finish it).
 type interruptedJSON struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-	ID   int64  `json:"id"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	ID      int64  `json:"id"`
+	Problem string `json:"problem,omitempty"`
 }
 
 type transferPlanJSON struct {
@@ -81,6 +87,10 @@ type transferResultJSON struct {
 	Bytes         int64        `json:"bytes"`
 	Record        *int64       `json:"record"`
 	TargetLibrary string       `json:"targetLibrary"`
+
+	cancelled bool     // work was left undone because of a cancel (Result.Cancelled)
+	resumed   int      // interrupted moves the job tried to finish (resume)
+	problems  []string // interrupted moves that could not be finished (resume)
 }
 
 // transferTarget resolves and opens the target library of a move from
@@ -180,7 +190,7 @@ func (s *Server) handleTransferPlan(w http.ResponseWriter, r *http.Request, l *l
 		Restore:    countJSON{Count: int64(p.Restore)},
 		Refused:    []failedJSON{},
 		SameVolume: p.SameVolume, Need: p.Need, NoSpace: p.NoSpace,
-		Interrupted: s.interruptedInvolving(r.Context(), l.id, th.id),
+		Interrupted: interruptedInvolving(allInterrupted(r.Context(), s.ws, s.log), l.id, th.id),
 	}
 	if p.Free >= 0 {
 		f := p.Free
@@ -193,16 +203,60 @@ func (s *Server) handleTransferPlan(w http.ResponseWriter, r *http.Request, l *l
 }
 
 // listedInterrupted is an unfinished move found in a listed library's
-// folder (the move's target).
+// folder (the move's target), with its source found in the workspace.
 type listedInterrupted struct {
 	target listed
 	in     transfer.Interrupted
+	// source is the workspace library the move came from (nil when it is
+	// not there); problem says why the move cannot be finished now (""
+	// when it can).
+	source  *listed
+	problem string
+}
+
+// from is the source's id: its current one when it is in the workspace.
+func (li listedInterrupted) from() string {
+	if li.source != nil {
+		return li.source.id
+	}
+	return li.in.Source.Name
+}
+
+func (li listedInterrupted) json() interruptedJSON {
+	id := li.in.ID
+	if id == 0 { // an unreadable journal: its name is the record id
+		id, _ = strconv.ParseInt(strings.TrimSuffix(filepath.Base(li.in.Path), ".journal"), 10, 64)
+	}
+	return interruptedJSON{From: li.from(), To: li.target.id, ID: id, Problem: li.problem}
+}
+
+// involves reports whether the move is from or into library id.
+func (li listedInterrupted) involves(id string) bool {
+	return li.target.id == id || li.from() == id || (li.in.Source.Name != "" && li.in.Source.Name == id)
+}
+
+// between reports whether the move is one between libraries a and b, in
+// either direction, that can be finished: Run finishes those itself
+// before it moves anything.
+func (li listedInterrupted) between(a, b string) bool {
+	from := li.from()
+	return li.problem == "" && (li.target.id == a && from == b || li.target.id == b && from == a)
+}
+
+// describe names the move for a message: "from peter to penny".
+func (li listedInterrupted) describe() string {
+	if from := li.from(); from != "" {
+		return fmt.Sprintf("from %s to %s", from, li.target.id)
+	}
+	return "into " + li.target.id
 }
 
 // allInterrupted reads the move journals of every library of the
 // workspace (read-only; a journal names its target's folder by where it
-// is).
-func allInterrupted(ws *workspace, log *slog.Logger) []listedInterrupted {
+// is) and finds the source library of each. It reads every library's
+// journal folder, and every library's id when a move is unfinished, so
+// a request calls it once.
+func allInterrupted(ctx context.Context, ws *workspace, log *slog.Logger) []listedInterrupted {
 	all, err := ws.discover()
 	if err != nil {
 		return nil
@@ -221,27 +275,81 @@ func allInterrupted(ws *workspace, log *slog.Logger) []listedInterrupted {
 			out = append(out, listedInterrupted{target: l, in: in})
 		}
 	}
-	return out
-}
-
-// interruptedInvolving returns the unfinished moves from or into any of
-// ids (by the source's id when the move started and the target's folder).
-func (s *Server) interruptedInvolving(_ context.Context, ids ...string) []interruptedJSON {
-	out := []interruptedJSON{}
-	for _, li := range allInterrupted(s.ws, s.log) {
-		for _, id := range ids {
-			if li.target.id == id || li.in.Source.Name == id {
-				out = append(out, interruptedJSON{From: li.in.Source.Name, To: li.target.id, ID: li.in.ID})
-				break
-			}
+	ids := map[string]string{} // listed id -> user.db library id, read once
+	for i := range out {
+		li := &out[i]
+		if li.in.ID == 0 {
+			li.problem = fmt.Sprintf("its journal (%s) cannot be read, so picmover cannot finish it; look at it by hand",
+				filepath.ToSlash(filepath.Join(library.MetaDir, transfer.JournalDir, filepath.Base(li.in.Path))))
+			continue
+		}
+		if src, ok := findSource(ctx, ws, all, li, ids); ok {
+			li.source = &src
+		} else {
+			li.problem = fmt.Sprintf("the library it came from (%s) is not in this workspace; put it back to finish the move",
+				li.in.Source.Name)
 		}
 	}
 	return out
 }
 
+// findSource returns the workspace library an interrupted move came from
+// (transfer.IsSource), other than its target. ids caches library ids.
+func findSource(ctx context.Context, ws *workspace, all []listed, li *listedInterrupted, ids map[string]string) (listed, bool) {
+	for _, l := range all {
+		if !l.library || l.id == li.target.id {
+			continue
+		}
+		libID, seen := ids[l.id]
+		if !seen {
+			libID, _ = libraryIDOf(ctx, ws, l)
+			ids[l.id] = libID
+		}
+		if libID == "" {
+			continue
+		}
+		root := l.path
+		if r, err := filepath.EvalSymlinks(l.path); err == nil {
+			root = r
+		}
+		if transfer.IsSource(li.in, libID, root) {
+			return l, true
+		}
+	}
+	return listed{}, false
+}
+
+// interruptedInvolving returns the unfinished moves of list from or into
+// any of ids.
+func interruptedInvolving(list []listedInterrupted, ids ...string) []interruptedJSON {
+	out := []interruptedJSON{}
+	for _, li := range list {
+		if slices.ContainsFunc(ids, li.involves) {
+			out = append(out, li.json())
+		}
+	}
+	return out
+}
+
+// blockingMove returns why a move between a and b cannot start while
+// another move involving either is unfinished (docs/design/
+// library-move.md, "Pre-flight"); "" when none is. A move between a and b
+// does not block (Run finishes it first), nor does one that cannot be
+// finished here (the Libraries page says why).
+func blockingMove(list []listedInterrupted, a, b string) string {
+	for _, li := range list {
+		if li.problem != "" || li.between(a, b) || !li.involves(a) && !li.involves(b) {
+			continue
+		}
+		return fmt.Sprintf("the move %s was interrupted; finish it first (Finish moving, on the Libraries page)", li.describe())
+	}
+	return ""
+}
+
 // handleTransferResume is POST /api/libraries/{lib}/transfer/resume {}:
 // a transfer job that finishes every interrupted move from or into the
-// library (both sides are opened by the job).
+// library (both sides are opened by the job). 400 when there is none;
+// 409 with the reasons when none of them can be finished now.
 func (s *Server) handleTransferResume(w http.ResponseWriter, r *http.Request) {
 	var body struct{}
 	if !decodeBody(w, r, &body) {
@@ -255,8 +363,23 @@ func (s *Server) handleTransferResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "a single library has no other library")
 		return
 	}
-	if len(s.interruptedInvolving(r.Context(), e.id)) == 0 {
+	var problems []string
+	resumable := 0
+	for _, li := range allInterrupted(r.Context(), s.ws, s.log) {
+		switch {
+		case !li.involves(e.id):
+		case li.problem != "":
+			problems = append(problems, notFinished(li, li.problem))
+		default:
+			resumable++
+		}
+	}
+	switch {
+	case resumable == 0 && len(problems) == 0:
 		writeError(w, http.StatusBadRequest, "no interrupted move involves this library")
+		return
+	case resumable == 0:
+		writeError(w, http.StatusConflict, strings.Join(problems, "; "))
 		return
 	}
 	if err := s.ws.open(r.Context(), e); err != nil {
@@ -271,48 +394,35 @@ func (s *Server) handleTransferResume(w http.ResponseWriter, r *http.Request) {
 	s.launch(w, r, e, jobParams{Kind: kindTransfer, resume: true}, nil)
 }
 
+// notFinished is the message of an interrupted move that could not be
+// finished.
+func notFinished(li listedInterrupted, why string) string {
+	return fmt.Sprintf("the interrupted move %s could not be finished: %s", li.describe(), why)
+}
+
 // pairOf opens both libraries of an interrupted move and returns them as
-// (source, target) entries; ok false (logged) when it cannot.
-func (m *jobManager) pairOf(ctx context.Context, li listedInterrupted, logger *slog.Logger) (src, dst *libEntry, ok bool) {
-	all, err := m.ws.discover()
-	if err != nil {
-		logger.Error("cannot list the workspace", "err", err)
-		return nil, nil, false
+// (source, target) entries; the error is a message for the user.
+func (m *jobManager) pairOf(ctx context.Context, li listedInterrupted) (src, dst *libEntry, err error) {
+	if li.problem != "" {
+		return nil, nil, errors.New(li.problem)
 	}
-	open := func(l listed) *libEntry {
+	open := func(l listed) (*libEntry, error) {
 		x := m.ws.entryFor(l)
 		if err := m.ws.open(ctx, x); err != nil {
-			logger.Warn("library could not be opened", "id", l.id, "err", err)
-			return nil
+			return nil, fmt.Errorf("%s cannot be opened: %s", l.id, publicLibError(err))
 		}
-		return x
+		return x, nil
 	}
-	dst = open(li.target)
-	if dst == nil {
-		return nil, nil, false
+	if dst, err = open(li.target); err != nil {
+		return nil, nil, err
 	}
-	for _, l := range all {
-		if !l.library {
-			continue
-		}
-		libID, err := libraryIDOf(ctx, m.ws, l)
-		if err != nil || libID == "" {
-			continue
-		}
-		root := l.path
-		if r, err := filepath.EvalSymlinks(l.path); err == nil {
-			root = r
-		}
-		if transfer.IsSource(li.in, libID, root) {
-			if src = open(l); src == nil {
-				return nil, nil, false
-			}
-			return src, dst, src != dst
-		}
+	if src, err = open(*li.source); err != nil {
+		return nil, nil, err
 	}
-	logger.Warn("the source library of an interrupted move is not in the workspace", "journal", li.in.Path,
-		"source", li.in.Source.Root)
-	return nil, nil, false
+	if src == dst {
+		return nil, nil, errors.New("its source and its target are the same library")
+	}
+	return src, dst, nil
 }
 
 // libraryIDOf returns the user.db library id of a listed library: from
@@ -327,29 +437,52 @@ func libraryIDOf(ctx context.Context, ws *workspace, l listed) (string, error) {
 	return userdata.PeekLibraryID(ctx, filepath.Join(l.path, userdata.FileName))
 }
 
-// lockPair takes the trash locks of a and b in id order (one order for
-// every caller, so two never deadlock) and returns the unlock.
+// errMoving answers a request that would change a library a move is
+// running on: its trash or its user data (the move reads and merges
+// them, and holds the trash lock for the whole run).
+var errMoving = errors.New("a move is running on this library; try again when it has finished")
+
+// lockPair marks a and b as moving and takes their trash locks in id
+// order (one order for every caller, so two never deadlock); it returns
+// the unlock.
 func lockPair(a, b *libEntry) func() {
 	if b.id < a.id {
 		a, b = b, a
 	}
+	a.moving.Add(1)
+	b.moving.Add(1)
 	a.trashMu.Lock()
 	b.trashMu.Lock()
 	return func() {
 		b.trashMu.Unlock()
 		a.trashMu.Unlock()
+		b.moving.Add(-1)
+		a.moving.Add(-1)
 	}
+}
+
+// lockTrash takes e's trash lock for a request; false, holding nothing,
+// while a move runs on e (it holds the lock for the whole run, so the
+// request would wait for all of it).
+func (e *libEntry) lockTrash() bool {
+	if e.moving.Load() > 0 {
+		return false
+	}
+	if e.trashMu.TryLock() {
+		return true
+	}
+	if e.moving.Load() > 0 {
+		return false
+	}
+	e.trashMu.Lock() // another trash request, or an import's restore: short
+	return true
 }
 
 // sideOf opens what a transfer needs of an open library: the library
 // (its internal folders created), and a writable store; close releases
 // the store.
 func sideOf(e *libEntry) (side transfer.Side, close func(), err error) {
-	state, h := e.snapshot()
-	if state != libOpen {
-		return transfer.Side{}, nil, fmt.Errorf("library %s is not open", e.id)
-	}
-	lib, err := library.Open(h.lib.Root())
+	lib, h, err := openLibOf(e)
 	if err != nil {
 		return transfer.Side{}, nil, err
 	}
@@ -360,23 +493,37 @@ func sideOf(e *libEntry) (side transfer.Side, close func(), err error) {
 	return transfer.Side{Lib: lib, DB: h.db, User: h.user, Store: store, Name: e.id}, func() { store.Close() }, nil
 }
 
+// openLibOf opens an open library's folder (its internal folders
+// created) and returns its handles.
+func openLibOf(e *libEntry) (*library.Library, *libHandles, error) {
+	state, h := e.snapshot()
+	if state != libOpen {
+		return nil, nil, fmt.Errorf("library %s is not open", e.id)
+	}
+	lib, err := library.Open(h.lib.Root())
+	if err != nil {
+		return nil, nil, err
+	}
+	return lib, h, nil
+}
+
 // runTransfer moves the job's hashes from its library to params.target,
 // or (resume) finishes the interrupted moves involving its library. The
 // log goes to the target library (transfer_<time>.log); exit codes as
-// the CLI: 0, 2 when files failed or a source copy could not be moved to
-// the trash, 130 cancelled, 1 otherwise.
+// the CLI: 0, 2 when files failed, a source copy could not be moved to
+// the trash or an interrupted move could not be finished, 130 when a
+// cancel left work undone, 1 otherwise.
 func (m *jobManager) runTransfer(j *job) (state string, code int, stats importer.Stats, sessionID int64, msg string) {
 	logEntry := j.entry
 	if j.params.target != nil {
 		logEntry = j.params.target
 	}
-	logSide, closeLog, err := sideOf(logEntry)
+	logLib, _, err := openLibOf(logEntry)
 	if err != nil {
 		m.log.Error("job not started", "id", j.id, "err", err)
 		return stateFailed, 1, stats, 0, publicLibError(err)
 	}
-	closeLog()
-	logFile, logPath, err := logSide.Lib.OpenLog(kindTransfer)
+	logFile, logPath, err := logLib.OpenLog(kindTransfer)
 	if err != nil {
 		m.log.Error("job not started", "id", j.id, "err", err)
 		return stateFailed, 1, stats, 0, publicLibError(err)
@@ -391,8 +538,15 @@ func (m *jobManager) runTransfer(j *job) (state string, code int, stats importer
 
 	res := transferResultJSON{Failed: []failedJSON{}}
 	opts := transfer.Options{Logger: logger, OnProgress: j.onTransferProgress, OnItem: func(it transfer.Item) {
-		if it.Status == transfer.StatusFailed {
+		switch {
+		case it.Status == transfer.StatusFailed:
 			j.onTransferFailure(it, &res)
+		case it.SourceErr != nil:
+			// Counted here, not from Result: the moves Run finishes
+			// first report their items too.
+			j.mu.Lock()
+			res.SourcePending++
+			j.mu.Unlock()
 		}
 	}, OnRecord: j.setImportID}
 
@@ -412,6 +566,15 @@ func (m *jobManager) runTransfer(j *job) (state string, code int, stats importer
 	j.result = res
 	j.mu.Unlock()
 
+	state, code, msg = transferOutcome(j, runErr, res, logger)
+	m.log.Info("job finished", "id", j.id, "kind", kindTransfer, "state", state, "exit_code", code)
+	return state, code, stats, 0, msg
+}
+
+// transferOutcome is the state, exit code and message of a finished
+// transfer job. A cancel counts only when it left work undone: Run (or
+// Recover) stopped early, or failed with the cancel's error.
+func transferOutcome(j *job, runErr error, res transferResultJSON, logger *slog.Logger) (state string, code int, msg string) {
 	var noSpace *transfer.NoSpaceError
 	switch {
 	case errors.As(runErr, &noSpace):
@@ -419,27 +582,61 @@ func (m *jobManager) runTransfer(j *job) (state string, code int, stats importer
 		msg = fmt.Sprintf("not enough free space in %s: %s needed, %s free", j.params.To, humanBytes(noSpace.Need), humanBytes(noSpace.Free))
 	case errors.Is(runErr, transfer.ErrNoUserData):
 		state, code, msg = stateFailed, 1, runErr.Error()
+	case errors.Is(runErr, context.Canceled), runErr != nil && j.ctx.Err() != nil, res.cancelled:
+		// Cut short by the cancel (an error after a cancel is its
+		// consequence). A cancel after the last file changes nothing.
+		state, code = stateCancelled, 130
 	case runErr != nil:
 		logger.Error("move failed", "err", runErr)
 		if msg = publicLibError(runErr); msg == genericLibError {
 			msg = "the move failed; see the job log"
 		}
 		state, code = stateFailed, 1
-	case j.ctx.Err() != nil:
-		state, code = stateCancelled, 130
-	case res.FailedCount > 0 && res.SourcePending > 0:
-		state, code = stateDone, 2
-		msg = fmt.Sprintf("%d files could not be moved, and %d originals could not be moved to the trash; see the job log",
-			res.FailedCount, res.SourcePending)
-	case res.FailedCount > 0:
-		state, code, msg = stateDone, 2, fmt.Sprintf("%d files could not be moved; see the job log", res.FailedCount)
-	case res.SourcePending > 0:
-		state, code, msg = stateDone, 2, fmt.Sprintf("%d photos were moved, but their originals could not be moved to the trash; finish the move again later", res.SourcePending)
+	case j.params.resume && res.resumed == 0 && len(res.problems) > 0:
+		state, code, msg = stateFailed, 1, strings.Join(res.problems, "; ")
 	default:
-		state = stateDone
+		var parts []string
+		if res.FailedCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s could not be moved (see the job log)", res.FailedCount, pluralWord(res.FailedCount, "file", "files")))
+		}
+		if res.SourcePending > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s moved to %s, but %s could not be moved to the trash in %s; finish the move from the Libraries page",
+				res.SourcePending, pluralWord(res.SourcePending, "photo was", "photos were"), targetOf(j, res),
+				pluralWord(res.SourcePending, "its original", "their originals"), sourceOf(j)))
+		}
+		parts = append(parts, res.problems...)
+		state, msg = stateDone, strings.Join(parts, "; ")
+		if msg != "" {
+			code = 2
+		}
 	}
-	m.log.Info("job finished", "id", j.id, "kind", kindTransfer, "state", state, "exit_code", code)
-	return state, code, stats, 0, msg
+	return state, code, msg
+}
+
+// targetOf and sourceOf name the libraries of a transfer job's result for
+// a message ("the target library" after a resume of several moves).
+func targetOf(j *job, res transferResultJSON) string {
+	if j.params.target != nil {
+		return j.params.target.id
+	}
+	if res.resumed == 1 && res.TargetLibrary != "" {
+		return res.TargetLibrary
+	}
+	return "the target library"
+}
+
+func sourceOf(j *job) string {
+	if !j.params.resume {
+		return j.entry.id
+	}
+	return "the source library"
+}
+
+func pluralWord(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // moveOnce runs one move of the job's hashes.
@@ -466,23 +663,33 @@ func (m *jobManager) moveOnce(j *job, res *transferResultJSON, opts transfer.Opt
 }
 
 // resumeAll finishes the interrupted moves from or into the job's
-// library, one pair of libraries at a time.
+// library, one pair of libraries at a time. A move that cannot be
+// finished (an unreadable journal, a source not in the workspace, a
+// library that cannot be opened, a recovery error) is reported in
+// res.problems and the others go on; only a cancel stops it.
 func (m *jobManager) resumeAll(j *job, res *transferResultJSON, opts transfer.Options, logger *slog.Logger) error {
-	for _, li := range allInterrupted(m.ws, m.log) {
-		if li.target.id != j.entry.id && li.in.Source.Name != j.entry.id {
+	for _, li := range allInterrupted(j.ctx, m.ws, m.log) {
+		if !li.involves(j.entry.id) {
 			continue
 		}
-		if li.in.ID == 0 {
-			logger.Error("unreadable move journal; look at it by hand", "journal", li.in.Path)
-			res.FailedCount++
+		if err := j.ctx.Err(); err != nil {
+			return err
+		}
+		problem := func(why string) {
+			logger.Error("interrupted move not finished", "journal", li.in.Path, "why", why)
+			j.mu.Lock()
+			res.problems = append(res.problems, notFinished(li, why))
+			j.mu.Unlock()
+		}
+		src, dst, err := m.pairOf(j.ctx, li)
+		if err != nil {
+			problem(err.Error())
 			continue
 		}
-		src, dst, ok := m.pairOf(j.ctx, li, logger)
-		if !ok {
-			res.FailedCount++
-			continue
-		}
-		if err := func() error {
+		j.mu.Lock()
+		res.resumed++
+		j.mu.Unlock()
+		err = func() error {
 			unlock := lockPair(src, dst)
 			defer unlock()
 			from, closeFrom, err := sideOf(src)
@@ -509,8 +716,17 @@ func (m *jobManager) resumeAll(j *job, res *transferResultJSON, opts transfer.Op
 			src.clearPlans()
 			dst.recountLargeMissing()
 			return err
-		}(); err != nil {
+		}()
+		switch {
+		case errors.Is(err, context.Canceled), err != nil && j.ctx.Err() != nil:
 			return err
+		case err != nil:
+			logger.Error("interrupted move not finished", "journal", li.in.Path, "err", err)
+			why := publicLibError(err)
+			if why == genericLibError {
+				why = "see the job log"
+			}
+			problem(why)
 		}
 	}
 	return nil
@@ -520,9 +736,9 @@ func addResult(out *transferResultJSON, r transfer.Result) {
 	out.Moved += r.Moved
 	out.Existing += r.Existing
 	out.Restored += r.Restored
-	out.SourcePending += r.SourcePending
 	out.Recovered += r.Recovered
 	out.Bytes += r.Bytes
+	out.cancelled = out.cancelled || r.Cancelled
 	if r.RecordID != 0 {
 		id := r.RecordID
 		out.Record = &id

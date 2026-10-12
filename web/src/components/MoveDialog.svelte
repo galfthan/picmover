@@ -11,7 +11,7 @@
   import { jobs } from '../lib/jobs.svelte';
   import { formatCount } from '../lib/format';
   import { moves, openHref, type MoveDialogState } from '../lib/moves.svelte';
-  import { failedHeading, interruptedText, photos, planLines, reasons, refusedHeading, resultLines, spaceProblem } from '../lib/movetext';
+  import { blocking, failedHeading, interruptedText, photos, planLines, reasons, refusedHeading, resultLines, sentence, spaceProblem } from '../lib/movetext';
   import { summaryFromLib } from '../lib/backupinfo';
   import Dialog from './Dialog.svelte';
   import BackupProgress from './BackupProgress.svelte';
@@ -45,9 +45,12 @@
   const send = $derived(plan ? req.hashes.filter((h) => !refused.has(h)) : []);
   const text = $derived(plan ? planLines(plan, targetName) : null);
   const noSpace = $derived(plan ? spaceProblem(plan, targetName) : null);
-  const blocked = $derived(!!plan && plan.interrupted.length > 0);
+  /** Interrupted moves to finish first; those that cannot be finished now are only shown. */
+  const mustFinish = $derived(plan ? blocking(plan.interrupted) : []);
+  const stuck = $derived(plan ? plan.interrupted.filter((m) => m.problem) : []);
+  const blocked = $derived(mustFinish.length > 0);
   /** The targets of the interrupted moves, once each: "Finish moving" resumes there. */
-  const resumeTargets = $derived([...new Set(plan?.interrupted.map((m) => m.to) ?? [])]);
+  const resumeTargets = $derived([...new Set(mustFinish.map((m) => m.to))]);
   const backedUp = $derived.by(() => {
     const l = libraries.find(from);
     const b = l ? summaryFromLib(l) : null;
@@ -124,7 +127,9 @@
     resuming = true;
     try {
       const r = await moves.resume(to, req.origin);
-      if (r.state === 'done' && moves.dialog) {
+      // A clean finish goes back to the plan; otherwise the run's result
+      // stays, saying what is not finished and why.
+      if (r.state === 'done' && r.notes.length === 0 && moves.dialog) {
         moves.dismissRun();
         await makePlan();
       }
@@ -159,7 +164,11 @@
         {:else}
           <p class="muted">Starting…</p>
         {/if}
-        <p class="muted small">The move goes on when you close this window.</p>
+        {#if run.part < run.parts}
+          <p class="muted small">The move goes on when you close this window. Keep this page open: the remaining parts are started from it.</p>
+        {:else}
+          <p class="muted small">The move goes on when you close this window.</p>
+        {/if}
         <div class="row end">
           <button onclick={() => moves.close()}>Close</button>
         </div>
@@ -169,6 +178,8 @@
             <div class="error-box">{run.resume ? 'Finishing the move' : 'The move'} failed: {run.error || 'unknown error'}</div>
           {:else if run.state === 'cancelled'}
             <p class="headline">The move was cancelled.</p>
+          {:else if run.resume && run.notes.length}
+            <p class="headline">The interrupted move to {to} is not finished.</p>
           {:else if run.resume}
             <p class="headline">Finished the interrupted move to {to}.</p>
           {/if}
@@ -177,6 +188,9 @@
               <p class:headline={i === 0 && run.state === 'done' && !run.resume}>{line}</p>
             {/each}
           {/if}
+          {#each run.notes as note, i (i)}
+            <div class="error-box">{sentence(note)}</div>
+          {/each}
           {#if run.totals.failedCount > 0}
             <p class="failed-head">{failedHeading(run.totals.failedCount)}</p>
             <ul class="reasons">
@@ -243,7 +257,7 @@
       {:else if plan && text}
         {#if blocked}
           <div class="notice interrupted" role="alert">
-            {#each plan.interrupted as m (`${m.from}/${m.to}/${m.id}`)}
+            {#each mustFinish as m (`${m.from}/${m.to}/${m.id}`)}
               <p>{interruptedText(m, nameOf)}</p>
             {/each}
             <p>Finish it before moving more photos.</p>
@@ -255,6 +269,13 @@
               {/each}
             </div>
             {#if resumeError}<div class="error-box small">{resumeError}</div>{/if}
+          </div>
+        {/if}
+        {#if stuck.length}
+          <div class="notice" role="status">
+            {#each stuck as m (`${m.from}/${m.to}/${m.id}`)}
+              <p>{interruptedText(m, nameOf)}</p>
+            {/each}
           </div>
         {/if}
         <p class="headline">{text.headline}</p>

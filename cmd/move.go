@@ -63,7 +63,9 @@ the two libraries are moved between, or with:
 
   picmover move --resume <library>
 
-which finishes every interrupted move into <library>.
+which finishes every interrupted move into <library> (one that cannot be
+finished is reported, and the others go on). Another move into or out of
+either library is refused while such a move is unfinished.
 
 Exit status: 0; 2 when some files could not be moved (they stay in the
 source) or an original could not be moved to the trash; 130 when
@@ -81,15 +83,17 @@ cancelled; 1 otherwise.`,
 				if p.all || p.filtered() || p.dryRun {
 					return usageError(cmd, errors.New("--resume takes no selection and no --dry-run"))
 				}
-				return runMoveResume(cmd, ctx, args[0])
+				return cancelledExit(cmd, ctx, runMoveResume(cmd, ctx, args[0]))
 			}
 			switch {
+			case p.importID < 0:
+				return usageError(cmd, fmt.Errorf("invalid --import %d: want an import record id (see picmover imports)", p.importID))
 			case !p.all && !p.filtered():
 				return usageError(cmd, errors.New("select the photos to move (for example --album NAME), or --all"))
 			case p.all && p.filtered():
 				return usageError(cmd, errors.New("--all takes no other selection"))
 			}
-			return runMove(cmd, ctx, args[0], args[1], p)
+			return cancelledExit(cmd, ctx, runMove(cmd, ctx, args[0], args[1], p))
 		},
 	}
 	f := c.Flags()
@@ -109,6 +113,17 @@ cancelled; 1 otherwise.`,
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.resume, "resume", false, "finish the interrupted moves into the library")
 	return c
+}
+
+// cancelledExit turns an error that a cancel caused before the move
+// began (opening the libraries, reading the selection) into exit 130.
+func cancelledExit(cmd *cobra.Command, ctx context.Context, err error) error {
+	var ee *exitError
+	if err == nil || ctx.Err() == nil || errors.As(err, &ee) {
+		return err
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "Cancelled; nothing was moved.")
+	return &exitError{code: 130}
 }
 
 // openedSide is a library opened and locked for a move.
@@ -267,7 +282,7 @@ func selectHashes(ctx context.Context, s transfer.Side, p moveParams) ([]uint64,
 			sets = append(sets, hs)
 		}
 	}
-	if p.importID > 0 {
+	if p.importID != 0 {
 		if _, err := s.User.GetImport(ctx, p.importID); err != nil {
 			return nil, fmt.Errorf("import record %d: %w", p.importID, err)
 		}
@@ -414,6 +429,9 @@ func runMove(cmd *cobra.Command, ctx context.Context, fromDir, toDir string, p m
 		return err
 	}
 	printMovePlan(out, from, to, pl)
+	if err := otherInterrupted(ctx, from, to, errOut); err != nil {
+		return err
+	}
 	if pl.NoSpace {
 		return &exitError{code: 1, msg: fmt.Sprintf("not enough free space in %s", to.Lib.Root())}
 	}
@@ -458,7 +476,7 @@ func runMove(cmd *cobra.Command, ctx context.Context, fromDir, toDir string, p m
 	if status != nil {
 		status.done()
 	}
-	return moveSummary(out, errOut, res, runErr, failures, logPath, to)
+	return moveSummary(out, errOut, res, runErr, ctx.Err() != nil, failures, logPath, to)
 }
 
 func phaseWord(phase string) string {
@@ -471,12 +489,24 @@ func phaseWord(phase string) string {
 	return "Moving"
 }
 
-// moveSummary prints the outcome and returns the exit error.
-func moveSummary(out, errOut io.Writer, res transfer.Result, runErr error, failures []transfer.Item, logPath string, to transfer.Side) error {
+// moveSummary prints the outcome and returns the exit error. The failed
+// count is that of the failures listed (they include the files of an
+// interrupted move between the two libraries that Run finished first).
+// A cancel counts when it cut the work short: Run stopped early, or
+// failed after the cancel.
+func moveSummary(out, errOut io.Writer, res transfer.Result, runErr error, cancelled bool, failures []transfer.Item, logPath string, to transfer.Side) error {
+	failed, pending := 0, 0
+	for _, it := range failures {
+		if it.Status == transfer.StatusFailed {
+			failed++
+		} else {
+			pending++
+		}
+	}
 	if res.Recovered > 0 {
 		fmt.Fprintf(out, "Finished from an interrupted move: %d\n", res.Recovered)
 	}
-	fmt.Fprintf(out, "Moved: %d, already there: %d, restored there: %d, failed: %d\n", res.Moved, res.Existing, res.Restored, res.Failed)
+	fmt.Fprintf(out, "Moved: %d, already there: %d, restored there: %d, failed: %d\n", res.Moved, res.Existing, res.Restored, failed)
 	if res.Bytes > 0 {
 		fmt.Fprintf(out, "Copied: %s\n", humanSize(res.Bytes))
 	}
@@ -496,15 +526,15 @@ func moveSummary(out, errOut io.Writer, res transfer.Result, runErr error, failu
 	case errors.As(runErr, &noSpace):
 		return &exitError{code: 1, msg: fmt.Sprintf("not enough free space in %s: %s needed, %s free",
 			to.Lib.Root(), humanSize(noSpace.Need), humanSize(noSpace.Free))}
-	case runErr != nil:
-		return runErr
-	case res.Cancelled:
+	case errors.Is(runErr, context.Canceled), runErr != nil && cancelled, res.Cancelled:
 		fmt.Fprintln(out, "Cancelled; the files moved so far are recorded.")
 		return &exitError{code: 130}
-	case res.SourcePending > 0:
+	case runErr != nil:
+		return runErr
+	case pending > 0:
 		return &exitError{code: 2, msg: fmt.Sprintf("%d originals could not be moved to the trash; run 'picmover move --resume %s' later",
-			res.SourcePending, quoteArg(to.Lib.Root()))}
-	case res.Failed > 0:
+			pending, quoteArg(to.Lib.Root()))}
+	case failed > 0:
 		return &exitError{code: 2}
 	}
 	return nil
@@ -517,7 +547,140 @@ func orHash(it transfer.Item) string {
 	return fmt.Sprintf("%016x", it.Hash)
 }
 
-// runMoveResume finishes the interrupted moves into dir.
+// sourceRootOf finds the library an interrupted move into target came
+// from: at the root its journal recorded, else (the folder was renamed or
+// moved) a folder next to target, in its workspace, holding a library
+// with the recorded id (transfer.IsSource).
+func sourceRootOf(ctx context.Context, in transfer.Interrupted, target string) (string, bool) {
+	cands := []string{in.Source.Root}
+	parent := filepath.Dir(target)
+	if des, err := os.ReadDir(parent); err == nil {
+		for _, de := range des {
+			if de.IsDir() && !strings.HasPrefix(de.Name(), ".") {
+				cands = append(cands, filepath.Join(parent, de.Name()))
+			}
+		}
+	}
+	for _, c := range cands {
+		root := c
+		if r, err := filepath.EvalSymlinks(c); err == nil {
+			root = r
+		}
+		if root == target {
+			continue
+		}
+		if fi, err := os.Stat(filepath.Join(root, library.DBName)); err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		id, err := userdata.PeekLibraryID(ctx, filepath.Join(root, userdata.FileName))
+		if err == nil && id != "" && transfer.IsSource(in, id, root) {
+			return root, true
+		}
+	}
+	return "", false
+}
+
+// libraryDirs returns the library folders next to dirs (their parents'
+// subfolders with a media.db), dirs excluded, links resolved.
+func libraryDirs(dirs ...string) []string {
+	seen := map[string]bool{}
+	for _, d := range dirs {
+		seen[d] = true
+	}
+	var out []string
+	for _, d := range dirs {
+		parent := filepath.Dir(d)
+		des, err := os.ReadDir(parent)
+		if err != nil {
+			continue
+		}
+		for _, de := range des {
+			if !de.IsDir() || strings.HasPrefix(de.Name(), ".") {
+				continue
+			}
+			p := filepath.Join(parent, de.Name())
+			if r, err := filepath.EvalSymlinks(p); err == nil {
+				p = r
+			}
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			if fi, err := os.Stat(filepath.Join(p, library.DBName)); err == nil && fi.Mode().IsRegular() {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+// otherInterrupted refuses a move between from and to while another move
+// into or out of either is unfinished (docs/design/library-move.md,
+// "Pre-flight"): moves into them, and moves out of them into a library
+// next to them. A move between the two is fine (Run finishes it first);
+// one that cannot be finished (an unreadable journal, a source library
+// that is not there) is reported and does not block.
+func otherInterrupted(ctx context.Context, from, to transfer.Side, errOut io.Writer) error {
+	type side struct {
+		root, id string
+	}
+	var sides []side
+	for _, s := range []transfer.Side{from, to} {
+		id, err := s.User.LibraryID(ctx)
+		if err != nil {
+			return err
+		}
+		sides = append(sides, side{s.Lib.Root(), id})
+	}
+	ours := func(in transfer.Interrupted) int {
+		for i, s := range sides {
+			if transfer.IsSource(in, s.id, s.root) {
+				return i
+			}
+		}
+		return -1
+	}
+	refuse := func(src, dst string) error {
+		return &exitError{code: 1, msg: fmt.Sprintf("the move from %s to %s was interrupted; finish it first: picmover move --resume %s",
+			src, dst, quoteArg(dst))}
+	}
+	for i, s := range sides {
+		list, err := transfer.ListInterruptedAt(s.root)
+		if err != nil {
+			return err
+		}
+		for _, in := range list {
+			switch src := ours(in); {
+			case in.ID == 0:
+				fmt.Fprintf(errOut, "warning: the move journal %s cannot be read; look at it by hand\n", in.Path)
+			case src >= 0 && src != i:
+				// Between the two: Run finishes it first.
+			default:
+				if root, ok := sourceRootOf(ctx, in, s.root); ok {
+					return refuse(root, s.root)
+				}
+				fmt.Fprintf(errOut, "warning: a move from %s into %s was interrupted, and that library is not there any more; put it back and run picmover move --resume %s\n",
+					in.Source.Root, s.root, quoteArg(s.root))
+			}
+		}
+	}
+	for _, dir := range libraryDirs(sides[0].root, sides[1].root) {
+		list, err := transfer.ListInterruptedAt(dir)
+		if err != nil {
+			continue
+		}
+		for _, in := range list {
+			if src := ours(in); src >= 0 {
+				return refuse(sides[src].root, dir)
+			}
+		}
+	}
+	return nil
+}
+
+// runMoveResume finishes the interrupted moves into dir. A move that
+// cannot be finished is reported and the others go on; the summary
+// counts both.
 func runMoveResume(cmd *cobra.Command, ctx context.Context, dir string) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	lib, err := library.Attach(dir)
@@ -535,43 +698,79 @@ func runMoveResume(cmd *cobra.Command, ctx context.Context, dir string) error {
 	var total transfer.Result
 	var failures []transfer.Item
 	var logPath string
+	var problems []string
+	attempted, errored := 0, 0
 	for _, in := range list {
+		if ctx.Err() != nil {
+			total.Cancelled = true
+			break
+		}
 		if in.ID == 0 {
-			fmt.Fprintf(errOut, "unreadable move journal %s: look at it by hand\n", in.Path)
-			total.Failed++
+			problems = append(problems, fmt.Sprintf("the move journal %s cannot be read, so it cannot be finished; look at it by hand", in.Path))
 			continue
 		}
+		attempted++
 		res, lp, err := resumeOne(ctx, in, lib.Root(), errOut, &failures)
 		if lp != "" {
 			logPath = lp
 		}
 		total.Recovered += res.Recovered
-		total.Moved += res.Moved
-		total.Existing += res.Existing
-		total.Restored += res.Restored
-		total.Failed += res.Failed
-		total.SourcePending += res.SourcePending
+		total.Cancelled = total.Cancelled || res.Cancelled
 		if err != nil {
-			return err
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				total.Cancelled = true
+				break
+			}
+			errored++
+			problems = append(problems, fmt.Sprintf("the interrupted move from %s could not be finished: %v", in.Source.Root, err))
 		}
 	}
-	fmt.Fprintf(out, "Finished: %d, failed: %d\n", total.Recovered, total.Failed)
+	failed, pending := 0, 0
 	for _, it := range failures {
-		fmt.Fprintf(errOut, "  %s: %s\n", orHash(it), transfer.Message(it.Err))
+		if it.Status == transfer.StatusFailed {
+			failed++
+		} else {
+			pending++
+		}
+	}
+	fmt.Fprintf(out, "Finished: %d, failed: %d\n", total.Recovered, failed)
+	for _, it := range failures {
+		if it.Status == transfer.StatusFailed {
+			fmt.Fprintf(errOut, "  %s: %s\n", orHash(it), transfer.Message(it.Err))
+		} else {
+			fmt.Fprintf(errOut, "  %s: moved, but the original could not be moved to the trash: %s\n", orHash(it), transfer.Message(it.SourceErr))
+		}
+	}
+	for _, p := range problems {
+		fmt.Fprintf(errOut, "%s\n", p)
+	}
+	if len(problems) > 0 {
+		fmt.Fprintf(out, "Interrupted moves not finished: %d of %d\n", len(problems), len(list))
 	}
 	if logPath != "" {
 		fmt.Fprintf(out, "Log: %s\n", logPath)
 	}
-	if total.Failed > 0 || total.SourcePending > 0 {
+	switch {
+	case total.Cancelled:
+		fmt.Fprintln(out, "Cancelled; the files finished so far are recorded.")
+		return &exitError{code: 130}
+	case attempted == errored:
+		return &exitError{code: 1, msg: "no interrupted move could be finished"}
+	case failed > 0 || pending > 0 || len(problems) > 0:
 		return &exitError{code: 2}
 	}
 	return nil
 }
 
 func resumeOne(ctx context.Context, in transfer.Interrupted, target string, errOut io.Writer, failures *[]transfer.Item) (transfer.Result, string, error) {
-	sides, err := openSides(ctx, []string{in.Source.Root, target}, errOut)
+	root, ok := sourceRootOf(ctx, in, target)
+	if !ok {
+		return transfer.Result{}, "", fmt.Errorf("the library it came from is not at %s, and no library next to %s is that library; put it back and try again",
+			in.Source.Root, target)
+	}
+	sides, err := openSides(ctx, []string{root, target}, errOut)
 	if err != nil {
-		return transfer.Result{}, "", fmt.Errorf("the source library of the interrupted move, %s: %w", in.Source.Root, err)
+		return transfer.Result{}, "", err
 	}
 	defer sides[0].close()
 	from, to := sides[0].side, sides[1].side
@@ -580,7 +779,7 @@ func resumeOne(ctx context.Context, in transfer.Interrupted, target string, errO
 		return transfer.Result{}, "", err
 	}
 	if !transfer.IsSource(in, libID, from.Lib.Root()) {
-		return transfer.Result{}, "", fmt.Errorf("%s is not the library the interrupted move came from", in.Source.Root)
+		return transfer.Result{}, "", fmt.Errorf("%s is not the library the interrupted move came from", root)
 	}
 	logFile, logPath, err := to.Lib.OpenLog("transfer")
 	if err != nil {
@@ -590,7 +789,7 @@ func resumeOne(ctx context.Context, in transfer.Interrupted, target string, errO
 	opts := transfer.Options{
 		Logger: slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		OnItem: func(it transfer.Item) {
-			if it.Status == transfer.StatusFailed {
+			if it.Status == transfer.StatusFailed || it.SourceErr != nil {
 				*failures = append(*failures, it)
 			}
 		},

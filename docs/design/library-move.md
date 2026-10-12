@@ -456,6 +456,73 @@ cmd/move.go                     picmover move
   that library (journals live in the target). Without a terminal and
   without `--yes` it exits 1 after printing the plan.
 
+### After review (server, CLI)
+
+- **Interrupted moves block** as "Pre-flight" says, outside the dialog
+  too: starting a transfer job is 409 (`{error}`, no `state`) "the move
+  from peter to paul was interrupted; finish it first (Finish moving, on
+  the Libraries page)" while a move into or out of either library is
+  unfinished; `picmover move` exits 1 with `picmover move --resume
+  <target>`. The interrupted moves between the two libraries themselves
+  do not block (Run finishes them first). The CLI looks for them in both
+  libraries and, for moves out of them, in the library folders next to
+  them.
+- **Moves that cannot be finished** do not block anything and are never
+  counted as failed files. Each listed move (`interruptedMoves`, the
+  plan's `interrupted`) carries `problem` when it cannot be finished now:
+  "its journal (.picmover/transfers/7.journal) cannot be read, so
+  picmover cannot finish it; look at it by hand" (then `from` is `""` and
+  `id` is the journal's file name), or "the library it came from (peter)
+  is not in this workspace; put it back to finish the move". `from` is
+  the source's current id when it is found in the workspace (by library
+  id and `IsSource`, so a renamed folder is found). Nothing is offered to
+  dismiss such a move: the journal stays until its source is back (then
+  Finish moving works) or a person deals with it; no file is touched.
+  The resume endpoint answers 409 with the reasons when no move it would
+  finish can be finished.
+- **Resume** goes on past a move it cannot finish (a problem above, a
+  library that cannot be opened, a recovery error) and reports each as
+  "the interrupted move from X to Y could not be finished: <reason>" in
+  the job's `error`: exit 2 when another was finished, exit 1 when none
+  was. Only a cancel stops it. The CLI's `--resume` does the same, finds
+  a source whose folder was renamed among the folders next to the target
+  (by library id), prints "Interrupted moves not finished: N of M", and
+  exits 2 (1 when none could be finished, 130 when cancelled).
+- **Edits during a move**: while a transfer job holds a library (both
+  libraries of the pair; `libEntry.moving`, set by `lockPair`), its trash
+  endpoints (`trash`, `trash/restore`, `trash/delete`) and its user data
+  changes (`ratings`, `tags` create/rename/delete, `media/tags`, `albums`
+  create/update/delete/items, `similar/ignore`) answer 409 `{error: "a
+  move is running on this library; try again when it has finished"}` at
+  once. Before, the trash requests waited for the whole move (the trash
+  lock), and a rating or tag set after a photo's batch had merged was
+  lost in the target.
+- **Cancel**: a job is `cancelled`/130 only when the cancel left work
+  undone: Run (or Recover) reports `Cancelled`, or failed with
+  `context.Canceled` (or after the cancel). A cancel arriving after the
+  last file is `done`. The CLI exits 130 the same way, also when the
+  cancel stops it before the move begins ("Cancelled; nothing was
+  moved.").
+- **Originals still in the source** (`sourcePending`) are counted from
+  the items (they include those of the moves Run finishes first) and the
+  job's `error` says "N photos were moved to <B>, but their originals
+  could not be moved to the trash in <A>; finish the move from the
+  Libraries page" (the journal stays open, so the move is listed as
+  interrupted). Failed files: "N files could not be moved (see the job
+  log)". The parts are joined with "; ".
+- **CLI summary**: `failed: N` counts the failures listed below it,
+  including those of an interrupted move between the two libraries that
+  the run finished first; the exit code follows the same counts.
+  `--import` must be a positive record id (a negative one is a usage
+  error; before, it selected nothing and still counted as a selection).
+- **Cost**: the move journals of the workspace (and, when a move is
+  unfinished, the library ids) are read once per request: once for
+  `GET /api/libraries`, not once per library. The job log is opened
+  without a thumbs store (one writable store per side per job).
+- Recovery closes the target's import record as `failed` even when it
+  finished every file (left as it is; the record is not shown as the
+  outcome of the resume anywhere).
+
 ### Tests
 
 `internal/transfer`: same-volume and cross-volume moves (metadata,
@@ -486,6 +553,18 @@ target without `state`, `interruptedMoves` and resume. `cmd`: usage
 errors, unknown album, dry run, refusal without `--yes`, move by album
 and by date, the album carried over, `imports` listing, `--resume` with
 nothing to do.
+
+After review: `internal/server/transfer_fixes_test.go` (a move refused
+while another involving either library is interrupted, the pair's own
+finished; unreadable journals and missing sources listed with their
+problem, resume 409, not blocking; a resume finishing one move and
+reporting another; trash and user data requests refused at once while
+moving; the job outcome for early, cut-short and late cancels, source
+pending, no space; an early cancel never `failed`).
+`cmd/move_fixes_test.go` (negative `--import`; refusal while another
+move is interrupted, the pair's own finished; `--resume` going on past
+an unreadable journal and finding a renamed source; the failed count
+matching the listed failures; exit 130 for a cancel before the move).
 
 Checked by hand against the built binary: `picmover serve` on a
 two-library workspace, driven in headless Chromium: select two photos,
@@ -594,6 +673,46 @@ progress: files, bytes, rate, ETA, current file, Cancel),
   listing's `libraries` (folders do not count); the dialog offers open,
   closed and busy libraries other than the source.
 
+### After review (frontend)
+
+- **Wording**: a same-drive plan says "Same drive: no copying; each file
+  is checked, then renamed." (not "instant": each file is hashed and
+  journalled, about 10 ms a file).
+- **Originals still here**: `TransferResult.sourcePending` is parsed and
+  summed into the run's totals. A job that ends with exit 2 keeps the
+  server's `error` in the run's `notes`; the dialog shows each as an
+  error box, the toast appends them, and the job outcome reads "Move to
+  library finished with problems (2 moved, 2 still here too): <error>"
+  instead of "some files failed". A job with `sourcePending > 0` does not
+  drop its tiles at once (those photos are still live here); the reload
+  after the job has the grid right.
+- **Interrupted moves** carry `problem` (`InterruptedMove.problem`, ''
+  when none; an entry with a problem may have an empty `from` and id 0).
+  Only those without a problem block the dialog and get "Finish moving";
+  the others are shown with "It cannot be finished now: <problem>." on
+  the plan, the banner and the Libraries page card. After Finish moving,
+  the dialog plans again only when the resume finished cleanly;
+  otherwise it stays on the result: "The interrupted move to kids is not
+  finished." with the server's reasons (the banner shows them too).
+- **Edits during a move**: `movingOn(lib)` (a transfer job running with
+  the library as `library` or `to`, or this page's run) disables rating,
+  tags, albums, Remove from album, Trash, Restore and Delete permanently
+  in the selection bar and the viewer, with "A move is running on this
+  library; ratings, tags, albums and the trash can be changed when it has
+  finished." A 409 from the server (another tab, a resume of other
+  libraries) shows its message where the action was.
+- **Leaving mid-run**: the parts of a run of more than 2000 photos are
+  started from the page, so while parts remain the page asks before it
+  is left (`beforeunload`) and the dialog says "Keep this page open: the
+  remaining parts are started from it." A reload anyway ends the run
+  after the running job (that job's outcome is shown by the job pill; no
+  "Moved N photos" for the whole selection is ever claimed).
+- The fake server follows: `transfer.pending` (originals that stay, with
+  the server's message), `problem` on interrupted moves (resume 409 when
+  none can be finished), 409 for trash and user data changes while a
+  transfer job runs on peter, and a resume ending with exit 2 leaves the
+  move listed.
+
 ### Tests
 
 `npm run check` (0 errors, 0 warnings) and `npm test`: 318 tests in 31
@@ -624,3 +743,12 @@ wording before and after this change.
   to the next, with the dialog's keys not reaching the viewer; the
   interrupted-move lines on both Libraries page cards with Finish moving
   and the toast.
+
+After review (325 tests, `TZ=UTC`): `lib/transfer.test.ts` reads
+problems and `sourcePending`, `blocking`, the problem wording and the
+exit-2 job outcome with the server's message; `Move.test.ts`: originals
+that could not go to the trash (message, tile kept), a move that
+cannot be finished not blocking (dialog and Libraries card, no Finish
+moving), a resume ending with a reason staying on the result instead of
+planning again, edits disabled and refused while a move runs, and
+`beforeunload` while parts of a run remain.

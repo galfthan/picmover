@@ -124,6 +124,10 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, e *libEntry, p j
 		if !ok {
 			return
 		}
+		if msg := blockingMove(allInterrupted(r.Context(), s.ws, s.log), e.id, te.id); msg != "" {
+			writeError(w, http.StatusConflict, msg) // no state: it is not about the source being open
+			return
+		}
 		p.target = te
 	}
 	if lib != nil && e.checkFolder() != nil {
