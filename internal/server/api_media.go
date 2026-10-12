@@ -611,3 +611,10 @@ func contentType(ext string) string {
 func displayable(ext string) bool {
 	return browserFormats[strings.ToLower(strings.TrimPrefix(ext, "."))]
 }
+
+// ParseRecur parses a recur filter value, "MM-DD" or "MM-DD..MM-DD", for
+// the command line (picmover move --recur).
+func ParseRecur(v string) (*catalog.Recur, error) { return parseRecur(v) }
+
+// ParseMonths parses a months filter value, "6,7,8", for the command line.
+func ParseMonths(v string) ([]int, error) { return parseMonths(v) }

@@ -552,3 +552,30 @@ func readOnlyDSN(path string) string {
 	u := url.URL{Scheme: "file", Path: p}
 	return u.String() + "?mode=ro&_pragma=busy_timeout(10000)&_pragma=query_only(1)"
 }
+
+// MatchingHashes returns the hashes of the rows matching f, oldest first
+// (taken_at, undated last, then id): the selection of a command-line move.
+func (d *DB) MatchingHashes(ctx context.Context, f Filter) ([]uint64, error) {
+	conds, args, err := f.where()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := d.QueryContext(ctx, "SELECT hash FROM media"+whereClause(conds)+
+		" ORDER BY taken_at IS NULL, taken_at, id", args...)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: matching hashes: %w", err)
+	}
+	defer rows.Close()
+	out := []uint64{}
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("catalog: matching hashes: %w", err)
+		}
+		out = append(out, uint64(h))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("catalog: matching hashes: %w", err)
+	}
+	return out, nil
+}
