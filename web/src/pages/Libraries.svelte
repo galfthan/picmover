@@ -18,6 +18,7 @@
   import CopyButton from '../components/CopyButton.svelte';
   import Dialog from '../components/Dialog.svelte';
   import JobProgress from '../components/JobProgress.svelte';
+  import InterruptedMoves from '../components/InterruptedMoves.svelte';
 
   // Discover jobs started elsewhere while idle, and pick up finished rebuilds.
   $effect(() => jobs.watch());
@@ -242,6 +243,7 @@
                 <span class="small muted">Recording {formatCount(job.stats.scanned)} files…</span>
               {/if}
             </div>
+            <InterruptedMoves lib={l.id} compact />
             {#if errors[l.id]}<div class="error-box small">{errors[l.id]}</div>{/if}
           </li>
         {/each}

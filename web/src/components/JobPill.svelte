@@ -5,7 +5,8 @@
   import { libPath } from '../lib/routes';
   import { libraries } from '../lib/libraries.svelte';
   import { library } from '../lib/library.svelte';
-  import { isBackupKind } from '../lib/api';
+  import { isBackupKind, toTransferProgress } from '../lib/api';
+  import { moves } from '../lib/moves.svelte';
   import { progressFraction } from '../lib/backupinfo';
   import { backups } from '../lib/backups.svelte';
 
@@ -48,6 +49,13 @@
       if (p && p.totalFiles) return `${what} ${formatCount(p.files ?? 0)} of ${formatCount(p.totalFiles)} files…`;
       return `${what}…`;
     }
+    if (job.kind === 'transfer') {
+      const p = toTransferProgress(job.phase);
+      const to = job.to ? (libraries.find(job.to)?.name ?? job.to) : 'another library';
+      if (p?.phase === 'recover') return `Finishing the move to ${to}…`;
+      if (p?.phase === 'move' && p.totalFiles) return `Moving to ${to}: ${formatCount(p.files)} of ${formatCount(p.totalFiles)} files…`;
+      return `Moving to ${to}…`;
+    }
     if (job.kind === 'rebuild') {
       return s.scanned > 0 ? `Recording ${formatCount(s.scanned)} files…` : 'Recording files in place…';
     }
@@ -63,12 +71,15 @@
     if (!j) return;
     const lib = j.library ?? library.id;
     if (lib === null) return;
-    if (j.kind === 'rebuild') navigate(libraries.mode === 'workspace' ? '/' : libPath(lib, 'library'));
+    if (j.kind === 'transfer') {
+      if (!moves.show()) navigate(libPath(lib, ''));
+    } else if (j.kind === 'rebuild') navigate(libraries.mode === 'workspace' ? '/' : libPath(lib, 'library'));
     else if (isBackupKind(j.kind)) navigate(libPath(lib, 'backups'));
     else navigate(libPath(lib, j.kind === 'import' ? 'import' : j.kind === 'similar' ? 'similar' : 'library'));
   }
 
   const fraction = $derived.by(() => {
+    if (job && job.kind === 'transfer') return job.phase?.phase === 'move' ? progressFraction(job.phase) : null;
     if (job && isBackupKind(job.kind)) return job.phase?.phase === 'snapshot' || backups.budgetOf(job) !== null ? null : progressFraction(job.phase);
     if (!job || job.kind !== 'import') return null;
     const s = job.stats;
