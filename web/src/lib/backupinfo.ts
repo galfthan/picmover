@@ -395,6 +395,10 @@ export function phaseLabel(kind: string, phase: string | undefined): string {
       return 'Removing files';
     case 'restore':
       return 'Restoring';
+    case 'move':
+      return 'Moving';
+    case 'recover':
+      return 'Finishing an interrupted move';
     default:
       return 'Starting';
   }

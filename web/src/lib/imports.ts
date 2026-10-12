@@ -11,7 +11,7 @@ export function importTitle(r: Pick<ImportRecord, 'id' | 'name'> & { sourceName?
 }
 
 // "record" is a rebuild session of an earlier version, backfilled from the catalog: a rebuild too.
-const MODES: Record<string, string> = { copy: 'Copy', move: 'Move', rebuild: 'Rebuild', record: 'Rebuild' };
+const MODES: Record<string, string> = { copy: 'Copy', move: 'Move', rebuild: 'Rebuild', record: 'Rebuild', transfer: 'Moved from a library' };
 
 /**
  * A rebuild (mode rebuild, or record: one backfilled from the catalog)

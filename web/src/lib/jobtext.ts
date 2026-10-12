@@ -1,8 +1,9 @@
 // Wording for job summaries, mirroring the CLI (cmd/import.go) so the UI and
 // the terminal say the same thing.
 
-import { isBackupKind, type Job } from './api';
+import { isBackupKind, toTransferResult, type Job } from './api';
 import { phaseLabel, runSummary } from './backupinfo';
+import { formatCount } from './format';
 
 export type Tone = 'ok' | 'warn' | 'error' | 'muted';
 
@@ -30,6 +31,8 @@ export function jobTitle(j: Job): string {
       return 'Prune';
     case 'restore':
       return 'Restore';
+    case 'transfer':
+      return 'Move to library';
     default:
       return 'Import';
   }
@@ -41,6 +44,7 @@ export function outcome(j: Job): { tone: Tone; text: string } {
   const log = j.logPath || 'the log';
   if (j.state === 'running' || j.state === 'queued') return { tone: 'muted', text: `${what} ${j.state}…` };
   if (isBackupKind(j.kind)) return backupOutcome(j, what, log);
+  if (j.kind === 'transfer') return transferOutcome(j, what, log);
   const s = j.stats;
   switch (exitCodeOf(j)) {
     case 0:
@@ -75,6 +79,32 @@ function backupOutcome(j: Job, what: string, log: string): { tone: Tone; text: s
   }
   if (j.state === 'failed' || code >= 2) return { tone: 'error', text: `${what} failed: ${j.error || 'unknown error'}` };
   return { tone: 'ok', text: `${what} finished${summary ? `: ${summary}` : ''}.` };
+}
+
+/** "300 moved, 12 already there, 1 restored, 2 failed" ("" before the job has a result). */
+export function transferSummary(j: Job): string {
+  const r = toTransferResult(j.result);
+  if (!r) return '';
+  const parts = [`${formatCount(r.moved)} moved`];
+  if (r.existing) parts.push(`${formatCount(r.existing)} already there`);
+  if (r.restored) parts.push(`${formatCount(r.restored)} restored`);
+  if (r.failedCount) parts.push(`${formatCount(r.failedCount)} failed`);
+  return parts.join(', ');
+}
+
+/** A move uses the import exit codes: 0, 2 some files failed, 130 cancelled, 1 failed. */
+function transferOutcome(j: Job, what: string, log: string): { tone: Tone; text: string } {
+  const summary = transferSummary(j);
+  switch (exitCodeOf(j)) {
+    case 0:
+      return { tone: 'ok', text: `${what} finished${summary ? `: ${summary}` : ''}.` };
+    case 130:
+      return { tone: 'warn', text: `${what} cancelled${summary ? ` (${summary})` : ''}.` };
+    case 2:
+      return { tone: 'warn', text: `${what} finished, but some files failed${summary ? ` (${summary})` : ''}; see ${log}` };
+    default:
+      return { tone: 'error', text: `${what} failed: ${j.error || 'unknown error'}` };
+  }
 }
 
 /**
