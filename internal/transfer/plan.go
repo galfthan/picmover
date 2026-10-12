@@ -1,9 +1,6 @@
 package transfer
 
-import (
-	"context"
-	"time"
-)
+import "context"
 
 // Plan is what a move would do, computed without writing anything
 // (docs/design/library-move.md, "Pre-flight"). Run repeats every check.
@@ -69,9 +66,8 @@ func MakePlan(ctx context.Context, from, to Side, hashes []uint64) (Plan, error)
 		p.Need = p.MoveBytes + spaceMargin
 		p.NoSpace = p.Free >= 0 && p.Need > p.Free
 	}
-	now := time.Now()
 	for _, s := range []Side{from, to} {
-		list, err := ListInterrupted(s.Lib, now)
+		list, err := ListInterruptedAt(s.Lib.Root()) // read only: no pruning
 		if err != nil {
 			return p, err
 		}

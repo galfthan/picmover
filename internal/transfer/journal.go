@@ -22,13 +22,17 @@ import (
 // written with one write and fsynced before the step it announces:
 //
 //	{"op":"begin","hash":"<16 hex>","kind":"move|existing|restore","rel":"<source path>","to":"<target path>","mode":"rename|copy"}
-//	{"op":"done","hash":"..."}   the file's protocol finished, source step included
+//	{"op":"trash","hash":"...","to":"<path>"}  the source copy goes to the source trash under another path (its own is taken there)
+//	{"op":"done","hash":"..."}   the file's protocol finished: source step, user.db trash rows and user data included
 //	{"op":"fail","hash":"..."}   the file was left as it was
-//	{"op":"end"}                 the run finished with nothing left to do
+//	{"op":"end"}                 the run finished with no entry left open
 //
 // A later begin of the same hash supersedes an earlier one (a rename that
 // met another volume becomes a copy). A journal without end is an
-// interrupted move, finished by Recover. A torn last line is ignored.
+// interrupted move, finished by Recover. A torn last line is ignored. end
+// is written only when every begin has its done or fail: an entry left
+// open on purpose (a step that failed, retried by Recover) keeps the move
+// interrupted.
 
 // JournalDir is the directory of the move journals inside library.MetaDir.
 const JournalDir = "transfers"
@@ -78,18 +82,31 @@ type entry struct {
 	hash          uint64
 	kind, rel, to string
 	mode          string
+	trash         string // the source's trash path when not rel (a trash line)
 	done, failed  bool
 	order         int // position of the first begin
 }
 
-// journal is an open journal being written.
+// journal is an open journal being written. open holds the hashes begun
+// and not yet done or failed: end is refused while there is one.
 type journal struct {
 	f    *os.File
 	path string
+	open map[uint64]bool
 }
+
+// journalFail is called with every journal write before it is made; a
+// test makes it fail.
+var journalFail = func([]byte) error { return nil }
 
 func journalDir(lib *library.Library) string {
 	return filepath.Join(lib.Root(), library.MetaDir, JournalDir)
+}
+
+// JournalPath is the path of the journal of the target's import record id
+// in the library at root (which may not exist).
+func JournalPath(root string, id int64) string {
+	return filepath.Join(root, library.MetaDir, JournalDir, strconv.FormatInt(id, 10)+".journal")
 }
 
 // createJournal creates the journal of record id in the target library
@@ -99,12 +116,12 @@ func createJournal(target *library.Library, h Header) (*journal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	p := filepath.Join(dir, strconv.FormatInt(h.ID, 10)+".journal")
+	p := JournalPath(target.Root(), h.ID)
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	j := &journal{f: f, path: p}
+	j := &journal{f: f, path: p, open: map[uint64]bool{}}
 	h.V = journalVersion
 	if err := j.write(h); err != nil {
 		f.Close()
@@ -115,13 +132,19 @@ func createJournal(target *library.Library, h Header) (*journal, error) {
 	return j, nil
 }
 
-// openJournal reopens an existing journal for appending (recovery).
-func openJournal(p string) (*journal, error) {
-	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+// openJournal reopens the journal read as p for appending (recovery), with
+// its open entries open.
+func openJournal(p *parsed) (*journal, error) {
+	f, err := os.OpenFile(p.path, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return nil, err
 	}
-	j := &journal{f: f, path: p}
+	j := &journal{f: f, path: p.path, open: map[uint64]bool{}}
+	for h, e := range p.entries {
+		if !e.done && !e.failed {
+			j.open[h] = true
+		}
+	}
 	// A torn last line (a crash in the middle of a write) would glue onto
 	// the next line: start on a fresh line. An empty line is skipped when
 	// read.
@@ -133,6 +156,9 @@ func openJournal(p string) (*journal, error) {
 }
 
 func (j *journal) raw(b []byte) error {
+	if err := journalFail(b); err != nil {
+		return fmt.Errorf("transfer: journal: %w", err)
+	}
 	if _, err := j.f.Write(b); err != nil {
 		return fmt.Errorf("transfer: journal: %w", err)
 	}
@@ -152,13 +178,41 @@ func (j *journal) write(v any) error {
 
 func hexHash(h uint64) string { return fmt.Sprintf("%016x", h) }
 
+// begin opens the entry of h; it stays open when the write fails (the
+// line may have reached the disk).
 func (j *journal) begin(h uint64, kind, rel, to, mode string) error {
+	j.open[h] = true
 	return j.write(event{Op: "begin", Hash: hexHash(h), Kind: kind, Rel: rel, To: to, Mode: mode})
 }
 
-func (j *journal) done(h uint64) error { return j.write(event{Op: "done", Hash: hexHash(h)}) }
-func (j *journal) fail(h uint64) error { return j.write(event{Op: "fail", Hash: hexHash(h)}) }
-func (j *journal) end() error          { return j.write(event{Op: "end"}) }
+// trash records that the source copy of h goes to the source trash at
+// the catalog path trashRel, not at its own.
+func (j *journal) trash(h uint64, trashRel string) error {
+	return j.write(event{Op: "trash", Hash: hexHash(h), To: trashRel})
+}
+
+func (j *journal) done(h uint64) error { return j.settle("done", h) }
+func (j *journal) fail(h uint64) error { return j.settle("fail", h) }
+
+// settle writes the done or fail line of h and closes its entry.
+func (j *journal) settle(op string, h uint64) error {
+	if err := j.write(event{Op: op, Hash: hexHash(h)}); err != nil {
+		return err
+	}
+	delete(j.open, h)
+	return nil
+}
+
+// settled reports whether no entry is open, so that end may be written.
+func (j *journal) settled() bool { return len(j.open) == 0 }
+
+// end writes the end line; it is refused while an entry is open.
+func (j *journal) end() error {
+	if !j.settled() {
+		return fmt.Errorf("transfer: journal: %d entries are open", len(j.open))
+	}
+	return j.write(event{Op: "end"})
+}
 
 func (j *journal) close() error {
 	if j == nil {
@@ -231,8 +285,12 @@ func readJournal(p string) (*parsed, error) {
 				n++
 				out.entries[h] = e
 			}
-			e.kind, e.rel, e.to, e.mode = ev.Kind, ev.Rel, ev.To, ev.Mode
+			e.kind, e.rel, e.to, e.mode, e.trash = ev.Kind, ev.Rel, ev.To, ev.Mode, ""
 			e.done, e.failed = false, false
+		case "trash":
+			if e != nil {
+				e.trash = ev.To
+			}
 		case "done":
 			if e != nil {
 				e.done = true
@@ -265,17 +323,46 @@ type Interrupted struct {
 // oldest first, and removes finished journals older than 30 days (lib is
 // locked by the caller). An unreadable journal is returned with ID 0 and
 // Open -1 (it needs a person: the move cannot be finished automatically).
+// A journal addressed to another library (one that came along when the
+// library folder was copied) is not listed (addressedTo).
 func ListInterrupted(lib *library.Library, now time.Time) ([]Interrupted, error) {
-	return listInterrupted(journalDir(lib), now, true)
+	return listInterrupted(lib.Root(), now, true)
 }
 
 // ListInterruptedAt is ListInterrupted for the library folder root that
 // this process may not hold: it only reads.
 func ListInterruptedAt(root string) ([]Interrupted, error) {
-	return listInterrupted(filepath.Join(root, library.MetaDir, JournalDir), time.Time{}, false)
+	return listInterrupted(root, time.Time{}, false)
 }
 
-func listInterrupted(dir string, now time.Time, prune bool) ([]Interrupted, error) {
+// sameRoot reports whether the library roots a and b are one folder.
+func sameRoot(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(fa, fb)
+}
+
+// holdsLibrary reports whether root holds a library (its catalog file).
+// Only a definite "not there" is false.
+func holdsLibrary(root string) bool {
+	_, err := os.Stat(filepath.Join(root, library.DBName))
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
+// addressedTo reports whether a journal whose target is t belongs to the
+// library at root: its root is root, or the journal's root holds no
+// library any more (the library folder was moved or renamed). A copy of
+// a library folder carries the original's journals; they belong to the
+// original while it exists.
+func addressedTo(t LibraryRef, root string) bool {
+	return t.Root == "" || sameRoot(t.Root, root) || !holdsLibrary(t.Root)
+}
+
+func listInterrupted(root string, now time.Time, prune bool) ([]Interrupted, error) {
+	dir := filepath.Join(root, library.MetaDir, JournalDir)
 	des, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -298,6 +385,9 @@ func listInterrupted(dir string, now time.Time, prune bool) ([]Interrupted, erro
 			if fi, err := de.Info(); prune && err == nil && now.Sub(fi.ModTime()) > keepJournals {
 				os.Remove(p)
 			}
+			continue
+		}
+		if !addressedTo(j.header.Target, root) {
 			continue
 		}
 		open := 0

@@ -319,7 +319,7 @@ section says otherwise.
 
 ```
 internal/transfer/transfer.go   Side, Options, Item, Result, Run, the per-file protocol, Message (user-facing error texts), SameLibrary
-internal/transfer/journal.go    journal format, ListInterrupted (locked library, prunes), ListInterruptedAt (read-only)
+internal/transfer/journal.go    journal format, JournalPath, ListInterrupted (locked library, prunes), ListInterruptedAt (read-only)
 internal/transfer/recover.go    Recover, RecoverPair, IsSource
 internal/transfer/plan.go       MakePlan
 internal/transfer/volume_*.go, free_*.go   sameVolume, diskFree (per platform; copies of importer/backup's unexported helpers)
@@ -327,7 +327,7 @@ internal/library/move.go        LiveFile, LiveTarget, MoveFileTo (ErrTargetExist
 internal/catalog/manage.go      SetDeletedAs, MatchingHashes
 internal/thumbs/store.go        Store.CopyFrom
 internal/userdata/merge.go      MergeFrom, MergeIgnored; imports.go: ImportModeTransfer
-internal/importrec              CloseCrashed skips mode transfer
+internal/importrec              CloseCrashed skips mode transfer unless the record has no journal
 internal/server/api_transfer.go plan, resume, the transfer job (runTransfer), interruptedMoves
 cmd/move.go                     picmover move
 ```
@@ -336,10 +336,48 @@ cmd/move.go                     picmover move
 
 - **Journal lines are JSON**, not space-separated (catalog paths may
   contain spaces): `{"op":"begin","hash","kind","rel","to","mode"}`,
-  `{"op":"done"|"fail","hash"}`, `{"op":"end"}`, after a JSON header
-  `{v:1, id, source:{id, root, name}, target:{id, root, name},
-  startedAt}`. A reopened journal starts with a newline so a torn last
-  line never glues onto the next.
+  `{"op":"trash","hash","to"}`, `{"op":"done"|"fail","hash"}`,
+  `{"op":"end"}`, after a JSON header `{v:1, id, source:{id, root, name},
+  target:{id, root, name}, startedAt}`. A reopened journal starts with a
+  newline so a torn last line never glues onto the next. `trash` is
+  written before the source copy goes to the source trash under a
+  `UniqueName` variant (its own trash path taken), so recovery knows
+  where to look.
+- **`done` follows the user data.** A file's `done` line is written at
+  the flush after its batch: after the source step, the source's
+  `user.db` trash rows, the target's `user.db` untrash (restores) and
+  `MergeFrom`, in that order. A crash anywhere before leaves the entry
+  open and recovery does those steps again (each is idempotent; a
+  recovered entry whose source row is already trashed gets its `user.db`
+  trash row). When a `user.db` step fails the entries stay open too.
+- **`end` only with no open entry.** The journal tracks the entries
+  begun and not done or failed; `end` is refused while there is one, in
+  `Run` and in `Recover`. An entry left open on purpose (a source step
+  that failed, a placement whose row was not inserted and could not be
+  undone, a recovery step that failed or a file that could not be read)
+  therefore keeps the move listed as interrupted, and the next recovery
+  retries it. `Recover` closes a still running record only when it ends
+  the journal (the record first, then `end`), so a recovery done in
+  several passes records every file.
+- **Batches** are taken out of the pending list before they are
+  flushed, so a journal error in a flush (which stops the run) never
+  flushes a batch twice; every file of the batch is still finished and
+  reported, and the error is returned at the end. The per-row fallback
+  counts a row as recorded only when `InsertMedia` inserted it (or the
+  live row of the hash is already at that path); otherwise the placement
+  is undone like a failed insert. Recovery's insert does the same and
+  leaves the entry open.
+- **Duplicates (case 1)**: B's file is checked to exist as a regular
+  file and **not hashed** (as the contract says): the content is
+  identified by B's catalog hash. When A's file is already missing, A's
+  row is forgotten (as recovery does) instead of leaving the source step
+  pending.
+- **Restore (case 2)** hashes B's trashed copy first, as the importer
+  does before a restore: a missing copy fails the file with
+  `ErrTargetCopyMissing`, a different one with `ErrTargetTrashMismatch`,
+  and A is left alone. A restore whose catalog update failed and whose
+  undo (back into the trash) failed too is left open for recovery. B's
+  `user.db` trash row is removed at the flush.
 - **Same library** is refused by root, or by `os.SameFile` of the two
   `media.db` files, not by `library_id`: a copied library folder shares
   its id and is a different library. Journals are matched to their
@@ -361,12 +399,47 @@ cmd/move.go                     picmover move
   renditions are deleted after a same-volume move, kept after a copy
   (the trash page shows them).
 - **Batches** fall back to one insert per row when the batch
-  transaction fails, so one bad row fails only its file.
+  transaction fails, so one bad row fails only its file. Before the
+  rows, each folder of a copy is synced together with its parents up to
+  the library root (folders the copy may have created).
 - **Recovery of a restore** whose target row is still trashed counts as
-  not committed (`ErrInterrupted`). Recovery adds `ErrUnrecorded` (file
-  in B, source row gone: run rebuild in B) next to `ErrLostTrack`.
+  not committed (`ErrInterrupted`), unless the trash no longer holds
+  B's file and B's path or one of its `UniqueName` variants holds a file
+  of the hash: a crash inside the restore, which recovery finishes
+  (`ClearDeleted` at that path). Recovery adds `ErrUnrecorded` (file in
+  B, source row gone: run rebuild in B) next to `ErrLostTrack`.
+- **Recovery and the source trash**: when A's row is live but its file
+  is not in place (and the entry is not a plain rename), recovery hashes
+  A's trash file at the journalled `trash` name, else at the row's own
+  path. A match is a crash between the rename to the trash and the
+  catalog update: going forward it marks the row trashed there
+  (`SetDeleted`/`SetDeletedAs`, `user.db` trash row), going back (B's
+  row gone) it puts the file back in place (`RestoreTo`). Only when it
+  is not there is A's row forgotten (forward) or the entry lost track
+  (back).
+- **Recovery errors**: a placed file or a source file that cannot be
+  read (anything but "does not exist", not a regular file, outside the
+  library) leaves the entry open instead of failing it or calling it
+  lost. The placed file's folders are synced (up to the root) before its
+  row is inserted and the source step runs.
+- **Recovery is addressed by root.** `Recover` refuses a journal whose
+  target root is another folder that still holds a library
+  (`ErrOtherTarget`), and the listings skip such journals: a copied
+  library folder carries the original's journals. The target id is not
+  compared (a `user.db` made anew has a new id).
+- **Cancelling a recovery** stops between entries (never inside one);
+  the rest stay open and `Result.Cancelled` is set. `RecoverPair` stops
+  between journals; `Run` returns cancelled after its recovery when ctx
+  is done.
 - **Run** finishes interrupted moves between the two libraries, in both
   directions, before it starts (`Result.Recovered`).
+- **A record without a journal**: a crash after `BeginImport` and
+  before the journal is created leaves a running transfer record that
+  no recovery can find. `importrec.CloseCrashed` closes a transfer
+  record whose journal (`transfer.JournalPath` next to `user.db`) does
+  not exist; nothing was moved under it.
+- **The plan** lists interrupted moves with the read-only listing
+  (`ListInterruptedAt`): it never prunes a journal.
 - **HTTP**: answers about the target carry no `state` (on a
   library-scoped path a state describes the source): busy is 409
   `{error, holder}`, others `{error}`. The plan adds `need` and
@@ -392,7 +465,20 @@ refusals, no space, a taken source trash name, cancellation mid-run,
 merge by tag and album name; recovery of a rename and of a copy not yet
 recorded, of a recorded file whose source step is missing, of nothing
 placed, of a wrong file at the target path, the lost-track case, a torn
-line with done entries, Run recovering first, `IsSource`.
+line with done entries, Run recovering first, `IsSource`. Review fixes,
+with crashes injected through the `crashAt` hook and journal write
+failures through `journalFail`: a journal error in a flush never
+flushes twice (rename and copy), a row not inserted by the fallback is
+undone, an undo that fails keeps the journal open, B's damaged trashed
+copy is not restored, a duplicate whose source is gone, the plan does
+not prune; a crash before the merge (one volume, two volumes, and right
+after the file is reported), between the move to the source trash and
+the catalog update (copy, duplicate, taken trash name, and a duplicate
+whose target copy is gone), after a restore before its untrash, inside
+the target's restore (own path and variant); a failed recovery step and
+an unreadable placed file staying open, a cancelled recovery, a journal
+of another target, `syncParents`. `internal/importrec`: a transfer
+record is closed only without a journal.
 `internal/library`: `MoveFileTo` never replaces, refuses internal targets
 and links; `RestoreTo`. `internal/server`: plan shapes and 400s, the
 job end to end (result, record, listed under both libraries), busy
