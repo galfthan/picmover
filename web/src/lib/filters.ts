@@ -5,7 +5,7 @@
 // when the page implies them.
 
 import type { FileType, Filters } from './api';
-import { formatRecur, isDay, parseRecur } from './dates';
+import { formatMonths, formatRecur, isDay, parseMonths, parseRecur } from './dates';
 
 const TYPES: readonly FileType[] = ['image', 'image_raw', 'video'];
 
@@ -33,6 +33,8 @@ export function filtersFromQuery(q: URLSearchParams): Filters {
   if (isDay(to)) f.to = to;
   const recur = parseRecur(q.get('recur'));
   if (recur) f.recur = formatRecur(recur);
+  const months = parseMonths(q.get('months'));
+  if (months?.length) f.months = months;
   const px = (k: string) => {
     const n = positiveInt(q.get(k));
     return n !== null && n <= MAX_PX ? n : null;
@@ -64,6 +66,8 @@ export function filtersToQuery(f: Filters): URLSearchParams {
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
   if (f.recur) q.set('recur', f.recur);
+  const months = formatMonths(f.months ?? []);
+  if (months) q.set('months', months);
   if (f.minPx) q.set('minpx', String(f.minPx));
   if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (f.rating) q.set('rating', String(f.rating));

@@ -257,6 +257,7 @@ All endpoints that accept filters (timeline, media, geo, geo/items) accept:
 |---|---|
 | `from`, `to` | unchanged: `YYYY-MM-DD` wall clock, `to` exclusive |
 | `recur` | `MM-DD` or `MM-DD..MM-DD`, inclusive, every year; the range may wrap the year end (`12-30..01-02`); `02-29` allowed |
+| `months` | month numbers 1–12 separated by commas (`1,2,3`, `1,7`), every year; any set, contiguous or not; repeats collapse; an empty item, a trailing comma or a value outside 1–12 is 400 |
 | `rating` | minimum rating 1–5 |
 | `tag` | tag id; repeatable; all must match (AND) |
 | `album` | album id |
@@ -268,8 +269,12 @@ All endpoints that accept filters (timeline, media, geo, geo/items) accept:
 compared with the bounds (`BETWEEN` or `OR` of two ranges when wrapping),
 inside the existing dated-range guard, so undated rows never match. It is
 a scan of the `media_taken_at` index (136k rows in a few ms). Buckets with
-`recur` return only the months that contain matches. Malformed values →
-400 `{"error": "..."}` naming the parameter.
+`recur` return only the months that contain matches. `months` is
+evaluated as `CAST(strftime('%m', taken_at, 'unixepoch') AS INTEGER) IN
+(?, …)` (one parameter per month) inside the same guard, so undated rows
+never match either; it combines with `recur`, `from`/`to` and the rest by
+AND, and Buckets return only the chosen months. Malformed values → 400
+`{"error": "..."}` naming the parameter.
 
 ## HTTP API
 
@@ -505,7 +510,8 @@ navigation and the rest are unchanged.
 
 The filter bar gains Rating (≥ 1…5 stars), Tags (multi-select chips, AND),
 Album (select), and **Dates** with two modes:
-- Range: two date inputs (day precision), either side open.
+- Range: a calendar range picker (day precision), either side open; see
+  "Dates and the calendar picker (web)".
 - Every year: month/day from and to, with presets Today, Christmas
   (12-24..12-26), New Year (12-31..01-01), Midsummer (06-19..06-26),
   Summer (06-01..08-31), This month. The year range inputs stay available
@@ -1186,3 +1192,174 @@ similar groups are paginated and ignored by group.
   `createTag`, `renameTag`, `deleteTag`, and their tests.
 - Album counts and covers that include trashed members (review L6) are a
   backend fix; the client shows what the server answers.
+
+## View memory (web)
+
+Filters live in the route query, so leaving a page (Import, Library, ...)
+used to lose them: the main nav linked to the bare page. The web UI now
+remembers, per page path, the last filter query and the place in the grid
+(`web/src/lib/viewmemory.svelte.ts`).
+
+- **What is remembered**: for the Photos grid (`/l/<id>/`), the Map
+  (`/l/<id>/map`), the trash, each album (`/l/<id>/albums/<aid>`) and each
+  import record (`/l/<id>/imports/<rid>`): the canonical filter query
+  (`filtersToQuery`; the map's `at`/`z` are not part of it) and, for grid
+  pages, an anchor: the bucket at the top of the view (`{year, month}`, or
+  `{undated: true}`) and the pixel offset into it.
+- **Recording**: the shell records the query of every visit to one of these
+  pages; a different query than the remembered one drops the anchor. The
+  grid saves its anchor when it unmounts (route change) and when its
+  filters change; an anchor for a query the page has moved on from is
+  ignored.
+- **Nav links**: the main nav (Photos, Map, Trash), the library switcher,
+  the Libraries page's library links, the album's "Go to Photos" and the
+  single-mode redirect from `#/` go to the remembered query. Links that
+  carry their own query ("Show imported", the Library page's stats, tag and
+  session links) and the Imports page's record links are unchanged.
+- **Clear**: the filter bar's Clear navigates to the bare path, which is
+  recorded like any visit and so replaces the remembered query.
+- **Scroll restore**: a grid that mounts with the remembered query (nav
+  link, browser Back/Forward) scrolls to the anchor's bucket top plus the
+  offset as soon as the first timeline is laid out and the scroller
+  measured; the scroll state is set before the rows render, so the top is
+  not painted or fetched first, and no second timeline load happens. A
+  bucket that no longer exists, or another query, starts at the top.
+- **Storage**: in memory plus `sessionStorage` under
+  `picmover.view.<path>` (for example `picmover.view./l/peter/`), JSON
+  `{query, anchor?, savedAt}`, validated on load. A reload within the tab
+  keeps it; a new tab starts fresh. The map's viewport stays in
+  localStorage (`picmover.map.view`) as before.
+- **Tests**: `src/lib/viewmemory.test.ts` (store, keys, validation) and
+  `src/ViewMemory.test.ts` (nav hrefs, Clear, reload, scroll restore, other
+  query and a vanished bucket start at the top).
+
+## Dates and the calendar picker (web)
+
+### One date format: dd/mm/yyyy
+
+Every date the web UI shows is day first with slashes, `14/07/2024`,
+whatever the browser's locale; times use the 24-hour clock. The helpers
+in `web/src/lib/format.ts` are the only place dates become text:
+
+| Helper | Input | Output and where |
+| --- | --- | --- |
+| `formatWallDate` | wall-clock capture time | `14/07/2024`: tiles, Similar, the Library span, Map titles, the trash date in the lightbox |
+| `formatTakenAt` | wall clock + offset | `14/07/2024 13:05:22 UTC+03:00`: lightbox title and info, as recorded, never shifted |
+| `formatInstant` | RFC 3339 instant | `14/07/2024 13:05` in the viewer's zone: import records, jobs, the last similar run, backup target times, the lock holder's "since" |
+| `formatLocalDay` | `Date` | `14/07/2024` in the viewer's zone: `formatRecent` (Imports page) past a week |
+| `formatDay` | day `2024-07-14` | `14/07/2024`: the Dates summary, the calendar inputs, a day bound in the year selects |
+| `parseDay` | typed text | `2024-07-14`, or null |
+
+`parseDay` accepts `dd/mm/yyyy`, also `d/m/yyyy` and `dd.mm.yyyy`; the year
+has four digits and the day must exist (`29/02/2023` is rejected). The
+`locale` parameters that only decided date order are gone; they remain
+where they pick words: month names (`monthName`, `bucketLabel` for the
+grid's "July 2024" headers, `describeRecur`'s "24 Dec – 26 Dec every
+year") and relative times (`formatAgo`, the relative part of
+`formatRecent`).
+
+`describeDates` (the Dates button) shows whole-year bounds as years
+(`2020 – 2024`, `2012`) and anything else as days on both sides
+(`01/01/2020 – 29/02/2020`, `20/12/2024 –`, `– 15/07/2024`).
+
+### The calendar range picker
+
+`components/Calendar.svelte` (no dependencies) is the Range tab of the
+Dates filter. Props: `from`, `to` (inclusive days, either may be absent),
+`years` (the library's years), `onchange(from, to)`, optional `min`/`max`.
+The month grid comes from `calendarMonths(year, month)` in
+`lib/calendar.ts`: 6 weeks of 7 days, Monday first, with the leading and
+trailing days of the neighbouring months.
+
+- Layout, top to bottom: Start and End text inputs (dd/mm/yyyy), presets
+  (Last 7 days, Last 30 days, This month, This year, Last year; the
+  matching one is marked), the month grid(s). Two months side by side
+  from 640 px of viewport width, one month below. In the two-month view a
+  day appears once: the trailing days of the left month and the leading
+  days of the right month are left blank.
+- Header: previous/next month buttons, and a month select and a year
+  select for the first shown month. Years run from the library's earliest
+  to latest year (30 years either side of the shown year when unknown), so
+  any year is one step away.
+- Picking: the first click sets a start (applied at once as a one-day
+  range); the second click, on that day or later, sets the end; a click
+  before the start starts over from that day. While a start waits for its
+  end, hovering (or moving with the keys) previews the end with a lighter
+  band. Any other change (a preset, typed text, Clear dates) ends the
+  waiting start.
+- Look: the range is one continuous band behind the days, the start and
+  end are solid accent discs, today has a ring, days of other months are
+  dimmed but clickable, days outside `min`/`max` are struck through and
+  inert. Only the theme variables of `app.css` are used, so light and dark
+  both follow the system.
+- Typed days apply on Enter or blur. Invalid text (not a real day, outside
+  `min`/`max`, or a start after the end) is marked (`aria-invalid`, red
+  border, one hint line) and not applied; emptying a field opens that
+  side. Applying a typed day or a preset moves the view to show it.
+- The Dates panel still closes on Escape and outside click; calendar
+  clicks and presets apply at once as before. The Every year tab keeps its
+  day range and year selects (a day bound shows as dd/mm/yyyy) under the
+  month grid ("Months every year" below); the Range
+  tab never had year limits, the year select and the This year / Last
+  year presets cover that.
+
+Keyboard (roving tabindex: one day per view takes Tab, the focused day,
+else the 1st of the first shown month):
+
+| Key | Action |
+| --- | --- |
+| Left / Right | previous / next day |
+| Up / Down | same weekday, previous / next week |
+| PageUp / PageDown | same day, previous / next month (clamped to the month's length) |
+| Shift+PageUp / Shift+PageDown | same day, previous / next year |
+| Home / End | Monday / Sunday of the week |
+| Enter / Space | pick the focused day (start or end, as a click) |
+
+The view follows the focused day across months. ARIA: each month is a
+`role="grid"` labelled with its month, the weekday initials are column
+headers with the full names, each day is a `role="gridcell"` with
+`aria-selected` (in the applied range), `aria-current="date"` for today
+and an `aria-label` with the full date ("Tuesday 5 March 2024"). A polite
+live region announces "Start 05/03/2024. Choose the end day." and
+"Selected 05/03/2024 to 10/03/2024".
+
+### Months every year
+
+The Every year tab opens with a month grid above the day-range controls:
+twelve toggle buttons (short names, 4 columns × 3 rows, `aria-pressed`)
+and "All" / "None" text buttons. Any set of months is allowed, Jan + Jul
+included; it goes to the URL and the requests as `months=1,7` (sorted,
+unique; commas stay literal in the hash).
+
+- Click toggles a month; Shift-click selects the run from the last clicked
+  month (in calendar order, no wrap). Keyboard: the grid is one Tab stop
+  (roving tabindex); arrows move by one month or one row, Home/End go to
+  Jan/Dec, Enter/Space toggle.
+- Look: chosen months are solid accent pills like the calendar's start and
+  end days; chosen neighbours in a row are joined by the calendar's lighter
+  band, so Jan–Mar reads as one stretch.
+- Picking months clears the `recur` day range, and editing the day range
+  or picking one of its presets clears the months. This is the UI only:
+  a URL with both keeps both, the tab shows both and the requests send
+  both (AND). The year limits keep both. Every change applies at once;
+  Clear dates clears months too. The panel opens on Every year when months
+  or a day range are set.
+- The summary (`describeDates`) names the months with runs collapsed:
+  "Jan–Mar every year", "Jan–Mar, Jul every year", "Dec every year"; a run
+  through New Year is one run, "Dec–Feb every year", listed first. With a
+  day range as well, both parts appear: "Jul every year, 24 Dec – 26 Dec
+  every year". `filtersFromQuery` drops `months` when any item is
+  malformed, as the server would reject it.
+
+Tests: `lib/format.test.ts` (the formats, strict `parseDay`),
+`lib/calendar.test.ts` (Feb 2024 and Feb 2023 cells, Monday alignment,
+December to January, month shifts, presets, year options),
+`Calendar.svelte.test.ts` (render, start/end and restart clicks, hover
+preview, keys, typed and invalid input, presets, month and year
+navigation; a `.svelte.test.ts` file so the props can be `$state`), and
+`Management.test.ts` (typed days and calendar clicks through the Dates
+filter into the URL; the month grid: Jan, Feb, Mar to `months=1,2,3` and
+"Jan–Mar every year", a day preset clearing months, Shift-click runs,
+arrows, All and None), `lib/dates.test.ts` (`parseMonths`, `monthRuns`,
+`describeMonths`) and `lib/filters.test.ts` (months round trip, malformed
+dropped, sorted and unique).

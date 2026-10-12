@@ -7,7 +7,7 @@
 // libraries.test.ts.
 
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import { ApiError, createLibrary, errorMessage, getWorkspace, isRecord, openLibrary, type FolderEntry, type Holder, type Job, type Lib } from './api';
+import { ApiError, createLibrary, errorMessage, getWorkspace, isRecord, openLibrary, type FolderEntry, type Holder, type Job, type Lib, type Workspace } from './api';
 import { formatInstant, parseLocalWallClock } from './format';
 import { jobs } from './jobs.svelte';
 
@@ -45,7 +45,7 @@ export interface GateInput {
   rebuilding: ReadonlySet<string>;
 }
 
-/** "in use by picmover import (pid 812) since 10 Oct 2026, 12:00". */
+/** "in use by picmover import (pid 812) since 10/10/2026 12:00". */
 export function holderText(h: Holder | null | undefined): string {
   if (!h) return 'in use by another picmover process';
   const cmd = h.cmd ? `picmover ${h.cmd}` : 'another picmover process';
@@ -98,7 +98,7 @@ const REOPEN_GUARD_MS = 5000;
 
 export class LibrariesStore {
   root = $state('');
-  mode = $state<'workspace' | 'single' | null>(null);
+  mode = $state<Workspace['mode'] | null>(null);
   libraries = $state<Lib[]>([]);
   folders = $state<FolderEntry[]>([]);
   loaded = $state(false);
@@ -132,12 +132,7 @@ export class LibrariesStore {
     const p = getWorkspace()
       .then((ws) => {
         if (g !== this.#gen) return;
-        this.root = ws.root;
-        this.mode = ws.mode;
-        this.libraries = ws.libraries;
-        this.folders = ws.folders;
-        this.error = null;
-        this.loaded = true;
+        this.#set(ws);
         // The listing now knows about rebuilds; keep only those it does not show yet.
         for (const id of [...this.rebuilding]) {
           const l = this.find(id);
@@ -157,6 +152,31 @@ export class LibrariesStore {
       });
     this.#inflight = p;
     return p;
+  }
+
+  #set(ws: Workspace): void {
+    this.root = ws.root;
+    this.mode = ws.mode;
+    this.libraries = ws.libraries;
+    this.folders = ws.folders;
+    this.error = null;
+    this.loaded = true;
+  }
+
+  /**
+   * Takes a listing from elsewhere (the answer of POST /api/app/workspace):
+   * another workspace, so every per-library note of the old one is dropped
+   * and a listing request in flight is ignored.
+   */
+  apply(ws: Workspace): void {
+    this.#gen++;
+    this.#inflight = null;
+    this.loading = false;
+    this.opening.clear();
+    this.failures.clear();
+    this.rebuilding.clear();
+    this.#reopened.clear();
+    this.#set(ws);
   }
 
   #put(lib: Lib): void {
@@ -187,7 +207,7 @@ export class LibrariesStore {
       if (e instanceof ApiError && e.status === 409 && state === 'error') {
         // Unreadable or needs a rebuild (the listing's peek may not have noticed): the gate offers Rebuild.
         this.#patch(id, { state: 'error', error: e.message });
-      } else if (e instanceof ApiError && e.status === 409 && state === 'folder') {
+      } else if (e instanceof ApiError && e.status === 409 && (state === 'folder' || state === 'unset')) {
         await this.load();
       } else if (e instanceof ApiError && e.status === 409) {
         this.#patch(id, { state: 'busy', holder: holderFrom(e.body?.holder) });
@@ -226,6 +246,13 @@ export class LibrariesStore {
   unavailable(id: string, status: number, state: string | null): void {
     if (status === 503) {
       this.#patch(id, { state: 'rebuilding' });
+      return;
+    }
+    if (state === 'unset') {
+      // The desktop app has no workspace (any more): the listing says
+      // "unset" and the shell sends the route to the setup card. One
+      // listing request however many calls failed (load() shares it).
+      if (this.mode !== 'unset') void this.load();
       return;
     }
     const last = this.#reopened.get(id) ?? 0;

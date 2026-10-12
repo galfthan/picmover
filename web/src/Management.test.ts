@@ -40,6 +40,7 @@ describe('management flows', () => {
     vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => void errors.push(a));
     vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => void errors.push(a));
     localStorage.clear();
+    sessionStorage.clear();
   });
 
   afterEach(() => {
@@ -404,7 +405,7 @@ describe('management flows', () => {
   it('keeps an existing day bound when a year limit changes, and summarises in days', async () => {
     await start('#/l/peter/?to=2024-07-16');
     const dates = [...document.querySelectorAll<HTMLButtonElement>('.datefilter > button')][0]!;
-    expect(dates.textContent).toContain('– 2024-07-15');
+    expect(dates.textContent).toContain('– 15/07/2024');
     dates.click();
     await settle();
     button(document.querySelector('.datefilter .panel')!, 'Every year')!.click();
@@ -412,13 +413,67 @@ describe('management flows', () => {
     const toYear = document.querySelector<HTMLSelectElement>('select[aria-label="To year"]')!;
     // The day bound is shown as such, not as "Any".
     expect(toYear.value).toBe('day');
-    expect(toYear.selectedOptions[0]?.textContent).toBe('2024-07-15');
+    expect(toYear.selectedOptions[0]?.textContent).toBe('15/07/2024');
     const fromYear = document.querySelector<HTMLSelectElement>('select[aria-label="From year"]')!;
     fromYear.value = '2024';
     fromYear.dispatchEvent(new Event('change', { bubbles: true }));
     await settle();
     expect(location.hash).toBe('#/l/peter/?from=2024-01-01&to=2024-07-16');
-    expect(dates.textContent).toContain('2024-01-01 – 2024-07-15');
+    expect(dates.textContent).toContain('01/01/2024 – 15/07/2024');
+  });
+
+  it('picks months every year in the month grid', async () => {
+    await start();
+    const dates = [...document.querySelectorAll<HTMLButtonElement>('.datefilter > button')][0]!;
+    dates.click();
+    await settle();
+    const panel = () => document.querySelector('.datefilter .panel')!;
+    button(panel(), 'Every year')!.click();
+    await settle();
+    const month = (name: string) => panel().querySelector<HTMLButtonElement>(`.mgrid button[aria-label="${name}"]`)!;
+    const timelineMonths = () =>
+      server.calls.filter((c) => c.path.startsWith('/api/l/peter/timeline')).map((c) => new URLSearchParams(c.path.split('?')[1] ?? '').get('months'));
+    for (const m of ['January', 'February', 'March']) {
+      month(m).click();
+      await settle();
+    }
+    expect(location.hash).toBe('#/l/peter/?months=1,2,3');
+    expect(timelineMonths()).toContain('1,2,3');
+    expect(dates.textContent).toContain('Jan–Mar every year');
+    expect(month('February').getAttribute('aria-pressed')).toBe('true');
+    expect(month('April').getAttribute('aria-pressed')).toBe('false');
+    // Toggling off, then a day preset: the preset clears the months.
+    month('February').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=1,3');
+    expect(dates.textContent).toContain('Jan, Mar every year');
+    button(panel(), 'Christmas')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?recur=12-24..12-26');
+    expect(month('January').getAttribute('aria-pressed')).toBe('false');
+    // Picking a month clears the day range; Shift-click selects the run from the last clicked month.
+    month('July').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=7');
+    month('October').dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=7,8,9,10');
+    expect(dates.textContent).toContain('Jul–Oct every year');
+    // The fake library is July and June 2024: July only.
+    expect(timelineMonths()).toContain('7,8,9,10');
+    // Keyboard: arrows move the focus, Space/Enter toggle (native buttons).
+    month('October').focus();
+    key('ArrowRight', month('October'));
+    expect(document.activeElement).toBe(month('November'));
+    // All, then None.
+    button(panel(), 'All')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?months=1,2,3,4,5,6,7,8,9,10,11,12');
+    expect(dates.textContent).toContain('Jan–Dec every year');
+    button(panel(), 'None')!.click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/');
+    expect(dates.textContent).not.toContain('every year');
   });
 
   it('puts the new filters in the URL and the requests', async () => {
@@ -435,18 +490,32 @@ describe('management flows', () => {
     expect(server.calls.some((c) => c.path === '/api/l/peter/timeline?recur=12-24..12-26')).toBe(true);
     expect(dates.textContent).toContain('24 Dec – 26 Dec every year');
 
-    // Range mode: an inclusive last day becomes an exclusive `to`.
+    // Range mode: an inclusive last day becomes an exclusive `to`. Typed
+    // dd/mm/yyyy days apply on Enter; calendar clicks apply at once.
     button(document.querySelector('.datefilter .panel')!, 'Range')!.click();
     await settle();
-    const [from, to] = [...document.querySelectorAll<HTMLInputElement>('.datefilter input[type="date"]')];
-    to!.value = '2024-07-15';
-    to!.dispatchEvent(new Event('change', { bubbles: true }));
-    await settle();
+    const typeDay = async (label: string, text: string) => {
+      const input = document.querySelector<HTMLInputElement>(`.datefilter input[aria-label="${label}"]`)!;
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      key('Enter', input);
+      await settle();
+    };
+    await typeDay('End day', '15/07/2024');
     expect(location.hash).toBe('#/l/peter/?to=2024-07-16');
-    from!.value = '2024-07-01';
-    from!.dispatchEvent(new Event('change', { bubbles: true }));
-    await settle();
+    await typeDay('Start day', '01/07/2024');
     expect(location.hash).toBe('#/l/peter/?from=2024-07-01&to=2024-07-16');
+    expect(dates.textContent).toContain('01/07/2024 – 15/07/2024');
+    // The calendar shows July 2024; a click starts a new range, the next ends it.
+    const day = (d: string) => document.querySelector<HTMLElement>(`.datefilter [role="gridcell"][data-day="${d}"][data-in="1"]`)!;
+    expect(day('2024-07-10').getAttribute('aria-selected')).toBe('true');
+    day('2024-07-03').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?from=2024-07-03&to=2024-07-04');
+    day('2024-07-10').click();
+    await settle();
+    expect(location.hash).toBe('#/l/peter/?from=2024-07-03&to=2024-07-11');
+    expect(dates.textContent).toContain('03/07/2024 – 10/07/2024');
     key('Escape', document.querySelector('.datefilter .panel')!);
     await settle();
     expect(document.querySelector('.datefilter .panel')).toBeNull();
@@ -467,8 +536,8 @@ describe('management flows', () => {
     album.value = '2';
     album.dispatchEvent(new Event('change', { bubbles: true }));
     await settle();
-    expect(location.hash).toBe('#/l/peter/?from=2024-07-01&to=2024-07-16&rating=2&tag=1&album=2');
-    expect(server.calls.some((c) => c.path === '/api/l/peter/timeline?from=2024-07-01&to=2024-07-16&rating=2&tag=1&album=2')).toBe(true);
+    expect(location.hash).toBe('#/l/peter/?from=2024-07-03&to=2024-07-11&rating=2&tag=1&album=2');
+    expect(server.calls.some((c) => c.path === '/api/l/peter/timeline?from=2024-07-03&to=2024-07-11&rating=2&tag=1&album=2')).toBe(true);
     expect(document.querySelector('.filters .chip')?.textContent).toContain('beach');
     button(document.querySelector('.filters')!, 'Clear')!.click();
     await settle();

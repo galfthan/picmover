@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ const (
 const (
 	modeWorkspace = "workspace"
 	modeSingle    = "single"
+	modeUnset     = "unset" // no workspace set (the desktop app's first run)
 )
 
 const (
@@ -53,6 +55,14 @@ var errReplaced = errors.New("the library folder was replaced or moved while it 
 // errReplacedBusy: an open of a replaced library while requests still use
 // the old handles.
 var errReplacedBusy = errors.New("the library folder was replaced; requests on the old folder are still running, try again")
+
+// errRetired: the entry belongs to a workspace that is no longer served
+// (the app switched the workspace while the request ran).
+var errRetired = errors.New("the workspace was changed; this library is no longer served here: reload the page")
+
+// errOwnLock: the library lock is held by this process (a library being
+// closed by a workspace switch while a request still uses it).
+var errOwnLock = errors.New("the library is still in use in this app (a request on it has not finished); try again in a moment")
 
 // errViaSymlink: a library is never created through a symbolic link.
 var errViaSymlink = errors.New("this entry is a symbolic link; a library is never created through a link: rebuild the folder it points to")
@@ -87,6 +97,12 @@ type libEntry struct {
 	lockInfo os.FileInfo // the lock file as it was when the lock was taken
 	stale    bool        // the folder was replaced: close the handles once inflight drops to 0
 	inflight int         // requests using the handles
+
+	// retired is set (under mu) when the entry left the registry in a
+	// workspace switch, or was never registered because its listing came
+	// from the previous workspace: open, rebuild and job starts refuse it
+	// (errRetired). Atomic so the job manager reads it without mu.
+	retired atomic.Bool
 
 	// planMu guards plans, the cached backup plans by target id.
 	planMu sync.Mutex
@@ -250,9 +266,10 @@ func (ws *workspace) lockLocked(ctx context.Context, e *libEntry, lib *library.L
 // workspace is the library registry: a folder of libraries (workspace
 // mode) or one library (single mode).
 type workspace struct {
-	root   string // absolute; the workspace folder, or the library root in single mode
-	single bool
-	log    *slog.Logger
+	// conf is the folder served and how (root, single, unset); the app
+	// replaces it as a whole when it switches the workspace (setConf).
+	conf atomic.Pointer[wsConf]
+	log  *slog.Logger
 
 	// ownedImports reports the import records the live job on a library
 	// owns (jobManager.ownedImports); nil until the job manager exists.
@@ -262,6 +279,30 @@ type workspace struct {
 	closed bool                 // shut down: nothing opens any more
 	libs   map[string]*libEntry // by id
 	peeks  map[string]peekEntry // by library folder
+}
+
+// wsConf is what a workspace serves.
+type wsConf struct {
+	root   string // absolute; the workspace folder, or the library root in single mode; "" when unset
+	single bool
+}
+
+// root is the served folder: the workspace folder, the library root in
+// single mode, "" when no workspace is set (the app's first run).
+func (ws *workspace) root() string { return ws.cfg().root }
+
+// single reports single mode (one library).
+func (ws *workspace) single() bool { return ws.cfg().single }
+
+// unset reports that no workspace is set: nothing is listed and every
+// library route answers 409 {state: "unset"}.
+func (ws *workspace) unset() bool { return ws.cfg().root == "" }
+
+func (ws *workspace) cfg() *wsConf {
+	if c := ws.conf.Load(); c != nil {
+		return c
+	}
+	return &wsConf{}
 }
 
 // fileStamp identifies a file's content cheaply: size and mtime (zero when
@@ -339,6 +380,10 @@ type listed struct {
 	path    string
 	library bool // has a regular media.db
 	link    bool // the entry is a symbolic link (to a plain folder)
+	// conf is the configuration the entry was listed under (nil: the
+	// current one); a listing of a workspace that is no longer served
+	// never registers an entry.
+	conf *wsConf
 }
 
 // discover lists the workspace: one ReadDir of the root. Hidden entries
@@ -346,17 +391,21 @@ type listed struct {
 // out; a symlinked entry is listed only when it resolves to a plain
 // folder directly under the root (see linkTarget).
 func (ws *workspace) discover() ([]listed, error) {
-	if ws.single {
-		return []listed{{id: singleID(ws.root), path: ws.root, library: true}}, nil
+	c := ws.cfg()
+	switch {
+	case c.root == "":
+		return nil, nil
+	case c.single:
+		return []listed{{id: singleID(c.root), path: c.root, library: true, conf: c}}, nil
 	}
-	ents, err := os.ReadDir(ws.root)
+	ents, err := os.ReadDir(c.root)
 	if err != nil {
 		return nil, err
 	}
 	var out []listed
 	for _, e := range ents {
 		name := e.Name()
-		p := filepath.Join(ws.root, name)
+		p := filepath.Join(c.root, name)
 		if !validLibID(name) || isHidden(e, p) {
 			continue
 		}
@@ -372,7 +421,7 @@ func (ws *workspace) discover() ([]listed, error) {
 			continue
 		}
 		fi, err := os.Lstat(filepath.Join(p, library.DBName))
-		out = append(out, listed{id: name, path: p, library: err == nil && fi.Mode().IsRegular(), link: link})
+		out = append(out, listed{id: name, path: p, library: err == nil && fi.Mode().IsRegular(), link: link, conf: c})
 	}
 	slices.SortFunc(out, func(a, b listed) int { return cmp.Compare(a.id, b.id) })
 	return out, nil
@@ -388,9 +437,9 @@ func (ws *workspace) linkOK(p string) bool {
 	if err != nil {
 		return false
 	}
-	root, err := filepath.EvalSymlinks(ws.root)
+	root, err := filepath.EvalSymlinks(ws.root())
 	if err != nil {
-		root = ws.root
+		root = ws.root()
 	}
 	if filepath.Dir(resolved) != filepath.Clean(root) || strings.HasPrefix(filepath.Base(resolved), ".") {
 		return false
@@ -442,10 +491,28 @@ func (ws *workspace) entry(id string) *libEntry {
 func (ws *workspace) entryFor(l listed) *libEntry {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	if ws.outdatedLocked(l) {
+		return retiredEntry(l)
+	}
 	if e := ws.libs[l.id]; e != nil {
 		return e
 	}
 	return ws.registerLocked(l)
+}
+
+// outdatedLocked reports that l was listed under a configuration that is
+// no longer served (a workspace switch happened since).
+func (ws *workspace) outdatedLocked(l listed) bool {
+	return l.conf != nil && l.conf != ws.cfg()
+}
+
+// retiredEntry is an unregistered entry for a listing of a previous
+// workspace: every open, rebuild and job start on it fails with
+// errRetired.
+func retiredEntry(l listed) *libEntry {
+	e := &libEntry{id: l.id, path: l.path, state: libClosed}
+	e.retired.Store(true)
+	return e
 }
 
 func (ws *workspace) registerLocked(l listed) *libEntry {
@@ -464,6 +531,9 @@ func (ws *workspace) registerLocked(l listed) *libEntry {
 func (ws *workspace) freshEntry(l listed) *libEntry {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	if ws.outdatedLocked(l) {
+		return retiredEntry(l)
+	}
 	if old := ws.libs[l.id]; old != nil {
 		old.mu.Lock()
 		if old.unlock != nil || old.db != nil || old.user != nil {
@@ -518,6 +588,9 @@ func (ws *workspace) open(ctx context.Context, e *libEntry) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.retired.Load() {
+		return errRetired
+	}
 	switch e.state {
 	case libRebuilding:
 		return nil
@@ -652,6 +725,10 @@ func openReadStore(lib *library.Library) (*thumbs.Store, error) {
 // beginRebuild must be followed by exactly one endRebuild.
 func (ws *workspace) beginRebuild(ctx context.Context, e *libEntry) (lib *library.Library, user *userdata.DB, err error) {
 	e.mu.Lock()
+	if e.retired.Load() {
+		e.mu.Unlock()
+		return nil, nil, errRetired
+	}
 	switch e.state {
 	case libRebuilding:
 		e.mu.Unlock()
@@ -664,7 +741,7 @@ func (ws *workspace) beginRebuild(ctx context.Context, e *libEntry) (lib *librar
 		}
 	default:
 		e.holder = nil
-		if fi, err := os.Lstat(e.path); err == nil && fi.Mode()&fs.ModeSymlink != 0 && !ws.single {
+		if fi, err := os.Lstat(e.path); err == nil && fi.Mode()&fs.ModeSymlink != 0 && !ws.single() {
 			if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); err != nil {
 				e.mu.Unlock()
 				return nil, nil, errViaSymlink
@@ -728,7 +805,7 @@ func (ws *workspace) endRebuild(ctx context.Context, e *libEntry, db *catalog.DB
 		return
 	}
 	e.closeCatalogLocked()
-	if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); errors.Is(err, fs.ErrNotExist) && !ws.single {
+	if _, err := os.Lstat(filepath.Join(e.path, library.DBName)); errors.Is(err, fs.ErrNotExist) && !ws.single() {
 		e.state, e.errMsg = libFolder, ""
 	} else {
 		if failure == nil {
@@ -761,11 +838,15 @@ func (ws *workspace) closeAll() {
 	}
 }
 
-// createLibrary creates <root>/<name> with an empty catalog and returns
-// its listing entry. The name must be a valid, non-reserved id that does
-// not exist yet (errExists).
-func (ws *workspace) createLibrary(ctx context.Context, name string) (listed, error) {
-	p := filepath.Join(ws.root, name)
+// createLibrary creates <c.root>/<name> with an empty catalog and returns
+// its listing entry (listed under c). The name must be a valid,
+// non-reserved id that does not exist yet (errExists). c is the request's
+// one snapshot of the configuration and must be a workspace.
+func (ws *workspace) createLibrary(ctx context.Context, c *wsConf, name string) (listed, error) {
+	if c.root == "" || c.single {
+		return listed{}, errors.New("no workspace to create a library in")
+	}
+	p := filepath.Join(c.root, name)
 	if err := os.Mkdir(p, 0o755); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return listed{}, errExists
@@ -781,7 +862,7 @@ func (ws *workspace) createLibrary(ctx context.Context, name string) (listed, er
 		return listed{}, err
 	}
 	db.Close()
-	return listed{id: name, path: p, library: true}, nil
+	return listed{id: name, path: p, library: true, conf: c}, nil
 }
 
 var errExists = errors.New("a folder with this name already exists")
@@ -802,9 +883,13 @@ func publicLibError(err error) string {
 	case err == nil:
 		return ""
 	case errors.As(err, &locked):
+		if ownLock(locked) {
+			return errOwnLock.Error()
+		}
 		return locked.Error()
 	case errors.Is(err, errReplaced), errors.Is(err, errReplacedBusy), errors.Is(err, errViaSymlink),
-		errors.Is(err, errNotRegularCatalog), errors.Is(err, errClosed):
+		errors.Is(err, errNotRegularCatalog), errors.Is(err, errClosed), errors.Is(err, errRetired),
+		errors.Is(err, errOwnLock):
 		return err.Error()
 	case errors.As(err, &ve):
 		return ve.Error()

@@ -188,6 +188,11 @@ func TestNewFilterParams(t *testing.T) {
 		{"recur=13-01", "recur"},
 		{"recur=02-30", "recur"},
 		{"recur=07-14..", "recur"},
+		{"months=0", "months"},
+		{"months=13", "months"},
+		{"months=a", "months"},
+		{"months=1,,2", "months"},
+		{"months=1,", "months"},
 		{"rating=0", "rating"},
 		{"rating=6", "rating"},
 		{"tag=x", "tag"},
@@ -212,6 +217,10 @@ func TestNewFilterParams(t *testing.T) {
 		"recur=12-31..01-05":                 1,
 		"recur=07-01..07-31&from=2024-07-15": 1,
 		"recur=07-14&tag=1":                  0, // unknown tag: nothing
+		"months=7":                           2,
+		"months=7,12":                        2,
+		"months=1,8,8":                       2,
+		"months=7&recur=07-14":               1,
 		"trashed=1":                          1, // the fixture's deleted row
 	} {
 		if n := f.countAll(q); n != want {

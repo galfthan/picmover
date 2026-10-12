@@ -114,7 +114,7 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 	}
 	j, err := s.jobs.start(e, p, zone)
 	switch {
-	case errors.Is(err, errBusy):
+	case errors.Is(err, errBusy), errors.Is(err, errSwitching), errors.Is(err, errRetired):
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	case errors.Is(err, errClosed):
@@ -211,10 +211,10 @@ func (s *Server) overlapsLibraries(source, resolved string) bool {
 		return out
 	}
 	sources := []string{filepath.Clean(source), filepath.Clean(resolved)}
-	if !s.ws.single {
+	if !s.ws.single() {
 		// The workspace root itself, or a folder that contains it (a
 		// plain folder of the workspace is a fine source).
-		for _, r := range spellings(s.ws.root) {
+		for _, r := range spellings(s.ws.root()) {
 			for _, c := range sources {
 				if pathEqual(r, c) || within(c, r) {
 					return true
@@ -224,8 +224,8 @@ func (s *Server) overlapsLibraries(source, resolved string) bool {
 	}
 	var roots []string
 	add := func(p string) { roots = append(roots, spellings(p)...) }
-	if s.ws.single {
-		add(s.ws.root)
+	if s.ws.single() {
+		add(s.ws.root())
 	} else {
 		all, err := s.ws.discover()
 		if err != nil {

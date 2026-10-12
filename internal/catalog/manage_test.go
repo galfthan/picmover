@@ -124,6 +124,51 @@ func TestFilterRecur(t *testing.T) {
 	}
 }
 
+func TestFilterMonths(t *testing.T) {
+	d := newDB(t)
+	ctx := context.Background()
+	wall := func(y int, m time.Month, day int) time.Time { return time.Date(y, m, day, 12, 0, 0, 0, time.UTC) }
+	dates := map[uint64]time.Time{
+		1: wall(2020, 12, 24), 2: wall(2021, 12, 26), 3: wall(2022, 7, 14), 4: wall(2023, 1, 1),
+		5: wall(2023, 1, 20), 6: wall(2023, 3, 3), 7: wall(2024, 2, 29), 8: wall(2019, 7, 1), 9: {},
+		10: time.Date(2022, 12, 31, 23, 59, 59, 0, time.UTC),
+	}
+	for h, at := range dates {
+		m := Media{Hash: h, Size: 1, FileType: "image", Ext: "jpg", RelPath: "image/" + string(rune('a'+h)) + ".jpg", TakenAt: at}
+		if !insert(t, d, &m) {
+			t.Fatal("insert")
+		}
+	}
+	for _, c := range []struct {
+		name string
+		f    Filter
+		want []uint64
+	}{
+		{"one month", Filter{Months: []int{7}}, []uint64{3, 8}},
+		{"several", Filter{Months: []int{1, 2, 3}}, []uint64{4, 5, 6, 7}},
+		{"non-contiguous", Filter{Months: []int{12, 7}}, []uint64{1, 2, 3, 8, 10}},
+		{"repeats", Filter{Months: []int{7, 7, 7}}, []uint64{3, 8}},
+		{"with recur", Filter{Months: []int{1, 7}, Recur: &Recur{"07-10", "01-10"}}, []uint64{3, 4}},
+		{"with from/to", Filter{Months: []int{12}, From: wall(2021, 1, 1), To: wall(2023, 1, 1)}, []uint64{2, 10}},
+		{"with hashes", Filter{Months: []int{12}, Hashes: []uint64{1, 9}}, []uint64{1}},
+		{"none match", Filter{Months: []int{11}}, nil},
+	} {
+		if got := bucketHashes(t, d, c.f); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+	// Buckets return only the chosen months; undated never.
+	bs, err := d.Buckets(ctx, Filter{Months: []int{7, 12}})
+	if err != nil || !reflect.DeepEqual(bs, []Bucket{{2022, 12, 1}, {2022, 7, 1}, {2021, 12, 1}, {2020, 12, 1}, {2019, 7, 1}}) {
+		t.Fatalf("buckets %v %v", bs, err)
+	}
+	for _, bad := range [][]int{{0}, {13}, {1, -1}, {1, 2, 99}} {
+		if _, err := d.Buckets(ctx, Filter{Months: bad}); err == nil {
+			t.Errorf("months %v accepted", bad)
+		}
+	}
+}
+
 func TestFilterSide(t *testing.T) {
 	d := newDB(t)
 	ctx := context.Background()

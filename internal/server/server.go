@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata" // IANA zones for job time zones on Windows
 
@@ -62,6 +63,20 @@ type Options struct {
 	Static fs.FS
 	Logger *slog.Logger // nil: discard
 
+	// Unset serves no workspace (the desktop app before the user chose
+	// one): /api/libraries lists nothing in mode "unset" and every library
+	// route answers 409 {error, state: "unset"} until POST
+	// /api/app/workspace sets one. Excludes Workspace and Library.
+	Unset bool
+	// App enables the /api/app endpoints of the desktop app (nil: they
+	// answer 404, as under "picmover serve").
+	App *AppHooks
+
+	// unlock, in single mode, releases the library lock when the library
+	// is closed (Close, or a workspace switch); nil: the caller keeps the
+	// lock (cmd/serve before Start).
+	unlock func()
+
 	// jobOptions, when set, adjusts the importer options of every job
 	// (tests use it to slow down or observe a job).
 	jobOptions func(*importer.Options)
@@ -80,6 +95,9 @@ type Server struct {
 	jobs    *jobManager
 	large   *largeDeriver // on-demand large thumbnails
 	handler http.Handler
+
+	app      *AppHooks  // nil: no /api/app endpoints
+	switchMu sync.Mutex // serialises workspace switches
 
 	// bodyTimeout bounds reading a request body (a client trickling a
 	// POST body would otherwise hold a goroutine); tests shorten it.
@@ -100,44 +118,31 @@ func New(opts Options) (*Server, error) {
 	}
 	ws := &workspace{log: log, libs: map[string]*libEntry{}, peeks: map[string]peekEntry{}}
 	switch {
+	case opts.Unset:
+		if opts.Workspace != "" || opts.Library != nil || opts.Catalog != nil || opts.Store != nil {
+			return nil, errors.New("server: Unset excludes Workspace, Library, Catalog and Store")
+		}
 	case opts.Workspace != "":
 		if opts.Library != nil || opts.Catalog != nil || opts.Store != nil {
 			return nil, errors.New("server: Workspace excludes Library, Catalog and Store")
 		}
-		root, err := filepath.Abs(opts.Workspace)
+		root, err := checkWorkspaceDir(opts.Workspace)
 		if err != nil {
 			return nil, err
 		}
-		if fi, err := os.Stat(root); err != nil {
-			return nil, fmt.Errorf("server: workspace: %w", err)
-		} else if !fi.IsDir() {
-			return nil, fmt.Errorf("server: workspace %s is not a directory", root)
-		}
-		ws.root = root
+		ws.conf.Store(&wsConf{root: root})
 	case opts.Library == nil || opts.Catalog == nil || opts.Store == nil:
 		return nil, errors.New("server: Library, Catalog and Store are required")
 	default:
-		ws.root, ws.single = opts.Library.Root(), true
-		user := opts.UserData
-		if user == nil {
-			user, err = userdata.Open(context.Background(), filepath.Join(opts.Library.Root(), userdata.FileName))
-			if err != nil {
-				return nil, err
-			}
+		unlock := opts.unlock
+		if unlock == nil {
+			// The lock belongs to the caller (cmd/serve): the entry records
+			// it as held, so nothing here takes it again or releases it.
+			unlock = func() {}
 		}
-		// Keep enough idle connections for the concurrent reads of a page
-		// load and a parallel geo scan (database/sql keeps 2 by default and
-		// would reopen, re-running the connection pragmas, on every request).
-		opts.Catalog.SetMaxIdleConns(maxIdleConns)
-		id := singleID(ws.root)
-		// The lock belongs to the caller (cmd/serve): the entry records it
-		// as held, so nothing here takes it again or releases it.
-		lockInfo, _ := os.Stat(opts.Library.LockPath())
-		ws.libs[id] = &libEntry{id: id, path: ws.root, state: libOpen, lib: opts.Library, db: opts.Catalog,
-			store: opts.Store, user: user, unlock: func() {}, external: true, lockInfo: lockInfo}
-		backfillImports(context.Background(), opts.Catalog, user, log)
-		// No job runs yet: every running record is a crashed run's.
-		closeCrashedImports(context.Background(), opts.Catalog, user, nil, log)
+		if err := ws.installSingle(opts.Library, opts.Catalog, opts.Store, opts.UserData, unlock); err != nil {
+			return nil, err
+		}
 	}
 	s := &Server{
 		ws:      ws,
@@ -147,6 +152,7 @@ func New(opts Options) (*Server, error) {
 		static:  opts.Static,
 		guard:   g,
 		large:   newLargeDeriver(log),
+		app:     opts.App,
 
 		bodyTimeout: bodyReadTimeout,
 	}
@@ -170,12 +176,74 @@ func New(opts Options) (*Server, error) {
 // Origin and mutation checks before reaching a route.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// Mode is "single" or "workspace".
-func (s *Server) Mode() string {
-	if s.ws.single {
+// Mode is "single", "workspace" or "unset" (no workspace chosen yet).
+func (s *Server) Mode() string { return s.ws.cfg().mode() }
+
+// mode is the /api/libraries mode of c.
+func (c *wsConf) mode() string {
+	switch {
+	case c.root == "":
+		return modeUnset
+	case c.single:
 		return modeSingle
 	}
 	return modeWorkspace
+}
+
+// checkWorkspaceDir returns the absolute path of dir, which must be an
+// existing directory.
+func checkWorkspaceDir(dir string) (string, error) {
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	if fi, err := os.Stat(root); err != nil {
+		return "", fmt.Errorf("server: workspace: %w", err)
+	} else if !fi.IsDir() {
+		return "", fmt.Errorf("server: workspace %s is not a directory", root)
+	}
+	return root, nil
+}
+
+// installSingle serves the library opened by the caller in single mode
+// (New): see newSingleEntry. The workspace must have no entries.
+func (ws *workspace) installSingle(lib *library.Library, db *catalog.DB, store *thumbs.Store, user *userdata.DB, unlock func()) error {
+	e, err := ws.newSingleEntry(lib, db, store, user, unlock)
+	if err != nil {
+		return err
+	}
+	ws.mu.Lock()
+	ws.libs[e.id] = e
+	ws.mu.Unlock()
+	ws.conf.Store(&wsConf{root: e.path, single: true})
+	return nil
+}
+
+// newSingleEntry is the single-mode entry of a library opened by the
+// caller: it opens user.db when user is nil, records the library as open
+// with the lock held (unlock releases it when the library is closed),
+// and tidies the import history (no job runs). The entry is not
+// registered.
+func (ws *workspace) newSingleEntry(lib *library.Library, db *catalog.DB, store *thumbs.Store, user *userdata.DB, unlock func()) (*libEntry, error) {
+	if user == nil {
+		var err error
+		user, err = userdata.Open(context.Background(), filepath.Join(lib.Root(), userdata.FileName))
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Keep enough idle connections for the concurrent reads of a page
+	// load and a parallel geo scan (database/sql keeps 2 by default and
+	// would reopen, re-running the connection pragmas, on every request).
+	db.SetMaxIdleConns(maxIdleConns)
+	root := lib.Root()
+	lockInfo, _ := os.Stat(lib.LockPath())
+	e := &libEntry{id: singleID(root), path: root, state: libOpen, lib: lib, db: db,
+		store: store, user: user, unlock: unlock, external: true, lockInfo: lockInfo}
+	backfillImports(context.Background(), db, user, ws.log)
+	// No job runs yet: every running record is a crashed run's.
+	closeCrashedImports(context.Background(), db, user, nil, ws.log)
+	return e, nil
 }
 
 // StopJobs is the first phase of a shutdown: it refuses new jobs,
@@ -217,13 +285,13 @@ const jobShutdownTimeout = 30 * time.Second
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/libraries", s.handleLibraries)
-	mux.HandleFunc("POST /api/libraries", s.handleLibraryCreate)
-	mux.HandleFunc("POST /api/libraries/{lib}/open", s.handleLibraryOpen)
-	mux.HandleFunc("GET /api/libraries/{lib}/cover", s.handleLibraryCover)
-	mux.HandleFunc("POST /api/libraries/{lib}/jobs", s.handleLibraryJobStart)
+	mux.HandleFunc("POST /api/libraries", s.needWorkspace(s.handleLibraryCreate))
+	mux.HandleFunc("POST /api/libraries/{lib}/open", s.needWorkspace(s.handleLibraryOpen))
+	mux.HandleFunc("GET /api/libraries/{lib}/cover", s.needWorkspace(s.handleLibraryCover))
+	mux.HandleFunc("POST /api/libraries/{lib}/jobs", s.needWorkspace(s.handleLibraryJobStart))
 
 	scoped := func(pattern string, h func(http.ResponseWriter, *http.Request, *libHandles)) {
-		mux.HandleFunc(pattern, s.scoped(h))
+		mux.HandleFunc(pattern, s.needWorkspace(s.scoped(h)))
 	}
 	scoped("GET /api/l/{lib}/library", s.handleLibrary)
 	scoped("GET /api/l/{lib}/timeline", s.handleTimeline)
@@ -270,6 +338,12 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleJobGet)
 	mux.HandleFunc("GET /api/jobs/{id}/events", s.handleJobEvents)
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.handleJobCancel)
+	// The desktop app's endpoints: 404 without Options.App.
+	mux.HandleFunc("GET /api/app", s.appOnly(s.handleApp))
+	mux.HandleFunc("POST /api/app/workspace", s.appOnly(s.handleAppWorkspace))
+	mux.HandleFunc("POST /api/app/open", s.appOnly(s.handleAppOpen))
+	mux.HandleFunc("POST /api/app/show", s.appOnly(s.handleAppShow))
+	mux.HandleFunc("POST /api/app/quit", s.appOnly(s.handleAppQuit))
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
 }

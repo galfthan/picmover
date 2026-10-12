@@ -7,6 +7,7 @@
   import { library } from '../lib/library.svelte';
   import { libraries } from '../lib/libraries.svelte';
   import { libHref } from '../lib/routes';
+  import { viewMemory } from '../lib/viewmemory.svelte';
   import { formatCount } from '../lib/format';
   import CopyButton from './CopyButton.svelte';
 
@@ -92,7 +93,7 @@
         {#if others.length}
           <div class="sep" role="separator"></div>
           {#each others as l (l.id)}
-            <a role="menuitem" href={libHref(l.id, '')} title={l.path}>
+            <a role="menuitem" href={viewMemory.withMemory(libHref(l.id, ''))} title={l.path}>
               <span class="lname">{l.name}</span>
               <span class="n">{l.summary ? formatCount(l.summary.total) : l.state === 'open' ? '' : l.state}</span>
             </a>

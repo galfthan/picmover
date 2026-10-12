@@ -189,6 +189,7 @@ describe('grid', () => {
     vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => void errors.push(a));
     vi.resetModules();
     localStorage.clear();
+    sessionStorage.clear();
     FakeEventSource.instances = [];
     FakeResizeObserver.instances = [];
     errors.length = 0;

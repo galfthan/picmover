@@ -1,7 +1,7 @@
 // Library-scoped URLs and chunked mutations, against a recording fake fetch.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, chunks, filterParams, libApi, libraryCoverUrl, setUnavailableHandler, toImport, toImportRefs } from './api';
+import { ApiError, appOpen, chunks, filterParams, getApp, getWorkspace, libApi, libraryCoverUrl, parseAppInfo, setAppWorkspace, setUnavailableHandler, toImport, toImportRefs } from './api';
 
 interface Call {
   method: string;
@@ -428,5 +428,54 @@ describe('import records', () => {
     reply = () => json({ id: 1, hash: H });
     expect(await api.getMedia(1)).not.toHaveProperty('imports');
     expect(toImportRefs(null)).toEqual([]);
+  });
+});
+
+describe('desktop app endpoints', () => {
+  const info = { app: true, version: 'v0.6.0', workspace: 'C:\\Users\\me\\Pictures', closeToTray: true, platform: 'windows', window: false };
+
+  it('parse GET /api/app and answer null on 404 (picmover serve)', async () => {
+    reply = () => json({ ...info, windowReason: 'failed' });
+    expect(await getApp()).toEqual({ ...info, windowReason: 'failed' });
+    reply = () => json({ error: 'not found' }, 404);
+    expect(await getApp()).toBeNull();
+    reply = () => json({ error: 'boom' }, 500);
+    await expect(getApp()).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('normalise odd /api/app bodies', () => {
+    expect(parseAppInfo({ app: false })).toBeNull();
+    expect(parseAppInfo(null)).toBeNull();
+    expect(parseAppInfo({ app: true })).toEqual({ app: true, version: '', workspace: '', closeToTray: true, platform: 'linux', window: false, windowReason: 'unsupported' });
+    expect(parseAppInfo({ ...info, platform: 'darwin', closeToTray: false, window: true })).toMatchObject({ platform: 'darwin', closeToTray: false, window: true, windowReason: 'ok' });
+  });
+
+  it('default a missing or unknown windowReason from window and platform (older servers)', () => {
+    expect(parseAppInfo(info)?.windowReason).toBe('no-runtime');
+    expect(parseAppInfo({ ...info, windowReason: 'later' })?.windowReason).toBe('no-runtime');
+    expect(parseAppInfo({ ...info, window: true })?.windowReason).toBe('ok');
+    expect(parseAppInfo({ ...info, platform: 'linux' })?.windowReason).toBe('unsupported');
+    for (const r of ['ok', 'no-runtime', 'browser-flag', 'failed', 'unsupported']) expect(parseAppInfo({ ...info, windowReason: r })?.windowReason).toBe(r);
+  });
+
+  it('post the workspace and return the libraries body; errors keep status and body', async () => {
+    reply = () => json({ root: '/data', mode: 'workspace', libraries: [], folders: [] });
+    expect(await setAppWorkspace('/data')).toEqual({ root: '/data', mode: 'workspace', libraries: [], folders: [] });
+    expect(calls.at(-1)).toMatchObject({ method: 'POST', path: '/api/app/workspace', body: { path: '/data' } });
+    reply = () => json({ error: 'a job is running', jobs: 1 }, 409);
+    const e = await setAppWorkspace('/data').catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).status).toBe(409);
+    expect((e as ApiError).body).toEqual({ error: 'a job is running', jobs: 1 });
+    reply = () => new Response(null, { status: 204 });
+    await appOpen();
+    expect(calls.at(-1)).toMatchObject({ method: 'POST', path: '/api/app/open', body: {} });
+  });
+
+  it('read the unset mode of /api/libraries', async () => {
+    reply = () => json({ root: '', mode: 'unset', libraries: [], folders: [] });
+    expect(await getWorkspace()).toEqual({ root: '', mode: 'unset', libraries: [], folders: [] });
+    reply = () => json({ mode: 'unset', libraries: null, folders: null });
+    expect(await getWorkspace()).toEqual({ root: '', mode: 'unset', libraries: [], folders: [] });
   });
 });

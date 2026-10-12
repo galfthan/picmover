@@ -40,30 +40,74 @@ export function formatOffset(offset: number): string {
   return `UTC${sign}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+// Dates are always shown day first, "14/07/2024", whatever the browser's
+// locale (docs/design/management.md "Dates and the calendar picker (web)").
+// Times use the 24-hour clock. Month names (grid headers, "every year"
+// filters) still come from Intl.
+
+const p2 = (n: number) => String(n).padStart(2, '0');
+const p4 = (n: number) => String(n).padStart(4, '0');
+
+/** "14/07/2024" from a Date's UTC fields. */
+function utcDay(d: Date): string {
+  return `${p2(d.getUTCDate())}/${p2(d.getUTCMonth() + 1)}/${p4(d.getUTCFullYear())}`;
+}
+
 /**
- * Renders a capture time as recorded, e.g. "14 Jul 2024, 13:05:22 UTC+03:00".
+ * Renders a capture time as recorded, e.g. "14/07/2024 13:05:22 UTC+03:00".
  * Undated (null) renders as "Undated".
  */
-export function formatTakenAt(wallClock: string | null | undefined, offset: number | null | undefined, locale?: string): string {
+export function formatTakenAt(wallClock: string | null | undefined, offset: number | null | undefined): string {
   const d = parseWallClock(wallClock);
   if (!d) return wallClock ? wallClock : 'Undated';
-  const s = dtf(locale, { dateStyle: 'medium', timeStyle: 'medium', timeZone: 'UTC' }).format(d);
+  const s = `${utcDay(d)} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
   return offset === null || offset === undefined ? s : `${s} ${formatOffset(offset)}`;
 }
 
-/** Short date only ("14 Jul 2024"), wall-clock; "Undated" for null. */
-export function formatWallDate(wallClock: string | null | undefined, locale?: string): string {
+/** Date only ("14/07/2024"), wall-clock; "Undated" for null. */
+export function formatWallDate(wallClock: string | null | undefined): string {
   const d = parseWallClock(wallClock);
-  if (!d) return 'Undated';
-  return dtf(locale, { dateStyle: 'medium', timeZone: 'UTC' }).format(d);
+  return d ? utcDay(d) : 'Undated';
 }
 
-/** A real instant (RFC 3339 with zone), rendered in the viewer's zone. */
-export function formatInstant(rfc3339: string | null | undefined, locale?: string): string {
+/** The viewer's local date of an instant: "14/07/2024". */
+export function formatLocalDay(d: Date): string {
+  return `${p2(d.getDate())}/${p2(d.getMonth() + 1)}/${p4(d.getFullYear())}`;
+}
+
+/** A real instant (RFC 3339 with zone), in the viewer's zone and 24-hour clock: "14/07/2024 13:05". */
+export function formatInstant(rfc3339: string | null | undefined): string {
   if (!rfc3339) return '-';
   const d = new Date(rfc3339);
   if (Number.isNaN(d.getTime())) return rfc3339;
-  return dtf(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(d);
+  return `${formatLocalDay(d)} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
+/** A calendar day "2024-07-14" as "14/07/2024"; anything else is returned unchanged ("" for none). */
+export function formatDay(day: string | null | undefined): string {
+  if (!day) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : day;
+}
+
+const DMY_RE = /^\s*(\d{1,2})([/.])(\d{1,2})\2(\d{4})\s*$/;
+
+/**
+ * Parses a typed day to "yyyy-mm-dd": "14/07/2024", "4/7/2024" and
+ * "14.07.2024" are accepted; the day must exist (not 29/02/2023). Null
+ * for anything else.
+ */
+export function parseDay(s: string | null | undefined): string | null {
+  if (!s) return null;
+  const m = DMY_RE.exec(s);
+  if (!m) return null;
+  const day = Number(m[1]);
+  const month = Number(m[3]);
+  const year = m[4]!;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const iso = `${year}-${p2(month)}-${p2(day)}`;
+  const d = parseWallClock(iso);
+  return d && utcDay(d) === `${p2(day)}/${p2(month)}/${year}` ? iso : null;
 }
 
 /** Binary units like the CLI: "512 B", "1.5 KiB", "2.0 GiB". */

@@ -71,7 +71,8 @@ func (u userFilter) empty() bool {
 }
 
 // parseFilter reads the filters shared by timeline, media, geo and
-// geo/items: type, gps, camera, session, from, to, recur, minpx, maxpx,
+// geo/items: type, gps, camera, session, from, to, recur, months (month
+// numbers 1-12 separated by commas, repeats collapsed), minpx, maxpx,
 // rating, tag (repeatable), album, import and trashed. A malformed or unknown value
 // is an error (400) naming the parameter.
 func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
@@ -120,6 +121,13 @@ func parseFilter(q url.Values) (catalog.Filter, userFilter, error) {
 			return f, uf, err
 		}
 		f.Recur = r
+	}
+	if v := q.Get("months"); v != "" {
+		ms, err := parseMonths(v)
+		if err != nil {
+			return f, uf, err
+		}
+		f.Months = ms
 	}
 	for _, b := range []struct {
 		name string
@@ -196,6 +204,26 @@ func parseRecur(v string) (*catalog.Recur, error) {
 		return nil, fmt.Errorf("invalid recur %q: want MM-DD or MM-DD..MM-DD", v)
 	}
 	return &catalog.Recur{From: from, To: to}, nil
+}
+
+// parseMonths parses "1,2,3": month numbers 1-12 separated by commas.
+// Repeats are collapsed; an empty item is an error.
+func parseMonths(v string) ([]int, error) {
+	var (
+		seen [13]bool
+		ms   []int
+	)
+	for item := range strings.SplitSeq(v, ",") {
+		m, err := strconv.Atoi(item)
+		if err != nil || m < 1 || m > 12 {
+			return nil, fmt.Errorf("invalid months %q: want month numbers 1-12 separated by commas", v)
+		}
+		if !seen[m] {
+			seen[m] = true
+			ms = append(ms, m)
+		}
+	}
+	return ms, nil
 }
 
 // resolveFilter turns the user.db part of a filter into f.Hashes: the

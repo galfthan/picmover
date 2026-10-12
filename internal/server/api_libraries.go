@@ -152,14 +152,25 @@ func (s *Server) libBackup(ctx context.Context, l listed, e *libEntry) *libBacku
 }
 
 // handleLibraries lists the workspace: libraries (a subfolder with a
-// regular media.db) and plain folders. In single mode the one library.
+// regular media.db) and plain folders. In single mode the one library;
+// in unset mode nothing.
 func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
-	all, err := s.ws.discover()
+	out, err := s.listLibraries(r.Context())
 	if err != nil {
 		s.internalError(w, r, err)
 		return
 	}
-	out := librariesJSON{Root: s.ws.root, Mode: s.Mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// listLibraries is the /api/libraries body.
+func (s *Server) listLibraries(ctx context.Context) (librariesJSON, error) {
+	c := s.ws.cfg()
+	all, err := s.ws.discover()
+	if err != nil {
+		return librariesJSON{}, err
+	}
+	out := librariesJSON{Root: c.root, Mode: c.mode(), Libraries: []libJSON{}, Folders: []folderJSON{}}
 	// The peeks a listing needs run concurrently, at most peekWorkers at
 	// a time; unchanged catalogs come from the cache.
 	var described []*libJSON
@@ -182,7 +193,7 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			*d = s.describe(r.Context(), l, e)
+			*d = s.describe(ctx, l, e)
 		})
 	}
 	wg.Wait()
@@ -190,7 +201,7 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 		out.Libraries = append(out.Libraries, *d)
 	}
 	slices.SortFunc(out.Libraries, func(a, b libJSON) int { return cmp.Compare(a.ID, b.ID) })
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 type createLibraryBody struct {
@@ -201,7 +212,14 @@ type createLibraryBody struct {
 // opens it: 201 lib. Workspace mode only (400 in single mode); 400 for an
 // invalid or reserved name, 409 when the folder exists.
 func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
-	if s.ws.single {
+	// One snapshot of the configuration for the whole request: a
+	// workspace switch meanwhile never makes it create elsewhere.
+	c := s.ws.cfg()
+	if c.root == "" {
+		writeJSON(w, http.StatusConflict, errorUnsetJSON)
+		return
+	}
+	if c.single {
 		writeError(w, http.StatusBadRequest, "new libraries can only be created when serving a workspace")
 		return
 	}
@@ -220,7 +238,7 @@ func (s *Server) handleLibraryCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	l, err := s.ws.createLibrary(r.Context(), name)
+	l, err := s.ws.createLibrary(r.Context(), c, name)
 	if errors.Is(err, errExists) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -323,8 +341,16 @@ func (s *Server) openFailed(w http.ResponseWriter, r *http.Request, l listed, e 
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if errors.Is(err, errRetired) {
+		writeJSON(w, http.StatusConflict, stateError{Error: err.Error(), State: libClosed})
+		return
+	}
 	if errors.As(err, &locked) {
-		writeJSON(w, http.StatusConflict, openBusyJSON{Error: err.Error(), State: libBusy, Holder: newHolder(locked)})
+		msg := err.Error()
+		if ownLock(locked) {
+			msg = errOwnLock.Error()
+		}
+		writeJSON(w, http.StatusConflict, openBusyJSON{Error: msg, State: libBusy, Holder: newHolder(locked)})
 		return
 	}
 	s.log.Info("cannot open library", "id", l.id, "err", err)

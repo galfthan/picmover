@@ -579,8 +579,8 @@ func ValidTargetPath(p string) error {
 // inside a library the server serves or the workspace root, lexically
 // and with links resolved.
 func (s *Server) targetOverlaps(p string) bool {
-	roots := []string{s.ws.root}
-	if !s.ws.single {
+	roots := []string{s.ws.root()}
+	if !s.ws.single() {
 		if all, err := s.ws.discover(); err == nil {
 			for _, l := range all {
 				roots = append(roots, l.path)

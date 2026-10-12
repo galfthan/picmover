@@ -3,7 +3,7 @@
 // imports.test.ts.
 
 import type { ImportRecord, ImportRef } from './api';
-import { formatAgo, formatCount } from './format';
+import { formatAgo, formatCount, formatLocalDay } from './format';
 
 /** "Summer trip", else the source's base name, else "Import #12". */
 export function importTitle(r: Pick<ImportRecord, 'id' | 'name'> & { sourceName?: string }): string {
@@ -56,26 +56,22 @@ export function importCounts(r: Pick<ImportRecord, 'imported' | 'existing' | 'du
 }
 
 const WEEK = 7 * 86400 * 1000;
-const dateFormats = new Map<string, Intl.DateTimeFormat>();
-
-/** Relative under a week ("3 hours ago", "yesterday"), else the local date; "" when unknown. */
+/**
+ * Relative under a week ("3 hours ago", "yesterday"), else the local date
+ * ("01/09/2026"); "" when unknown. `locale` only picks the relative wording.
+ */
 export function formatRecent(rfc3339: string | null | undefined, now: number = Date.now(), locale?: string): string {
   if (!rfc3339) return '';
   const d = new Date(rfc3339);
   if (Number.isNaN(d.getTime())) return '';
   if (Math.abs(now - d.getTime()) < WEEK) return formatAgo(d, now, locale);
-  let f = dateFormats.get(locale ?? '');
-  if (!f) {
-    f = new Intl.DateTimeFormat(locale, { dateStyle: 'medium' });
-    dateFormats.set(locale ?? '', f);
-  }
-  return f.format(d);
+  return formatLocalDay(d);
 }
 
 /**
- * The lightbox line: "Imported 10 Oct 2026, 12:00 from DCIM", plus
+ * The lightbox line: "Imported 10/10/2026 12:00 from DCIM", plus
  * " · <name>" when the record is named; a rebuild (isRebuild) says
- * "Recorded 10 Oct 2026, 12:00" (nothing came from anywhere). The source
+ * "Recorded 10/10/2026 12:00" (nothing came from anywhere). The source
  * name is left out when the server does not send it.
  */
 export function importLine(r: ImportRef, when: string): string {

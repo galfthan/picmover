@@ -189,3 +189,37 @@ func TestStaticDotfilesAndExtensions(t *testing.T) {
 		wantStatus(t, f.get(p), http.StatusOK)
 	}
 }
+
+// TestStaticManifestAndIcons: the web app manifest and its icons are
+// served with their own content types (not the SPA fallback), also to a
+// same-origin manifest fetch.
+func TestStaticManifestAndIcons(t *testing.T) {
+	fsys := staticFS()
+	fsys["manifest.webmanifest"] = &fstest.MapFile{Data: []byte(`{"name":"picmover"}`)}
+	fsys["favicon.png"] = &fstest.MapFile{Data: []byte("\x89PNG")}
+	fsys["icons/icon-192.png"] = &fstest.MapFile{Data: []byte("\x89PNG")}
+	fsys["icons/icon-512.png"] = &fstest.MapFile{Data: []byte("\x89PNG")}
+	f := newFixtureWith(t, func(o *Options) { o.Static = fsys })
+	for p, ct := range map[string]string{
+		"/manifest.webmanifest": "application/manifest+json",
+		"/favicon.png":          "image/png",
+		"/icons/icon-192.png":   "image/png",
+		"/icons/icon-512.png":   "image/png",
+	} {
+		w := f.get(p)
+		wantStatus(t, w, http.StatusOK)
+		if got := w.Header().Get("Content-Type"); got != ct {
+			t.Errorf("%s: Content-Type %q, want %q", p, got, ct)
+		}
+		if strings.Contains(w.Body.String(), "<title>picmover") {
+			t.Errorf("%s: got index.html", p)
+		}
+	}
+	// The browser's manifest fetch: same origin, cors mode, dest manifest.
+	if w := f.request(http.MethodGet, "/manifest.webmanifest", nil, map[string]string{
+		"Origin": "http://" + f.addr, "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "manifest",
+	}); w.Code != http.StatusOK {
+		t.Errorf("manifest fetch: %d %s", w.Code, w.Body)
+	}
+	wantStatus(t, f.get("/icons/missing.png"), http.StatusNotFound)
+}

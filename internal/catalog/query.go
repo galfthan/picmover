@@ -32,6 +32,11 @@ type Filter struct {
 	// Recur restricts dated rows to a day range every year; nil = none.
 	// Undated rows never match.
 	Recur *Recur
+	// Months restricts dated rows to these months (1-12) of any year;
+	// empty = none. Repeats are collapsed; a value outside 1-12 is an
+	// error. Undated rows never match. Combines with Recur, From/To and
+	// the rest by AND.
+	Months []int
 	// MinSide and MaxSide bound the longer edge, MAX(width, height), in
 	// pixels (inclusive); 0 = no bound. Rows with unknown dimensions
 	// (width or height NULL or 0) never match when either bound is set.
@@ -113,6 +118,23 @@ func (f Filter) where() ([]string, []any, error) {
 			conds = append(conds, datedRange+" AND ("+md+" >= ? OR "+md+" <= ?)")
 		}
 		args = append(args, r.From, r.To)
+	}
+	if len(f.Months) > 0 {
+		var seen [13]bool
+		var ms []any
+		for _, m := range f.Months {
+			if m < 1 || m > 12 {
+				return nil, nil, fmt.Errorf("catalog: invalid month %d", m)
+			}
+			if !seen[m] {
+				seen[m] = true
+				ms = append(ms, m)
+			}
+		}
+		ph := strings.TrimSuffix(strings.Repeat("?, ", len(ms)), ", ")
+		// Inside the dated-range guard, like Recur.
+		conds = append(conds, datedRange+" AND CAST(strftime('%m', taken_at, 'unixepoch') AS INTEGER) IN ("+ph+")")
+		args = append(args, ms...)
 	}
 	if f.FileType != "" {
 		if !ValidFileType(f.FileType) {

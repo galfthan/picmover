@@ -4,7 +4,7 @@
 // ResizeObserver fakes, and helpers to let effects and timers settle.
 
 import { vi } from 'vitest';
-import type { Job, Lib, MediaItem } from '../lib/api';
+import type { AppInfo, Job, Lib, MediaItem } from '../lib/api';
 
 export function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -175,8 +175,30 @@ const cls = (count: number, bytes: number, paths: unknown[] = []): FakeClass => 
 
 const summary = (n: number) => ({ total: n, images: n, raw: 0, videos: 0, withGps: 0, deleted: 0, bytes: 1, earliest: '2024-06-01T10:00:00', latest: '2024-07-31T10:00:00' });
 
-/** A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver. */
-export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
+/** The desktop app's GET /api/app answer (docs/design/desktop-shell.md); tests override fields. */
+export function appInfo(p: Partial<AppInfo> = {}): AppInfo {
+  const window = p.window ?? true;
+  const windowReason = window ? 'ok' : (p.platform ?? 'linux') === 'windows' ? 'no-runtime' : 'unsupported';
+  return { app: true, version: 'v0.6.0-test', workspace: '/media', closeToTray: true, platform: 'linux', window, windowReason, ...p };
+}
+
+/**
+ * A fresh fake server; `install()` stubs fetch, EventSource and ResizeObserver.
+ * Mode "unset" is the desktop app without a workspace: the listing is empty,
+ * every library route answers 409 state "unset", and POST /api/app/workspace
+ * switches it to a workspace with the usual libraries, or (a folder in
+ * `libraryFolders`, as one with media.db) to single mode on that library;
+ * 409 without `jobs` when that library is busy or broken. `app.info` set (see
+ * `appInfo`) makes it the desktop app; null (the default) answers the app
+ * routes 404 as `picmover serve` does.
+ */
+export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace') {
+  /** The listing's mode and root; POST /api/app/workspace changes them. */
+  const ws: { mode: 'workspace' | 'single' | 'unset'; root: string; single: Lib | null } = { mode, root: mode === 'single' ? '/media/peter' : mode === 'unset' ? '' : '/media', single: null };
+  /** Folders the workspace POST treats as libraries (they have media.db): it serves them in single mode. */
+  const libraryFolders = new Set(['/media/peter', '/media/penny', '/media/broken']);
+  /** `info` null: the app routes answer 404 (`picmover serve`); `fail`: the next that many GET /api/app answer 500. */
+  const app: { info: AppInfo | null; fail: number } = { info: null, fail: 0 };
   const calls: Call[] = [];
   const items: Item[] = [];
   // July: ids 1..6 (newest first), June: 7..8, one trashed (9).
@@ -555,6 +577,12 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     const rating = Number(q.get('rating'));
     if (rating) list = list.filter((x) => (x.rating ?? 0) >= rating);
     for (const t of q.getAll('tag')) list = list.filter((x) => x.tagIds.includes(Number(t)));
+    // Months of any year, by the wall-clock taken time; undated never match.
+    const months = q.get('months');
+    if (months) {
+      const set = new Set(months.split(',').map(Number));
+      list = list.filter((x) => !!x.takenAt && set.has(Number(x.takenAt.slice(5, 7))));
+    }
     // The dimension filter on the longer edge; unknown dimensions never match.
     const minPx = Number(q.get('minpx') ?? 0);
     const maxPx = Number(q.get('maxpx') ?? 0);
@@ -578,6 +606,11 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
       if (v && (!/^[+-]?\d+$/.test(v) || Number(v) < 1 || Number(v) > 1_000_000)) {
         return json({ error: `invalid ${k} "${v}": want a size in pixels 1-1000000` }, 400);
       }
+    }
+    // The months filter as the server: month numbers 1-12 separated by commas.
+    const months = q.get('months');
+    if (months !== null && months !== '' && !months.split(',').every((m) => /^[+-]?\d+$/.test(m) && Number(m) >= 1 && Number(m) <= 12)) {
+      return json({ error: `invalid months "${months}": want month numbers 1-12 separated by commas` }, 400);
     }
     const [lo, hi] = [Number(q.get('minpx') || 0), Number(q.get('maxpx') || 0)];
     if (lo && hi && lo > hi) return json({ error: `invalid minpx ${lo}: greater than maxpx ${hi}` }, 400);
@@ -773,6 +806,53 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     return json({ error: 'not found' }, 404);
   }
 
+  /** The /api/libraries body; libraries and folders live under the current root. */
+  function listing() {
+    if (ws.mode === 'unset') return { root: '', mode: 'unset', libraries: [], folders: [] };
+    if (ws.mode === 'single') return { root: ws.root, mode: 'single', libraries: ws.single ? [ws.single] : libs, folders: ws.single ? [] : folders };
+    const at = <T extends { id?: string; path: string }>(x: T): T => ({ ...x, path: `${ws.root === '/' ? '' : ws.root}/${x.id ?? ''}` });
+    return { root: ws.root, mode: ws.mode, libraries: ws.root === '/media' ? libs : libs.map(at), folders: ws.root === '/media' ? folders : folders.map(at) };
+  }
+
+  /** The desktop app routes (404 unless `app.info` is set), checked as the server does. */
+  function appRoute(p: string, method: string, body: Record<string, unknown>): Response {
+    if (p === '/api/app' && method === 'GET' && app.fail > 0) {
+      app.fail--;
+      return json({ error: 'internal error' }, 500);
+    }
+    const info = app.info;
+    if (!info) return json({ error: 'not found' }, 404);
+    if (p === '/api/app' && method === 'GET') return json(info);
+    if (p === '/api/app/open' && method === 'POST') return new Response(null, { status: 204 });
+    if (p === '/api/app/workspace' && method === 'POST') {
+      const path = body.path;
+      if (typeof path !== 'string' || path === '' || !validTargetPath(path)) return json({ error: 'path: expected an absolute folder path' }, 400);
+      if (path.split('/').includes('.picmover')) return json({ error: "That folder is inside a library's .picmover directory; choose the folder that holds your libraries." }, 400);
+      const running = backup.jobs.filter((j) => j.state === 'running' || j.state === 'queued').length;
+      if (running) return json({ error: 'a job is running', jobs: running }, 409);
+      if (libraryFolders.has(path)) {
+        // As the server: a folder with media.db is served as one library (single mode), or refused 409 {error}.
+        const name = path.slice(path.lastIndexOf('/') + 1);
+        const known = libs.find((l) => l.path === path);
+        if (known?.state === 'busy') return json({ error: `The library is in use by another picmover process (pid ${known.holder?.pid ?? 0}, ${known.holder?.cmd ?? ''}, since ${known.holder?.since ?? ''}).` }, 409);
+        if (known?.state === 'error') return json({ error: `The library cannot be opened: ${known.error ?? 'unreadable'}` }, 409);
+        for (const l of libs) if (l.state === 'open') l.state = 'closed';
+        ws.mode = 'single';
+        ws.root = path;
+        ws.single = { ...(known ?? { id: name, name, path, summary: summary(0) }), state: 'open' };
+        app.info = { ...info, workspace: path };
+        return json(listing());
+      }
+      ws.mode = 'workspace';
+      ws.root = path;
+      ws.single = null;
+      for (const l of libs) if (l.state === 'open') l.state = 'closed';
+      app.info = { ...info, workspace: path };
+      return json(listing());
+    }
+    return json({ error: 'not found' }, 404);
+  }
+
   function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = new URL(String(input), 'http://127.0.0.1:7439');
     const method = init?.method ?? 'GET';
@@ -780,8 +860,13 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
     calls.push({ method, path: url.pathname + url.search, body: method === 'POST' ? body : null });
     const p = url.pathname;
     let res: Response;
-    if (p === '/api/libraries' && method === 'GET') {
-      res = json({ root: mode === 'single' ? '/media/peter' : '/media', mode, libraries: libs, folders });
+    const unset = json({ error: 'no workspace', state: 'unset' }, 409);
+    if (p === '/api/app' || p.startsWith('/api/app/')) {
+      res = appRoute(p, method, body);
+    } else if (p === '/api/libraries' && method === 'GET') {
+      res = json(listing());
+    } else if (ws.mode === 'unset' && (p.startsWith('/api/libraries') || p.startsWith('/api/l/'))) {
+      res = unset;
     } else if (p === '/api/libraries' && method === 'POST') {
       const l: Lib = { id: String(body.name), name: String(body.name), path: `/media/${String(body.name)}`, state: 'open', summary: summary(0) };
       libs.push(l);
@@ -842,7 +927,7 @@ export function fakeServer(mode: 'workspace' | 'single' = 'workspace') {
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, ws, libraryFolders, app, install, posts, finish };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

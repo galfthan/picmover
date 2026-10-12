@@ -12,6 +12,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/library"
+	"picmover/internal/server"
 )
 
 // humanSize formats a byte count with binary units, e.g. "1.5 GiB".
@@ -110,39 +111,12 @@ func openExistingLocked(ctx context.Context, dir, lockName string, errOut io.Wri
 // when another process holds it, the error names that process ("library
 // is in use by another picmover process (pid N, serve, since ...)").
 func lockLibrary(ctx context.Context, lib *library.Library, name string, errOut io.Writer) (func(), error) {
-	unlock, err := lib.Lock(ctx, name)
-	if errors.Is(err, library.ErrLockUnsupported) {
-		if errOut == nil {
-			errOut = os.Stderr
-		}
-		fmt.Fprintf(errOut, "Warning: %v; going on without the library lock, so do not run another "+
-			"picmover command that writes this library at the same time.\n", err)
-		return unlock, nil
-	}
-	return unlock, err
+	return server.LockLibrary(ctx, lib, name, errOut)
 }
-
-// rebuildError explains how to recover from a catalog of another format.
-type rebuildError struct {
-	root string
-	err  error
-}
-
-func (e *rebuildError) Error() string {
-	return fmt.Sprintf("%v\nRecreate the catalog from the files with:\n  picmover rebuild %s\n"+
-		"(the old catalog is kept as %s.bak-<timestamp>; thumbnails are reused)", e.err, quoteArg(e.root), library.DBName)
-}
-
-func (e *rebuildError) Unwrap() error { return e.err }
 
 // catalogError turns catalog.ErrNeedsRebuild into a message naming
 // "picmover rebuild <library>"; other errors are returned unchanged.
-func catalogError(root string, err error) error {
-	if errors.Is(err, catalog.ErrNeedsRebuild) {
-		return &rebuildError{root: root, err: err}
-	}
-	return err
-}
+func catalogError(root string, err error) error { return server.CatalogError(root, err) }
 
 // quoteArg quotes a path for a shell command line when it needs it.
 func quoteArg(s string) string { return library.QuoteArg(s) }
