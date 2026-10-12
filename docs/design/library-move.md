@@ -310,6 +310,104 @@ workspace, is 400; single-library mode has no target and is 400.
   coming back gets its old rating, as `management.md` intends.
 - **CLI with no selection flag** is refused unless `--all` is given.
 
+## As implemented (backend)
+
+Branch `feat/library-move`. Everything above holds except where this
+section says otherwise.
+
+### Code
+
+```
+internal/transfer/transfer.go   Side, Options, Item, Result, Run, the per-file protocol, Message (user-facing error texts), SameLibrary
+internal/transfer/journal.go    journal format, ListInterrupted (locked library, prunes), ListInterruptedAt (read-only)
+internal/transfer/recover.go    Recover, RecoverPair, IsSource
+internal/transfer/plan.go       MakePlan
+internal/transfer/volume_*.go, free_*.go   sameVolume, diskFree (per platform; copies of importer/backup's unexported helpers)
+internal/library/move.go        LiveFile, LiveTarget, MoveFileTo (ErrTargetExists), RestoreTo
+internal/catalog/manage.go      SetDeletedAs, MatchingHashes
+internal/thumbs/store.go        Store.CopyFrom
+internal/userdata/merge.go      MergeFrom, MergeIgnored; imports.go: ImportModeTransfer
+internal/importrec              CloseCrashed skips mode transfer
+internal/server/api_transfer.go plan, resume, the transfer job (runTransfer), interruptedMoves
+cmd/move.go                     picmover move
+```
+
+### Deviations and additions
+
+- **Journal lines are JSON**, not space-separated (catalog paths may
+  contain spaces): `{"op":"begin","hash","kind","rel","to","mode"}`,
+  `{"op":"done"|"fail","hash"}`, `{"op":"end"}`, after a JSON header
+  `{v:1, id, source:{id, root, name}, target:{id, root, name},
+  startedAt}`. A reopened journal starts with a newline so a torn last
+  line never glues onto the next.
+- **Same library** is refused by root, or by `os.SameFile` of the two
+  `media.db` files, not by `library_id`: a copied library folder shares
+  its id and is a different library. Journals are matched to their
+  source by id **and** root (`IsSource`); the root may differ only when
+  the journal's root no longer holds a library (the folder was moved).
+- **Ignored pairs** are copied when both hashes moved in the same run
+  (`MergeIgnored`), not "both in B after the move".
+- **Undo of a copy** whose target row cannot be inserted removes the
+  fresh copy in B (verified equal to the original, which is still in
+  A). It is the only file removal of the feature, and only of a file
+  the run itself created and never recorded.
+- **Source trash name taken**: when A's trash already holds another
+  file at the photo's path, the original goes to the trash under the
+  first free `UniqueName` variant and the row records it
+  (`SetDeletedAs`); an undo uses `RestoreTo`.
+- **Renditions**: copied when A has the thumbnail and the preview (the
+  large thumbnail too when present); otherwise B's row is `pending` and
+  `picmover thumbs` (or the Library page) generates them. A's
+  renditions are deleted after a same-volume move, kept after a copy
+  (the trash page shows them).
+- **Batches** fall back to one insert per row when the batch
+  transaction fails, so one bad row fails only its file.
+- **Recovery of a restore** whose target row is still trashed counts as
+  not committed (`ErrInterrupted`). Recovery adds `ErrUnrecorded` (file
+  in B, source row gone: run rebuild in B) next to `ErrLostTrack`.
+- **Run** finishes interrupted moves between the two libraries, in both
+  directions, before it starts (`Result.Recovered`).
+- **HTTP**: answers about the target carry no `state` (on a
+  library-scoped path a state describes the source): busy is 409
+  `{error, holder}`, others `{error}`. The plan adds `need` and
+  `noSpace`; transfer progress adds `rate` (bytes/s) and `eta` (s); the
+  result adds `sourcePending`, `recovered` and `bytes`; `result` is
+  absent until the job finishes. `POST /api/libraries/{lib}/transfer/resume`
+  finishes every interrupted move from **or** into `{lib}` (400 when
+  there is none). Lib objects carry `interruptedMoves: [{from, to, id}]`
+  (omitted when empty) on both libraries. The job log is in the
+  target's `.picmover/logs/transfer_<time>.log`.
+- **CLI**: `--album` and `--tag` take names (an album name shared by
+  several albums selects all of them); `--hashes FILE` allows `#`
+  comments; `--resume <library>` finishes the interrupted moves **into**
+  that library (journals live in the target). Without a terminal and
+  without `--yes` it exits 1 after printing the plan.
+
+### Tests
+
+`internal/transfer`: same-volume and cross-volume moves (metadata,
+renditions, user data, record, journal), existing and restored content,
+target name taken (case-insensitively), a changed source on both paths,
+refusals, no space, a taken source trash name, cancellation mid-run,
+merge by tag and album name; recovery of a rename and of a copy not yet
+recorded, of a recorded file whose source step is missing, of nothing
+placed, of a wrong file at the target path, the lost-track case, a torn
+line with done entries, Run recovering first, `IsSource`.
+`internal/library`: `MoveFileTo` never replaces, refuses internal targets
+and links; `RestoreTo`. `internal/server`: plan shapes and 400s, the
+job end to end (result, record, listed under both libraries), busy
+target without `state`, `interruptedMoves` and resume. `cmd`: usage
+errors, unknown album, dry run, refusal without `--yes`, move by album
+and by date, the album carried over, `imports` listing, `--resume` with
+nothing to do.
+
+Checked by hand against the built binary: `picmover serve` on a
+two-library workspace, driven in headless Chromium: select two photos,
+Move to… → penny → plan "Move 2 photos (10.6 KiB) to penny. Same drive:
+instant." → Move → "Moved 2 photos to penny."; peter's grid kept one
+tile, penny's showed two with their thumbnails, the files were renamed
+on disk and penny's Imports listed a `transfer` record from peter.
+
 ## As implemented (frontend)
 
 Built against this contract while the Go side was written in parallel, so
