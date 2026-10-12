@@ -10,6 +10,8 @@ export type Change =
   | { kind: 'restored'; hashes: string[] }
   /** Deleted permanently. */
   | { kind: 'deleted'; hashes: string[] }
+  /** Moved to another library (gone from this one's live rows; across volumes in its trash). */
+  | { kind: 'moved'; lib: string; hashes: string[] }
   | { kind: 'album'; albumId: number; added: string[]; removed: string[] }
   | { kind: 'tags'; hashes: string[] };
 

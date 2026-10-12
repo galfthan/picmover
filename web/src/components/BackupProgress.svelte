@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Inline progress of a backup, scrub, prune or restore job: phase, files
+  // Inline progress of a backup, scrub, prune, restore or transfer (move to library) job: phase, files
   // and bytes done of total, rate, ETA, the current file and Cancel. Fed by
   // the job's SSE progress events through jobs.svelte.ts (job.phase).
   // Rate and ETA come from the server when it sends them. A scrub with a
@@ -76,7 +76,9 @@
         ? 'Stop the scrub? The next scrub continues where this one stopped.'
         : job.kind === 'restore'
           ? 'Stop restoring? Files already copied back stay in the library.'
-          : 'Stop pruning?',
+          : job.kind === 'transfer'
+            ? 'Stop moving? Files already moved stay in the other library.'
+            : 'Stop pruning?',
   );
 
   let cancelling = $state(false);

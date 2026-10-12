@@ -21,6 +21,7 @@
     trashItems,
     undoTrash,
   } from '../lib/actions';
+  import { canMove, moves } from '../lib/moves.svelte';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
   import AlbumPicker from './AlbumPicker.svelte';
@@ -182,6 +183,9 @@
       <AlbumPicker albums={library.albums} exclude={albumId !== null ? [albumId] : []} label="Album" disabled={!!busy} onpick={album} />
       {#if mode === 'album'}
         <button disabled={!!busy} onclick={removeAlbum}>Remove from album</button>
+      {/if}
+      {#if canMove()}
+        <button disabled={!!busy} onclick={() => moves.open(api.id, selection.list(), 'selection')} title="Move the selected items to another library">Move to…</button>
       {/if}
       <button class="danger" disabled={!!busy} onclick={trash}>Trash</button>
     {/if}

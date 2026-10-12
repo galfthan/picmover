@@ -309,3 +309,134 @@ workspace, is 400; single-library mode has no target and is 400.
   keeps ratings of trashed and permanently deleted content, so content
   coming back gets its old rating, as `management.md` intends.
 - **CLI with no selection flag** is refused unless `--all` is given.
+
+## As implemented (frontend)
+
+Built against this contract while the Go side was written in parallel, so
+it is tested against the fake server (`web/src/testing/fakes.ts`), not the
+real one. Everything in "Frontend" is implemented.
+
+### Files
+
+`lib/api.ts` (`TRANSFER_CHUNK`, `TransferPlan`, `TransferProgress`,
+`TransferResult`, `InterruptedMove`, `TransferJobRequest`; strict parsers
+`toTransferPlan`, `toTransferProgress`, `toTransferResult`,
+`toInterrupted`, `sumPlans`; `LibApi.transferPlan`, `resumeTransfer`;
+`Job.to`, `Lib.interruptedMoves`, job kind and import mode `transfer`),
+`lib/movetext.ts` (pure wording: plan lines, the free-space refusal,
+reasons grouped, results, interrupted-move lines), `lib/moves.svelte.ts`
+(the dialog request and the run: consecutive jobs, totals, changes,
+refreshes, the toast when the dialog is closed), `components/MoveDialog.svelte`
+(rendered by `App.svelte` from `moves.dialog`),
+`components/InterruptedMoves.svelte` (banner on the photo pages, one line
+on the Libraries page cards). Touched: `lib/jobs.svelte.ts` (`waitFor(id)`
+resolves when a job has ended, a lost job as failed; `adopt(job, lib)`
+follows a job started through another route), `lib/changes.ts` (change
+`moved {lib, hashes}`), `pages/Grid.svelte` (drops moved tiles; reloads in
+the trash page), `components/SelectionBar.svelte` and
+`components/Lightbox.svelte` (entry points), `components/JobPill.svelte`
+("Moving to kids: 12 of 300 files…", "Finishing the move to kids…"; opens
+the dialog), `components/BackupProgress.svelte` (reused for the run's
+progress: files, bytes, rate, ETA, current file, Cancel),
+`lib/backupinfo.ts` (phases `move`, `recover`), `lib/jobtext.ts` (title
+"Move to library", outcome with the result counts), `lib/imports.ts` (mode
+`transfer` reads "Moved from a library").
+
+### Shapes relied on
+
+- **Plan** exactly as the API table. Missing or malformed fields read as
+  0, `false`, `null` or empty: `sameVolume` only when it is `true`, `free`
+  only as a number ≥ 0 (and only used when `sameVolume` is false),
+  `refused` entries need a 16-hex `hash` (`error` a string), interrupted
+  entries need non-empty `from`/`to` and an `id` that is a **positive
+  integer number** (a string id is dropped). The client refuses a copy
+  when `move.bytes + 1 GiB > free` (the server's rule) and says so before
+  the request; the server checks again.
+- **Chunks**: plans of more than 2000 hashes are sent as consecutive
+  requests of 2000 and summed (`sameVolume` and `free` from the first,
+  `refused` concatenated, `interrupted` deduplicated). The job request is
+  `{kind: "transfer", to, hashes}` with at most 2000 hashes, without the
+  plan's `refused` hashes; a larger selection runs as one job per 2000,
+  each started after the previous has ended.
+- **Job object**: `to`, `progress` (also in SSE `progress` events at the
+  top level, under `progress` or under `stats`, as the backup kinds),
+  `result` once finished, `importId`, `state`, `exitCode`, `error`. A job
+  **continues the run** when `state` is `done` or `exitCode` is 2 (some
+  files failed); `cancelled` or exit 130 stops it as cancelled, anything
+  else as failed with `error`. The result's `failedCount` is read as at
+  least `failed.length`; `record` must be a positive integer.
+- **Moved tiles**: the hashes of a job minus `failed` leave the source's
+  pages at once, but only when the job finished as above and
+  `failedCount == failed.length` (else the in-place reload after every
+  job, `jobs.doneCount`, has the grid right).
+- **Busy target at job start**: the 409 must **not** carry a `state`
+  field. A library-scoped 409 with `state` means "this (source) library
+  is not open" to the client and makes the shell reopen the source.
+- **Resume**: `POST /api/libraries/{to}/transfer/resume` (the target of
+  the interrupted move, where the journal is) answers the job object
+  (bare or `{job}`); a missing `library` is filled with `to`. After it the
+  dialog plans again.
+- **Listing**: a library may carry `interruptedMoves: [{from, to, id}]`
+  (optional; absent means none). It is shown on both libraries, so the
+  server should list the move under its source and its target.
+- **Open in <target>**: `#/l/<to>/imports/<record>` (the import record's
+  grid, as the Imports page links it) when the run had one record; the
+  target's Imports page when it had several (one record per job).
+
+### Deviations and additions
+
+- The headline counts every photo that leaves this library (to move +
+  already there + in the target's trash) and the bytes to move ("Move 312
+  photos (4.1 GiB) to Penny."); sizes are in binary units as everywhere in
+  the UI. Items in the target's trash get their own line ("3 are in
+  Penny's trash; they come back there, and their copies here go to the
+  trash."). Within the 1 GiB margin the refusal says "4.0 GiB needed plus
+  1.0 GiB to spare, 4.5 GiB free". Refused items and failures are listed
+  as reasons with counts ("the file is missing (3)"), not per hash.
+- With backup targets the plan adds "This library's backups keep the
+  moved files until they are pruned."
+- The dialog can be closed while a move runs (it says so); the pill opens
+  it again. A run that ends with the dialog closed shows a toast with
+  "Open in <target>".
+- The selection loses the hashes of the jobs that started (all of them
+  after a whole run); a move that cannot start keeps the selection.
+- Picking a closed target opens it through the libraries store first (the
+  same open as the shell's); a target that turns out busy or broken is
+  reported in the dialog and the list stays.
+- Keys reaching the lightbox while the move dialog is open are ignored
+  (arrows, Delete, `m`). After the shown item moved, the viewer goes on to
+  the next item, else the previous, else closes.
+- "Move to…" needs workspace mode and at least two entries in the
+  listing's `libraries` (folders do not count); the dialog offers open,
+  closed and busy libraries other than the source.
+
+### Tests
+
+`npm run check` (0 errors, 0 warnings) and `npm test`: 318 tests in 31
+files (21 new), all passing with `TZ=UTC`; in a UTC+3 zone two older
+tests (`Imports.test.ts` "lists the records newest first",
+`Management.test.ts` "reviews near-duplicates") fail on relative-time
+wording before and after this change.
+
+- `lib/transfer.test.ts`: plan, progress, result and interrupted shapes
+  (malformed entries dropped), `sumPlans`, a 4500-hash plan sent as
+  2000 + 2000 + 500 with progress and summed, the resume URL; wording of
+  plans (same drive, across drives, duplicates, restores, nothing to
+  move), the free-space refusal (with and within the margin, unknown free
+  space, same drive), reasons, results, interrupted lines, `continues`.
+- `Move.test.ts` (whole app, fake server): Move to… in grid and album
+  pages, not in the trash, not in single mode (bar and viewer); the target
+  list (busy with holder and disabled, broken absent) and Escape; a closed
+  target opened before the plan; same drive with the progress (files,
+  current file, pill) and the result with "Open in kids" →
+  `#/l/kids/imports/50`, tiles gone, selection cleared, libraries and
+  library counts reloaded; across drives, then not enough space with Move
+  disabled; refused and duplicate items with the job sending only the
+  movable hashes; failures with reasons keeping their tiles; a job that
+  cannot start keeping the selection; an interrupted move blocking until
+  Finish moving (resume request, pill, re-plan); 4100 hashes as three
+  consecutive jobs (2000, 2000, 100) and several records; a cancelled job
+  stopping the run; `m` in the viewer moving the shown item and going on
+  to the next, with the dialog's keys not reaching the viewer; the
+  interrupted-move lines on both Libraries page cards with Finish moving
+  and the toast.

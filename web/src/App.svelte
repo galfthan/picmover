@@ -13,6 +13,8 @@
   import { libApi, setUnavailableHandler, type LibApi } from './lib/api';
   import JobPill from './components/JobPill.svelte';
   import Lightbox from './components/Lightbox.svelte';
+  import MoveDialog from './components/MoveDialog.svelte';
+  import { moves } from './lib/moves.svelte';
   import LibrarySwitcher from './components/LibrarySwitcher.svelte';
   import LibraryGate from './components/LibraryGate.svelte';
   import Toasts from './components/Toasts.svelte';
@@ -243,6 +245,9 @@
 
   {#if viewId !== null && open && api}
     <Lightbox id={viewId} {api} {baseHash} />
+  {/if}
+  {#if moves.dialog}
+    <MoveDialog state={moves.dialog} />
   {/if}
   <Toasts />
 </div>

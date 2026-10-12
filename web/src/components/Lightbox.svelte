@@ -9,6 +9,9 @@
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
   import { addToAlbum, deleteItems, failureText, rateItems, removeFromAlbum, restoreItems, tagItems, trashItems, undoTrash } from '../lib/actions';
+  import { canMove, moves } from '../lib/moves.svelte';
+  import { onChange } from '../lib/changes';
+  import { libraries } from '../lib/libraries.svelte';
   import CopyButton from './CopyButton.svelte';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
@@ -228,6 +231,22 @@
     });
   }
 
+  const movable = $derived(!!d && !trashed && canMove());
+
+  function move() {
+    if (!d || trashed || !canMove()) return;
+    moves.open(api.id, [d.hash], 'viewer');
+  }
+
+  // The shown item was moved to another library (here or from the selection bar): go on to the next.
+  $effect(() =>
+    onChange((c) => {
+      if (c.kind !== 'moved' || c.lib !== untrack(() => api.id)) return;
+      const cur = untrack(() => d);
+      if (cur && c.hashes.includes(cur.hash)) leave();
+    }),
+  );
+
   async function focusTags() {
     if (!showInfo) toggleInfo();
     await tick();
@@ -261,6 +280,8 @@
 
   function onKey(e: KeyboardEvent) {
     if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    // The move dialog is on top: its keys are not the viewer's.
+    if (moves.dialog) return;
     const t = e.target;
     if (t instanceof HTMLElement && (t.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(t.tagName))) return;
     switch (e.key) {
@@ -320,6 +341,11 @@
         if (!d || !trashed) return;
         e.preventDefault();
         restore();
+        break;
+      case 'm':
+        if (!movable) return;
+        e.preventDefault();
+        move();
         break;
     }
   }
@@ -503,6 +529,14 @@
                 onpick={addAlbum}
               />
             </dd>
+
+            {#if movable}
+              <dt>Library</dt>
+              <dd class="chips">
+                <span>{libraries.find(api.id)?.name ?? api.id}</span>
+                <button class="small" disabled={working || moves.running} onclick={move} title="Move to another library (M)">Move to…</button>
+              </dd>
+            {/if}
           {/if}
 
           <dt>Date</dt>
