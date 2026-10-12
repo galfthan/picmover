@@ -509,8 +509,10 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     refused: new Map<string, string>(),
     /** Failed by the job with this reason. */
     fail: new Map<string, string>(),
-    /** Unfinished moves the plan reports (and the listing as `interruptedMoves`). */
-    interrupted: [] as { from: string; to: string; id: number }[],
+    /** Failed to go to the trash after being placed in the target (`sourcePending`): they stay in peter. */
+    pending: new Set<string>(),
+    /** Unfinished moves the plan reports (and the listing as `interruptedMoves`); `problem` when they cannot be finished. */
+    interrupted: [] as { from: string; to: string; id: number; problem?: string }[],
     /** The hashes of each transfer job, by job id. */
     jobHashes: new Map<number, string[]>(),
     nextRecord: 50,
@@ -596,6 +598,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     let moved = 0;
     let existing = 0;
     let restored = 0;
+    let sourcePending = 0;
     const failed: { hash: string; error: string }[] = [];
     const cancelled = p.exitCode === 130 || p.state === 'cancelled';
     for (const [n, h] of hashes.entries()) {
@@ -609,13 +612,25 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
       if (transfer.existing.has(h)) existing++;
       else if (transfer.restore.has(h)) restored++;
       else moved++;
+      if (transfer.pending.has(h)) {
+        sourcePending++;
+        continue; // the original is still live here
+      }
       if (!x) continue;
       if (transfer.sameVolume && !transfer.existing.has(h) && !transfer.restore.has(h)) items.splice(items.indexOf(x), 1);
       else x.deletedAt = '2026-10-10T11:59:00';
     }
-    const exitCode = p.exitCode ?? (failed.length ? 2 : 0);
+    const exitCode = p.exitCode ?? (failed.length || sourcePending ? 2 : 0);
     const state = p.state ?? (exitCode === 0 || exitCode === 2 ? 'done' : exitCode === 130 ? 'cancelled' : 'failed');
     const cap = p.failedCap ?? 200;
+    const notes: string[] = [];
+    if (failed.length) notes.push(`${failed.length} ${failed.length === 1 ? 'file' : 'files'} could not be moved (see the job log)`);
+    if (sourcePending) {
+      notes.push(
+        `${sourcePending} ${sourcePending === 1 ? 'photo was' : 'photos were'} moved to ${before.to}, but ${sourcePending === 1 ? 'its original' : 'their originals'} could not be moved to the trash in ${before.library}; finish the move from the Libraries page`,
+      );
+    }
+    const error = p.error !== undefined ? p.error : exitCode === 2 && notes.length ? notes.join('; ') : null;
     const done = transferJobJSON({
       id,
       to: before.to ?? '',
@@ -625,13 +640,13 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
       finishedAt: new Date().toISOString(),
       state,
       exitCode,
-      error: p.error ?? null,
+      error,
       progress: { phase: before.to && hashes.length === 0 ? 'recover' : 'move', files: hashes.length, totalFiles: hashes.length, bytes: 0, totalBytes: 0, current: '' },
-      result: { moved, existing, restored, failed: failed.slice(0, cap), failedCount: failed.length, record: before.importId ?? null, targetLibrary: before.to ?? '' },
+      result: { moved, existing, restored, failed: failed.slice(0, cap), failedCount: failed.length, sourcePending, record: before.importId ?? null, targetLibrary: before.to ?? '' },
       logPath: `/media/${before.to ?? 'x'}/.picmover/logs/transfer_2026-10-10_12-00-00.log`,
     });
     backup.jobs[i] = done;
-    if (hashes.length === 0) {
+    if (hashes.length === 0 && exitCode === 0) {
       transfer.interrupted = transfer.interrupted.filter((m) => m.to !== before.to);
       for (const l of libs) if (l.interruptedMoves) l.interruptedMoves = l.interruptedMoves.filter((m) => m.to !== before.to);
     }
@@ -871,6 +886,13 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     if (method === 'GET' && path === 'jobs') return json({ jobs: backup.jobs.filter((j) => j.library === 'peter') });
     if (path === 'backups' || path.startsWith('backups/')) return backups(path, q, method, body);
     if (method !== 'POST') return json({ error: 'not found' }, 404);
+    // Trash and user data changes wait for no move: refused while one runs on the library.
+    if (
+      /^(ratings|tags(\/\d+(\/delete)?)?|media\/tags|albums(\/\d+(\/items|\/delete)?)?|trash(\/restore|\/delete)?|similar\/ignore)$/.test(path) &&
+      backup.jobs.some((j) => j.kind === 'transfer' && (j.state === 'running' || j.state === 'queued') && (j.library === 'peter' || j.to === 'peter'))
+    ) {
+      return json({ error: 'a move is running on this library; try again when it has finished' }, 409);
+    }
     switch (path) {
       case 'ratings':
         for (const x of items) if (hs.includes(x.hash)) x.rating = (body.rating as number) || undefined;
@@ -1042,9 +1064,11 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
       }
     } else if (/^\/api\/libraries\/[^/]+\/transfer\/resume$/.test(p) && method === 'POST') {
       const id = decodeURIComponent(p.split('/')[3] ?? '');
-      const m = transfer.interrupted.find((x) => x.to === id) ?? libs.find((l) => l.id === id)?.interruptedMoves?.find((x) => x.to === id);
+      const all = [...transfer.interrupted, ...(libs.find((l) => l.id === id)?.interruptedMoves ?? [])].filter((x) => x.to === id || x.from === id);
+      const m = all.find((x) => !x.problem);
       if (!libs.some((l) => l.id === id)) res = json({ error: 'no such library' }, 404);
-      else if (!m) res = json({ error: 'no interrupted move into this library' }, 409);
+      else if (!all.length) res = json({ error: 'no interrupted move involves this library' }, 400);
+      else if (!m) res = json({ error: all.map((x) => `the interrupted move from ${x.from} to ${x.to} could not be finished: ${x.problem}`).join('; ') }, 409);
       else if (backup.jobs.some((j) => j.state === 'running' || j.state === 'queued')) res = json({ error: 'another job is running' }, 409);
       else {
         const job = transferJobJSON({ id: ++jobId, to: id, library: m.from, importId: m.id, progress: { phase: 'recover', files: 0, totalFiles: 0, bytes: 0, totalBytes: 0, current: '' } });

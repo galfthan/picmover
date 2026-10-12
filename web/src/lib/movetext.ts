@@ -46,7 +46,11 @@ export function planLines(p: TransferPlan, target: string): { headline: string; 
     );
   }
   if (p.move.count > 0) {
-    lines.push(p.sameVolume ? 'Same drive: instant.' : `Copies ${formatBytes(p.move.bytes)} across drives, then puts the originals in this library's trash.`);
+    lines.push(
+      p.sameVolume
+        ? 'Same drive: no copying; each file is checked, then renamed.'
+        : `Copies ${formatBytes(p.move.bytes)} across drives, then puts the originals in this library's trash.`,
+    );
   }
   return { headline: `Move ${photos(n)}${size} to ${target}.`, lines };
 }
@@ -66,16 +70,27 @@ export function refusedHeading(n: number): string {
   return `${formatCount(n)} ${n === 1 ? 'photo' : 'photos'} cannot be moved:`;
 }
 
-/** "A move from peter to penny was interrupted." with names when known. */
+/** "A move from peter to penny was interrupted." with names when known, and why it cannot be finished when it cannot. */
 export function interruptedText(m: InterruptedMove, name: (id: string) => string): string {
-  return `A move from ${name(m.from)} to ${name(m.to)} was interrupted.`;
+  const head = m.from ? `A move from ${name(m.from)} to ${name(m.to)} was interrupted.` : `A move into ${name(m.to)} was interrupted.`;
+  return head + problemText(m);
 }
 
 /** The banner text of library `lib` for one of its interrupted moves. */
 export function interruptedFor(lib: string, m: InterruptedMove, name: (id: string) => string): string {
-  if (m.to === lib) return `A move from ${name(m.from)} was interrupted.`;
-  if (m.from === lib) return `A move to ${name(m.to)} was interrupted.`;
+  if (m.to === lib) return (m.from ? `A move from ${name(m.from)} was interrupted.` : 'A move into this library was interrupted.') + problemText(m);
+  if (m.from === lib) return `A move to ${name(m.to)} was interrupted.` + problemText(m);
   return interruptedText(m, name);
+}
+
+/** " It cannot be finished now: <problem>." ('' when it can). */
+function problemText(m: InterruptedMove): string {
+  return m.problem ? ` It cannot be finished now: ${m.problem}.` : '';
+}
+
+/** The interrupted moves of a plan that must be finished before the move (those that can be: the others are only reported). */
+export function blocking(moves: readonly InterruptedMove[]): InterruptedMove[] {
+  return moves.filter((m) => !m.problem);
 }
 
 export interface MoveTotals {
@@ -84,12 +99,14 @@ export interface MoveTotals {
   restored: number;
   failed: Failure[];
   failedCount: number;
+  /** In the target, but the original is still here (its move to the trash failed). */
+  sourcePending: number;
   /** The target's import records, one per job. */
   records: number[];
 }
 
 export function emptyTotals(): MoveTotals {
-  return { moved: 0, existing: 0, restored: 0, failed: [], failedCount: 0, records: [] };
+  return { moved: 0, existing: 0, restored: 0, failed: [], failedCount: 0, sourcePending: 0, records: [] };
 }
 
 /** The finished run in sentences: what was moved, then duplicates and restores. */
@@ -109,6 +126,13 @@ export function resultLines(t: MoveTotals, target: string): string[] {
 /** "2 could not be moved:" (failures listed below it). */
 export function failedHeading(n: number): string {
   return `${formatCount(n)} ${n === 1 ? 'photo' : 'photos'} could not be moved:`;
+}
+
+/** A server message as a sentence: capitalised, ending with a period. */
+export function sentence(s: string): string {
+  const t = s.trim();
+  if (!t) return '';
+  return t.charAt(0).toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? '' : '.');
 }
 
 /** Whether a finished job of a run lets the next one start: done, or done with some files failed (exit 2). */

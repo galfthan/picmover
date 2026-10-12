@@ -129,7 +129,7 @@ describe('move to library', () => {
     expect(plans()).toEqual([{ to: 'kids', hashes: [hashOf(1), hashOf(2)] }]);
     const d = dialog()!;
     expect(text(d)).toContain('Move 2 photos (2.0 KiB) to kids.');
-    expect(text(d)).toContain('Same drive: instant.');
+    expect(text(d)).toContain('Same drive: no copying; each file is checked, then renamed.');
     expect(text(d)).toContain("This library's backups keep the moved files until they are pruned.");
 
     const librariesBefore = gets('libraries');
@@ -335,7 +335,7 @@ describe('move to library', () => {
   });
 
   it('shows an interrupted move on both libraries with Finish moving', async () => {
-    const m = { from: 'peter', to: 'kids', id: 7 };
+    const m = { from: 'peter', to: 'kids', id: 7, problem: '' };
     server.transfer.interrupted = [m];
     server.libs.find((l) => l.id === 'peter')!.interruptedMoves = [m];
     server.libs.find((l) => l.id === 'kids')!.interruptedMoves = [m];
@@ -351,5 +351,96 @@ describe('move to library', () => {
     await settle();
     expect(document.body.textContent).not.toContain('was interrupted');
     expect(text(document.querySelector('.toast'))).toContain('Finished the interrupted move to kids.');
+  });
+
+  it('says when originals could not go to the trash, and keeps their tiles', async () => {
+    server.transfer.pending.add(hashOf(2));
+    await start('#/l/peter/');
+    await select(1, 2);
+    await moveTo('kids');
+    click(button(dialog(), 'Move')!);
+    await settle();
+    server.finishTransfer(lastJobId());
+    await settle();
+    const d = dialog()!;
+    expect(text(d)).toContain(
+      '1 photo was moved to kids, but its original could not be moved to the trash in peter; finish the move from the Libraries page.',
+    );
+    // Photo 2 is still live here: no tile drops before the reload, and the reload keeps it.
+    expect(tile(2)).not.toBeNull();
+    const { moves } = await import('./lib/moves.svelte');
+    expect(moves.run).toMatchObject({ state: 'done', totals: { sourcePending: 1 } });
+  });
+
+  it('does not block on an interrupted move that cannot be finished, and says why', async () => {
+    const stuck = { from: 'gone', to: 'kids', id: 7, problem: 'the library it came from (gone) is not in this workspace; put it back to finish the move' };
+    server.transfer.interrupted = [stuck];
+    server.libs.find((l) => l.id === 'kids')!.interruptedMoves = [stuck];
+    await start('#/l/peter/');
+    await select(1);
+    await moveTo('kids');
+    const d = dialog()!;
+    expect(text(d)).toContain('A move from gone to kids was interrupted. It cannot be finished now: the library it came from (gone) is not in this workspace');
+    expect(button(d, 'Finish moving')).toBeUndefined();
+    expect(button(d, 'Move')!.disabled).toBe(false);
+
+    await go('#/');
+    const card = [...document.querySelectorAll<HTMLElement>('li.libcard')].find((c) => c.querySelector('.name')?.textContent === 'kids')!;
+    expect(text(card)).toContain('It cannot be finished now');
+    expect(button(card, 'Finish moving')).toBeUndefined();
+  });
+
+  it('shows why a resume did not finish everything instead of planning again', async () => {
+    server.transfer.interrupted = [{ from: 'peter', to: 'kids', id: 7 }];
+    await start('#/l/peter/');
+    await select(1);
+    await moveTo('kids');
+    click(button(dialog(), 'Finish moving')!);
+    await settle();
+    server.finishTransfer(lastJobId(), { exitCode: 2, error: 'the interrupted move into kids could not be finished: its journal (.picmover/transfers/8.journal) cannot be read' });
+    await settle();
+    expect(plans()).toHaveLength(1);
+    const d = dialog()!;
+    expect(text(d)).toContain('The interrupted move to kids is not finished.');
+    expect(text(d)).toContain('The interrupted move into kids could not be finished: its journal (.picmover/transfers/8.journal) cannot be read.');
+  });
+
+  it('disables trash and edits on a library a move runs on', async () => {
+    await start('#/l/peter/');
+    await select(1, 2);
+    await moveTo('kids');
+    click(button(dialog(), 'Move')!);
+    await settle();
+    click(button(dialog(), 'Close')!);
+    await settle();
+    expect(text(bar())).toContain('A move is running on this library');
+    expect(button(bar(), 'Trash')!.disabled).toBe(true);
+    // The server refuses too.
+    const r = await fetch('/api/l/peter/trash', { method: 'POST', body: JSON.stringify({ hashes: [hashOf(3)] }) });
+    expect(r.status).toBe(409);
+    server.finishTransfer(lastJobId());
+    await settle();
+    await select(3);
+    expect(button(bar(), 'Trash')!.disabled).toBe(false);
+  });
+
+  it('asks before the page is left while parts of a run remain', async () => {
+    await start('#/l/peter/');
+    const { moves } = await import('./lib/moves.svelte');
+    const done = moves.start('peter', 'kids', Array.from({ length: 2500 }, (_, i) => hashOf(i + 100)), 'selection');
+    await settle();
+    const leave = () => {
+      const e = new Event('beforeunload', { cancelable: true });
+      window.dispatchEvent(e);
+      return e.defaultPrevented;
+    };
+    expect(leave()).toBe(true);
+    server.finishTransfer(lastJobId());
+    await settle();
+    // The last part runs: nothing is left to start from this page.
+    expect(leave()).toBe(false);
+    server.finishTransfer(lastJobId());
+    await done;
+    expect(leave()).toBe(false);
   });
 });

@@ -89,6 +89,7 @@ export function transferSummary(j: Job): string {
   if (r.existing) parts.push(`${formatCount(r.existing)} already there`);
   if (r.restored) parts.push(`${formatCount(r.restored)} restored`);
   if (r.failedCount) parts.push(`${formatCount(r.failedCount)} failed`);
+  if (r.sourcePending) parts.push(`${formatCount(r.sourcePending)} still here too`);
   return parts.join(', ');
 }
 
@@ -101,6 +102,9 @@ function transferOutcome(j: Job, what: string, log: string): { tone: Tone; text:
     case 130:
       return { tone: 'warn', text: `${what} cancelled${summary ? ` (${summary})` : ''}.` };
     case 2:
+      // The server says what is not done (files that failed, originals
+      // still here, interrupted moves it could not finish).
+      if (j.error) return { tone: 'warn', text: `${what} finished with problems${summary ? ` (${summary})` : ''}: ${j.error}` };
       return { tone: 'warn', text: `${what} finished, but some files failed${summary ? ` (${summary})` : ''}; see ${log}` };
     default:
       return { tone: 'error', text: `${what} failed: ${j.error || 'unknown error'}` };

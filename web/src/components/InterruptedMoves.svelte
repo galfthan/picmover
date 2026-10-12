@@ -7,7 +7,7 @@
   import { libraries } from '../lib/libraries.svelte';
   import { jobs } from '../lib/jobs.svelte';
   import { moves } from '../lib/moves.svelte';
-  import { interruptedFor } from '../lib/movetext';
+  import { interruptedFor, sentence } from '../lib/movetext';
 
   interface Props {
     lib: string;
@@ -27,6 +27,7 @@
     try {
       const r = await moves.resume(to);
       if (r.state === 'failed') error = r.error || 'Finishing the move failed.';
+      else if (r.notes.length) error = r.notes.map(sentence).join(' ');
     } catch (e) {
       error = errorMessage(e);
     } finally {
@@ -40,7 +41,9 @@
     {#each list as m (`${m.from}/${m.to}/${m.id}`)}
       <span class="line">
         <span>{interruptedFor(lib, m, nameOf)}</span>
-        <button class="small" disabled={busy || moves.running || !!jobs.active} onclick={() => finish(m.to)}>Finish moving</button>
+        {#if !m.problem}
+          <button class="small" disabled={busy || moves.running || !!jobs.active} onclick={() => finish(m.to)}>Finish moving</button>
+        {/if}
       </span>
     {/each}
     {#if error}<span class="err small">{error}</span>{/if}
