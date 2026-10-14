@@ -104,7 +104,7 @@ func newSharing(s *Server, dir, cmd string) *sharing {
 	sh.listen = func(addr string) (net.Listener, error) { return net.Listen("tcp4", addr) }
 	sh.pairs = share.NewPairings(sh.clock)
 	sh.pairIP = share.PerMinute(5, sh.clock)
-	sh.pairAll = share.PerMinute(20, sh.clock)
+	sh.pairAll = share.PerMinute(60, sh.clock) // well-formed codes only
 	sh.authFail = share.NewLockout(30, 5*time.Minute, sh.clock)
 	sh.perDevice = share.NewLimiter(30, 100, sh.clock)
 	sh.perDeviceMedia = share.NewLimiter(200, 500, sh.clock)

@@ -70,7 +70,7 @@ func (f *shareFixture) resetLimits() {
 	sh := f.srv.share
 	sh.authFail = share.NewLockout(30, 5*time.Minute, sh.clock)
 	sh.pairIP = share.PerMinute(5, sh.clock)
-	sh.pairAll = share.PerMinute(20, sh.clock)
+	sh.pairAll = share.PerMinute(60, sh.clock)
 }
 
 // fillPattern turns a route pattern's path into a request path.

@@ -884,6 +884,9 @@ func (s *Server) handlePairingIssue(w http.ResponseWriter, r *http.Request) {
 func (sh *sharing) issuePairing(ctx context.Context, x *share.Share) (pairingJSON, error) {
 	host := sh.host.Load()
 	if host == nil {
+		if snap := sh.snapshot(); snap.state == sharePaused {
+			return pairingJSON{}, fmt.Errorf("sharing on Wi-Fi is paused (%s); resume it first", snap.reason)
+		}
 		return pairingJSON{}, errors.New("sharing on Wi-Fi is off; turn it on first")
 	}
 	if st := sh.s.shareState(ctx, x); st != share.StateActive {
