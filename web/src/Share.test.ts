@@ -97,6 +97,35 @@ describe('sharing (admin)', () => {
     expect(document.querySelector('h1')?.textContent).toBe('Share on Wi-Fi');
   });
 
+  it('shortens the pill by whole parts in a narrow top bar, with all of it in the tooltip', async () => {
+    // jsdom lays nothing out: 7 px a character, and the pill gets 130 px.
+    let room = 130;
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockImplementation(function (this: HTMLElement) {
+      return (this.textContent ?? '').length * 7;
+    });
+    vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (this: Element) {
+      return this.classList.contains('fit') ? room : 0;
+    });
+    const s = server.addShare({ name: 'My phone', kind: 'libraries' });
+    server.pairPhone(s.id);
+    server.sharing.state = 'on';
+    await start('#/l/peter/');
+    await vi.advanceTimersByTimeAsync(30_000);
+    const shown = () => pill()?.querySelector('.shown')?.textContent;
+    // "Sharing · 1 share · 1 phone" is 189 px: the share count goes, never half a word.
+    expect(shown()).toBe('Sharing · 1 phone');
+    expect(pill()?.getAttribute('title')).toBe('Sharing on Wi-Fi at https://192.168.1.20:7443/ · 1 share · 1 phone');
+    room = 60;
+    server.pairPhone(s.id);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(shown()).toBe('Sharing');
+    expect(pill()?.getAttribute('title')).toContain('2 phones');
+    room = 1000;
+    server.pairPhone(s.id);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(shown()).toBe('Sharing · 1 share · 3 phones');
+  });
+
   it('has no pill and says so on a server without sharing', async () => {
     server.sharing.supported = false;
     await start('#/share');

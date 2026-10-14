@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { toPairRequests, toShare, toSharingStatus, type Share } from './api';
-import { deviceNameProblem, expiryAt, expirySeconds, expiryText, fingerprintStart, scopeText, stateText } from './sharetext';
+import { deviceNameProblem, expiryAt, expirySeconds, expiryText, fingerprintStart, fittingVariant, pillVariants, scopeText, stateText } from './sharetext';
 
 const NOW = Date.parse('2026-10-14T12:00:00Z');
 
@@ -107,5 +107,42 @@ describe('share texts', () => {
     expect(deviceNameProblem('x'.repeat(61))).toBe('At most 60 characters.');
     expect(deviceNameProblem('a\u0007b')).toBe('A name cannot contain control characters.');
     expect(deviceNameProblem("Anna's iPhone")).toBeNull();
+  });
+});
+
+describe('the top-bar pill', () => {
+  const on = { state: 'on', reason: '', url: 'https://192.168.1.20:7443/', shares: 3, phones: 4 };
+
+  it('shortens by whole parts: the timer, then the shares, then the word phones; Sharing stays', () => {
+    const { variants, title } = pillVariants(on, '52 min left');
+    expect(variants).toEqual([
+      { text: 'Sharing · 3 shares · 4 phones', left: '52 min left' },
+      { text: 'Sharing · 3 shares · 4 phones', left: '' },
+      { text: 'Sharing · 4 phones', left: '' },
+      { text: 'Sharing · 4', left: '' },
+      { text: 'Sharing', left: '' },
+    ]);
+    expect(title).toBe('Sharing on Wi-Fi at https://192.168.1.20:7443/ · 3 shares · 4 phones · 52 min left');
+    expect(pillVariants({ ...on, shares: 1, phones: 1 }, '').variants.map((v) => v.text)).toEqual(['Sharing · 1 share · 1 phone', 'Sharing · 1 phone', 'Sharing · 1', 'Sharing']);
+    // Every variant is a prefix of whole words of the full text or "Sharing · n": nothing is cut mid-word.
+    for (const v of variants) expect(v.text.startsWith('Sharing')).toBe(true);
+  });
+
+  it('paused keeps "Sharing paused" when the reason does not fit', () => {
+    expect(pillVariants({ ...on, state: 'paused', reason: 'network changed' }, '')).toEqual({
+      variants: [
+        { text: 'Sharing paused: network changed', left: '' },
+        { text: 'Sharing paused', left: '' },
+      ],
+      title: 'Sharing paused: network changed',
+    });
+    expect(pillVariants({ ...on, state: 'error', reason: 'port in use' }, '')).toEqual({ variants: [{ text: 'Sharing failed', left: '' }], title: 'port in use' });
+  });
+
+  it('picks the longest variant that fits, else the shortest', () => {
+    expect(fittingVariant([300, 220, 130, 80, 50], 400)).toBe(0);
+    expect(fittingVariant([300, 220, 130, 80, 50], 140)).toBe(2);
+    expect(fittingVariant([300, 220, 130, 80, 50], 20)).toBe(4);
+    expect(fittingVariant([], 20)).toBe(0);
   });
 });
