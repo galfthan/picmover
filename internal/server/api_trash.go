@@ -117,7 +117,10 @@ func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request, l *libHandl
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	l.entry.trashMu.Lock()
+	if !l.entry.lockTrash() {
+		writeError(w, http.StatusConflict, errMoving.Error())
+		return
+	}
 	defer l.entry.trashMu.Unlock()
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)
@@ -185,7 +188,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, l *libHan
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	l.entry.trashMu.Lock()
+	if !l.entry.lockTrash() {
+		writeError(w, http.StatusConflict, errMoving.Error())
+		return
+	}
 	defer l.entry.trashMu.Unlock()
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)
@@ -258,7 +264,10 @@ func (s *Server) handleTrashDelete(w http.ResponseWriter, r *http.Request, l *li
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	l.entry.trashMu.Lock()
+	if !l.entry.lockTrash() {
+		writeError(w, http.StatusConflict, errMoving.Error())
+		return
+	}
 	defer l.entry.trashMu.Unlock()
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)

@@ -17,6 +17,11 @@ const (
 	ImportModeMove    = "move"
 	ImportModeRebuild = "rebuild"
 	ImportModeRecord  = "record" // a rebuild session backfilled from the catalog (its name there)
+	// ImportModeTransfer is a move of photos from another library of the
+	// workspace (docs/design/library-move.md); Source is that library's
+	// root. A running transfer record is closed by the move's recovery
+	// from its journal, never as a crashed import.
+	ImportModeTransfer = "transfer"
 )
 
 // Import outcomes (ImportRecord.Outcome).
@@ -84,7 +89,7 @@ type ImportItem struct {
 
 func validMode(m string) bool {
 	switch m {
-	case ImportModeCopy, ImportModeMove, ImportModeRebuild, ImportModeRecord:
+	case ImportModeCopy, ImportModeMove, ImportModeRebuild, ImportModeRecord, ImportModeTransfer:
 		return true
 	}
 	return false

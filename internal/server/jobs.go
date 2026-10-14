@@ -79,6 +79,15 @@ type jobParams struct {
 	Confirm  bool   `json:"confirm"`  // prune
 	Expected *int   `json:"expected"` // prune: the plan's extra.count
 	Mode     string `json:"mode"`     // restore: missing (default)
+	// Transfer (docs/design/library-move.md).
+	To     string   `json:"to"`     // the target library id
+	Hashes []string `json:"hashes"` // 1-2000 hashes to move
+
+	// Set by the server, never by a client (unexported: the strict
+	// decoder refuses them).
+	hashes []uint64  // transfer: Hashes parsed
+	target *libEntry // transfer: the target library, opened
+	resume bool      // transfer: finish the interrupted moves instead
 }
 
 // isBackupKind reports the job kinds of step 5.
@@ -129,6 +138,7 @@ type jobJSON struct {
 	Target       string `json:"target,omitempty"`   // backup kinds: the marker id
 	Mode         string `json:"mode,omitempty"`     // restore jobs
 	Budget       int64  `json:"budget,omitempty"`   // scrub jobs: seconds (omitted: the whole set)
+	To           string `json:"to,omitempty"`       // transfer jobs: the target library
 	// Progress is the phase of a similar job (omitted for other kinds and
 	// before the first phase).
 	Progress   *phaseJSON `json:"progress,omitempty"`
@@ -145,6 +155,8 @@ type jobJSON struct {
 	// Backup is the progress of a backup-kind job, sent as "progress"
 	// instead of Progress.
 	Backup *backupProgressJSON `json:"-"`
+	// Transfer is the progress of a transfer job, sent as "progress".
+	Transfer *transferProgressJSON `json:"-"`
 	// Result is the run stats of a finished backup-kind job.
 	Result any `json:"result,omitempty"`
 }
@@ -166,6 +178,12 @@ type backupProgressJSON struct {
 // MarshalJSON sends a backup-kind job's progress as "progress".
 func (j jobJSON) MarshalJSON() ([]byte, error) {
 	type plain jobJSON
+	if j.Transfer != nil {
+		return json.Marshal(struct {
+			plain
+			Progress *transferProgressJSON `json:"progress"`
+		}{plain(j), j.Transfer})
+	}
 	if j.Backup != nil {
 		return json.Marshal(struct {
 			plain
@@ -196,6 +214,10 @@ func (j *jobJSON) UnmarshalJSON(b []byte) error {
 	if isBackupKind(j.Kind) {
 		j.Backup = new(backupProgressJSON)
 		return json.Unmarshal(aux.Progress, j.Backup)
+	}
+	if j.Kind == kindTransfer {
+		j.Transfer = new(transferProgressJSON)
+		return json.Unmarshal(aux.Progress, j.Transfer)
 	}
 	j.Progress = new(phaseJSON)
 	return json.Unmarshal(aux.Progress, j.Progress)
@@ -269,7 +291,9 @@ type job struct {
 	subs      map[*subscriber]struct{}
 	phase     *phaseJSON // similar jobs
 	bprog     *backupProgressJSON
-	result    any // backup kinds: the run stats once finished
+	tprog     *transferProgressJSON // transfer jobs
+	started   time.Time             // transfer jobs: when the run began (rate)
+	result    any                   // backup kinds: the run stats once finished
 }
 
 func (j *job) finalLocked() bool {
@@ -298,6 +322,13 @@ func (j *job) jsonLocked() jobJSON {
 		}
 	case kindRebuild:
 		out.NoThumbs = j.params.NoThumbs
+	case kindTransfer:
+		out.To = j.params.To
+		if j.tprog != nil {
+			tp := *j.tprog
+			out.Transfer = &tp
+		}
+		out.Result = j.result
 	case kindBackup, kindScrub, kindPrune, kindRestore:
 		out.Target = j.params.Target
 		if j.params.Kind == kindRestore {
@@ -762,7 +793,7 @@ func (m *jobManager) list(e *libEntry) []*job {
 	defer m.mu.Unlock()
 	out := make([]*job, 0, len(m.jobs))
 	for i := len(m.jobs) - 1; i >= 0; i-- {
-		if e == nil || m.jobs[i].entry == e {
+		if e == nil || m.jobs[i].entry == e || m.jobs[i].params.target == e {
 			out = append(out, m.jobs[i])
 		}
 	}
@@ -823,6 +854,8 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		return m.runRebuild(j)
 	case kindBackup, kindScrub, kindPrune, kindRestore:
 		return m.runBackupJob(j)
+	case kindTransfer:
+		return m.runTransfer(j)
 	}
 	libState, h := j.entry.snapshot()
 	if libState != libOpen {

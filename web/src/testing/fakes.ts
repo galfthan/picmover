@@ -491,6 +491,170 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     return done;
   }
 
+  /**
+   * Moving to another library (docs/design/library-move.md): what the plan
+   * finds per hash and what a transfer job does with it. Hashes not named
+   * here are moved; trashed or unknown ones are refused as the server does.
+   */
+  const transfer = {
+    sameVolume: true,
+    free: null as number | null,
+    /** Bytes of each item to move. */
+    size: 1000,
+    /** Already live in the target (case 1). */
+    existing: new Set<string>(),
+    /** In the target's trash (case 2). */
+    restore: new Set<string>(),
+    /** Refused by the plan with this reason. */
+    refused: new Map<string, string>(),
+    /** Failed by the job with this reason. */
+    fail: new Map<string, string>(),
+    /** Failed to go to the trash after being placed in the target (`sourcePending`): they stay in peter. */
+    pending: new Set<string>(),
+    /** Unfinished moves the plan reports (and the listing as `interruptedMoves`); `problem` when they cannot be finished. */
+    interrupted: [] as { from: string; to: string; id: number; problem?: string }[],
+    /** The hashes of each transfer job, by job id. */
+    jobHashes: new Map<number, string[]>(),
+    nextRecord: 50,
+  };
+
+  /** A transfer job object as the server sends it (the source is `library`, the target `to`). */
+  function transferJobJSON(p: { id: number; to: string; library?: string; importId: number } & Record<string, unknown>): Job {
+    const { id, to, library = 'peter', importId, ...rest } = p;
+    return {
+      id,
+      library,
+      kind: 'transfer',
+      to,
+      state: 'running',
+      move: false,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      stats: { ...ZERO_STATS },
+      sessionId: null,
+      importId,
+      progress: null,
+      result: null,
+      logPath: '',
+      error: null,
+      exitCode: null,
+      ...rest,
+    } as unknown as Job;
+  }
+
+  /** The checks every transfer request shares; a Response when refused. */
+  function transferRefusal(body: Record<string, unknown>): Response | null {
+    if (ws.mode !== 'workspace') return json({ error: 'single-library mode has no other library' }, 400);
+    const to = body.to;
+    if (typeof to !== 'string' || to === '') return json({ error: 'to: expected a library id' }, 400);
+    if (to === 'peter') return json({ error: 'the target library is peter itself' }, 400);
+    if (!libs.some((l) => l.id === to)) return json({ error: `no library "${to}" in the workspace` }, 400);
+    const hs = body.hashes;
+    if (!Array.isArray(hs) || hs.length === 0 || hs.length > 2000) return json({ error: 'hashes: expected 1-2000 hashes' }, 400);
+    return null;
+  }
+
+  function transferPlan(body: Record<string, unknown>): Response {
+    const bad = transferRefusal(body);
+    if (bad) return bad;
+    const hs = body.hashes as string[];
+    const out = { move: { count: 0, bytes: 0 }, existing: { count: 0 }, restore: { count: 0 }, refused: [] as { hash: string; error: string }[] };
+    for (const h of hs) {
+      const x = items.find((i) => i.hash === h);
+      const why = transfer.refused.get(h) ?? (!x ? 'not in the catalog' : x.deletedAt ? 'already in the trash in peter' : null);
+      if (why) out.refused.push({ hash: h, error: why });
+      else if (transfer.existing.has(h)) out.existing.count++;
+      else if (transfer.restore.has(h)) out.restore.count++;
+      else {
+        out.move.count++;
+        out.move.bytes += transfer.size;
+      }
+    }
+    return json({ ...out, sameVolume: transfer.sameVolume, free: transfer.sameVolume ? null : transfer.free, interrupted: transfer.interrupted });
+  }
+
+  function transferJob(body: Record<string, unknown>): Response {
+    const bad = transferRefusal(body);
+    if (bad) return bad;
+    const target = libs.find((l) => l.id === body.to);
+    if (target?.state === 'busy') return json({ error: `${target.name} is in use by another picmover process` }, 409);
+    if (backup.jobs.some((j) => j.state === 'running' || j.state === 'queued')) return json({ error: 'another job is running' }, 409);
+    const job = transferJobJSON({ id: ++jobId, to: String(body.to), importId: transfer.nextRecord++ });
+    transfer.jobHashes.set(job.id, [...(body.hashes as string[])]);
+    backup.jobs.unshift(job);
+    return json(job, 201);
+  }
+
+  /**
+   * Ends transfer job `id` as the server does: the moved items leave
+   * peter (gone on one volume, in its trash across volumes), duplicates
+   * and restored ones go to its trash; `done` carries `result`.
+   */
+  function finishTransfer(id: number, p: { exitCode?: number; state?: string; error?: string | null; failedCap?: number } = {}): Job {
+    const i = backup.jobs.findIndex((j) => j.id === id);
+    const before = backup.jobs[i] as (Job & { to?: string }) | undefined;
+    if (!before) throw new Error(`no fake job ${id}`);
+    const hashes = transfer.jobHashes.get(id) ?? [];
+    let moved = 0;
+    let existing = 0;
+    let restored = 0;
+    let sourcePending = 0;
+    const failed: { hash: string; error: string }[] = [];
+    const cancelled = p.exitCode === 130 || p.state === 'cancelled';
+    for (const [n, h] of hashes.entries()) {
+      if (cancelled && n >= Math.ceil(hashes.length / 2)) break;
+      const why = transfer.fail.get(h);
+      if (why) {
+        failed.push({ hash: h, error: why });
+        continue;
+      }
+      const x = items.find((it) => it.hash === h);
+      if (transfer.existing.has(h)) existing++;
+      else if (transfer.restore.has(h)) restored++;
+      else moved++;
+      if (transfer.pending.has(h)) {
+        sourcePending++;
+        continue; // the original is still live here
+      }
+      if (!x) continue;
+      if (transfer.sameVolume && !transfer.existing.has(h) && !transfer.restore.has(h)) items.splice(items.indexOf(x), 1);
+      else x.deletedAt = '2026-10-10T11:59:00';
+    }
+    const exitCode = p.exitCode ?? (failed.length || sourcePending ? 2 : 0);
+    const state = p.state ?? (exitCode === 0 || exitCode === 2 ? 'done' : exitCode === 130 ? 'cancelled' : 'failed');
+    const cap = p.failedCap ?? 200;
+    const notes: string[] = [];
+    if (failed.length) notes.push(`${failed.length} ${failed.length === 1 ? 'file' : 'files'} could not be moved (see the job log)`);
+    if (sourcePending) {
+      notes.push(
+        `${sourcePending} ${sourcePending === 1 ? 'photo was' : 'photos were'} moved to ${before.to}, but ${sourcePending === 1 ? 'its original' : 'their originals'} could not be moved to the trash in ${before.library}; finish the move from the Libraries page`,
+      );
+    }
+    const error = p.error !== undefined ? p.error : exitCode === 2 && notes.length ? notes.join('; ') : null;
+    const done = transferJobJSON({
+      id,
+      to: before.to ?? '',
+      library: before.library,
+      importId: before.importId ?? 0,
+      startedAt: before.startedAt,
+      finishedAt: new Date().toISOString(),
+      state,
+      exitCode,
+      error,
+      progress: { phase: before.to && hashes.length === 0 ? 'recover' : 'move', files: hashes.length, totalFiles: hashes.length, bytes: 0, totalBytes: 0, current: '' },
+      result: { moved, existing, restored, failed: failed.slice(0, cap), failedCount: failed.length, sourcePending, record: before.importId ?? null, targetLibrary: before.to ?? '' },
+      logPath: `/media/${before.to ?? 'x'}/.picmover/logs/transfer_2026-10-10_12-00-00.log`,
+    });
+    backup.jobs[i] = done;
+    if (hashes.length === 0 && exitCode === 0) {
+      transfer.interrupted = transfer.interrupted.filter((m) => m.to !== before.to);
+      for (const l of libs) if (l.interruptedMoves) l.interruptedMoves = l.interruptedMoves.filter((m) => m.to !== before.to);
+    }
+    const es = [...FakeEventSource.instances].reverse().find((e) => e.url === `/api/jobs/${id}/events`);
+    es?.emit('done', done);
+    return done;
+  }
+
   const libs: Lib[] =
     mode === 'single'
       ? [{ id: 'peter', name: 'peter', path: '/media/peter', state: 'open', summary: summary(8) }]
@@ -722,6 +886,13 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     if (method === 'GET' && path === 'jobs') return json({ jobs: backup.jobs.filter((j) => j.library === 'peter') });
     if (path === 'backups' || path.startsWith('backups/')) return backups(path, q, method, body);
     if (method !== 'POST') return json({ error: 'not found' }, 404);
+    // Trash and user data changes wait for no move: refused while one runs on the library.
+    if (
+      /^(ratings|tags(\/\d+(\/delete)?)?|media\/tags|albums(\/\d+(\/items|\/delete)?)?|trash(\/restore|\/delete)?|similar\/ignore)$/.test(path) &&
+      backup.jobs.some((j) => j.kind === 'transfer' && (j.state === 'running' || j.state === 'queued') && (j.library === 'peter' || j.to === 'peter'))
+    ) {
+      return json({ error: 'a move is running on this library; try again when it has finished' }, 409);
+    }
     switch (path) {
       case 'ratings':
         for (const x of items) if (hs.includes(x.hash)) x.rating = (body.rating as number) || undefined;
@@ -783,7 +954,10 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         for (let i = 0; i < g.length; i++) for (let j = i + 1; j < g.length; j++) ignoredPairs.add(pairKey(g[i]!.hash, g[j]!.hash));
         return json({ ignored: ignoredPairs.size - before });
       }
+      case 'transfer/plan':
+        return transferPlan(body);
       case 'jobs':
+        if (body.kind === 'transfer') return transferJob(body);
         return backupJob(body) ?? json({ id: ++jobId, kind: body.kind, state: 'running', library: 'peter', startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
     }
     const am = /^albums\/(\d+)(\/items|\/delete)?$/.exec(path);
@@ -888,6 +1062,20 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         l.state = 'open';
         res = json(l);
       }
+    } else if (/^\/api\/libraries\/[^/]+\/transfer\/resume$/.test(p) && method === 'POST') {
+      const id = decodeURIComponent(p.split('/')[3] ?? '');
+      const all = [...transfer.interrupted, ...(libs.find((l) => l.id === id)?.interruptedMoves ?? [])].filter((x) => x.to === id || x.from === id);
+      const m = all.find((x) => !x.problem);
+      if (!libs.some((l) => l.id === id)) res = json({ error: 'no such library' }, 404);
+      else if (!all.length) res = json({ error: 'no interrupted move involves this library' }, 400);
+      else if (!m) res = json({ error: all.map((x) => `the interrupted move from ${x.from} to ${x.to} could not be finished: ${x.problem}`).join('; ') }, 409);
+      else if (backup.jobs.some((j) => j.state === 'running' || j.state === 'queued')) res = json({ error: 'another job is running' }, 409);
+      else {
+        const job = transferJobJSON({ id: ++jobId, to: id, library: m.from, importId: m.id, progress: { phase: 'recover', files: 0, totalFiles: 0, bytes: 0, totalBytes: 0, current: '' } });
+        transfer.jobHashes.set(job.id, []);
+        backup.jobs.unshift(job);
+        res = json(job, 201);
+      }
     } else if (/^\/api\/libraries\/[^/]+\/jobs$/.test(p)) {
       const id = decodeURIComponent(p.split('/')[3] ?? '');
       res = json({ id: ++jobId, kind: 'rebuild', state: 'running', library: id, startedAt: '2026-10-10T12:00:00Z', finishedAt: null, stats: {}, error: null }, 201);
@@ -927,7 +1115,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, ws, libraryFolders, app, install, posts, finish };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, transfer, ws, libraryFolders, app, install, posts, finish, finishTransfer };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

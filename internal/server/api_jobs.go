@@ -93,6 +93,17 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 		writeError(w, http.StatusBadRequest, "invalid job: trailing data")
 		return
 	}
+	s.launch(w, r, e, p, lib)
+}
+
+// launch checks the job p and starts it on e (see startJob).
+func (s *Server) launch(w http.ResponseWriter, r *http.Request, e *libEntry, p jobParams, lib *library.Library) {
+	if p.resume {
+		_, h := e.snapshot()
+		if h != nil {
+			lib = h.lib
+		}
+	}
 	if lib == nil && p.Kind != kindRebuild {
 		writeJSON(w, http.StatusConflict, stateError{Error: "library is not open; only a rebuild can run on it", State: func() string { st, _ := e.snapshot(); return st }()})
 		return
@@ -107,6 +118,17 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request, e *libEntry, l
 			writeError(w, code, msg)
 			return
 		}
+	}
+	if p.Kind == kindTransfer && !p.resume {
+		te, ok := s.transferTarget(w, r, e, p.To)
+		if !ok {
+			return
+		}
+		if msg := blockingMove(allInterrupted(r.Context(), s.ws, s.log), e.id, te.id); msg != "" {
+			writeError(w, http.StatusConflict, msg) // no state: it is not about the source being open
+			return
+		}
+		p.target = te
 	}
 	if lib != nil && e.checkFolder() != nil {
 		writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})
@@ -192,8 +214,13 @@ func (s *Server) validateJob(p *jobParams, lib *library.Library) (*time.Location
 		return nil, nil
 	case kindRebuild, kindBackup, kindScrub, kindPrune, kindRestore:
 		return nil, nil // the backup kinds are checked by checkBackupJob
+	case kindTransfer:
+		if p.resume {
+			return nil, nil
+		}
+		return nil, validateTransfer(p) // the target is resolved by launch
 	}
-	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar, rebuild, backup, scrub, prune or restore", p.Kind)
+	return nil, fmt.Errorf("invalid kind %q: want import, thumbs, similar, rebuild, backup, scrub, prune, restore or transfer", p.Kind)
 }
 
 // overlapsLibraries reports whether an import source (as given and

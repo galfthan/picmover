@@ -192,6 +192,8 @@ export interface Lib {
   error?: string | null;
   /** Backup summary, when the server provides it (step 5); absent otherwise. */
   backup?: LibBackup | null;
+  /** Unfinished moves involving this library (docs/design/library-move.md); absent when the server does not say. */
+  interruptedMoves?: InterruptedMove[] | null;
 }
 
 /** The workspace listing's per-library backup summary (docs/design/backups.md "Frontend"). */
@@ -236,7 +238,7 @@ export interface Album {
 
 // ---- Import history (docs/design/imports.md) ----
 
-export type ImportMode = 'copy' | 'move' | 'rebuild' | 'record';
+export type ImportMode = 'copy' | 'move' | 'rebuild' | 'record' | 'transfer';
 export type ImportOutcome = 'running' | 'done' | 'cancelled' | 'failed';
 
 /** One import record of user.db, as GET imports and GET imports/<iid> answer. */
@@ -434,7 +436,7 @@ export interface BackupProgressEvent {
 
 // ---- Jobs ----
 
-export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild' | BackupRunKind;
+export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild' | 'transfer' | BackupRunKind;
 export const BACKUP_KINDS: readonly string[] = ['backup', 'scrub', 'prune', 'restore'];
 export const isBackupKind = (k: string): k is BackupRunKind => BACKUP_KINDS.includes(k);
 export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -491,6 +493,8 @@ export interface Job {
   target?: string;
   /** Restore mode of a restore job. */
   mode?: string;
+  /** Target library id of a transfer job (`library` is the source). */
+  to?: string;
   /** Run stats of a finished backup-kind job (absent before it finishes); `stats` stays the importer's counters. */
   result?: Record<string, unknown>;
   /** Server-side phase progress of a running similar job (also in listings). */
@@ -558,7 +562,14 @@ export interface RestoreJobRequest {
 
 export type BackupJobKindRequest = BackupJobRequest | ScrubJobRequest | PruneJobRequest | RestoreJobRequest;
 
-export type JobRequest = ImportJobRequest | ThumbsJobRequest | SimilarJobRequest | RebuildJobRequest | BackupJobKindRequest;
+/** Moves `hashes` (at most TRANSFER_CHUNK) from the job's library to library `to`. */
+export interface TransferJobRequest {
+  kind: 'transfer';
+  to: string;
+  hashes: string[];
+}
+
+export type JobRequest = ImportJobRequest | ThumbsJobRequest | SimilarJobRequest | RebuildJobRequest | BackupJobKindRequest | TransferJobRequest;
 
 export type ResultStatus = 'imported' | 'imported_existing' | 'duplicate' | 'skipped_small' | 'error';
 
@@ -839,6 +850,12 @@ export interface LibApi {
   forgetTarget(id: string): Promise<void>;
   getPlan(id: string, signal?: AbortSignal): Promise<BackupPlan>;
   getRuns(id: string, signal?: AbortSignal): Promise<BackupRun[]>;
+
+  /**
+   * The pre-flight of moving `hashes` to library `to` (no writes). More than
+   * TRANSFER_CHUNK hashes are planned per chunk and summed.
+   */
+  transferPlan(to: string, hashes: readonly string[], progress?: ChunkProgress, signal?: AbortSignal): Promise<TransferPlan>;
 }
 
 function versioned(base: string, kind: 'thumb' | 'large' | 'preview', ref: ThumbRef): string {
@@ -1048,6 +1065,164 @@ function makeLibApi(id: string): LibApi {
       const r = await get<{ runs?: unknown }>(`/backups/targets/${encTarget(tid)}/runs`, signal);
       return Array.isArray(r.runs) ? r.runs.filter(isRecord).map(toRun) : [];
     },
+
+    async transferPlan(to, hashes, progress, signal) {
+      const parts: TransferPlan[] = [];
+      let done = 0;
+      for (const part of chunks(hashes, TRANSFER_CHUNK)) {
+        parts.push(toTransferPlan(await postJSON<unknown>(`${base}/transfer/plan`, { to, hashes: part }, signal, id)));
+        done += part.length;
+        progress?.(done, hashes.length);
+      }
+      return sumPlans(parts);
+    },
+  };
+}
+
+// ---- Moving between libraries (docs/design/library-move.md) ----
+
+/** Hashes per transfer plan request and per transfer job (the server's cap). */
+export const TRANSFER_CHUNK = 2000;
+
+/** A move whose journal has no `end`: it must be finished (resumed in `to`) before another move involving either library. */
+export interface InterruptedMove {
+  /** The source library; '' when the journal cannot be read. */
+  from: string;
+  to: string;
+  /** The target's import record of the move. */
+  id: number;
+  /** Why it cannot be finished now (the source is not in the workspace, the journal cannot be read); '' when "Finish moving" can. */
+  problem: string;
+}
+
+export interface TransferPlan {
+  /** Not in the target yet: placed there (renamed on one volume, copied across volumes). */
+  move: { count: number; bytes: number };
+  /** Already live in the target: this library's copy goes to its trash. */
+  existing: { count: number };
+  /** In the target's trash: restored there, this library's copy goes to its trash. */
+  restore: { count: number };
+  /** Not movable (trashed here, not in the catalog, bad path), with the reason. */
+  refused: Failure[];
+  /** Both libraries on one volume: a move is a rename. */
+  sameVolume: boolean;
+  /** Free bytes on the target's volume (other volumes only); null when unknown or not asked. */
+  free: number | null;
+  interrupted: InterruptedMove[];
+}
+
+export interface TransferProgress {
+  phase: 'plan' | 'move' | 'recover' | string;
+  files: number;
+  totalFiles: number;
+  bytes: number;
+  totalBytes: number;
+  current: string;
+}
+
+export interface TransferResult {
+  moved: number;
+  existing: number;
+  restored: number;
+  /** At most 200 entries; `failedCount` is the total. */
+  failed: Failure[];
+  failedCount: number;
+  /** Photos now in the target whose original could not be moved to the trash here: they are still in this library too. */
+  sourcePending: number;
+  /** The target's import record of the move; null when none. */
+  record: number | null;
+  targetLibrary: string;
+}
+
+const count = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+const positiveId = (v: unknown): number | null => (typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : null);
+
+/** `{hash, error}` entries with a valid hash; anything else is dropped. */
+function hashFailures(v: unknown): Failure[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(isRecord).flatMap((f) => (isHash(f.hash) ? [{ hash: f.hash, error: typeof f.error === 'string' ? f.error : '' }] : []));
+}
+
+/**
+ * Interrupted moves (plan `interrupted`, lib `interruptedMoves`); malformed
+ * entries are dropped. One with a `problem` may lack `from` (its journal
+ * cannot be read) and have the id 0.
+ */
+export function toInterrupted(v: unknown): InterruptedMove[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(isRecord).flatMap((m) => {
+    const problem = typeof m.problem === 'string' ? m.problem : '';
+    const id = positiveId(m.id) ?? (problem ? 0 : null);
+    const from = typeof m.from === 'string' ? m.from : '';
+    if ((from === '' && !problem) || typeof m.to !== 'string' || m.to === '' || id === null) return [];
+    return [{ from, to: m.to, id, problem }];
+  });
+}
+
+/** The plan answer with every field present; missing or malformed values are zero, false, null or empty. */
+export function toTransferPlan(v: unknown): TransferPlan {
+  const r = isRecord(v) ? v : {};
+  const move = isRecord(r.move) ? r.move : {};
+  const existing = isRecord(r.existing) ? r.existing : {};
+  const restore = isRecord(r.restore) ? r.restore : {};
+  return {
+    move: { count: count(move.count), bytes: count(move.bytes) },
+    existing: { count: count(existing.count) },
+    restore: { count: count(restore.count) },
+    refused: hashFailures(r.refused),
+    sameVolume: r.sameVolume === true,
+    free: typeof r.free === 'number' && Number.isFinite(r.free) && r.free >= 0 ? r.free : null,
+    interrupted: toInterrupted(r.interrupted),
+  };
+}
+
+/** Chunked plans as one: counts and bytes summed, `sameVolume` and `free` from the first, lists concatenated (interrupted moves once). */
+export function sumPlans(parts: readonly TransferPlan[]): TransferPlan {
+  const first = parts[0];
+  const seen = new Set<string>();
+  const interrupted = parts.flatMap((p) => p.interrupted).filter((m) => {
+    const k = `${m.from}\u0000${m.to}\u0000${m.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return {
+    move: { count: parts.reduce((n, p) => n + p.move.count, 0), bytes: parts.reduce((n, p) => n + p.move.bytes, 0) },
+    existing: { count: parts.reduce((n, p) => n + p.existing.count, 0) },
+    restore: { count: parts.reduce((n, p) => n + p.restore.count, 0) },
+    refused: parts.flatMap((p) => p.refused),
+    sameVolume: first?.sameVolume ?? false,
+    free: first?.free ?? null,
+    interrupted,
+  };
+}
+
+/** A transfer job's `progress`; null when absent or without a phase. */
+export function toTransferProgress(v: unknown): TransferProgress | null {
+  if (!isRecord(v) || typeof v.phase !== 'string') return null;
+  return {
+    phase: v.phase,
+    files: count(v.files),
+    totalFiles: count(v.totalFiles),
+    bytes: count(v.bytes),
+    totalBytes: count(v.totalBytes),
+    current: typeof v.current === 'string' ? v.current : '',
+  };
+}
+
+/** A finished transfer job's `result`; null before it finishes (absent or not an object). */
+export function toTransferResult(v: unknown): TransferResult | null {
+  if (!isRecord(v)) return null;
+  const failed = hashFailures(v.failed);
+  return {
+    moved: count(v.moved),
+    existing: count(v.existing),
+    restored: count(v.restored),
+    failed,
+    failedCount: Math.max(count(v.failedCount), failed.length),
+    sourcePending: count(v.sourcePending),
+    record: positiveId(v.record),
+    targetLibrary: typeof v.targetLibrary === 'string' ? v.targetLibrary : '',
   };
 }
 
@@ -1201,6 +1376,11 @@ export function openLibrary(id: string): Promise<Lib> {
 /** Starts a job through the workspace route (also for folders and unreadable catalogs; rebuild only). */
 export async function startWorkspaceJob(id: string, req: RebuildJobRequest): Promise<Job> {
   return unwrapJob(await postJSON<unknown>(`/api/libraries/${enc(id)}/jobs`, req));
+}
+
+/** Finishes the interrupted moves into library `id` (a `transfer` job that only recovers). */
+export async function resumeTransfer(id: string): Promise<Job> {
+  return unwrapJob(await postJSON<unknown>(`/api/libraries/${enc(id)}/transfer/resume`, {}));
 }
 
 // ---- Desktop app (docs/design/desktop-shell.md "App endpoints") ----

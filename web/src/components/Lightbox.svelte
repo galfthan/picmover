@@ -9,6 +9,9 @@
   import { library } from '../lib/library.svelte';
   import { toasts } from '../lib/toast.svelte';
   import { addToAlbum, deleteItems, failureText, rateItems, removeFromAlbum, restoreItems, tagItems, trashItems, undoTrash } from '../lib/actions';
+  import { canMove, moves, movingOn, MOVING_TEXT } from '../lib/moves.svelte';
+  import { onChange } from '../lib/changes';
+  import { libraries } from '../lib/libraries.svelte';
   import CopyButton from './CopyButton.svelte';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
@@ -120,6 +123,8 @@
   let albumOpen = $state(false);
   let working = $state(false);
   let editError = $state('');
+  /** A move runs on this library: its trash and user data cannot change until it has finished. */
+  const locked = $derived(movingOn(api.id));
 
   const trashed = $derived(!!d?.deletedAt);
   const rating = $derived(d?.rating ?? 0);
@@ -130,6 +135,10 @@
   async function edit(fn: (cur: MediaDetail) => Promise<((x: MediaDetail) => MediaDetail) | void>) {
     const cur = d;
     if (!cur || working) return;
+    if (locked) {
+      editError = MOVING_TEXT;
+      return;
+    }
     working = true;
     editError = '';
     try {
@@ -228,6 +237,22 @@
     });
   }
 
+  const movable = $derived(!!d && !trashed && canMove());
+
+  function move() {
+    if (!d || trashed || !canMove()) return;
+    moves.open(api.id, [d.hash], 'viewer');
+  }
+
+  // The shown item was moved to another library (here or from the selection bar): go on to the next.
+  $effect(() =>
+    onChange((c) => {
+      if (c.kind !== 'moved' || c.lib !== untrack(() => api.id)) return;
+      const cur = untrack(() => d);
+      if (cur && c.hashes.includes(cur.hash)) leave();
+    }),
+  );
+
   async function focusTags() {
     if (!showInfo) toggleInfo();
     await tick();
@@ -261,6 +286,8 @@
 
   function onKey(e: KeyboardEvent) {
     if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+    // The move dialog is on top: its keys are not the viewer's.
+    if (moves.dialog) return;
     const t = e.target;
     if (t instanceof HTMLElement && (t.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(t.tagName))) return;
     switch (e.key) {
@@ -321,6 +348,11 @@
         e.preventDefault();
         restore();
         break;
+      case 'm':
+        if (!movable) return;
+        e.preventDefault();
+        move();
+        break;
     }
   }
 
@@ -373,9 +405,9 @@
         <button class="ghost" class:on={full} onclick={toggleFull} title="Original size (F, or double-click)">1:1</button>
       {/if}
       {#if d && !trashed}
-        <button class="ghost" onclick={trash} disabled={working} title="Move to the trash (Delete)">Trash</button>
+        <button class="ghost" onclick={trash} disabled={working || locked} title="Move to the trash (Delete)">Trash</button>
       {:else if d}
-        <button class="ghost" onclick={restore} disabled={working} title="Restore (R)">Restore</button>
+        <button class="ghost" onclick={restore} disabled={working || locked} title="Restore (R)">Restore</button>
       {/if}
       {#if d}
         <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original">Download</a>
@@ -447,31 +479,31 @@
               Deleted {formatAgo(parseLocalWallClock(d.deletedAt))}{#if d.deletedAt}&nbsp;({formatWallDate(d.deletedAt)}){/if}
             </span>
             <div class="row">
-              <button class="primary small" disabled={working} onclick={restore}>Restore</button>
+              <button class="primary small" disabled={working || locked} onclick={restore}>Restore</button>
               <ConfirmButton
                 label="Delete permanently"
                 question="Delete this file permanently?"
                 confirmLabel="Delete"
                 cancelLabel="Cancel"
                 danger
-                disabled={working}
+                disabled={working || locked}
                 onconfirm={deleteForever}
               />
             </div>
           </div>
         {/if}
-        {#if editError}<div class="error-box small" role="alert">{editError}</div>{/if}
+        {#if editError}<div class="error-box small" role="alert">{editError}</div>{:else if locked}<p class="muted small">{MOVING_TEXT}</p>{/if}
         <dl>
           {#if !trashed}
             <dt>Rating</dt>
-            <dd><RatingStars value={rating} onchange={rate} disabled={working} /></dd>
+            <dd><RatingStars value={rating} onchange={rate} disabled={working || locked} /></dd>
 
             <dt>Tags</dt>
             <dd class="chips">
               {#each itemTags as t (t.id)}
                 <span class="chip">
                   <a href={libHref(api.id, '', { tag: t.id })}>{t.name}</a>
-                  <button class="ghost small" aria-label="Remove tag {t.name}" disabled={working} onclick={() => removeTag(t.id)}>×</button>
+                  <button class="ghost small" aria-label="Remove tag {t.name}" disabled={working || locked} onclick={() => removeTag(t.id)}>×</button>
                 </span>
               {/each}
               <TagInput
@@ -480,7 +512,7 @@
                 exclude={itemTags.map((t) => t.id)}
                 label="Add tag (T)"
                 placeholder="Add tag… (T)"
-                disabled={working}
+                disabled={working || locked}
                 onpick={addTag}
               />
             </dd>
@@ -490,7 +522,7 @@
               {#each itemAlbums as a (a.id)}
                 <span class="chip">
                   <a href={libHref(api.id, `albums/${a.id}`)}>{a.name}</a>
-                  <button class="ghost small" aria-label="Remove from album {a.name}" disabled={working} onclick={() => removeAlbum(a.id)}>×</button>
+                  <button class="ghost small" aria-label="Remove from album {a.name}" disabled={working || locked} onclick={() => removeAlbum(a.id)}>×</button>
                 </span>
               {/each}
               <AlbumPicker
@@ -498,11 +530,19 @@
                 exclude={itemAlbums.map((a) => a.id)}
                 label="Add to album (B)"
                 placement="down"
-                disabled={working}
+                disabled={working || locked}
                 bind:open={albumOpen}
                 onpick={addAlbum}
               />
             </dd>
+
+            {#if movable}
+              <dt>Library</dt>
+              <dd class="chips">
+                <span>{libraries.find(api.id)?.name ?? api.id}</span>
+                <button class="small" disabled={working || moves.running} onclick={move} title="Move to another library (M)">Move to…</button>
+              </dd>
+            {/if}
           {/if}
 
           <dt>Date</dt>

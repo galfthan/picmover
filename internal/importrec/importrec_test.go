@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/importer"
+	"picmover/internal/transfer"
 	"picmover/internal/userdata"
 )
 
@@ -246,6 +248,34 @@ func TestCloseCrashed(t *testing.T) {
 	// Nothing is left to close but the owned one.
 	if n, err := CloseCrashed(ctx, u, cat.SessionHashes, func(id int64) bool { return id == live.ID() }, nil); err != nil || n != 0 {
 		t.Fatalf("again %d %v", n, err)
+	}
+}
+
+// A running transfer record is left to the move's recovery while its
+// journal exists, and closed when it has none (the process died before
+// creating it).
+func TestCloseCrashedTransfer(t *testing.T) {
+	ctx := context.Background()
+	u := openUser(t)
+	root := filepath.Dir(u.Path())
+	withJournal := Begin(ctx, u, nil, "/libs/a", userdata.ImportModeTransfer, nil)
+	without := Begin(ctx, u, nil, "/libs/a", userdata.ImportModeTransfer, nil)
+	p := transfer.JournalPath(root, withJournal.ID())
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n, err := CloseCrashed(ctx, u, nil, nil, nil)
+	if err != nil || n != 1 {
+		t.Fatalf("closed %d %v", n, err)
+	}
+	if rec, _ := u.GetImport(ctx, without.ID()); rec.Outcome != userdata.ImportFailed {
+		t.Fatalf("record without a journal %+v", rec)
+	}
+	if rec, _ := u.GetImport(ctx, withJournal.ID()); rec.Outcome != userdata.ImportRunning {
+		t.Fatalf("record with a journal closed %+v", rec)
 	}
 }
 

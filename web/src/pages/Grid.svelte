@@ -19,6 +19,7 @@
   import Scrubber from '../components/Scrubber.svelte';
   import FiltersBar from '../components/Filters.svelte';
   import SelectionBar from '../components/SelectionBar.svelte';
+  import InterruptedMoves from '../components/InterruptedMoves.svelte';
 
   interface Props {
     api: LibApi;
@@ -247,6 +248,11 @@
           selection.clear();
           void loadTimeline(false);
         }
+        break;
+      case 'moved':
+        if (c.lib !== api.id) break;
+        if (mode === 'trash') void loadTimeline(false);
+        else removeHashes(c.hashes);
         break;
       case 'album':
         if (mode !== 'album' || c.albumId !== albumId) break;
@@ -610,6 +616,7 @@
 
 <div class="grid-page">
   {@render header?.()}
+  <InterruptedMoves lib={api.id} />
   <div class="toolbar">
     <FiltersBar {filters} onchange={applyFilters} hideAlbum={mode === 'album'} hideImport={mode === 'import'} />
     <div class="spacer"></div>

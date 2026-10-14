@@ -582,6 +582,36 @@ func syncDir(dir string) {
 	}
 }
 
+// CopyFrom copies the renditions of hash from src, another library's
+// store, into s with Put: the thumbnail, the preview and the large
+// thumbnail when src has one. ok is false, and nothing is written, when
+// src has no thumbnail or no preview of hash; the caller then leaves the
+// row's thumbnails pending.
+func (s *Store) CopyFrom(ctx context.Context, src *Store, hash uint64) (ok bool, err error) {
+	thumb, tw, th, ok, err := src.Thumb(ctx, hash)
+	if err != nil || !ok {
+		return false, err
+	}
+	preview, err := os.ReadFile(src.PreviewPath(hash))
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && len(preview) == 0) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("thumbs: copy %016x: %w", hash, err)
+	}
+	large, err := os.ReadFile(src.LargePath(hash))
+	if errors.Is(err, fs.ErrNotExist) {
+		large, err = nil, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("thumbs: copy %016x: %w", hash, err)
+	}
+	if err := s.Put(ctx, hash, thumb, tw, th, large, preview); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Delete removes every rendition of hash: the row first, then the
 // previews (either format) and the large thumbnail, so a row never
 // outlives its preview. Missing entries are not an error.

@@ -98,6 +98,8 @@ class JobStore {
   #lastSeq = -1;
   #retryTimer: ReturnType<typeof setTimeout> | null = null;
   #backoff = 1000;
+  /** Callers of waitFor, per job id. */
+  #waiters = new Map<number, ((j: Job) => void)[]>();
 
   get current(): Job | null {
     return this.jobs.find((j) => j.id === this.currentId) ?? null;
@@ -119,6 +121,7 @@ class JobStore {
       if (g !== this.#initGen) return;
       this.jobs = list;
       this.loadError = null;
+      for (const j of list) if (!isActive(j)) this.#settle(j);
       const follow = list.find((j) => isActive(j)) ?? list[0] ?? null;
       if (!follow) {
         this.#unsubscribe();
@@ -149,7 +152,12 @@ class JobStore {
       if (e instanceof ApiError && e.status === 409) void this.init();
       throw e;
     }
-    const job = normalize(started);
+    return this.adopt(started);
+  }
+
+  /** Follows a job started through another route (e.g. resuming a move); `lib` fills a missing `library`. */
+  adopt(started: Job, lib?: string): Job {
+    const job = normalize(!started.library && lib !== undefined ? { ...started, library: lib } : started);
     this.#upsert(job);
     this.#follow(job.id);
     return job;
@@ -173,6 +181,24 @@ class JobStore {
     await cancelJob(id);
   }
 
+  /**
+   * Resolves with job `id` once it has ended (at once when it already has).
+   * A job the server lost resolves as failed. Used to run jobs one after
+   * another (one job runs at a time).
+   */
+  waitFor(id: number): Promise<Job> {
+    const j = this.jobs.find((x) => x.id === id);
+    if (j && !isActive(j)) return Promise.resolve(j);
+    return new Promise((resolve) => this.#waiters.set(id, [...(this.#waiters.get(id) ?? []), resolve]));
+  }
+
+  #settle(j: Job): void {
+    const list = this.#waiters.get(j.id);
+    if (!list) return;
+    this.#waiters.delete(j.id);
+    for (const resolve of list) resolve(j);
+  }
+
   #upsert(job: Job): void {
     const j = normalize(job);
     const i = this.jobs.findIndex((x) => x.id === j.id);
@@ -180,6 +206,7 @@ class JobStore {
     if (prev && j.phase === undefined && prev.phase && sameStart(prev.startedAt, j.startedAt)) j.phase = prev.phase;
     if (i >= 0) this.jobs[i] = j;
     else this.jobs = [j, ...this.jobs].sort((a, b) => b.id - a.id);
+    if (!isActive(j)) this.#settle(j);
     if (j.id === this.currentId) {
       if (!sameStart(this.#followStarted, j.startedAt)) this.#reset(j.id, j.startedAt);
       else if (j.startedAt) this.#followStarted = j.startedAt;
@@ -318,6 +345,7 @@ class JobStore {
     this.#backoff = 1000;
     const before = this.jobs.find((x) => x.id === id);
     this.jobs = this.jobs.filter((x) => x !== before);
+    if (before) this.#settle({ ...before, state: 'failed', error: before.error ?? 'the server no longer knows this job' });
     // It may have changed the library before it was lost.
     if (before && isActive(before)) this.#finished();
     await this.init();
