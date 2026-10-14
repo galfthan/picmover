@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
+	"time"
 
 	"rsc.io/qr"
 )
@@ -100,8 +101,10 @@ type fakeConn struct {
 	closed bool
 }
 
-func (c *fakeConn) RemoteAddr() net.Addr { return c.remote }
-func (c *fakeConn) Close() error         { c.closed = true; return nil }
+func (c *fakeConn) RemoteAddr() net.Addr             { return c.remote }
+func (c *fakeConn) Close() error                     { c.closed = true; return nil }
+func (c *fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 
 type fakeListener struct {
 	net.Listener
@@ -120,7 +123,8 @@ func (l *fakeListener) Accept() (net.Conn, error) {
 func TestFilterListener(t *testing.T) {
 	tcp := func(s string) net.Addr { return &net.TCPAddr{IP: net.ParseIP(s), Port: 5555} }
 	outside, inside, lo := &fakeConn{remote: tcp("192.168.2.9")}, &fakeConn{remote: tcp("192.168.1.34")}, &fakeConn{remote: tcp("127.0.0.1")}
-	ln := FilterListener(&fakeListener{conns: []*fakeConn{outside, inside, lo}}, AllowFrom(ipnet("192.168.1.0/24")), 1)
+	ln := FilterListener(&fakeListener{conns: []*fakeConn{outside, inside, lo}}, AllowFrom(ipnet("192.168.1.0/24")),
+		ConnLimits{Total: 1})
 	c, err := ln.Accept()
 	if err != nil || c.(*slotConn).Conn != inside || !outside.closed {
 		t.Fatalf("first accept %v %v, outside closed %v", c, err, outside.closed)
@@ -131,9 +135,87 @@ func TestFilterListener(t *testing.T) {
 	}
 	c.Close()
 	c.Close() // frees its slot once
-	ln = FilterListener(&fakeListener{conns: []*fakeConn{{remote: tcp("127.0.0.1")}}}, AllowFrom(ipnet("192.168.1.0/24")), 1)
+	ln = FilterListener(&fakeListener{conns: []*fakeConn{{remote: tcp("127.0.0.1")}}}, AllowFrom(ipnet("192.168.1.0/24")),
+		ConnLimits{Total: 1})
 	if _, err := ln.Accept(); err != nil {
 		t.Fatal("loopback refused")
+	}
+}
+
+// S3: one address cannot take more than PerIP connections; others still
+// get theirs, and a closed connection frees its address's slot.
+func TestFilterListenerPerIP(t *testing.T) {
+	tcp := func(s string) net.Addr { return &net.TCPAddr{IP: net.ParseIP(s), Port: 5555} }
+	var conns []*fakeConn
+	for i := 0; i < 4; i++ {
+		conns = append(conns, &fakeConn{remote: tcp("192.168.1.66")})
+	}
+	other := &fakeConn{remote: tcp("192.168.1.34")}
+	again := &fakeConn{remote: tcp("192.168.1.66")}
+	fl := &fakeListener{conns: append(conns, other)}
+	ln := FilterListener(fl, AllowFrom(ipnet("192.168.1.0/24")), ConnLimits{Total: 10, PerIP: 3})
+	var got []net.Conn
+	for i := 0; i < 4; i++ {
+		c, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, c)
+	}
+	if !conns[3].closed || got[3].(*slotConn).Conn != other {
+		t.Fatalf("the 4th connection of one address was not refused")
+	}
+	got[0].Close()
+	fl.conns = []*fakeConn{again}
+	if c, err := ln.Accept(); err != nil || c.(*slotConn).Conn != again {
+		t.Fatalf("a freed slot was not reused: %v", err)
+	}
+}
+
+// S3: a connection that sends nothing is closed after the first-byte
+// deadline; one that speaks gets the deadline its server asks for.
+func TestFilterListenerFirstByte(t *testing.T) {
+	raw, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := FilterListener(raw, AllowFrom(nil), ConnLimits{Total: 4, PerIP: 4, FirstByte: 100 * time.Millisecond})
+	defer ln.Close()
+	silent, err := net.Dial("tcp4", raw.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(time.Hour)) // the server's own, longer deadline
+	start := time.Now()
+	if _, err := c.Read(make([]byte, 1)); err == nil || time.Since(start) > 2*time.Second {
+		t.Fatalf("silent connection: %v after %v", err, time.Since(start))
+	}
+	c.Close()
+
+	talker, err := net.Dial("tcp4", raw.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer talker.Close()
+	c, err = ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(time.Hour))
+	talker.Write([]byte("x"))
+	if _, err := c.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // past the first-byte deadline
+	talker.Write([]byte("y"))
+	if _, err := c.Read(make([]byte, 1)); err != nil {
+		t.Fatalf("after the first byte the server's deadline applies: %v", err)
 	}
 }
 

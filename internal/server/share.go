@@ -39,6 +39,10 @@ const (
 	shareDrain = 5 * time.Second
 )
 
+// shareConnLimits are the share listener's connection limits (tests
+// change them).
+var shareConnLimits = share.DefaultConnLimits
+
 // errAdminNotLoopback: sharing needs the admin listener on loopback.
 var errAdminNotLoopback = errors.New("sharing needs the admin listener on a loopback address (the default --addr); the shared view has its own listener")
 
@@ -285,7 +289,7 @@ func (sh *sharing) listenLocked(m *share.Manager, home bool) error {
 		ErrorLog: slog.NewLogLogger(sh.log.Handler(), slog.LevelDebug),
 	}
 	done := make(chan struct{})
-	fl := share.FilterListener(ln, share.AllowFrom(cand.Subnet), share.MaxConns)
+	fl := share.FilterListener(ln, share.AllowFrom(cand.Subnet), shareConnLimits)
 	go func() {
 		defer close(done)
 		// ServeTLS sets up HTTP/2 on the TLS config (GetCertificate

@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Iface is a network interface as Candidates sees it (net.Interface and
@@ -192,20 +193,38 @@ func AllowFrom(subnet *net.IPNet) func(net.IP) bool {
 	}
 }
 
-// MaxConns caps the share listener's concurrent connections.
-const MaxConns = 64
+// ConnLimits bound the share listener's connections.
+type ConnLimits struct {
+	Total int // concurrent connections in all
+	PerIP int // concurrent connections of one remote address
+	// FirstByte closes a connection that sends nothing for this long
+	// (0: no such deadline). The TLS handshake and the request headers
+	// then have the server's own timeouts.
+	FirstByte time.Duration
+}
+
+// DefaultConnLimits are the share listener's limits: a phone over HTTP/2
+// needs one connection, over HTTP/1.1 up to six, plus the occasional
+// preconnect; one address cannot hold the listener's connections, and a
+// connection that never speaks is gone after 5 seconds.
+var DefaultConnLimits = ConnLimits{Total: 256, PerIP: 12, FirstByte: 5 * time.Second}
 
 // FilterListener wraps ln: a connection whose remote IP allow refuses, or
-// one beyond max concurrent connections, is closed at Accept, before the
-// TLS handshake.
-func FilterListener(ln net.Listener, allow func(net.IP) bool, max int) net.Listener {
-	return &filterListener{Listener: ln, allow: allow, slots: make(chan struct{}, max)}
+// one beyond the total or per-address caps of lim, is closed at Accept,
+// before the TLS handshake. A connection that sends no byte within
+// lim.FirstByte times out.
+func FilterListener(ln net.Listener, allow func(net.IP) bool, lim ConnLimits) net.Listener {
+	return &filterListener{Listener: ln, allow: allow, lim: lim, per: map[string]int{}}
 }
 
 type filterListener struct {
 	net.Listener
 	allow func(net.IP) bool
-	slots chan struct{}
+	lim   ConnLimits
+
+	mu    sync.Mutex
+	total int
+	per   map[string]int // open connections by remote IP
 }
 
 func (l *filterListener) Accept() (net.Conn, error) {
@@ -214,16 +233,40 @@ func (l *filterListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !l.allow(remoteIP(c.RemoteAddr())) {
+		ip := remoteIP(c.RemoteAddr())
+		if !l.allow(ip) || !l.take(ip.String()) {
 			c.Close()
 			continue
 		}
-		select {
-		case l.slots <- struct{}{}:
-			return &slotConn{Conn: c, release: func() { <-l.slots }}, nil
-		default:
-			c.Close()
+		key := ip.String()
+		sc := &slotConn{Conn: c, release: func() { l.give(key) }}
+		if l.lim.FirstByte > 0 {
+			sc.early = time.Now().Add(l.lim.FirstByte)
+			_ = c.SetReadDeadline(sc.early)
 		}
+		return sc, nil
+	}
+}
+
+// take reserves a connection slot for key; false over a cap.
+func (l *filterListener) take(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if (l.lim.Total > 0 && l.total >= l.lim.Total) || (l.lim.PerIP > 0 && l.per[key] >= l.lim.PerIP) {
+		return false
+	}
+	l.total++
+	l.per[key]++
+	return true
+}
+
+// give frees key's slot.
+func (l *filterListener) give(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total--
+	if l.per[key]--; l.per[key] <= 0 {
+		delete(l.per, key)
 	}
 }
 
@@ -242,16 +285,60 @@ func remoteIP(a net.Addr) net.IP {
 	return net.ParseIP(host)
 }
 
-// slotConn frees its connection slot once, at the first Close.
+// slotConn frees its connection slot once, at the first Close. Until its
+// first byte arrives, every read deadline is clamped to early (the
+// first-byte deadline); after it, the deadline last asked for applies.
 type slotConn struct {
 	net.Conn
 	once    sync.Once
 	release func()
+
+	mu    sync.Mutex
+	early time.Time // zero once the first byte arrived, or without a first-byte deadline
+	asked time.Time // the read deadline last asked for
 }
 
 func (c *slotConn) Close() error {
 	c.once.Do(c.release)
 	return c.Conn.Close()
+}
+
+func (c *slotConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.mu.Lock()
+		if !c.early.IsZero() {
+			c.early = time.Time{}
+			_ = c.Conn.SetReadDeadline(c.asked)
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *slotConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = t
+	return c.Conn.SetReadDeadline(c.clampLocked(t))
+}
+
+func (c *slotConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = t
+	if err := c.Conn.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return c.Conn.SetReadDeadline(c.clampLocked(t))
+}
+
+// clampLocked is t, or the first-byte deadline while it is earlier.
+func (c *slotConn) clampLocked(t time.Time) time.Time {
+	if c.early.IsZero() || (!t.IsZero() && t.Before(c.early)) {
+		return t
+	}
+	return c.early
 }
 
 // errNoGateway is returned by the per-OS gateway readers.
