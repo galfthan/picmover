@@ -73,7 +73,10 @@ type sharing struct {
 	pairIP    *share.Limiter // POST /api/pair per remote IP
 	pairAll   *share.Limiter // POST /api/pair in total
 	authFail  *share.Lockout // failed authentication per remote IP
-	perDevice *share.Limiter // authenticated requests per device
+	perDevice *share.Limiter // authenticated API requests per device
+	// perDeviceMedia: renditions and originals per device (a grid loads a
+	// month of thumbnails at once over HTTP/2).
+	perDeviceMedia *share.Limiter
 
 	host atomic.Pointer[shareHost] // nil while not listening
 
@@ -104,6 +107,7 @@ func newSharing(s *Server, dir, cmd string) *sharing {
 	sh.pairAll = share.PerMinute(20, sh.clock)
 	sh.authFail = share.NewLockout(30, 5*time.Minute, sh.clock)
 	sh.perDevice = share.NewLimiter(30, 100, sh.clock)
+	sh.perDeviceMedia = share.NewLimiter(200, 500, sh.clock)
 	return sh
 }
 

@@ -87,7 +87,7 @@ func (s *Server) handleSharePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replace := ""
-	if cur, _, ok := s.verifyDevice(r); ok {
+	if cur, _, ok, _ := s.verifyDevice(r); ok {
 		if !body.Replace {
 			var out alreadyPairedJSON
 			out.Error = fmt.Sprintf("This phone is already paired with %q.", cur.Share.Name)

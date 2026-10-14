@@ -185,7 +185,7 @@ func (s *Server) albumOf(ctx context.Context, li listed, id int64) (userdata.Alb
 // {error, paired: false} when not paired, 403 {error, state} when the
 // share is not active.
 func (s *Server) handleShareSession(w http.ResponseWriter, r *http.Request) {
-	req, ok := s.shareDeviceAuth(w, r)
+	req, ok := s.shareDeviceAuth(w, r, false)
 	if !ok {
 		return
 	}

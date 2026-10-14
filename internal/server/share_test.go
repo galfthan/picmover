@@ -866,13 +866,14 @@ func TestShareMiddleware(t *testing.T) {
 	_, port, _ = strings.Cut(host, ":")
 	wantStatus(t, req("GET", "/api/session", "", map[string]string{"Host": "testhost.local:" + port}), http.StatusOK)
 
-	// 30 failed authentications a minute lock the address out.
+	// 30 failed authentications (malformed cookies) a minute lock the
+	// address out of the API; the static files still load.
 	f.resetLimits()
 	for i := 0; i < 31; i++ {
-		f.phone("GET", "/api/libraries", "", "")
+		f.phone("GET", "/api/libraries", "", share.CookieName+"=junk")
 	}
 	wantStatus(t, f.phone("GET", "/api/session", "", c), http.StatusTooManyRequests)
-	wantStatus(t, f.phone("GET", "/", "", ""), http.StatusTooManyRequests)
+	wantStatus(t, f.phone("GET", "/", "", ""), http.StatusOK)
 	// Pairing: 5 a minute per address.
 	f.resetLimits()
 	for i := 0; i < 5; i++ {

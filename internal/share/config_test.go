@@ -266,6 +266,14 @@ func TestDevicesVerifyRevoke(t *testing.T) {
 			t.Errorf("verified %q", c)
 		}
 	}
+	// Only a malformed value or a wrong secret of an existing device is
+	// suspect (R1): an unknown device is what a revoked phone sends.
+	for c, want := range map[string]bool{id + "." + string(bad): true, "x": true, "": true,
+		"d_0000000000000000." + enc: false, val: false} {
+		if _, _, suspect := m.VerifyCookie(c); suspect != want {
+			t.Errorf("VerifyCookie(%q) suspect %v", c, suspect)
+		}
+	}
 	// share.json never holds a secret.
 	b, _ := os.ReadFile(filepath.Join(m.Dir(), ConfigName))
 	if bytes.Contains(b, []byte(enc)) {

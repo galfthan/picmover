@@ -530,17 +530,29 @@ type Verified struct {
 // value, an unknown device or a wrong secret. It reads the in-memory
 // settings (the sharing process's).
 func (m *Manager) Verify(cookie string) (Verified, bool) {
+	v, ok, _ := m.VerifyCookie(cookie)
+	return v, ok
+}
+
+// VerifyCookie is Verify that also tells a suspect failure, which counts
+// against the address's lockout: a malformed value, or the wrong secret
+// for a device that exists. A well-formed cookie of an unknown device (a
+// revoked phone whose page still loads thumbnails) is not suspect.
+func (m *Manager) VerifyCookie(cookie string) (v Verified, ok, suspect bool) {
 	id, secret, ok := parseCookie(cookie)
 	if !ok {
-		return Verified{}, false
+		return Verified{}, false, true
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, d := m.cfg.Device(id)
-	if d == nil || !secretMatches(secret, d.SecretSHA256) {
-		return Verified{}, false
+	if d == nil {
+		return Verified{}, false, false
 	}
-	return Verified{Device: *d, Share: *s.clone()}, true
+	if !secretMatches(secret, d.SecretSHA256) {
+		return Verified{}, false, true
+	}
+	return Verified{Device: *d, Share: *s.clone()}, true, false
 }
 
 // clone deep-copies a share.

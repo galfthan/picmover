@@ -38,7 +38,12 @@ type shareLibHandler func(http.ResponseWriter, *http.Request, *shareReq, *libHan
 // shareRouteTable is every route of the share listener.
 func (s *Server) shareRouteTable() []shareRoute {
 	lib := func(pattern string, h shareLibHandler) shareRoute {
-		return shareRoute{pattern, shareRouteLibrary, s.shareScoped(h)}
+		return shareRoute{pattern, shareRouteLibrary, s.shareScoped(h, false)}
+	}
+	// media routes (renditions and originals) take their own, larger
+	// per-device budget: a grid asks for a month of thumbnails at once.
+	media := func(pattern string, h shareLibHandler) shareRoute {
+		return shareRoute{pattern, shareRouteLibrary, s.shareScoped(h, true)}
 	}
 	// A static route serves one file, or (dir) a file named by the
 	// {file...} wildcard under that folder of the frontend.
@@ -57,10 +62,10 @@ func (s *Server) shareRouteTable() []shareRoute {
 		lib("GET /api/l/{lib}/media", s.handleShareMediaList),
 		lib("GET /api/l/{lib}/facets", s.handleShareFacets),
 		lib("GET /api/l/{lib}/media/{id}", s.handleShareMediaDetail),
-		lib("GET /api/l/{lib}/thumb/{hash}", s.shareRendition(s.handleThumb)),
-		lib("GET /api/l/{lib}/preview/{hash}", s.shareRendition(s.handlePreview)),
-		lib("GET /api/l/{lib}/large/{hash}", s.shareRendition(s.handleLarge)),
-		lib("GET /api/l/{lib}/file/{id}", s.handleShareFile),
+		media("GET /api/l/{lib}/thumb/{hash}", s.shareRendition(s.handleThumb)),
+		media("GET /api/l/{lib}/preview/{hash}", s.shareRendition(s.handlePreview)),
+		media("GET /api/l/{lib}/large/{hash}", s.shareRendition(s.handleLarge)),
+		media("GET /api/l/{lib}/file/{id}", s.handleShareFile),
 		lib("GET /api/l/{lib}/albums", s.handleShareAlbums),
 		lib("POST /api/l/{lib}/ratings", s.handleShareRating),
 		static("GET /{$}", shareAppFile),
@@ -160,7 +165,10 @@ func (sh *sharing) middleware(h http.Handler) http.Handler {
 			fmt.Fprintf(w, "misdirected request: host %q is not served here\n", r.Host)
 			return
 		}
-		if sh.authFail.Locked(remoteHost(r)) {
+		// The lockout covers the API, except POST /api/pair (it has its own
+		// limits): the static files load even for a locked-out address, so
+		// a phone that tripped it still gets the page that explains.
+		if lockable(r) && sh.authFail.Locked(remoteHost(r)) {
 			sh.reject(w, r, http.StatusTooManyRequests, "too many failed requests; try again in a few minutes")
 			return
 		}
@@ -184,6 +192,12 @@ func (sh *sharing) middleware(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// lockable reports whether a request is subject to the auth-failure
+// lockout: every /api/ path but /api/pair.
+func lockable(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/pair"
 }
 
 // reject answers a refused request (JSON under /api/, text elsewhere),
@@ -255,35 +269,45 @@ func (s *Server) baseState(sh *share.Share, now time.Time) string {
 }
 
 // verifyDevice resolves the device cookie of r: the device and its share,
-// or false (no, malformed, unknown or revoked cookie).
-func (s *Server) verifyDevice(r *http.Request) (share.Verified, string, bool) {
+// or false (no, malformed, unknown or revoked cookie). suspect is set for
+// a malformed cookie or a wrong secret of an existing device: only those
+// count against the address's lockout (no cookie, or the cookie of a
+// revoked phone, is what an unpaired or removed phone sends).
+func (s *Server) verifyDevice(r *http.Request) (v share.Verified, cookie string, ok, suspect bool) {
 	m := s.share.mgr
 	if m == nil {
-		return share.Verified{}, "", false
+		return share.Verified{}, "", false, false
 	}
 	c, err := r.Cookie(share.CookieName)
 	if err != nil {
-		return share.Verified{}, "", false
+		return share.Verified{}, "", false, false
 	}
-	v, ok := m.Verify(c.Value)
-	return v, c.Value, ok
+	v, ok, suspect = m.VerifyCookie(c.Value)
+	return v, c.Value, ok, suspect
 }
 
 // shareDeviceAuth authenticates a phone request (step 1 of "Per-request
-// authorization"): 401 {error, paired: false} without a valid device
-// (counted against the remote IP's lockout), 429 for a runaway device,
-// 403 {error, state} when its share is not active. It records the
-// device's activity and renews its cookie when due.
-func (s *Server) shareDeviceAuth(w http.ResponseWriter, r *http.Request) (*shareReq, bool) {
+// authorization"): 401 {error, paired: false} without a valid device (a
+// malformed cookie or a wrong secret counts against the remote IP's
+// lockout), 429 for a runaway device (media routes have their own,
+// larger budget), 403 {error, state} when its share is not active. It
+// records the device's activity and renews its cookie when due.
+func (s *Server) shareDeviceAuth(w http.ResponseWriter, r *http.Request, media bool) (*shareReq, bool) {
 	sh := s.share
 	ip := remoteHost(r)
-	v, cookie, ok := s.verifyDevice(r)
+	v, cookie, ok, suspect := s.verifyDevice(r)
 	if !ok {
-		sh.authFail.Fail(ip)
+		if suspect {
+			sh.authFail.Fail(ip)
+		}
 		writeJSON(w, http.StatusUnauthorized, notPairedJSON{Error: errNotPaired})
 		return nil, false
 	}
-	if !sh.perDevice.Allow(v.Device.ID) {
+	limit := sh.perDevice
+	if media {
+		limit = sh.perDeviceMedia
+	}
+	if !limit.Allow(v.Device.ID) {
 		writeError(w, http.StatusTooManyRequests, "too many requests")
 		return nil, false
 	}
@@ -308,8 +332,14 @@ func (s *Server) shareDeviceAuth(w http.ResponseWriter, r *http.Request) (*share
 
 // shareDevice wraps a route that needs a device of an active share.
 func (s *Server) shareDevice(h func(http.ResponseWriter, *http.Request, *shareReq)) http.HandlerFunc {
+	return s.shareDeviceBudget(h, false)
+}
+
+// shareDeviceBudget is shareDevice with the media routes' budget when
+// media is set.
+func (s *Server) shareDeviceBudget(h func(http.ResponseWriter, *http.Request, *shareReq), media bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		req, ok := s.shareDeviceAuth(w, r)
+		req, ok := s.shareDeviceAuth(w, r, media)
 		if !ok {
 			return
 		}
@@ -319,9 +349,10 @@ func (s *Server) shareDevice(h func(http.ResponseWriter, *http.Request, *shareRe
 
 // shareScoped wraps a library route: device → share (shareDeviceAuth),
 // the {lib} key through the scope, the library acquired (opened on
-// demand) and bound to the scope's stable keys.
-func (s *Server) shareScoped(h shareLibHandler) http.HandlerFunc {
-	return s.shareDevice(func(w http.ResponseWriter, r *http.Request, req *shareReq) {
+// demand) and bound to the scope's stable keys. media selects the media
+// routes' per-device budget.
+func (s *Server) shareScoped(h shareLibHandler, media bool) http.HandlerFunc {
+	return s.shareDeviceBudget(func(w http.ResponseWriter, r *http.Request, req *shareReq) {
 		ref, ok := req.auth.library(r.PathValue("lib"))
 		if !ok {
 			shareNotFound(w)
@@ -333,7 +364,7 @@ func (s *Server) shareScoped(h shareLibHandler) http.HandlerFunc {
 		}
 		defer l.entry.release()
 		h(w, r, req, l)
-	})
+	}, media)
 }
 
 // errShareUnavailable is the 503 message of a library a phone cannot use
