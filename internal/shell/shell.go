@@ -254,6 +254,9 @@ func (a *app) main(ctx context.Context) error {
 			Logger:    a.log,
 			App:       a.hooks(),
 			ShareCmd:  "picmover-app",
+			// <config>/picmover/share: share.DefaultDir for the real
+			// config dir, and the test's own one in tests.
+			ShareDir: filepath.Join(a.configDir, "share"),
 		})
 	}
 	run, err := start(workspace)
