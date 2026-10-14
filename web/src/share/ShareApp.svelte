@@ -29,6 +29,26 @@
     void shareSession.load();
   });
 
+  // Capabilities changed on the computer (turned on as well as off) take
+  // effect without a reload: the session is read again when the page comes
+  // back into view, and every few minutes while it is in view.
+  const SESSION_EVERY = 3 * 60_000;
+  $effect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    };
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    }, SESSION_EVERY);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  });
+  /** Something was refused (403 without a state, a failed image or video): the capabilities may have changed. */
+  const recheck = () => shareSession.refresh(5_000);
+
   const share = $derived(shareSession.share);
   const caps = $derived(shareSession.caps);
   const resolved = $derived(resolveRoute(route.current, shareSession.status === 'ready' ? share : null));
@@ -251,7 +271,7 @@
           {filtered}
           emptyText="Nothing here yet"
           onclearfilters={clearFilters}
-          onforbidden={() => shareSession.load(true)}
+          onforbidden={recheck}
         />
       {:else if client && page.kind === 'grid'}
         {#key page.lib}
@@ -266,7 +286,7 @@
             albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
             emptyText="No photos yet"
             onclearfilters={clearFilters}
-            onforbidden={() => shareSession.load(true)}
+            onforbidden={recheck}
           />
         {/key}
       {:else if client && page.kind === 'album'}
@@ -282,7 +302,7 @@
             albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
             emptyText="This album is empty"
             onclearfilters={clearFilters}
-            onforbidden={() => shareSession.load(true)}
+            onforbidden={recheck}
           />
         {/key}
       {/if}

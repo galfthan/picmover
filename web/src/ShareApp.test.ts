@@ -315,6 +315,42 @@ describe('phone app', () => {
       expect(thumbChecks()).toBe(2);
     });
 
+    it('back on the page, reads the timeline once and refetches the months only when it changed', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      const media = () => server.requests('/api/l/peter/media?').length;
+      const timelines = () => server.requests('/api/l/peter/timeline').length;
+      const [m0, t0] = [media(), timelines()];
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+      await settle();
+      expect(timelines()).toBe(t0 + 1);
+      expect(media()).toBe(m0);
+      expect(tiles()).toHaveLength(8);
+      // A photo went meanwhile: the months are read again.
+      server.items.splice(1, 1);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await settle();
+      expect(media()).toBeGreaterThan(m0);
+      expect(tiles()).toHaveLength(7);
+    });
+
+    it('closing a lightbox opened from a link scrolls the grid to the photo it showed', async () => {
+      setup('libraries');
+      for (let i = 0; i < 90; i++) {
+        const id = 100 + i;
+        server.items.push({ id, hash: id.toString(16).padStart(16, '0'), type: 'image', takenAt: `2023-03-${String(1 + (i % 28)).padStart(2, '0')}T10:00:00`, w: 400, h: 300, thumb: 'ok', lib: 'peter' });
+      }
+      await start('#/l/peter/view/150');
+      const scroller = document.querySelector<HTMLElement>('.share-grid .scroller')!;
+      expect(scroller.scrollTop).toBe(0);
+      click(button('Close')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/');
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+      expect(document.querySelector('a.tile[href="#/l/peter/view/150"]')).not.toBeNull();
+    });
+
     it('lists the albums and opens one', async () => {
       setup('libraries');
       await start('#/l/peter/albums');
@@ -521,6 +557,101 @@ describe('phone app', () => {
       await settle();
       expect(location.hash).toBe('#/?gps=1');
       expect(tiles()).toHaveLength(1);
+    });
+  });
+
+  describe('capabilities changed on the computer', () => {
+    const visible = () => {
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+    const badges = () => document.querySelectorAll('a.tile .rating').length;
+
+    it('drops the stars from tiles and lightbox when ratings are turned off, without a reload', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      expect(badges()).toBe(1);
+      server.caps.rate = false;
+      visible();
+      await settle();
+      expect(badges()).toBe(0);
+      expect(document.querySelector('.topbar .filterbtn')).not.toBeNull();
+      click(tiles()[0]!);
+      await settle();
+      expect(lightbox()!.querySelector('[aria-label="Rating"]')).toBeNull();
+    });
+
+    it('shows what was turned on while the page is open', async () => {
+      setup('album');
+      await start('#/view/1');
+      expect(lightbox()!.querySelector('[aria-label="Rating"]')).toBeNull();
+      expect(badges()).toBe(0);
+      server.caps.rate = true;
+      server.caps.download = true;
+      await vi.advanceTimersByTimeAsync(3 * 60_000);
+      await settle();
+      expect(lightbox()!.querySelectorAll('[aria-label="Rating"] button')).toHaveLength(5);
+      expect([...lightbox()!.querySelectorAll('a')].some((a) => a.textContent?.trim() === 'Download')).toBe(true);
+      expect(badges()).toBe(1);
+    });
+
+    it('a session read in the background that fails keeps the page; a refusal replaces it', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      vi.mocked(fetch).mockImplementationOnce(() => Promise.reject(new TypeError('Failed to fetch')));
+      visible();
+      await settle();
+      expect(tiles()).toHaveLength(8);
+      expect(text()).not.toContain('Cannot reach the computer');
+      server.share.state = 'paused';
+      visible();
+      await settle();
+      expect(text()).toContain('This share is paused');
+    });
+
+    it('says videos are no longer allowed when they were turned off during playback', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/3');
+      server.caps.video = false;
+      const sessions = server.requests('/api/session').length;
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(text()).not.toContain('cannot be played in this browser');
+      expect(server.requests('/api/session').length).toBe(sessions + 1);
+      expect(lightbox()!.querySelector('video')).toBeNull();
+      expect(lightbox()!.textContent).toContain('Video not available in this share');
+    });
+
+    it('says when the computer cannot be reached or is busy, rather than blaming the browser', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/3');
+      server.mediaFail.times = 1;
+      server.mediaFail.status = 503;
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.banner')?.textContent).toContain('The computer is busy. Try again in a moment.');
+      click(button('Try again')!);
+      await settle();
+      expect(lightbox()!.querySelector('video')?.getAttribute('src')).toBe('/api/l/peter/file/3');
+      vi.mocked(fetch).mockImplementationOnce(() => Promise.reject(new TypeError('Failed to fetch')));
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.banner')?.textContent).toContain('Cannot reach the computer');
+    });
+
+    it('falls back from an original that is no longer allowed', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/1');
+      lightbox()!.querySelector('.stage')!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      await settle();
+      const img = lightbox()!.querySelector<HTMLImageElement>('.full img')!;
+      expect(img.getAttribute('src')).toBe('/api/l/peter/file/1');
+      server.caps.download = false;
+      img.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.note')?.textContent).toBe('Originals are no longer allowed in this share.');
+      expect(lightbox()!.querySelector('.full img')?.getAttribute('src') ?? lightbox()!.querySelector('img.preview')?.getAttribute('src')).toContain('/preview/');
+      expect([...lightbox()!.querySelectorAll('a')].some((a) => a.textContent?.trim() === 'Download')).toBe(false);
     });
   });
 

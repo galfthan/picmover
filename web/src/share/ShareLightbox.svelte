@@ -20,11 +20,18 @@
   // Android and Sailfish), and without `touch-action` on Gecko 91 the
   // listeners are non-passive and cancel the browser's panning themselves.
   // Two fingers are left to the browser (pinch zoom).
+  //
+  // A video or original that fails to load is asked what it answers
+  // (shareapi checkUrl): a 403 means the capability was turned off on the
+  // computer (the session is read again and the control goes away), no
+  // answer means the computer cannot be reached; only a URL that loads
+  // fine is "cannot be played in this browser". The lightbox follows the
+  // client it is given, which changes with the capabilities.
   import { untrack } from 'svelte';
   import { formatBytes, formatCoord, formatDuration, formatTakenAt } from '../lib/format';
   import RatingStars from '../components/RatingStars.svelte';
   import { classify, dragAxis, startsAwayFromEdges, DOUBLE_TAP_MS, type Point } from './gestures';
-  import { errorText, isAbort, ShareError, type ShareClient, type ShareDetail } from './shareapi';
+  import { errorText, isAbort, ShareError, UNREACHABLE, type ShareClient, type ShareDetail, type UrlCheck } from './shareapi';
 
   interface Props {
     client: ShareClient;
@@ -55,6 +62,10 @@
   let previewLoaded = $state(false);
   let previewFailed = $state(false);
   let videoFailed = $state(false);
+  /** Why the video or the original did not load ("" while asking, or when it loads fine but cannot be played). */
+  let mediaNote = $state('');
+  let videoTry = $state(0);
+  let fullFailed = $state(false);
   let full = $state(false);
   let chrome = $state(true);
   let info = $state(false);
@@ -77,6 +88,8 @@
       previewLoaded = false;
       previewFailed = false;
       videoFailed = false;
+      fullFailed = false;
+      mediaNote = '';
       loadError = '';
       nb = { prev: null, next: null };
     });
@@ -143,6 +156,52 @@
     } finally {
       rating = false;
     }
+  }
+
+  // ---- A video or an original that did not load ----
+
+  /** What to say about a media URL's answer; "" when it loads fine (the browser could not use it). */
+  function problem(r: UrlCheck, what: 'video' | 'original'): string {
+    if (r.status === 0) return UNREACHABLE;
+    if (r.status === 404) return goneText;
+    if (r.status === 403 && !r.state) return what === 'video' ? 'Videos are no longer allowed in this share.' : 'Originals are no longer allowed in this share.';
+    if (r.status === 401 || r.status === 403) return ''; // the shell shows "removed" or "paused"
+    if (r.status === 429 || r.status >= 500) return 'The computer is busy. Try again in a moment.';
+    if (r.status >= 400) return `The computer answered ${r.status}.`;
+    return '';
+  }
+
+  async function failed(url: string, what: 'video' | 'original') {
+    const cur = id;
+    let r: UrlCheck;
+    try {
+      r = await client.check(url);
+    } catch {
+      return;
+    }
+    if (cur !== id) return;
+    mediaNote = problem(r, what);
+    if (r.status === 403 && !r.state) onforbidden?.();
+    if (r.status === 404) ongone?.(cur);
+  }
+
+  function onVideoError() {
+    if (!d) return;
+    videoFailed = true;
+    mediaNote = '';
+    void failed(client.fileUrl(d.id), 'video');
+  }
+  function retryVideo() {
+    videoFailed = false;
+    mediaNote = '';
+    videoTry++;
+  }
+  function onFullError() {
+    if (!d || fullFailed) return;
+    fullFailed = true;
+    void failed(client.fileUrl(d.id), 'original').then(() => {
+      if (mediaNote) note = mediaNote;
+    });
   }
 
   // ---- Zoom and bars ----
@@ -326,11 +385,13 @@
       {#key item.id}
         <div class="media" class:video={playable && !!d && !videoFailed} style:transform={dragStyle} style:opacity={dragY ? Math.max(0.3, 1 - dragY / 400) : null}>
           {#if playable && d && !videoFailed}
-            <!-- svelte-ignore a11y_media_has_caption -->
-            <video controls playsinline preload="metadata" src={client.fileUrl(d.id)} poster={client.previewUrl(d)} onerror={() => (videoFailed = true)}></video>
+            {#key videoTry}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video controls playsinline preload="metadata" src={client.fileUrl(d.id)} poster={client.previewUrl(d)} onerror={onVideoError}></video>
+            {/key}
           {:else if full && d}
             <div class="full">
-              <img src={d.displayable ? client.fileUrl(d.id) : client.previewUrl(d)} alt="" />
+              <img src={d.displayable && caps.download && !fullFailed ? client.fileUrl(d.id) : client.previewUrl(d)} alt="" onerror={onFullError} />
             </div>
           {:else}
             {#if thumbRequestable && !previewLoaded}
@@ -354,8 +415,13 @@
           <div class="banner">Video not available in this share</div>
         {:else if videoFailed && d}
           <div class="banner" role="alert">
-            <span>This video cannot be played in this browser.</span>
-            {#if caps.download}<a class="btn" href={client.fileUrl(d.id, true)} download>Download</a>{/if}
+            {#if mediaNote}
+              <span>{mediaNote}</span>
+              {#if mediaNote !== goneText}<button class="ghost" onclick={retryVideo}>Try again</button>{/if}
+            {:else}
+              <span>This video cannot be played in this browser.</span>
+              {#if caps.download}<a class="btn" href={client.fileUrl(d.id, true)} download>Download</a>{/if}
+            {/if}
           </div>
         {/if}
       {/key}
