@@ -1210,9 +1210,20 @@ Error screens:
       GPS as text with `location`).
   - Video (`video`) uses `<video controls playsinline preload="metadata">`
     with the preview as poster, and Download beside it when allowed.
+    The video sits between the top and bottom bars, never under them,
+    so the player's own controls (seek bar, time) stay reachable and a
+    tap on them cannot land on a star; a tap on the video is the
+    player's and does not toggle the bars.
     Without `video`, video tiles show the preview with a "Video not
     available in this share" note. Without `video` and `download`, a
     video can still be seen as its poster.
+  - A video or original that fails to load is asked what it answers
+    (one byte, a Range request): 403 says the capability was turned off
+    ("Videos are no longer allowed in this share") and re-reads the
+    session, no answer is "Cannot reach the computer", 429/5xx "The
+    computer is busy" with Try again; only a URL that loads fine is "This
+    video cannot be played in this browser". A failed original falls
+    back to the preview.
 - **Hidden** (absent from the share bundle, not merely hidden): Import,
   Imports, Library stats, Map, Trash, Similar, Backups, Libraries
   management, workspace setup, the selection bar, tag editing, the album editor,
@@ -1224,6 +1235,12 @@ Error screens:
     share, "no longer in this album").
   - A 403 (the capability was turned off meanwhile) re-reads the session
     and hides the stars.
+- **Capabilities changed on the computer** take effect without a reload:
+  the session is read again when the page comes back into view, every
+  3 minutes while it is shown, and after any refusal; the grid reloads
+  its items (keeping the scroll) and the lightbox its detail when the
+  capabilities differ. Only a refusal (401, 403 `{state}`) replaces the
+  page; a background read that fails keeps it.
 
 ### Filters on the phone
 
@@ -1370,9 +1387,11 @@ are enough to find things in it. So an album share has no tag section,
   (no longer live rows); the grid drops them at its next timeline load.
 - **Trash from the admin UI:** a trashed photo is 404 for every share
   route (the live-row check), so a phone that still shows its tile gets
-  a broken image. The share grid reloads the timeline when the tab
-  becomes visible again (`visibilitychange`), and on any 404 from the
-  lightbox.
+  a broken image. The share grid reads the timeline again when the tab
+  becomes visible again (`visibilitychange`) and refetches the months
+  only when it changed, and reloads on any 404 from the lightbox. A
+  thumbnail that fails is retried with a bounded backoff (below, "Review
+  fixes").
 - **Ratings in both directions:**
   - A phone rating is a normal `SetRating`. An admin grid that is open
     shows the old value until it reloads its bucket. This version adds
@@ -2167,13 +2186,21 @@ in an album share.
 With approval on, the request blocks up to 60 s.
 
 Client: the token is taken out of the address bar before anything else;
-the code is sent upper-case without dashes ("K7QM3XRD"). A 409 with
-`current` asks "Pair it with this share instead?" and resends with
-`replace: true`; a 409 without it, a 410 (with or without `state`) and
-any other `{error}` show the server's message, and the token form falls
-back to the code after a 410 or 403. 403 is "The computer did not
-approve this phone", 429 "Too many tries". A request still open after
-1.5 s shows "Waiting for the computer…".
+the code is sent upper-case without dashes ("K7QM3XRD"). While typed,
+the code field says at once when a character cannot be in a code
+("Codes don't use 0, 1, I, L or O"; both halves of each look-alike pair
+are outside the alphabet, so nothing can be mapped) and is set up for
+codes (autocapitalize characters, autocorrect and spell check off). A
+409 with `current` asks "Pair it with this share instead?" and resends
+with `replace: true`; when `current.sameShare` is true (requested of the
+backend in the review) it says "This phone is already paired with this
+share" with Continue instead. A 409 without `current`, a 410 (with or
+without `state`) and any other `{error}` show the server's message, and
+the token form falls back to the code after a 410 or 403; a 410 with
+`state: "off"` (sharing turned off while the computer was asked) says
+"Sharing was turned off on the computer" with Start over. 403 is "The
+computer did not approve this phone", 429 "Too many tries". A request
+still open after 1.5 s shows "Waiting for the computer…".
 
 `GET /api/libraries` (library share; **404** in an album share):
 `{"libraries": [shareLib]}` as in the session. Client: never requested
@@ -2336,6 +2363,13 @@ pairing dialog is open):
 - `mdns` is the setting (an addition to the design).
 - `addresses[].virtual` (docker, VPN) is absent when false; the address
   menu marks those entries "virtual".
+- `addresses[].wireless` (an addition from the review, backend in
+  progress): true for a Wi-Fi interface, false for wired; absent when
+  unknown. The client parses it leniently (only a boolean counts) and
+  labels entries "Wi-Fi" or "wired"; while a wired address is chosen
+  and a non-virtual Wi-Fi one exists, it suggests that one with a
+  button (it never switches a saved choice by itself). The page always
+  says "Phones must be on the same network as this address."
 - `firewallHint` is **one plain-text string** (lines separated by
   `\n`): the ufw and firewalld commands for the subnet and port on Linux,
   one paragraph on Windows and macOS. Shown wrapped in a `<pre>`.
@@ -2353,7 +2387,11 @@ it every 10 s while sharing is on or paused and every 30 s while it is
 off, and right after any change made through the admin UI; it shows
 "Sharing · N shares · M phones" (with "52 min left" under an auto-off
 timer), amber "Sharing paused: <reason>", red "Sharing failed", or a
-plain "Share" link.
+plain "Share" link. In a narrow top bar the pill shortens by whole
+parts, never mid-word: the timer goes first, then the share count
+("Sharing · 4 phones"), then the word ("Sharing · 4"), down to
+"Sharing"; the tooltip has all of it. It asks for the width of its
+longest text and shows the longest variant that fits the width it gets.
 
 `adminShare`:
 
@@ -2548,6 +2586,103 @@ Mismatches found between the two branches and how they were settled:
 
 No backend change was needed: every mismatch was on the client side or
 in the fakes.
+
+### Review fixes (web)
+
+An adversarial review of the phone and admin UI (headless Chromium at
+390×844 with touch, and the Sailfish Browser's Gecko 91) found these;
+all are fixed on the client, with tests:
+
+- **Video under the bars (W1).** The `<video>` filled the stage and the
+  bottom bar covered the player's controls: seek and time could not be
+  reached, and tapping pause could hit a star. The video is now inset by
+  the bars' height plus the safe areas (`--bar-h`, `.media.video`), so
+  the native controls sit above the bottom bar in portrait and
+  landscape; the touch guard for the controls' strip at the video's
+  bottom now does its job. Tests: `share/layout.test.ts` (the rules),
+  `ShareApp.test.ts` (the wrapper, a tap on the video keeps the bars);
+  end to end below.
+- **Sideways overscroll (W2).** Only `overscroll-behavior-y` was off, so
+  a horizontal drag on a bar became the browser's back gesture.
+  `overscroll-behavior: none` on `html, body`. Test:
+  `share/layout.test.ts`.
+- **Pill cut mid-word (W3).** See the pill above (`pillVariants`,
+  `fittingVariant` in `lib/sharetext.ts`). Tests: `sharetext.test.ts`,
+  `Share.test.ts` with stubbed widths.
+- **No Wi-Fi hint for the address (W4).** See `addresses[].wireless`
+  above. Tests: `sharetext.test.ts` (parser, labels, suggestion),
+  `Share.test.ts` (labels, suggestion only, button, an older server).
+- **Capabilities half applied (W5).** Tiles kept ★ after `rate` was
+  turned off (the grid keyed on the library only); capabilities turned
+  on were not seen until a reload; a revoked video said "cannot be
+  played in this browser"; a revoked original left a blank 1:1 view.
+  See "Capabilities changed on the computer" and the media checks
+  above. `shareSession.refresh()` is the background read (unchanged
+  sessions keep their object). Tests: `ShareApp.test.ts` "capabilities
+  changed on the computer".
+- **Pairing (W6, W9).** See the pairing client above. Tests:
+  `routes.test.ts` (`codeProblem`), `ShareApp.test.ts` (hint and
+  attributes, already paired with this share, sharing turned off during
+  approval).
+- **Smaller (W7).** Closing a lightbox, however it was opened (a link, a
+  reload), scrolls the grid to the photo it showed. Back on the page the
+  grid reads the timeline once and refetches the months only if it
+  changed (it used to clear every bucket and reload every thumbnail).
+  "Cannot reach the computer" is shown only when `fetch` itself failed
+  (`NetworkError`), not for any `TypeError`. The scrubber's position
+  marker is a short bar at the edge beside the year labels (it crossed
+  the first year at the top); the gutter is 30 px. The ⋮ menu is a plain
+  disclosure (`aria-controls`, `aria-expanded`, Escape closes) instead
+  of `role="menu"` around text. Tab cycles inside the lightbox, since
+  Gecko 91 has no `inert`. Tests: `ShareApp.test.ts`,
+  `shareapi.test.ts`, `layout.test.ts`.
+- **Grey tiles after a 429 (W8).** `Tile` takes an optional
+  `retryDelay` from its client (the admin `LibApi` has none, so the
+  admin grid is unchanged: `Grid.test.ts` checks that). The share client
+  checks a failed thumbnail's URL (one byte) and answers when to load it
+  again: after `Retry-After` (seconds or a date, capped at a minute) or
+  a 1-2-4-8 s backoff with jitter on 429, 408, 5xx and no answer; at
+  once when it loads now; never on 404 or a refusal; at most 4 times.
+  All tiles share one check at a time and one cool-down, so a burst of
+  failures does not add to the rate limit; a 401 or 403 `{state}` met
+  by a check goes to the refusal handler. Tests: `shareapi.test.ts`
+  (`retrier`, `retryAfterMs`, `checkUrl`), `ShareApp.test.ts` (429 with
+  Retry-After, 404).
+- Also: the library title in a share kept no space before its dot
+  ("My phone· peter"); it reads "My phone · peter".
+
+Backend dependencies left open (the client already handles both cases):
+
+- `addresses[].wireless` on `GET /api/share` (in progress); without it
+  nothing is labelled or suggested.
+- `current.sameShare: true` on the pairing 409 when the cookie's device
+  already belongs to the pairing's share. The 409 body has only the
+  current share's name, and the phone cannot know the pairing's share
+  before redeeming, so without the flag it still asks to replace the
+  share with itself.
+- 410 `{error, state: "off"}` for a redeem cut short by turning sharing
+  off (in progress); until then it is a 403 "did not approve".
+- `Retry-After` on 429 answers: honoured when present; without it the
+  backoff applies.
+
+End to end after the fixes (2026-10-15, Chromium 153 headless over the
+DevTools protocol, 390×844 with touch and an Android user agent; a
+scratch binary from this branch with an isolated HOME and config, admin
+on 127.0.0.1:18539, share port 18543, a copy of the review's scratch
+workspace): the code form showed the misread hint; the phone paired by
+QR URL; on the 3 s video the video ran from y=52 to 792 with the bars at
+0–52 and 792–844, `elementFromPoint` 12 and 30 px above the video's
+bottom (the seek bar and the control row) returned the `VIDEO`, a tap on
+the seek bar seeked (currentTime 2.4 s) without touching the stars or
+the bars, and in landscape (844×390) the video ended at the bottom
+bar's top; html and body computed `overscroll-behavior` none/none and a
+sideways drag across the top bar left the URL and history alone; the
+scrubber's marker overlapped no year label; closing the lightbox showed
+the video's tile in view; no console errors. On the admin page the pill
+read "Sharing · 1 phone" at 1366, 1024 and 900 px (a crowded top bar)
+and "Sharing · 1" at 700 px, never cut; the Share page showed the
+same-network sentence (that server sends no `wireless` yet, so the
+options carry no Wi-Fi/wired label).
 
 ### Not done
 
