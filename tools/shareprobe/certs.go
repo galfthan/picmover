@@ -14,38 +14,32 @@ package main
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
+
+	"picmover/internal/share"
 )
 
+// The certificate code is the product's (internal/share); the probe only
+// adds its outside leaf and keeps its own file names.
 const (
-	caValidity   = 10 * 365 * 24 * time.Hour
-	leafValidity = 397 * 24 * time.Hour
-	// renewBefore reissues a leaf this long before it expires.
-	renewBefore = 30 * 24 * time.Hour
+	caValidity   = share.CAValidity
+	leafValidity = share.LeafValidity
+	renewBefore  = share.RenewBefore
 	// outsideName is the public name in the constraint-test leaf.
 	outsideName = "constraint-test.example.com"
 )
 
 // permittedIPRanges are the CA's permitted IP subtrees.
-var permittedIPRanges = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"}
-
-// permittedDNS are the CA's permitted DNS subtrees.
-var permittedDNS = []string{"local", "home.arpa"}
+var permittedIPRanges = share.PermittedIPRanges
 
 // certSet is what the probe serves.
 type certSet struct {
@@ -56,14 +50,7 @@ type certSet struct {
 }
 
 // fingerprint is the SHA-256 of a DER certificate as AB:CD:… .
-func fingerprint(der []byte) string {
-	sum := sha256.Sum256(der)
-	parts := make([]string, len(sum))
-	for i, b := range sum {
-		parts[i] = fmt.Sprintf("%02X", b)
-	}
-	return strings.Join(parts, ":")
-}
+func fingerprint(der []byte) string { return share.Fingerprint(der) }
 
 // leafNames are the SANs of the normal leaf.
 func leafNames(ip net.IP, hostname string) ([]net.IP, []string) {
@@ -80,121 +67,26 @@ func leafNames(ip net.IP, hostname string) ([]net.IP, []string) {
 
 // localName is "<hostname>.local" when the hostname is a valid DNS label,
 // else "".
-func localName(hostname string) string {
-	h := strings.ToLower(strings.TrimSuffix(hostname, ".local"))
-	if i := strings.IndexByte(h, '.'); i >= 0 {
-		h = h[:i]
-	}
-	if h == "" || len(h) > 63 || h[0] == '-' || h[len(h)-1] == '-' {
-		return ""
-	}
-	for _, c := range h {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
-			return ""
-		}
-	}
-	return h + ".local"
-}
-
-func serial() *big.Int {
-	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
-	if err != nil {
-		panic(err)
-	}
-	return n.Add(n, big.NewInt(1))
-}
+func localName(hostname string) string { return share.LocalName(hostname) }
 
 // newCA makes the name-constrained local CA.
 func newCA(hostname string, now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-	var ranges []*net.IPNet
-	for _, s := range permittedIPRanges {
-		_, n, err := net.ParseCIDR(s)
-		if err != nil {
-			return nil, nil, err
-		}
-		n.IP = n.IP.To4()
-		ranges = append(ranges, n)
-	}
 	name := "picmover shareprobe CA"
 	if hostname != "" {
 		name += " (" + hostname + ")"
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber:                serial(),
-		Subject:                     pkix.Name{CommonName: name, Organization: []string{"picmover (local, test)"}},
-		NotBefore:                   now.Add(-time.Hour),
-		NotAfter:                    now.Add(caValidity),
-		IsCA:                        true,
-		BasicConstraintsValid:       true,
-		MaxPathLen:                  0,
-		MaxPathLenZero:              true,
-		KeyUsage:                    x509.KeyUsageCertSign,
-		PermittedDNSDomainsCritical: true,
-		PermittedDNSDomains:         permittedDNS,
-		PermittedIPRanges:           ranges,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	cert, err := x509.ParseCertificate(der)
-	return cert, key, err
+	return share.NewCA(name, now)
 }
 
 // newLeaf makes a server certificate signed by the CA.
 func newLeaf(ca *x509.Certificate, caKey *ecdsa.PrivateKey, ips []net.IP, dns []string, now time.Time) (tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	cn := ""
-	if len(dns) > 0 {
-		cn = dns[0]
-	} else if len(ips) > 0 {
-		cn = ips[0].String()
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial(),
-		Subject:               pkix.Name{CommonName: cn},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(leafValidity),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IPAddresses:           ips,
-		DNSNames:              dns,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, nil
+	return share.NewLeaf(ca, caKey, ips, dns, now)
 }
 
-// leafFits reports whether a stored leaf still covers the wanted names and
-// is not near expiry.
+// leafFits reports whether a stored leaf names exactly the wanted names
+// and is not near expiry.
 func leafFits(c tls.Certificate, ca *x509.Certificate, ips []net.IP, dns []string, now time.Time) bool {
-	l := c.Leaf
-	if l == nil || now.Add(renewBefore).After(l.NotAfter) || l.CheckSignatureFrom(ca) != nil {
-		return false
-	}
-	if len(l.IPAddresses) != len(ips) || !slices.Equal(l.DNSNames, dns) {
-		return false
-	}
-	for i := range ips {
-		if !l.IPAddresses[i].Equal(ips[i]) {
-			return false
-		}
-	}
-	return true
+	return share.LeafFits(c, ca, ips, dns, now) && len(c.Leaf.IPAddresses) == len(ips)
 }
 
 // loadOrCreateCerts reads the CA and leaves from dir, creating or
@@ -258,54 +150,19 @@ func loadOrCreateCerts(dir string, ip net.IP, hostname string, now time.Time) (*
 	return cs, notes, nil
 }
 
-// readPair loads a PEM certificate and key; the returned certificate has
-// Leaf set.
+// readPair loads a PEM certificate and key (Leaf set); a key readable by
+// others is refused.
 func readPair(certPath, keyPath string) (tls.Certificate, error) {
-	if fi, err := os.Stat(keyPath); err == nil && fi.Mode().Perm()&0o077 != 0 && os.PathSeparator == '/' {
-		return tls.Certificate{}, fmt.Errorf("%s is readable by other users; fix with chmod 600 or delete the probe directory", keyPath)
-	}
-	c, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	if c.Leaf == nil {
-		if c.Leaf, err = x509.ParseCertificate(c.Certificate[0]); err != nil {
-			return tls.Certificate{}, err
-		}
-	}
-	return c, nil
+	return share.ReadPair(certPath, keyPath)
 }
 
 // writePair writes the certificate (0644) and key (0600) atomically.
 func writePair(certPath, keyPath string, der []byte, key *ecdsa.PrivateKey) error {
-	kder, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return err
-	}
-	if err := writeAtomic(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kder}), 0o600); err != nil {
-		return err
-	}
-	return writeAtomic(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644)
+	return share.WritePair(certPath, keyPath, der, key)
 }
 
 func writeAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil && os.PathSeparator == '/' {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return share.WriteFileAtomic(path, data, mode)
 }
 
 // caPEM is the CA certificate as PEM (for /ca.pem).
