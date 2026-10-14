@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shareClient, shareFilterParams, toAlbums, toCapabilities, toDetail, toItem, toSession, toShareInfo } from './shareapi';
+import { shareClient, shareFilterParams, toAlbums, toCapabilities, toDetail, toFacets, toItem, toSession, toShareInfo } from './shareapi';
 
 const none = { video: false, download: false, rate: false, location: false };
 const every = { video: true, download: true, rate: true, location: true };
@@ -69,5 +69,44 @@ describe('share client parsing', () => {
     expect(c.previewUrl({ hash: '0000000000000001' })).toBe('/api/l/album/preview/0000000000000001');
     expect(c.fileUrl(3, true)).toBe('/api/l/album/file/3?download=1');
     expect(shareFilterParams({ type: 'image', from: '2020-01-01', rating: 2, album: 3 }, { year: 2024, month: 7 }).toString()).toBe('type=image&from=2020-01-01&rating=2&album=3&year=2024&month=7');
+    expect(
+      shareFilterParams({ to: '2021-01-01', recur: '06-19..06-26', months: [1, 7], camera: 'Z 6', gps: true, tags: [3, 4], minPx: 10, maxPx: 20 }).toString(),
+    ).toBe('to=2021-01-01&recur=06-19..06-26&months=1%2C7&camera=Z+6&gps=1&tag=3&tag=4&minpx=10&maxpx=20');
+    expect(c.thumbUrl({ hash: '0000000000000001' })).toBe('/api/l/album/thumb/0000000000000001');
+  });
+
+  it('reads the facets, keeping gps only with location', () => {
+    const raw = {
+      total: 5,
+      types: { image: 4, image_raw: 0, video: 1 },
+      years: [{ year: 2024, count: 5 }, { year: 'x' }],
+      undated: 0,
+      cameras: [{ make: 'Canon', model: 'EOS R5', count: 4 }, { make: 'x' }],
+      gps: 1,
+      tags: [{ id: 3, name: 'beach', count: 2 }, { id: 0, name: 'bad' }],
+      albums: [{ id: 2, name: 'Summer', count: 3 }],
+    };
+    expect(toFacets(raw, every)).toEqual({
+      total: 5,
+      types: { image: 4, image_raw: 0, video: 1 },
+      years: [{ year: 2024, count: 5 }],
+      undated: 0,
+      cameras: [{ make: 'Canon', model: 'EOS R5', count: 4 }],
+      gps: 1,
+      tags: [{ id: 3, name: 'beach', count: 2 }],
+      albums: [{ id: 2, name: 'Summer', count: 3 }],
+    });
+    expect(toFacets(raw, none).gps).toBeNull();
+    // An album share's answer: no gps, tags or albums.
+    expect(toFacets({ total: 0, types: {}, years: [], cameras: [] }, none)).toEqual({
+      total: 0,
+      types: { image: 0, image_raw: 0, video: 0 },
+      years: [],
+      undated: 0,
+      cameras: [],
+      gps: null,
+      tags: [],
+      albums: [],
+    });
   });
 });

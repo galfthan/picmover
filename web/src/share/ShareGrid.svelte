@@ -19,6 +19,7 @@
   import Scrubber from '../components/Scrubber.svelte';
   import ShareLightbox, { type Neighbours } from './ShareLightbox.svelte';
   import { errorText, ShareError, type ShareClient, type ShareFilters } from './shareapi';
+  import { filtersKey } from './filters';
 
   interface Props {
     client: ShareClient;
@@ -154,7 +155,7 @@
     }
   }
 
-  const fkey = $derived(`${client.id}|${basePath}|${filters.type ?? ''}|${filters.from ?? ''}|${filters.to ?? ''}|${filters.rating ?? ''}|${filters.album ?? ''}`);
+  const fkey = $derived(`${client.id}|${basePath}|${filtersKey(filters)}`);
   $effect(() => {
     void fkey;
     untrack(() => void loadTimeline(true));

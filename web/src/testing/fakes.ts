@@ -1451,6 +1451,8 @@ export type FakeServer = ReturnType<typeof fakeServer>;
 export interface ShareItem extends MediaItem {
   lat?: number;
   lon?: number;
+  /** Camera model ("" for none). */
+  camera?: string;
 }
 
 export interface FakeShareOptions {
@@ -1492,6 +1494,14 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   first.lon = 24.94;
   first.gps = true;
   items[2]!.dur = 7000;
+  // Cameras: peter's July on the Canon (the video has none), June on a
+  // Pixel (outside the album "Summer"), penny on an iPhone.
+  for (const x of items) x.camera = x.lib === 'penny' ? 'iPhone 12' : x.takenAt?.startsWith('2024-06') ? 'Pixel 7' : x.type === 'video' ? '' : 'Canon EOS R6';
+  /** peter's tags: "beach" on 1 and 2, "private" only on 7 (outside the album). */
+  const tags = [
+    { id: 1, name: 'beach', hashes: [hashOf(1), hashOf(2)] },
+    { id: 4, name: 'private', hashes: [hashOf(7)] },
+  ];
   /** peter's albums; an album share covers "Summer" (2). */
   const albums = [
     { id: 2, name: 'Summer', hashes: [hashOf(1), hashOf(2), hashOf(3)] },
@@ -1535,7 +1545,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       : { libraries: libsJSON() }),
   });
   const itemJSON = (x: ShareItem & { lib: string }): Record<string, unknown> => {
-    const { lib: _l, lat: _a, lon: _o, rating, gps, ...rest } = x;
+    const { lib: _l, lat: _a, lon: _o, camera: _c, rating, gps, ...rest } = x;
     return { ...rest, ...(caps.rate && rating ? { rating } : {}), ...(caps.location && gps ? { gps } : {}) };
   };
   const ym = (x: ShareItem) => {
@@ -1544,18 +1554,29 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   };
   const notFound = () => json({ error: 'not found' }, 404);
   /** The filter whitelist of timeline and media; media adds year and month. */
-  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album']);
+  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'tag', 'camera', 'gps', 'minpx', 'maxpx']);
+  /** The scope's photos of a {lib} key: the album's live members, or the library's. */
+  const inLib = (lib: string) => visible().filter((x) => kind === 'album' || x.lib === lib);
 
   function select(lib: string, q: URLSearchParams, extra: string[] = []): (ShareItem & { lib: string })[] | Response {
     for (const k of q.keys()) if (!ALLOWED.has(k) && !extra.includes(k)) return json({ error: `invalid filter "${k}"` }, 400);
+    // The server's capability and scope checks, in its order.
     if (q.has('rating') && !caps.rate) return json({ error: 'invalid filter "rating": not allowed in this share' }, 400);
+    if (q.has('gps') && !caps.location) return json({ error: 'invalid filter "gps": not allowed in this share' }, 400);
     if (q.has('album') && kind === 'album') return json({ error: 'invalid filter "album": this share is one album' }, 400);
-    let list = visible().filter((x) => kind === 'album' || x.lib === lib);
+    if (q.has('tag') && kind === 'album') return json({ error: 'invalid filter "tag": this share is one album' }, 400);
+    if ((q.get('camera') ?? '').length > 200) return json({ error: 'invalid filter "camera": too long' }, 400);
+    let list = inLib(lib);
     const aid = Number(q.get('album'));
     if (aid) {
       const a = lib === 'peter' ? albums.find((x) => x.id === aid) : undefined;
       if (!a) return notFound();
       list = list.filter((x) => a.hashes.includes(x.hash));
+    }
+    for (const v of q.getAll('tag')) {
+      if (!/^[1-9]\d*$/.test(v)) return json({ error: `invalid tag "${v}": want a tag id` }, 400);
+      const tg = lib === 'peter' ? tags.find((x) => x.id === Number(v)) : undefined;
+      list = list.filter((x) => !!tg && tg.hashes.includes(x.hash));
     }
     const t = q.get('type');
     if (t) list = list.filter((x) => x.type === t);
@@ -1565,7 +1586,56 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (from) list = list.filter((x) => (x.takenAt ?? '') >= from);
     const to = q.get('to');
     if (to) list = list.filter((x) => (x.takenAt ?? '9999') < to);
+    const months = q.get('months');
+    if (months) list = list.filter((x) => x.takenAt !== null && months.split(',').map(Number).includes(Number(x.takenAt.slice(5, 7))));
+    const recur = q.get('recur');
+    if (recur) {
+      const [a, b = a] = recur.split('..') as [string, string?];
+      list = list.filter((x) => {
+        const md = x.takenAt?.slice(5, 10);
+        if (!md) return false;
+        return a <= b! ? md >= a && md <= b! : md >= a || md <= b!;
+      });
+    }
+    const cam = q.get('camera');
+    if (cam) list = list.filter((x) => x.camera === cam);
+    if (q.get('gps') === '1') list = list.filter((x) => x.gps === true);
+    const minPx = Number(q.get('minpx'));
+    if (minPx) list = list.filter((x) => Math.max(x.w, x.h) >= minPx);
+    const maxPx = Number(q.get('maxpx'));
+    if (maxPx) list = list.filter((x) => Math.max(x.w, x.h) <= maxPx);
     return list;
+  }
+
+  /** GET /api/l/{lib}/facets as the server computes it: inside the scope, gps with location, tags and albums in a library share. */
+  function facetsOf(lib: string, real: string): Record<string, unknown> {
+    const list = inLib(lib);
+    const years = new Map<number, number>();
+    const cams = new Map<string, number>();
+    for (const x of list) {
+      const y = ym(x)[0]!;
+      if (y) years.set(y, (years.get(y) ?? 0) + 1);
+      if (x.camera) cams.set(x.camera, (cams.get(x.camera) ?? 0) + 1);
+    }
+    const out: Record<string, unknown> = {
+      total: list.length,
+      types: { image: list.filter((x) => x.type === 'image').length, image_raw: list.filter((x) => x.type === 'image_raw').length, video: list.filter((x) => x.type === 'video').length },
+      years: [...years].sort((a, b) => b[0] - a[0]).map(([year, count]) => ({ year, count })),
+      undated: list.filter((x) => !x.takenAt).length,
+      cameras: [...cams].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([model, count]) => ({ make: model.split(' ')[0], model, count })),
+    };
+    if (caps.location) out.gps = list.filter((x) => x.gps).length;
+    if (kind !== 'album') {
+      const live = items.filter((x) => x.lib === real);
+      const counted = (g: { id: number; name: string; hashes: string[] }[]) =>
+        g
+          .map((x) => ({ id: x.id, name: x.name, count: live.filter((i) => x.hashes.includes(i.hash)).length }))
+          .filter((x) => x.count > 0)
+          .sort((a, b) => a.name.localeCompare(b.name));
+      out.tags = real === 'peter' ? counted(tags) : [];
+      out.albums = real === 'peter' ? counted(albums) : [];
+    }
+    return out;
   }
 
   const STATE_MSG: Record<string, string> = {
@@ -1626,6 +1696,10 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (method === 'GET' && rest === 'albums') {
       if (kind === 'album') return notFound();
       return json({ albums: real === 'peter' ? albums.map((a) => ({ id: a.id, name: a.name, count: a.hashes.length, cover: a.hashes[0] ?? null })) : [] });
+    }
+    if (method === 'GET' && rest === 'facets') {
+      for (const k of q.keys()) return json({ error: `invalid filter "${k}"` }, 400);
+      return json(facetsOf(lib, real));
     }
     if (method === 'GET' && rest === 'timeline') {
       const list = select(lib, q);
@@ -1747,6 +1821,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     calls,
     items,
     albums,
+    tags,
     caps,
     share,
     device,
