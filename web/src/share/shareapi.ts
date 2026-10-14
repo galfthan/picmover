@@ -120,17 +120,51 @@ export interface ShareDetail extends MediaItem {
   albums: { id: number; name: string }[];
 }
 
-/** The filters a share accepts (a whitelist on the server; anything else is 400). */
+/**
+ * The filters a share accepts (a whitelist on the server; anything else is
+ * 400). `rating` needs `rate`, `gps` needs `location`, `album` and `tags`
+ * exist only in a library share: the server answers 400 otherwise, so the
+ * phone never sends them (share/filters.ts drops them from the route).
+ */
 export interface ShareFilters {
   type?: 'image' | 'image_raw' | 'video';
   /** YYYY-MM-DD, wall clock. */
   from?: string;
   /** YYYY-MM-DD, wall clock, exclusive. */
   to?: string;
+  /** Every year: "MM-DD" or "MM-DD..MM-DD" (inclusive, may wrap the year end). */
+  recur?: string;
+  /** Every year: months 1..12, sorted and unique. */
+  months?: number[];
   /** Minimum rating 1..5; only with `rate`. */
   rating?: number;
   /** Library shares only: an album of the library. */
   album?: number;
+  /** Exact camera model. */
+  camera?: string;
+  /** Only photos with a location; only with `location`. */
+  gps?: boolean;
+  /** Library shares only: tag ids, all must match; sorted and unique. */
+  tags?: number[];
+  /** Bounds on the longer edge in pixels (inclusive). */
+  minPx?: number;
+  maxPx?: number;
+}
+
+/** GET /api/l/{lib}/facets: what the filter sheet can offer, inside the share's scope. */
+export interface ShareFacets {
+  total: number;
+  types: { image: number; image_raw: number; video: number };
+  /** Years of the dated photos, newest first. */
+  years: { year: number; count: number }[];
+  undated: number;
+  /** Most frequent first. */
+  cameras: { make: string; model: string; count: number }[];
+  /** With `location` only; null otherwise. */
+  gps: number | null;
+  /** Library shares only (empty otherwise): with live photos, by name. */
+  tags: { id: number; name: string; count: number }[];
+  albums: { id: number; name: string; count: number }[];
 }
 
 // ---- Lenient parsers ----
@@ -238,6 +272,35 @@ export function toAlbums(v: unknown): ShareAlbum[] {
     const id = positiveId(a.id);
     return id === null ? [] : [{ id, name: str(a.name), count: count(a.count), cover: hashOrNull(a.cover) }];
   });
+}
+
+function toNamedCounts(v: unknown): { id: number; name: string; count: number }[] {
+  return (Array.isArray(v) ? v : []).filter(isRecord).flatMap((x) => {
+    const id = positiveId(x.id);
+    return id === null ? [] : [{ id, name: str(x.name) || `#${id}`, count: count(x.count) }];
+  });
+}
+
+/** The facets; `gps` only with `location`, tags and albums as sent (a library share's). */
+export function toFacets(v: unknown, caps: ShareCapabilities): ShareFacets {
+  const r = isRecord(v) ? v : {};
+  const t = isRecord(r.types) ? r.types : {};
+  return {
+    total: count(r.total),
+    types: { image: count(t.image), image_raw: count(t.image_raw), video: count(t.video) },
+    years: (Array.isArray(r.years) ? r.years : []).filter(isRecord).flatMap((y) => {
+      const year = num(y.year);
+      return Number.isInteger(year) && year >= 1 && year <= 9999 ? [{ year, count: count(y.count) }] : [];
+    }),
+    undated: count(r.undated),
+    cameras: (Array.isArray(r.cameras) ? r.cameras : []).filter(isRecord).flatMap((c) => {
+      const model = str(c.model);
+      return model ? [{ make: str(c.make), model, count: count(c.count) }] : [];
+    }),
+    gps: caps.location && typeof r.gps === 'number' ? count(r.gps) : null,
+    tags: toNamedCounts(r.tags),
+    albums: toNamedCounts(r.albums),
+  };
 }
 
 function toSummary(v: unknown, key: string): ShareLibrarySummary {
@@ -352,14 +415,21 @@ export async function getLibraries(signal?: AbortSignal): Promise<ShareLib[]> {
 
 const enc = encodeURIComponent;
 
-/** Query string for the share's filters (no leading '?'). */
+/** Query string for the share's filters (no leading '?'); `tag` repeats. */
 export function shareFilterParams(f: ShareFilters, extra?: Record<string, number>): URLSearchParams {
   const q = new URLSearchParams();
   if (f.type) q.set('type', f.type);
   if (f.from) q.set('from', f.from);
   if (f.to) q.set('to', f.to);
+  if (f.recur) q.set('recur', f.recur);
+  if (f.months?.length) q.set('months', f.months.join(','));
   if (f.rating) q.set('rating', String(f.rating));
   if (f.album) q.set('album', String(f.album));
+  if (f.camera) q.set('camera', f.camera);
+  if (f.gps) q.set('gps', '1');
+  for (const t of f.tags ?? []) q.append('tag', String(t));
+  if (f.minPx) q.set('minpx', String(f.minPx));
+  if (f.maxPx) q.set('maxpx', String(f.maxPx));
   if (extra) for (const k of Object.keys(extra)) q.set(k, String(extra[k]));
   return q;
 }
@@ -387,6 +457,8 @@ export interface ShareClient {
   getBucket(f: ShareFilters, year: number, month: number, signal?: AbortSignal): Promise<MediaItem[]>;
   getMedia(id: number, signal?: AbortSignal): Promise<ShareDetail>;
   getAlbums(signal?: AbortSignal): Promise<ShareAlbum[]>;
+  /** The filter sheet's choices within the share's scope. */
+  getFacets(signal?: AbortSignal): Promise<ShareFacets>;
   /** One visible hash; ShareError 409 while a move runs, 404 when gone, 403 without `rate`. */
   setRating(hash: string, rating: number): Promise<{ updated: number }>;
 }
@@ -421,6 +493,9 @@ export function shareClient(id: string, caps: ShareCapabilities): ShareClient {
     },
     async getAlbums(signal) {
       return toAlbums(await getJSON(`${base}/albums`, signal));
+    },
+    async getFacets(signal) {
+      return toFacets(await getJSON(`${base}/facets`, signal), caps);
     },
     async setRating(hash, rating) {
       const r = await postJSON(`${base}/ratings`, { hashes: [hash], rating });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseHash } from '../lib/router';
-import { filtersFromQuery, filtersQuery, gridPath, normaliseCode, pairToken, phoneName, resolveRoute, yearRange, yearsOf } from './routes';
+import { gridPath, normaliseCode, pairToken, phoneName, resolveRoute } from './routes';
 import { toShareInfo, type ShareInfo } from './shareapi';
 
 const libShare = (ids: string[]): ShareInfo => toShareInfo({ name: 'My phone', kind: 'libraries', libraries: ids.map((id) => ({ id, name: id })) });
@@ -50,22 +50,6 @@ describe('share routes', () => {
     expect(gridPath({ kind: 'grid', lib: 'peter', viewId: 1 })).toBe('l/peter');
     expect(gridPath({ kind: 'album', lib: 'peter', albumId: 3, viewId: null })).toBe('l/peter/albums/3');
     expect(gridPath({ kind: 'albumshare', viewId: null })).toBe('');
-  });
-
-  it('filters: only the whitelist, and a rating only with `rate`', () => {
-    const q = new URLSearchParams('type=video&from=2020-01-01&to=2021-01-01&rating=3&tag=1&camera=x&album=2&trashed=1');
-    expect(filtersFromQuery(q, true)).toEqual({ type: 'video', from: '2020-01-01', to: '2021-01-01', rating: 3 });
-    expect(filtersFromQuery(q, false)).toEqual({ type: 'video', from: '2020-01-01', to: '2021-01-01' });
-    expect(filtersFromQuery(new URLSearchParams('type=movie&from=2020&rating=9'), true)).toEqual({});
-    expect(filtersQuery({ type: 'image', rating: 2 }).toString()).toBe('type=image&rating=2');
-  });
-
-  it('year ranges', () => {
-    expect(yearRange(2019, 2021)).toEqual({ from: '2019-01-01', to: '2022-01-01' });
-    expect(yearRange(2021, 2019)).toEqual({ from: '2019-01-01', to: '2022-01-01' });
-    expect(yearRange(null, 2019)).toEqual({ from: undefined, to: '2020-01-01' });
-    expect(yearRange(0, null)).toEqual({ from: undefined, to: undefined });
-    expect(yearsOf({ from: '2019-01-01', to: '2022-01-01' })).toEqual({ from: 2019, to: 2021 });
   });
 
   it('codes are case- and dash-insensitive, from the 32-letter alphabet', () => {

@@ -241,14 +241,19 @@ func (s *Server) handleShareLibrary(w http.ResponseWriter, r *http.Request, req 
 }
 
 // shareFilterKeys are the query parameters a phone's list may carry; the
-// media list adds year and month. Anything else is 400.
+// media list adds year and month. Anything else is 400 (trashed, import
+// and session among them).
 var shareFilterKeys = map[string]bool{"type": true, "from": true, "to": true, "recur": true, "months": true,
-	"rating": true, "album": true}
+	"rating": true, "album": true, "tag": true, "camera": true, "gps": true, "minpx": true, "maxpx": true}
+
+// maxShareCamera bounds the camera filter's value (a model name).
+const maxShareCamera = 200
 
 // shareFilter parses a phone's list filter: the whitelist, rating only
-// with rate, album only where the scope covers whole libraries (and only
-// an album of this library: 404 otherwise), then the scope's restriction
-// and the user.db part. It answers itself when it returns false.
+// with rate, gps only with location, album and tag only where the scope
+// covers whole libraries (an album that is not one of this library's is
+// 404), then the scope's restriction and the user.db part. It answers
+// itself when it returns false.
 func (s *Server) shareFilter(w http.ResponseWriter, r *http.Request, req *shareReq, l *libHandles, extra ...string) (catalog.Filter, bool) {
 	q := r.URL.Query()
 	for k := range q {
@@ -257,12 +262,24 @@ func (s *Server) shareFilter(w http.ResponseWriter, r *http.Request, req *shareR
 			return catalog.Filter{}, false
 		}
 	}
-	if q.Has("rating") && !req.sh.Capabilities.Rate {
-		writeError(w, http.StatusBadRequest, `invalid filter "rating": not allowed in this share`)
-		return catalog.Filter{}, false
+	caps := req.sh.Capabilities
+	for _, c := range []struct {
+		key     string
+		allowed bool
+		why     string
+	}{
+		{"rating", caps.Rate, "not allowed in this share"},
+		{"gps", caps.Location, "not allowed in this share"},
+		{"album", req.auth.wholeLibrary(), "this share is one album"},
+		{"tag", req.auth.wholeLibrary(), "this share is one album"},
+	} {
+		if q.Has(c.key) && !c.allowed {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid filter %q: %s", c.key, c.why))
+			return catalog.Filter{}, false
+		}
 	}
-	if q.Has("album") && !req.auth.wholeLibrary() {
-		writeError(w, http.StatusBadRequest, `invalid filter "album": this share is one album`)
+	if len(q.Get("camera")) > maxShareCamera {
+		writeError(w, http.StatusBadRequest, `invalid filter "camera": too long`)
 		return catalog.Filter{}, false
 	}
 	f, uf, err := parseFilter(q)
@@ -270,23 +287,29 @@ func (s *Server) shareFilter(w http.ResponseWriter, r *http.Request, req *shareR
 		writeError(w, http.StatusBadRequest, err.Error())
 		return f, false
 	}
+	return f, s.shareScope(w, r, req, l, &f, uf)
+}
+
+// shareScope narrows f (and its user.db part uf) to the share's scope
+// and resolves uf into f.Hashes. It answers itself when it returns false.
+func (s *Server) shareScope(w http.ResponseWriter, r *http.Request, req *shareReq, l *libHandles, f *catalog.Filter, uf userFilter) bool {
 	var fe *errFilter
-	switch err := req.auth.restrict(r.Context(), l, &f, &uf); {
+	switch err := req.auth.restrict(r.Context(), l, f, &uf); {
 	case errors.As(err, &fe):
 		writeError(w, http.StatusBadRequest, fe.Error())
-		return f, false
+		return false
 	case errors.Is(err, errScopeMissing):
 		shareNotFound(w)
-		return f, false
+		return false
 	case err != nil:
 		s.internalError(w, r, err)
-		return f, false
+		return false
 	}
-	if err := resolveFilter(r.Context(), l, &f, uf); err != nil {
+	if err := resolveFilter(r.Context(), l, f, uf); err != nil {
 		s.internalError(w, r, err)
-		return f, false
+		return false
 	}
-	return f, true
+	return true
 }
 
 func containsString(list []string, s string) bool {

@@ -314,24 +314,189 @@ describe('phone app', () => {
       expect(location.hash).toBe('#/');
       expect(paths().some((p) => p.startsWith('/api/l/secret'))).toBe(false);
     });
+  });
 
-    it('filters by type, rating and years through the route', async () => {
+  describe('filters', () => {
+    const sheet = () => document.querySelector<HTMLFormElement>('form.sheet');
+    const sections = () => [...(sheet()?.querySelectorAll('h3') ?? [])].map((h) => h.textContent?.trim());
+    const inSheet = (label: string) =>
+      [...(sheet()?.querySelectorAll<HTMLButtonElement>('button') ?? [])].find((b) => b.getAttribute('aria-label') === label || b.firstChild?.textContent?.trim() === label || b.textContent?.trim() === label);
+    const select = (label: string) => sheet()!.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`)!;
+    const chips = () => [...document.querySelectorAll('.chips .chip .label')].map((c) => c.textContent?.trim());
+    const filterButton = () => document.querySelector<HTMLButtonElement>('.topbar .filterbtn')!;
+    function choose(sel: HTMLSelectElement, value: string) {
+      sel.value = value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      flushSync();
+    }
+    async function openSheet() {
+      click(filterButton());
+      await settle();
+      expect(sheet()).not.toBeNull();
+    }
+
+    it('a visible Filter button opens a sheet with every section the share allows, from its facets', async () => {
       setup('libraries');
       await start('#/l/peter/');
-      click(button('Filter')!);
+      expect(filterButton().textContent?.trim()).toBe('Filter');
+      await openSheet();
+      expect(paths()).toContain('/api/l/peter/facets');
+      expect(sections()).toEqual(['Show', 'Dates', 'Rating at least', 'Camera', 'Location', 'Album', 'Tags', 'Size']);
+      expect([...select('Camera').options].map((o) => o.textContent)).toEqual(['Any camera', 'Canon EOS R6 (5)', 'Pixel 7 (2)']);
+      expect([...select('Album').options].map((o) => o.textContent)).toEqual(['Any album', 'Secret (1)', 'Summer (3)']);
+      expect(inSheet('beach')?.textContent).toBe('beach2');
+      // Years from the facets, with their counts.
+      expect(inSheet('2024')).toBeDefined();
+      click(sheet()!.querySelector('button[aria-label="Close"]')!);
       await settle();
-      click(button('Videos')!);
-      click(button('4★')!);
-      type(document.querySelector<HTMLInputElement>('input[aria-label="From year"]')!, '2024');
-      type(document.querySelector<HTMLInputElement>('input[aria-label="To year"]')!, '2024');
-      click(button('Apply')!);
+      expect(sheet()).toBeNull();
+    });
+
+    it('applies through the route, shows removable chips and a count, and keeps them on reload', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      await openSheet();
+      click(inSheet('Photos')!);
+      click(inSheet('2024')!);
+      choose(select('Camera'), 'Canon EOS R6');
+      click(inSheet('beach')!);
+      flushSync();
+      click(inSheet('Apply')!);
       await settle();
-      expect(location.hash).toBe('#/l/peter/?type=video&from=2024-01-01&to=2025-01-01&rating=4');
-      expect(server.requests('/api/l/peter/timeline').at(-1)?.path).toBe('/api/l/peter/timeline?type=video&from=2024-01-01&to=2025-01-01&rating=4');
+      expect(sheet()).toBeNull();
+      const want = '?type=image&from=2024-01-01&to=2025-01-01&camera=Canon+EOS+R6&tag=1';
+      expect(location.hash).toBe(`#/l/peter/${want}`);
+      expect(server.requests('/api/l/peter/timeline').at(-1)?.path).toBe(`/api/l/peter/timeline${want}`);
+      expect(tiles().map((t) => t.getAttribute('href'))).toEqual([`#/l/peter/view/1${want}`, `#/l/peter/view/2${want}`]);
+      expect(chips()).toEqual(['Photos', '2024', 'Canon EOS R6', '#beach']);
+      expect(filterButton().getAttribute('aria-label')).toBe('Filter, 4 on');
+      expect(filterButton().querySelector('.badge')?.textContent).toBe('4');
+      // One chip's × removes that filter only.
+      click(button('Remove filter #beach')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/?type=image&from=2024-01-01&to=2025-01-01&camera=Canon+EOS+R6');
+      // A reload keeps them; the sheet opens with them.
+      unmountApp?.();
+      document.body.innerHTML = '';
+      await start(location.hash);
+      expect(chips()).toEqual(['Photos', '2024', 'Canon EOS R6']);
+      await openSheet();
+      expect(inSheet('Photos')?.getAttribute('aria-pressed')).toBe('true');
+      expect(select('Camera').value).toBe('Canon EOS R6');
+      expect(select('From year').value).toBe('2024');
+      expect(select('To month').value).toBe('12');
+      click(inSheet('Clear all')!);
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/');
+      expect(document.querySelector('.chips')).toBeNull();
+    });
+
+    it('Clear all on the chips, and the empty state, clear every filter', async () => {
+      setup('libraries');
+      await start('#/l/peter/?type=video&rating=5');
+      expect(chips()).toEqual(['Videos', '5★']);
       expect(text()).toContain('Nothing matches these filters');
       click(button('Clear filters')!);
       await settle();
       expect(location.hash).toBe('#/l/peter/');
+      await go('#/l/peter/?type=video&months=7');
+      click(document.querySelector<HTMLButtonElement>('.chips .clear')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/');
+    });
+
+    it('every year: months and days like the admin', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      await openSheet();
+      click(inSheet('Every year')!);
+      flushSync();
+      click(inSheet('June')!);
+      click(inSheet('July')!);
+      flushSync();
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/?months=6,7');
+      expect(chips()).toEqual(['Jun–Jul every year']);
+      expect(tiles()).toHaveLength(8);
+      await openSheet();
+      click(inSheet('Christmas')!);
+      flushSync();
+      click(inSheet('Apply')!);
+      await settle();
+      // A day range replaces the months.
+      expect(location.hash).toBe('#/l/peter/?recur=12-24..12-26');
+      expect(text()).toContain('Nothing matches these filters');
+    });
+
+    it('the lightbox keeps the filters and turns pages within the filtered photos only', async () => {
+      setup('libraries');
+      await start('#/l/peter/?tag=1');
+      expect(tiles()).toHaveLength(2);
+      click(tiles()[0]!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/view/1?tag=1');
+      click(button('Next')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/view/2?tag=1');
+      // Photo 3 is not tagged: there is no next page.
+      expect(button('Next')).toBeUndefined();
+      history.back();
+      await settle();
+      expect(location.hash).toBe('#/l/peter/?tag=1');
+      expect(chips()).toEqual(['#beach']);
+    });
+
+    it('hides what the share may not use, and drops it from the route', async () => {
+      setup('libraries', { capabilities: { rate: false, location: false } });
+      await start('#/l/peter/?rating=3&gps=1&type=video');
+      expect(server.requests('/api/l/peter/timeline').at(-1)?.path).toBe('/api/l/peter/timeline?type=video');
+      expect(chips()).toEqual(['Videos']);
+      await openSheet();
+      expect(sections()).not.toContain('Rating at least');
+      expect(sections()).not.toContain('Location');
+      expect(server.calls.filter((c) => c.path.startsWith('/api/l/')).every((c) => !/[?&](rating|gps)=/.test(c.path))).toBe(true);
+    });
+
+    it('an album share filters within the album: facets of its photos only, no tags or albums', async () => {
+      setup('album');
+      await start('#/?tag=1&album=5&rating=3&gps=1&camera=Canon+EOS+R6');
+      // Only what the album share may use reaches the server.
+      expect(server.requests('/api/l/album/timeline').at(-1)?.path).toBe('/api/l/album/timeline?camera=Canon+EOS+R6');
+      expect(chips()).toEqual(['Canon EOS R6']);
+      expect(tiles()).toHaveLength(2);
+      await openSheet();
+      expect(paths()).toContain('/api/l/album/facets');
+      expect(sections()).toEqual(['Show', 'Dates', 'Camera', 'Size']);
+      // The Pixel took photos outside the album only: not offered.
+      expect([...select('Camera').options].map((o) => o.textContent)).toEqual(['Any camera', 'Canon EOS R6 (2)']);
+      expect(text()).not.toContain('private');
+      click(inSheet('Videos')!);
+      choose(select('Camera'), '');
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/?type=video');
+      expect(tiles()).toHaveLength(1);
+      click(tiles()[0]!);
+      await settle();
+      expect(location.hash).toBe('#/view/3?type=video');
+      expect(paths().filter((p) => p.startsWith('/api/l/')).every((p) => p.startsWith('/api/l/album/'))).toBe(true);
+      expect(paths().some((p) => /[?&](tag|album|rating|gps)=/.test(p))).toBe(false);
+    });
+
+    it('an album share with location offers the location filter', async () => {
+      setup('album', { capabilities: { location: true } });
+      await start('#/');
+      await openSheet();
+      expect(sections()).toContain('Location');
+      expect(inSheet('Has location')?.textContent).toBe('Has location1');
+      click(inSheet('Has location')!);
+      flushSync();
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/?gps=1');
+      expect(tiles()).toHaveLength(1);
     });
   });
 

@@ -50,6 +50,7 @@ func (s *Server) shareRouteTable() []shareRoute {
 		lib("GET /api/l/{lib}/library", s.handleShareLibrary),
 		lib("GET /api/l/{lib}/timeline", s.handleShareTimeline),
 		lib("GET /api/l/{lib}/media", s.handleShareMediaList),
+		lib("GET /api/l/{lib}/facets", s.handleShareFacets),
 		lib("GET /api/l/{lib}/media/{id}", s.handleShareMediaDetail),
 		lib("GET /api/l/{lib}/thumb/{hash}", s.shareRendition(s.handleThumb)),
 		lib("GET /api/l/{lib}/preview/{hash}", s.shareRendition(s.handlePreview)),

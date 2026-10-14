@@ -11,9 +11,12 @@
   import ShareGrid from './ShareGrid.svelte';
   import ShareAlbums from './ShareAlbums.svelte';
   import ShareLibraries from './ShareLibraries.svelte';
-  import { filtersFromQuery, filtersQuery, filtersToQuery, gridPath, hasFilters, pairToken, resolveRoute, takePairToken, yearRange, yearsOf, type SharePage } from './routes';
+  import ShareFilterChips from './ShareFilterChips.svelte';
+  import ShareFilterSheet from './ShareFilterSheet.svelte';
+  import { filterChips, filtersFromQuery, filtersQuery, hasFilters, type Chip, type FilterScope } from './filters';
+  import { gridPath, pairToken, resolveRoute, takePairToken, type SharePage } from './routes';
   import { shareSession } from './session.svelte';
-  import { errorText, isAbort, shareClient, type ShareAlbum, type ShareClient, type ShareFilters } from './shareapi';
+  import { errorText, shareClient, type ShareAlbum, type ShareClient, type ShareFacets, type ShareFilters } from './shareapi';
 
   // The QR code's token leaves the address bar before anything else happens.
   let token = $state<string | null>(takePairToken());
@@ -57,9 +60,46 @@
   const client = $derived(lib !== null ? clientFor(lib) : null);
   const libName = $derived(page && 'lib' in page ? (share?.libraries.find((l) => l.id === page.lib)?.name ?? page.lib) : '');
 
-  const filters = $derived<ShareFilters>(filtersFromQuery(route.current.query, caps.rate));
+  const scope = $derived<FilterScope>({ rate: caps.rate, location: caps.location, library: share?.kind === 'libraries' });
+  const filters = $derived.by<ShareFilters>(() => {
+    const f = filtersFromQuery(route.current.query, scope);
+    // The album page is its album: an album in the query would fight it.
+    if (page?.kind === 'album') delete f.album;
+    return f;
+  });
   const filtered = $derived(hasFilters(filters));
   const query = $derived(filtersQuery(filters));
+
+  // ---- Facets: the sheet's choices, and the names of tags and albums in the chips ----
+
+  let facets = $state.raw<{ lib: string; data: ShareFacets } | null>(null);
+  let facetsError = $state('');
+  let facetsFor = '';
+  function loadFacets(c: ShareClient, force: boolean) {
+    if (!force && (facets?.lib === c.id || facetsFor === c.id)) return;
+    facetsFor = c.id;
+    facetsError = '';
+    c.getFacets()
+      .then((data) => {
+        if (client?.id === c.id) facets = { lib: c.id, data };
+      })
+      .catch((e: unknown) => {
+        if (client?.id === c.id) facetsError = errorText(e);
+      })
+      .finally(() => {
+        if (facetsFor === c.id) facetsFor = '';
+      });
+  }
+  const libFacets = $derived(client && facets?.lib === client.id ? facets.data : null);
+  // Chips name tags and albums: read the facets once when the route has some.
+  $effect(() => {
+    if (client && (filters.tags?.length || filters.album)) loadFacets(client, false);
+  });
+  const names = $derived({
+    tags: new Map((libFacets?.tags ?? []).map((t) => [t.id, t.name])),
+    albums: new Map((libFacets?.albums ?? []).map((a) => [a.id, a.name])),
+  });
+  const chips = $derived(filterChips(filters, names));
 
   // The album of an album page in a library share (its name and count for the header).
   let albums = $state.raw<{ lib: string; list: ShareAlbum[] } | null>(null);
@@ -93,32 +133,24 @@
     return `Available until ${d.getDate()} ${monthName(d.getMonth() + 1, 'short')}${sameYear ? '' : ` ${d.getFullYear()}`}`;
   }
 
-  // The filter sheet edits a draft; Apply puts it in the route.
-  let draftType = $state<ShareFilters['type'] | ''>('');
-  let draftRating = $state(0);
-  let draftFrom = $state('');
-  let draftTo = $state('');
+  // The filter sheet edits a draft; Apply puts it in the route (so Back,
+  // reload and the lightbox keep it). The facets are read again each time
+  // the sheet opens: photos may have come or gone.
   function openFilters() {
-    draftType = filters.type ?? '';
-    draftRating = filters.rating ?? 0;
-    const y = yearsOf(filters);
-    draftFrom = y.from === null ? '' : String(y.from);
-    draftTo = y.to === null ? '' : String(y.to);
+    if (client) loadFacets(client, true);
     filterOpen = true;
   }
-  const year = (s: string) => (/^\d{4}$/.test(s.trim()) ? Number(s.trim()) : null);
-  const gridHref = (f: ShareFilters) => href(page ? `${gridPath(page)}/` : '/', filtersToQuery(f));
-  function applyFilters(e: SubmitEvent) {
-    e.preventDefault();
-    const f: ShareFilters = { ...yearRange(year(draftFrom), year(draftTo)) };
-    if (draftType) f.type = draftType;
-    if (caps.rate && draftRating > 0) f.rating = draftRating;
+  const gridHref = (f: ShareFilters) => href(page ? `${gridPath(page)}/` : '/', filtersQuery(f));
+  function applyFilters(f: ShareFilters) {
     filterOpen = false;
     navigate(gridHref(f));
   }
   function clearFilters() {
     filterOpen = false;
     navigate(gridHref({}));
+  }
+  function removeChip(c: Chip) {
+    navigate(gridHref(c.without));
   }
 
   const showsGrid = $derived(page?.kind === 'grid' || page?.kind === 'album' || page?.kind === 'albumshare');
@@ -175,8 +207,9 @@
         {/if}
       </div>
       {#if showsGrid}
-        <button class="ghost icon" class:on={filtered} aria-label="Filter" aria-pressed={filtered} onclick={openFilters}>
-          <span aria-hidden="true">⚲</span>
+        <button class="filterbtn" class:on={filtered} aria-label={chips.length ? `Filter, ${chips.length} on` : 'Filter'} aria-haspopup="dialog" onclick={openFilters}>
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4 2v-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          <span>Filter</span>{#if chips.length}<span class="badge">{chips.length}</span>{/if}
         </button>
       {/if}
       <button class="ghost icon" aria-label="Menu" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>
@@ -196,6 +229,10 @@
           {#if album}<span class="muted small">{album.count} {album.count === 1 ? 'item' : 'items'}</span>{/if}
         </div>
       {/if}
+    {/if}
+
+    {#if showsGrid && chips.length}
+      <ShareFilterChips {chips} onremove={removeChip} onopen={openFilters} onclear={clearFilters} />
     {/if}
 
     <main>
@@ -271,39 +308,15 @@
     {/if}
 
     {#if filterOpen}
-      <button class="scrim" aria-label="Close the filters" onclick={() => (filterOpen = false)}></button>
-      <form class="sheet" aria-label="Filters" onsubmit={applyFilters}>
-        <fieldset>
-          <legend>Show</legend>
-          <div class="seg">
-            {#each [['', 'All'], ['image', 'Photos'], ['video', 'Videos']] as [v, label] (v)}
-              <button type="button" class:on={draftType === v} aria-pressed={draftType === v} onclick={() => (draftType = v as ShareFilters['type'] | '')}>{label}</button>
-            {/each}
-          </div>
-        </fieldset>
-        {#if caps.rate}
-          <fieldset>
-            <legend>Rating at least</legend>
-            <div class="seg">
-              {#each [0, 1, 2, 3, 4, 5] as n (n)}
-                <button type="button" class:on={draftRating === n} aria-pressed={draftRating === n} onclick={() => (draftRating = n)}>{n === 0 ? 'Any' : `${n}★`}</button>
-              {/each}
-            </div>
-          </fieldset>
-        {/if}
-        <fieldset>
-          <legend>Years</legend>
-          <div class="years">
-            <input type="text" inputmode="numeric" maxlength="4" placeholder="from" aria-label="From year" bind:value={draftFrom} />
-            <span>–</span>
-            <input type="text" inputmode="numeric" maxlength="4" placeholder="to" aria-label="To year" bind:value={draftTo} />
-          </div>
-        </fieldset>
-        <div class="sheet-buttons">
-          <button type="button" onclick={clearFilters}>Clear</button>
-          <button type="submit" class="primary">Apply</button>
-        </div>
-      </form>
+      <ShareFilterSheet
+        {filters}
+        facets={libFacets}
+        {facetsError}
+        {scope}
+        albumImplied={page.kind === 'album'}
+        onapply={applyFilters}
+        onclose={() => (filterOpen = false)}
+      />
     {/if}
   {:else}
     <div class="empty">Loading…</div>
@@ -359,9 +372,6 @@
     min-height: 44px;
     padding: 0;
     font-size: 20px;
-  }
-  .icon.on {
-    color: var(--accent);
   }
   .tabs {
     flex: none;
@@ -460,71 +470,30 @@
   .help p {
     margin: 6px 0;
   }
-  .sheet {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 901;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    max-height: 85vh;
-    overflow-y: auto;
-    padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px));
-    border-radius: 12px 12px 0 0;
-    background: var(--surface);
-    box-shadow: var(--shadow);
-  }
-  fieldset {
-    margin: 0;
-    padding: 0;
-    border: 0;
-  }
-  legend {
-    margin-bottom: 6px;
-    color: var(--muted);
-    font-size: 13px;
-  }
-  .seg {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .seg button {
-    min-height: 44px;
-    min-width: 44px;
-  }
-  .seg button.on {
-    background: var(--accent-strong);
-    border-color: var(--accent-strong);
-    color: #fff;
-  }
-  .years {
-    display: flex;
+  .filterbtn {
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
+    min-height: 40px;
+    padding: 0 12px;
+    border-radius: 20px;
+    flex: none;
   }
-  .years input {
-    width: 96px;
-    min-height: 44px;
-    font-size: 16px;
+  .filterbtn.on {
+    border-color: var(--accent-strong);
+    color: var(--accent);
   }
-  .sheet-buttons {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-  .sheet-buttons button {
-    min-height: 44px;
-    min-width: 96px;
-  }
-  @media (min-width: 700px) {
-    .sheet {
-      left: 50%;
-      right: auto;
-      width: 480px;
-      margin-left: -240px;
-    }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 10px;
+    background: var(--accent-strong);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
   }
 </style>

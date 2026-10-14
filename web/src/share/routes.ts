@@ -13,10 +13,10 @@
 //
 // The lightbox route keeps the grid it was opened from in its path, so a
 // reload or a shared link reopens it over the same grid. Filters live in
-// the query (`type`, `from`, `to`, `rating`) and are kept on view routes.
+// the query (share/filters.ts) and are kept on view routes.
 
 import { href, type Route } from '../lib/router';
-import type { ShareFilters, ShareInfo } from './shareapi';
+import type { ShareInfo } from './shareapi';
 
 export type SharePage =
   | { kind: 'pair' }
@@ -74,55 +74,6 @@ export function gridPath(p: SharePage): string {
     default:
       return '';
   }
-}
-
-const TYPES = ['image', 'image_raw', 'video'] as const;
-const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
-
-/** The share's filters from the route query; `rating` only when the share may see ratings. */
-export function filtersFromQuery(q: URLSearchParams, rate: boolean): ShareFilters {
-  const f: ShareFilters = {};
-  const t = q.get('type');
-  if (t && (TYPES as readonly string[]).includes(t)) f.type = t as ShareFilters['type'];
-  const from = q.get('from');
-  if (from && DAY_RE.test(from)) f.from = from;
-  const to = q.get('to');
-  if (to && DAY_RE.test(to)) f.to = to;
-  const r = q.get('rating');
-  if (rate && r && /^[1-5]$/.test(r)) f.rating = Number(r);
-  return f;
-}
-
-export function filtersToQuery(f: ShareFilters): Record<string, string | number | undefined> {
-  return { type: f.type, from: f.from, to: f.to, rating: f.rating };
-}
-
-/** The route query of the filters (for the lightbox routes, which keep them). */
-export function filtersQuery(f: ShareFilters): URLSearchParams {
-  const q = new URLSearchParams();
-  for (const [k, v] of Object.entries(filtersToQuery(f))) if (v !== undefined && v !== '') q.set(k, String(v));
-  return q;
-}
-
-export function hasFilters(f: ShareFilters): boolean {
-  return !!(f.type || f.from || f.to || f.rating);
-}
-
-/** The year range of `from`/`to` (whole years; `to` is exclusive). */
-export function yearsOf(f: ShareFilters): { from: number | null; to: number | null } {
-  const y = (s: string | undefined) => (s ? Number(s.slice(0, 4)) : null);
-  const to = y(f.to);
-  return { from: y(f.from), to: to === null ? null : to - 1 };
-}
-
-/** `from`/`to` for a year range (either end may be open). */
-export function yearRange(from: number | null, to: number | null): Pick<ShareFilters, 'from' | 'to'> {
-  const ok = (n: number | null): n is number => n !== null && Number.isInteger(n) && n >= 1 && n <= 9998;
-  let a = ok(from) ? from : null;
-  let b = ok(to) ? to : null;
-  if (a !== null && b !== null && a > b) [a, b] = [b, a];
-  const day = (n: number) => `${String(n).padStart(4, '0')}-01-01`;
-  return { from: a === null ? undefined : day(a), to: b === null ? undefined : day(b + 1) };
 }
 
 /** The pairing token of a "#/pair/<token>" hash, else null. */
