@@ -36,5 +36,12 @@ export default defineConfig(({ mode }) => ({
   test: {
     include: ['src/**/*.test.ts'],
     environment: 'node',
+    // The first test of a file that mounts App (after vi.resetModules)
+    // imports and transforms the whole admin app: about a second on an
+    // idle machine, more than vitest's default 5 s when the CPU is busy
+    // (a parallel build, go test). The tests themselves run on fake
+    // timers, so the timeout only guards against a hang.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 }));
