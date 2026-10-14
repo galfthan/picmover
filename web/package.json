@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node scripts/keep-gitkeep.mjs",
+    "build": "vite build && node scripts/keep-gitkeep.mjs && node scripts/check-share-apis.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
     "test": "vitest run"
