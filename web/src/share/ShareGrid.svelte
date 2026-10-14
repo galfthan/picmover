@@ -50,7 +50,7 @@
   const GAP = 2;
   const HEADER = 40;
   const BUCKET_PAD = 8;
-  const SCRUB = 28; // right gutter for the scrubber
+  const SCRUB = 30; // right gutter for the scrubber
 
   let width = $state(0);
   let height = $state(0);
@@ -536,7 +536,7 @@
   .canvas {
     position: relative;
     margin-left: 2px;
-    margin-right: 28px;
+    margin-right: 30px;
   }
   .bucket {
     position: absolute;
@@ -576,13 +576,22 @@
     background: var(--placeholder);
     border-radius: 2px;
   }
-  /* The scrubber is narrower on a phone; the year labels still fit. */
+  /* The scrubber is narrower on a phone; the year labels still fit. The
+     position marker is a short bar at the very edge, beside the labels
+     rather than across them (at the top it sat on the first year). */
   .share-grid :global(.scrubber) {
-    width: 28px;
+    width: 30px;
   }
   .share-grid :global(.scrubber .year) {
-    right: 2px;
+    right: 5px;
+    padding: 0 1px;
     font-size: 10px;
+  }
+  .share-grid :global(.scrubber .pos) {
+    right: 0;
+    width: 3px;
+    height: 18px;
+    border-radius: 2px;
   }
   .share-grid :global(.scrubber .hover) {
     right: 32px;

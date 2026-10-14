@@ -410,6 +410,12 @@ describe('phone app', () => {
       expect(document.querySelector('a.tile[href="#/l/peter/view/150"]')).not.toBeNull();
     });
 
+    it('names the library after the share with a spaced dot', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      expect(document.querySelector('.topbar .title')?.textContent).toBe('My phone · Peter');
+    });
+
     it('lists the albums and opens one', async () => {
       setup('libraries');
       await start('#/l/peter/albums');
@@ -734,10 +740,17 @@ describe('phone app', () => {
       // The menu: who this phone is and until when.
       click(button('Menu')!);
       await settle();
-      const menu = document.querySelector('[role="menu"]')!;
+      // A plain disclosure (it holds text): no ARIA menu roles.
+      const menu = document.getElementById('share-menu')!;
+      expect(button('Menu')!.getAttribute('aria-controls')).toBe('share-menu');
+      expect(button('Menu')!.getAttribute('aria-expanded')).toBe('true');
+      expect(document.querySelector('[role="menu"], [role="menuitem"]')).toBeNull();
       expect(menu.textContent).toContain("Paired as Anna's phone");
       expect(menu.textContent).toContain('Available until 13 Nov');
       expect(menu.textContent).not.toContain('Libraries');
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+      await settle();
+      expect(document.getElementById('share-menu')).toBeNull();
     });
   });
 
@@ -863,6 +876,30 @@ describe('phone app', () => {
       await swipe([500, 200], [510, 450]);
       await vi.waitFor(() => expect(location.hash).toBe('#/l/peter/'));
       expect(lightbox()).toBeNull();
+    });
+
+    it('keeps Tab inside the lightbox (no inert on Gecko 91)', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/2');
+      const lb = lightbox()!;
+      const focusables = [...lb.querySelectorAll<HTMLElement>('a[href], button:not([disabled])')];
+      const tab = (shift = false) => {
+        const e = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: shift, bubbles: true, cancelable: true });
+        (document.activeElement ?? document.body).dispatchEvent(e);
+        return e;
+      };
+      focusables.at(-1)!.focus();
+      expect(tab().defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(focusables[0]);
+      expect(tab(true).defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(focusables.at(-1));
+      // From the page behind (focus escaped somehow): back into the lightbox.
+      document.querySelector<HTMLElement>('.topbar button')!.focus();
+      tab();
+      expect(lb.contains(document.activeElement)).toBe(true);
+      // In the middle, Tab is the browser's.
+      focusables[0]!.focus();
+      expect(tab().defaultPrevented).toBe(false);
     });
 
     it('a tap toggles the bars and a double tap zooms', async () => {

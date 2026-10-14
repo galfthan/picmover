@@ -211,9 +211,37 @@
     full = !full;
   }
 
+  /**
+   * Tab cycles inside the lightbox. The grid behind is `inert`, but Gecko
+   * 91 (the Sailfish Browser) has no inert, so without this Tab would walk
+   * into the page underneath.
+   */
+  function trapTab(e: KeyboardEvent) {
+    const root = dialog;
+    if (!root) return;
+    const els = [...root.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), input:not([disabled]), video[controls], [tabindex]:not([tabindex="-1"])')];
+    const first = els[0];
+    const last = els[els.length - 1];
+    const a = document.activeElement;
+    const inside = a instanceof Node && root.contains(a);
+    if (!first || !last) {
+      e.preventDefault();
+      root.focus();
+    } else if (e.shiftKey && (!inside || a === first || a === root)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (!inside || a === last)) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   function onKey(e: KeyboardEvent) {
     if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
     switch (e.key) {
+      case 'Tab':
+        trapTab(e);
+        break;
       case 'ArrowLeft':
         e.preventDefault();
         go(nb.prev);
