@@ -3,7 +3,8 @@
 Status: implemented (backend and frontend merged and reconciled), with
 the Phase 0 device results recorded ("Phase 0 results"). "As
 implemented" at the end holds the authoritative API listing, what
-differs from the design above and what is not built yet. Anything still marked
+differs from the design above and what is not built yet; "Review
+fixes" lists what three reviews found and how it was fixed. Anything still marked
 **unverified** or **pending** is a browser or OS behaviour that no device
 has confirmed yet.
 
@@ -714,6 +715,13 @@ file while another process holds the lock. The same applies to the
   This is what keeps a laptop that leaves the house from offering the
   share on a café Wi-Fi, where the address range is also private.
 
+  *Changed in review (S1, R3, R4; see "Review fixes"):* only the user's
+  hand (the Share page, the tray, `serve --share`) records the home
+  network; "Keep sharing on" at launch listens only on the saved one. No
+  LAN address at all is transient: sharing waits (paused, `waiting:
+  true`) and resumes by itself when the home network is back. Only
+  another network pauses until the user resumes.
+
 ## Persistence
 
 `os.UserConfigDir()/picmover/share/` holds the files below. That is
@@ -834,10 +842,13 @@ rewrite the file constantly.
      now < expiresAt`. Otherwise it answers 410 `{error: "This pairing
      code has expired or was already used. Show a new one on the
      computer."}`, or 400 for a malformed body.
-   - For a code: a wrong code adds one attempt to **every** open pairing.
-     After 5 wrong attempts in total, all open pairings are cancelled
-     (the computer shows "Too many wrong codes; show a new one"). With 40
-     bits and at most 5 tries per 2 minutes, guessing is hopeless.
+   - For a code: ~~a wrong code adds one attempt to every open pairing;
+     after 5, all open pairings are cancelled~~ *(changed in review, S2)*
+     wrong codes count per remote address: after 5 that address is
+     refused pairing for 10 minutes, the open pairings stay, and the
+     Share page shows a notice naming the address. With 40 bits, 5 tries
+     per address per 10 minutes and a global budget, guessing is
+     hopeless, and nobody can cancel someone else's pairing.
    - Checks the pairing's share: it must still exist and be active (not
      paused, expired, broken or unavailable), else 410 with that
      reason.
@@ -884,8 +895,9 @@ rewrite the file constantly.
 ### Staying signed in
 
 - The cookie is the only credential. `__Host-` forces `Secure`,
-  `Path=/` and no `Domain`, so it is bound to exactly this host and
-  port. Gecko, WebKit and Blink all implement cookie prefixes.
+  `Path=/` and no `Domain`, so it is bound to exactly this host.
+  Gecko, WebKit and Blink all implement cookie prefixes. *Correction
+  (review):* cookies are not bound to the port; see "Threat model".
 - **Renewal:** on an authenticated request, when `cookieIssuedAt` is
   older than 7 days, the response re-sends the same cookie with a fresh
   `Max-Age` and updates `cookieIssuedAt`. The cookie then never reaches
@@ -1093,8 +1105,9 @@ the listener binds one IPv4 address.
 ### Port
 
 The default is 7443, saved once used, and configurable on the Share page
-and with `--share-port`. Phones bookmark the URL and the cookie is bound
-to host and port, so a busy port is **not** replaced by a random one:
+and with `--share-port` (which applies to that run only and is never
+saved; changed in review, R16). Phones bookmark the URL, so a busy port
+is **not** replaced by a random one:
 sharing goes to `error` with "Port 7443 is in use by another program;
 choose another port on the Share page".
 
@@ -1454,6 +1467,9 @@ Adversaries and what stops them:
 | Other networks (the laptop on café Wi-Fi) | Reach the share port | Bound to one interface; connection filter; pause on network change; auto-off; device auth still required |
 | A local malicious process on the computer | Read `share.json`, keys and the libraries | Out of scope: it can read the photos directly. Files are 0600 so that other local *accounts* cannot. |
 | A future developer adding an admin route, or a scope kind | Expose it to phones, or let a list return rows that `visible` refuses | The separate allowlisted mux plus the golden-list test; the route × scope test matrix and the `restrict`/`visible` agreement test |
+| Another HTTPS service on the computer's address (another port), or a page it serves | Receive the phone's device cookie, or overwrite it | **Accepted, documented (review).** Cookies are not isolated by port: a phone that visits `https://<the computer's IP>:<another port>/` sends `__Host-picmover` there, and that service can set a cookie of the same name. Anything else listening on the computer's LAN address is trusted like picmover itself; a stolen cookie is revoked on the Share page. A clobbered cookie only unpairs the phone. |
+| A guest of a share with `download` on and `video` off | Get a video's bytes | **By design (review).** `download` covers every original, videos included: `GET …/file/{id}?download=1` of a video answers with its bytes as an attachment. `video` governs only inline playback (`file` without `?download=1`). A share that must not hand out videos needs both off. (The reverse also holds, as the capability warning says: with `video` on, a played video can be saved.) |
+| An unpaired device holding connections or guessing codes | Exhaust the listener, cancel the owner's pairing, use up the pairing budget | *(review)* At most 12 connections per address and 256 in all, a connection that sends nothing is closed after 5 s; wrong codes block only their own address; the global pairing budget is taken only by well-formed codes. |
 
 ## Security and safety rules
 
@@ -1999,16 +2015,19 @@ way.
 Backend:
 
 ```
-internal/share/config.go          share.json (Manager: Open, Hold/Release of share.lock, Snapshot, Update, Verify, Seen, AddDevice), Sweep
+internal/share/config.go          share.json (Manager: Open, Hold/Release of share.lock, Managed, Snapshot, Update, Verify(Cookie), Seen, AddDevice, Sweep)
+internal/share/extra.go           unknown share.json members kept on rewrite; alive_*.go: processAlive (Managed)
 internal/share/shares.go          Share, Device, states, cookie format, CleanName, BrowserLabel
 internal/share/scope.go           Scope (unknown kinds kept byte for byte), LibraryKey, AlbumKey, Capabilities and their defaults
 internal/share/pairing.go         Pairings: Issue, Find, Use, Cancel, Ask/Wait/Decide (approval), notices
 internal/share/ratelimit.go       Limiter (token buckets), Lockout
 internal/share/tlscert.go         NewCA, NewLeaf, Certs (Ensure, TLSConfig, Fingerprints), WriteFileAtomic
-internal/share/netif.go           Candidates, Choose, Compare (home network), FilterListener; gateway_*.go per OS
+internal/share/netif.go           Candidates, Choose, Compare and Locate (home network), FilterListener (ConnLimits); gateway_*.go,
+                                  wireless_*.go per OS
 internal/share/qr.go              QRSVG, QRTerminal (rsc.io/qr)
 internal/server/share.go          sharing: the listener's lifecycle (Start, Stop, restart, watch, checkNetwork, auto-off)
 internal/server/share_routes.go   shareRouteTable, shareMux, the share middleware, device auth, shareScoped, shareAcquire
+internal/server/share_libs.go     libraries opened for phones closed again (closePhoneLibraries); cached user.db peeks
 internal/server/share_scope.go    scopeAuth with librariesScope and albumScope
 internal/server/share_api.go      the phone's handlers (session, libraries, library, timeline, media, detail, file, albums, ratings); the filter whitelist
 internal/server/share_facets.go   GET /api/l/{lib}/facets
@@ -2075,8 +2094,12 @@ same-origin`, `Cross-Origin-Opener-Policy: same-origin` and
 HSTS or CORS. JSON and errors are `Cache-Control: no-store`.
 
 Refusals before routing: wrong Host **421** (plain text); an address
-locked out after 30 failed authentications a minute **429** `{"error"}`
-for 5 minutes, *on every path including the static files*; a foreign
+locked out after 30 suspect authentications a minute (a malformed
+device cookie, or a wrong secret for a device that exists; *not* a
+missing cookie or the cookie of a revoked or unknown device) **429**
+`{"error"}` with `Retry-After` (the seconds left) for 5 minutes, on
+every `/api/` path except `POST /api/pair` (the static files and
+pairing stay reachable; changed in review, R1/S5); a foreign
 `Origin` (anything but `https://<accepted host>`), `Sec-Fetch-Site:
 cross-site` or `same-site`, or a POST without `Content-Type:
 application/json` and `X-Picmover: 1` **403** `{"error"}`; a body over
@@ -2088,7 +2111,10 @@ Device authentication (every `/api/` route but `POST /api/pair`):
 
 - no, malformed, unknown or revoked cookie: **401**
   `{"error": "This phone is not paired with picmover. Show a pairing code on the computer.", "paired": false}`
-- more than 30 requests a second (burst 100) from one device: **429** `{"error"}`
+- more than 30 requests a second (burst 100) from one device on the
+  JSON routes, or 200 a second (burst 500) on `thumb`, `preview`,
+  `large` and `file` (their own budget; review R2): **429** `{"error"}`
+  with `Retry-After: 1`
 - share not active: **403** `{"error", "state"}` with `state` one of
   `"paused"` ("This share is paused."), `"expired"` ("This share has
   ended."), `"gone"` ("This album is no longer shared."),
@@ -2155,14 +2181,28 @@ in an album share.
   unknown, used, expired or cancelled; also after approval timed out
   (`"Not approved in time. …"`). When the pairing exists but its share
   is not active, **410** `{"error": "This share is paused.", "state": "paused"}`
-  (`state` as above).
-- **409** `{"error": "This phone is already paired with \"My phone\".", "current": {"share": "My phone"}}`:
+  (`state` as above; also when the share is paused or ends while the
+  request waits for approval).
+- **410** `{"error": "Sharing was turned off on the computer. Try again when it is on.", "state": "off"}`:
+  the approval wait ended because sharing was turned off, paused (network)
+  or picmover quit (review R8; it used to be the 403 of a denial).
+- **409** `{"error": "This phone is already paired with \"My phone\".", "current": {"share": "My phone", "sameShare": true}}`:
   the request carried a valid device cookie and no `replace`; the token
-  is not used up. With `replace: true` the old device is removed in the
-  same save.
+  is not used up. `current.sameShare` is `true` when that device belongs
+  to the share being paired (absent otherwise), so the phone can say
+  "already paired with this share" instead of offering to replace. With
+  `replace: true` the old device is removed in the same save.
 - **409** `{"error"}` (no `current`): the share already has 20 phones.
+  The pairing is **not** used up (review R12): after a phone is revoked
+  the same code works.
 - **403** `{"error": "The computer did not allow this phone."}` (no `state`): denied on the computer.
-- **429** `{"error"}`: 5 a minute per address, 20 in total.
+- **429** `{"error"}` with `Retry-After`: 5 a minute per address
+  (`Retry-After: 15`); an address that sent 5 wrong codes is refused
+  for 10 minutes (`"Too many wrong codes from this phone; try again in
+  10 minutes."`, `Retry-After` the seconds left); 60 well-formed codes a
+  minute in total (malformed values and tokens do not count;
+  `Retry-After: 15`). Wrong codes never cancel an open pairing (review
+  S2).
 
 With approval on, the request blocks up to 60 s.
 
@@ -2314,9 +2354,9 @@ pairing dialog is open):
 
 ```json
 {"state": "on", "url": "https://192.168.1.20:7443/", "mdnsUrl": "https://terra.local:7443/",
- "port": 7443, "address": "192.168.1.20",
- "addresses": [{"ip": "192.168.1.20", "iface": "wlp3s0", "subnet": "192.168.1.0/24"},
-               {"ip": "172.17.0.1", "iface": "docker0", "subnet": "172.17.0.0/16", "virtual": true}],
+ "port": 7443, "address": "192.168.1.20", "phones": 3,
+ "addresses": [{"ip": "192.168.1.20", "iface": "wlp3s0", "subnet": "192.168.1.0/24", "wireless": true},
+               {"ip": "172.17.0.1", "iface": "docker0", "subnet": "172.17.0.0/16", "virtual": true, "wireless": false}],
  "fingerprint": {"leaf": "AB:CD:…", "ca": "12:34:…"},
  "keepOn": false, "mdns": true,
  "autoOff": {"mode": "1h", "until": "2026-10-14T20:00:00+03:00"},
@@ -2324,8 +2364,15 @@ pairing dialog is open):
  "shares": [adminShare]}
 ```
 
-- `state`: `"off"`, `"on"`, `"paused"` (`reason: "network changed"`, or
-  why a rebind failed), `"error"` (`reason`, e.g. "Port 7443 is in use
+- `state`: `"off"`, `"on"`, `"paused"`, `"error"`. `paused` has a
+  `reason`: `"network changed"` (another network: stays paused until
+  the user resumes), `"waiting for the home network"` with
+  **`"waiting": true`** (no LAN address: resumes by itself when the home
+  network is back; review R3/R4), `"turn sharing on once on the Share
+  page to record the home network"` ("Keep sharing on" at launch with no
+  home network saved), or `"sharing could not listen on <ip>: …"` (also
+  `waiting`, retried every 15 s). `waiting` is absent when false.
+  `error` has a `reason` (e.g. "Port 7443 is in use
   by another program; choose another port on the Share page", "no Wi-Fi
   or LAN address found; …"). `reason`, `url`, `mdnsUrl` and
   `managedElsewhere` are absent when empty. `address` is the bound
@@ -2335,7 +2382,13 @@ pairing dialog is open):
   then says the certificate is made when sharing is first turned on.
 - `mdns` is the setting (an addition to the design).
 - `addresses[].virtual` (docker, VPN) is absent when false; the address
-  menu marks those entries "virtual".
+  menu marks those entries "virtual". `addresses[].wireless` (review
+  addition) is always present: `true` for a Wi-Fi interface (Linux:
+  `/sys/class/net/<if>/wireless` or `phy80211`; Windows: the adapter
+  name contains "Wi-Fi", "WLAN" or "wireless"; macOS: always `false`,
+  the name does not tell).
+- `phones` (review addition, R10) counts the paired phones of every
+  share: what an address or port change affects (below).
 - `firewallHint` is **one plain-text string** (lines separated by
   `\n`): the ufw and firewalld commands for the subnet and port on Linux,
   one paragraph on Windows and macOS. Shown wrapped in a `<pre>`.
@@ -2347,7 +2400,7 @@ library is looked at:
 `{"state": "on", "url": "https://…/", "shares": 2, "phones": 3, "autoOff": {"mode": "quit"}}`.
 `shares` counts the shares that are not paused, expired, of another
 workspace or of an unknown kind (an album share whose album is gone
-still counts); `phones` their devices; `reason`, `url`,
+still counts); `phones` their devices; `reason`, `waiting`, `url`,
 `autoOff.until` and `managedElsewhere` as above. Client: the pill polls
 it every 10 s while sharing is on or paused and every 30 s while it is
 off, and right after any change made through the admin UI; it shows
@@ -2386,8 +2439,10 @@ plain "Share" link.
   unknown kind (whose scope reads "Unknown kind “x”; update picmover").
 - `device.lastSeen` is null before the first request.
 - `pairing` is the open pairing's expiry (null when none), `notice`
-  (absent, or "Too many wrong codes; show a new one.") is shown on the
-  card, `requests` counts pending approval requests: the page fetches
+  (absent, or since review S2 "Too many wrong codes were typed from
+  192.168.1.50; that address cannot pair for 10 minutes. The code shown
+  still works.") is shown on the card, `requests` counts pending
+  approval requests: the page fetches
   `GET …/requests` only for an active share with `approve` whose count is
   not 0.
 
@@ -2396,9 +2451,32 @@ plain "Share" link.
 **200** with `state: "error"` and the `reason`. `address` must be one of
 `addresses[].ip` (it records that interface), `port` 1–65535 (the page's
 field accepts 1024–65535), `autoOff` one of the four values (**400**
-otherwise). A changed address, port or `mdns` re-listens when on.
-`enabled: true` while paused resumes and records the current network as
-home ("Resume on this network").
+otherwise). A changed address or port listens again when on, **once**,
+also together with `enabled: true` (review R10); a changed `mdns`
+applies at once without listening again. A `port` replaces a `serve
+--share-port` port of this run. `enabled: true` while paused resumes
+and records the current network as home ("Resume on this network"); it
+is the only way, with the tray and `serve --share`, that records it
+(review S1).
+
+**Address and port changes and paired phones** (review R10; the choice:
+no confirmation round trip, a count before and a notice after):
+
+- Before applying, the page can warn from `GET /api/share`'s `phones`:
+  with `phones > 0`, a new `address` means every phone must pair again
+  (the device cookie belongs to the host, i.e. the IP address; a phone
+  that opened the `.local` URL keeps working when mDNS is on), and a new
+  `port` means phones must open the new URL (bookmarks break) but
+  normally stay paired (cookies are not bound to the port).
+- The answer to a POST that changed them carries
+  `"notice": "<text>"` (absent otherwise, and never in `GET`), one or
+  both of: "The sharing address changed: phones paired at the old
+  address must be paired again (their sign-in belongs to the address; a
+  phone that opened the .local name keeps it)." and "The sharing port
+  changed: phones must open the new address (bookmarks of the old one
+  stop working). They normally stay paired; a phone that shows \"Not
+  paired\" must be paired again." The same text is logged at Warn. It
+  is sent only when `phones > 0`.
 
 `POST /api/share/cert/renew` `{}` → the GET body.
 
@@ -2429,8 +2507,10 @@ on an album share or empty is **400**; unknown sid **404**; name taken
 
 `POST …/delete` → **204**; `…/revoke-all` → adminShare;
 `…/pairings` → `{"url": "https://192.168.1.20:7443/#/pair/<token>", "mdnsUrl"?: "https://terra.local:7443/#/pair/<token>", "code": "K7QM-3XRD", "qrSvg": "<svg …>", "expiresAt": "…"}`
-(the QR encodes `url`; **409** `{"error"}` when sharing is off or the
-share is not active, shown in the dialog); `…/pairings/cancel` → **204**
+(the QR encodes `url`; **409** `{"error"}` when sharing is off ("sharing
+on Wi-Fi is off; turn it on first"), paused ("sharing on Wi-Fi is paused
+(<reason>); resume it first", review R9) or the share is not active,
+shown in the dialog); `…/pairings/cancel` → **204**
 (sent when the dialog closes before a phone paired); `GET …/requests` →
 `[{"id": "r_…", "name", "browser", "address", "at"}]`;
 `POST …/requests/{rid}` `{"approve": bool}` → **204** (**404** unknown:
@@ -2450,9 +2530,10 @@ Backend:
   share). Routes still never switch on the kind.
 - **Unknown scope kinds** are `unavailable` to their phones (they never
   authorize anything) and to the Share page.
-- **Session and pair are counted** against the auth-failure lockout
-  when they answer 401; static files are not, but a locked-out address
-  gets 429 for them too.
+- **The auth-failure lockout** counts only suspect cookies (malformed,
+  or a wrong secret for an existing device) on any route, and refuses
+  only `/api/` routes other than `POST /api/pair` (changed in review,
+  R1/S5: it used to count every 401 and refuse every path).
 - **Workspace key.** `serve <library>` keys shares by the library root
   (links resolved) with the folder name as id (`singleID`, "library"
   for a drive root); `picmover share create --workspace <library>` does
@@ -2483,10 +2564,11 @@ Backend:
   Plain `serve` (without `--share`) can still turn sharing on from the
   Share page.
 - **Tray:** "Share on Wi-Fi" is a checkbox, titled "Share on Wi-Fi
-  (192.168.1.20)" while on and "Share on Wi-Fi (paused: network
-  changed)" while paused; it follows the Share page within 5 s. With no
-  shares, or when sharing cannot start, it opens `#/share`. "Keep
-  sharing on" (`keepOn`) is honoured at the app's launch only.
+  (192.168.1.20)" while on and "Share on Wi-Fi (paused: <reason>)"
+  while paused ("(paused)" for a long reason); it follows the Share page
+  within 5 s. With no shares, or when sharing cannot start, it opens
+  `#/share`. "Keep sharing on" (`keepOn`) is honoured at the app's
+  launch only, through `Running.StartSharingKept` (review S1/R4).
 - **`userdata.PeekLibraryID`** now opens read-only (not immutable) first,
   so it sees a running server's `-wal`; it falls back to the immutable
   open as before.
@@ -2549,6 +2631,113 @@ Mismatches found between the two branches and how they were settled:
 No backend change was needed: every mismatch was on the client side or
 in the fakes.
 
+### Review fixes
+
+Three adversarial reviews (security, robustness, frontend) of the
+merged branch found the items below; the backend ones were fixed on
+`fix/lan-share-backend`. Each has a regression test (`internal/server/
+share_review_*_test.go`, `internal/share/review*_test.go` unless noted).
+
+Security:
+
+- **S1** "Keep sharing on" started on any network and recorded it as
+  home. Now `sharing.StartKept` (`Running.StartSharingKept`, used by the
+  app at launch) compares with the saved home network (`share.Locate`):
+  home listens, another network pauses (`network changed`) until the
+  user resumes, no home saved pauses with "turn sharing on once on the
+  Share page…". Only `Start` (Share page, tray, `serve --share`) and a
+  user's address/port change record home.
+- **S2** Wrong codes cancelled every open pairing; malformed requests
+  from four addresses used up the global 20/min. Wrong codes now count
+  per address (`Pairings.Find(token, code, addr)`): 5 block that address
+  from `POST /api/pair` for 10 min (`Blocked`), the pairings stay, the
+  Share page gets a notice naming the address. The global budget (now
+  60/min) is taken only by well-formed codes.
+- **S3** 64 idle sockets from one address took every slot.
+  `FilterListener` now takes `ConnLimits{Total: 256, PerIP: 12,
+  FirstByte: 5s}`: a connection that sends no byte in 5 s is closed
+  (read deadlines are clamped until the first byte; then the server's
+  own handshake/header/idle timeouts apply).
+- **S4** `/assets/..%2Fsecret.txt` served frontend root files. Static
+  routes now name their file, or their folder plus `{file...}`; empty,
+  `.`, `..` segments, backslashes and escaped separators are 404.
+- **S5** (with R1) the lockout counted every 401 by address; see R1.
+- Doc: the threat model now says that cookies ignore ports (another
+  HTTPS service on the computer's address receives and can overwrite the
+  device cookie) and that `download` hands out videos through
+  `?download=1` even with `video` off.
+- Reviewed with no change: `GET /api/l/{lib}/facets` and the filter
+  whitelist. Facets go through the same `restrict` as the timeline
+  (album shares count only the album's live members), `gps` needs
+  `location`, `tags`/`albums` only where the scope is whole libraries
+  and only with live photos, no query parameter is accepted, and the
+  `album`, `tag`, `rating`, `gps` filters are refused per scope and
+  capability before parsing.
+
+Robustness:
+
+- **R1** A revoked phone's stale thumbnails locked its address out,
+  re-pairing included. Only suspect cookies count
+  (`Manager.VerifyCookie`), and the lockout refuses only `/api/` routes
+  other than `/api/pair`.
+- **R2** The per-device 30/s (burst 100) starved a grid. `thumb`,
+  `preview`, `large` and `file` have their own 200/s (burst 500).
+- **R3** A pause never resumed. No LAN address is transient (paused,
+  `waiting: true`): the watcher listens again when the home network is
+  back; another network pauses for good.
+- **R4** "Keep sharing on" before Wi-Fi was up ended in `error`. It now
+  waits (as R3) with the watcher running.
+- **R5** `Managed()` probed by taking `share.lock`, making the real
+  holder's changes fail. It reads the holder record
+  (`library.PeekHolder`) and checks the process is alive; `lock` waits
+  up to 1 s for a brief holder (one change) instead of refusing.
+- **R6** A new interface reissued the leaf. `Certs.EnsureFor(need, all,
+  …)` keeps the leaf while it names the bound address and 127.0.0.1
+  (and the name, and is not near expiry).
+- **R7** A late auto-off timer stopped a new session. Timers carry a
+  generation checked under `sh.mu`.
+- **R8** Approval ended by stop/pause/quit was a 403 denial. Now 410
+  `{error, state: "off"}`; a share paused or ended during the wait gives
+  its own state.
+- **R9** Issuing a pairing while paused said "off"; now it says paused
+  with the reason.
+- **R10** Port/address changes silently unpaired phones, and `enabled`
+  plus a port listened twice. One listen; `mdns` no longer re-listens;
+  `phones` in `GET /api/share` and a `notice` in the POST answer (see
+  the API listing).
+- **R11** A library a phone opened kept its lock for the server's
+  lifetime. It is closed after 10 min without phone requests and when
+  sharing turns off, unless the admin side used it (an admin open or
+  library request clears the mark) or a request, job or move uses it.
+  Creating a share of a never-opened library closes it right after its
+  `LibraryID` is made.
+- **R12** A full share used up the pairing; it now refuses first.
+- **R13** The 5 s drain ran under `sh.mu`. The listener closes under the
+  lock (the port is free at once); `Shutdown` waits after unlocking.
+- **R14** `share.json`: unknown members of the settings, shares, scopes
+  and devices are kept on rewrite (`extra.go`); damaged files (also
+  `{}` or no version) are set aside only under the lock, as
+  `share.json.damaged-<UTC>`, the newest 5 kept; the sharing process
+  sweeps expired shares and idle devices once a minute.
+- **R15** `PeekLibraryID`/`PeekAlbums` of closed libraries are cached by
+  the user.db and -wal stamps (`workspace.peekUser`); the tray's status
+  looks at each share once.
+- **R16** `serve --share-port N` is the port of that run, never saved;
+  a port set on the Share page replaces it.
+
+Additions for the frontend (exact JSON in the API listing):
+`addresses[].wireless` (always present), `waiting` and `phones` in
+`GET /api/share` (`waiting` also in `/api/share/status`), `notice` in
+the answer of `POST /api/share`, 410 `{error, state: "off"}` for an
+approval wait ended by sharing going off, `current.sameShare` in the
+409 "already paired", and `Retry-After` (seconds) on every 429 of the
+share listener. Deviation from the review's suggestions: the per-IP
+connection cap is 12, not 8 (an HTTP/1.1 browser opens up to six
+connections per host, plus preconnects and a second tab); the address
+and port warning is a count before and a notice after, not a 409
+confirmation round trip, so the current Share page keeps working
+unchanged.
+
 ### Not done
 
 - The CA install step (Q3: `/ca.crt`, the "Install the certificate"
@@ -2599,6 +2788,23 @@ status); one sharing process; shutdown flushing last seen; cookie
 renewal. `cmd`: `picmover share` end to end (including the ambiguous
 album and the refusal while held), `--expires` parsing, `serve --share`
 refusals and the printed URL, fingerprint, share line and pairing.
+
+Review fixes (Go): `share_review_test.go` (S4 static paths),
+`share_review_auth_test.go` (R1/S5 lockout, R2 media budget),
+`share_review_pair_test.go` (S2 wrong codes and the global budget, R12,
+R8, R9), `share_review_conn_test.go` (S3 per-address cap and first-byte
+deadline over real TCP/TLS), `share_review_life_test.go` (S1 keepOn on
+another network and without home, R3 waiting and resuming, R4 keepOn
+before the network with the watcher, R6, R7, R13 status during a drain,
+R10 one listen, notice and mdns, R16), `share_review_libs_test.go` (R11
+idle close, admin use, stop, share creation; R15 no re-reads),
+`share_review_api_test.go` (`Retry-After`, `sameShare`, `wireless`,
+`phones`); in `internal/share`: `review_test.go` (Locate, EnsureFor),
+`review_config_test.go` (Managed never collides, dead holder, unknown
+members, damaged copies, periodic sweep), `wireless_linux_test.go`,
+`TestFilterListenerPerIP`/`FirstByte`, wrong codes per address and the
+approval endings in `pairing_test.go`, `VerifyCookie` in
+`config_test.go`. `internal/shell`: the tray's paused labels.
 
 Filters on the phone (`ShareApp.test.ts`, `share/filters.test.ts`,
 `share/shareapi.test.ts`): the Filter button and the sheet's sections
