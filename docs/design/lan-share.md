@@ -1,11 +1,10 @@
 # Sharing on the home Wi-Fi (phone viewing)
 
-Status: design for review, written before any implementation. Nothing
-here is built yet. When it is, "As implemented" sections go at the end,
-backend first and then frontend, as in the other design documents.
-Anything marked **unverified** is a browser or OS behaviour that a spike
-on real devices has to confirm before the related code is written (see
-"Phase 0" and "Open questions").
+Status: design, with the Phase 0 device results recorded ("Phase 0
+results"). "As implemented" sections go at the end, backend first and
+then frontend, as in the other design documents. Anything still marked
+**unverified** or **pending** is a browser or OS behaviour that no device
+has confirmed yet.
 
 ## Goal
 
@@ -815,9 +814,10 @@ rewrite the file constantly.
 5. The camera app opens the URL in the phone's default browser. The
    certificate warning appears the first time (see "TLS"). After the
    user accepts it, the browser loads `/` → `share.html`.
-   **Unverified:** whether every target browser keeps the fragment
-   across its "proceed anyway" interstitial. If it does not, the page has
-   no token and shows the code form; the user types the 8 characters.
+   Phase 0: Android Chrome keeps the fragment through its "Proceed"
+   interstitial (scanned QR), and the Sailfish Browser keeps it on a
+   typed fragment URL. iOS is untested. When a browser loses it, the page
+   has no token and shows the code form; the user types the 8 characters.
 6. The share app sees `#/pair/<token>`, at once runs
    `history.replaceState` to `#/pair` (the token leaves the address bar
    and history), and shows "Name this phone" (pre-filled from the
@@ -998,21 +998,45 @@ not claim pinning. What does help:
 - The optional CA install (Q3) turns that one-time comparison into real
   trust from then on.
 
-### Browser behaviour (all marked items must be confirmed in Phase 0)
+### Browser behaviour
 
-| | iOS Safari (iOS 17/18) | Android Chrome (current) | Sailfish Browser (Sailfish OS 5.1) |
+Android Chrome and the Sailfish Browser were measured in Phase 0 (see
+"Phase 0 results"). iOS was not tested: the user has no Apple device,
+so iOS support is best effort, built on standards and untested. The iOS
+column is what the design expects, not what was seen.
+
+| | iOS Safari (iOS 17/18), **untested** | Android Chrome (current) | Sailfish Browser (Sailfish OS 5.1) |
 |---|---|---|---|
-| Engine | WebKit | Blink | Gecko **ESR 91** (stock browser, embedlite). Jolla targets ESR 115 for 5.2, not 5.1. Community builds of newer Gecko exist but are not the target. |
-| First visit to a self-signed site | "This Connection Is Not Private" → Show Details → "visit this website" → confirm | "Your connection is not private" → Advanced → "Proceed to … (unsafe)" | A security warning page; whether it offers a lasting "accept the risk" exception like desktop Firefox is **unverified** |
-| How long the exception lasts | **Unverified:** believed to last until Safari's website data is cleared | Remembered for about a week, then the warning returns (**unverified** exact period) | **Unverified** (desktop Firefox stores permanent exceptions; embedlite may not) |
-| Address bar | "Not Secure" | Red "Not secure" | **Unverified** |
-| `Secure` and `__Host-` cookies with an accepted exception | Expected to work (the scheme is https) | Works | Expected to work (Gecko 91 supports `SameSite`, `Secure` and prefixes); **unverified** in embedlite |
-| HTTP cache for responses over an excepted certificate | **Unverified** | Chrome does not cache them, so thumbnails are re-fetched on every visit (**unverified** for current versions) | **Unverified** |
-| `<video>` over an excepted certificate | **Known risk:** media loads go through a separate media process that may not honour Safari's exception, so playback can fail while images work. Also check that cookies are sent on media requests. | Expected to work (same network stack) | **Unverified.** Playback goes through GStreamer on the device, and codecs depend on the device and its hardware decoders. H.264/AAC MP4 is the likely common format, but HEVC (`.mov` from iPhones) and VP9 are uncertain. |
+| Engine | WebKit | Blink | Gecko ESR 91 (stock browser, embedlite; the UA reports Firefox). Jolla targets ESR 115 for 5.2, not 5.1. |
+| First visit to a self-signed site | "This Connection Is Not Private" → Show Details → "visit this website" → confirm | "Your connection is not private" → Advanced → "Proceed to … (unsafe)" | A security warning page with a way to proceed (passed in Phase 0) |
+| How long the exception lasts | Believed to last until Safari's website data is cleared | Remembered for about a week, then the warning returns (**pending**: the after-days check has not been run) | **Pending** (the after-days check has not been run) |
+| Address bar | "Not Secure" | Red "Not secure" | Not recorded |
+| `Secure` and `__Host-` cookies with an accepted exception | Expected to work (the scheme is https) | **Pass**: kept across fetch, navigation, reload and a browser restart | **Pass**: kept across fetch, navigation and reload |
+| Cookie on `<img>`, `<video>` (Range) and downloads | Expected to work; the media process is the known risk | **Pass** | **Pass**, the download is saved |
+| HTTP cache for responses over an excepted certificate | Unknown | **Not used**: every fetch is a full response | **Used** |
+| `<video>` over an excepted certificate | **Known risk:** media loads go through a separate media process that may not honour Safari's exception, so playback can fail while images work | H.264, HEVC (MP4 and MOV), VP9 and AV1 (WebM and MP4) play | H.264, HEVC (MP4 and MOV) and VP9 play; **AV1 fails** (no decoder) |
+| Svelte 5 share bundle | Expected to work (Safari 15+) | Mounts | Mounts (see "Sailfish Browser specifics" for missing APIs) |
 | Service worker / PWA install | Not on a certificate-error origin | Not allowed on a certificate-error origin | Not relevant (embedlite) |
-| `.local` names (mDNS) | Resolves natively | **Unverified** (Android support for `.local` in Chrome has been inconsistent across versions) | **Unverified** (Sailfish has Avahi packages, but whether the browser's resolver uses mDNS is unknown) |
+| `.local` names (mDNS) | Resolves natively | **Pass** (`<host>.local` resolved and loaded) | **Fails**: does not resolve; the IP had to be typed |
+| Edge swipes | Unknown | Lost to the system gestures; the middle works | Middle 5/5, edges 0/5 (system gestures) |
 
 Consequences built into the design:
+
+- **The share URL uses the IP address.** The Sailfish Browser cannot
+  resolve `.local`, so QR codes, printed URLs and the Share page lead
+  with `https://<ip>:<port>/`. The `.local` URL is only an extra (Q9),
+  shown when `mdns` is on. The Share page and the README recommend a
+  DHCP reservation for the computer, since the cookie is bound to the
+  address.
+- **No AV1 assumptions.** Nothing picks AV1 or relies on it playing; a
+  file the browser cannot play gets the Download fallback.
+- **Caching under a certificate exception is browser-dependent.**
+  Chrome refetches everything, Gecko caches. Thumbnails stay small
+  (`thumb` in the grid), and renditions still carry
+  `private, max-age` with a versioned ETag so the browsers that do cache
+  benefit.
+- **Lightbox swipes start away from the screen edges** on both measured
+  phones; the edges belong to the system.
 
 - **Video fallback:** the lightbox always offers **Download** next to
   the player, and shows "This video cannot be played in this browser"
@@ -1240,14 +1264,22 @@ Error screens:
     fails the build when a listed API appears in a share chunk without
     the polyfill.
 
-  Whether Svelte 5's runtime runs on Gecko 91 at all is **unverified**
-  and is the first Phase 0 item for Sailfish.
-- **Touch:** Gecko 91 supports Touch Events and Pointer Events
-  (`touch-action` included), so the existing swipe code and the
-  Scrubber's pointer capture should work. Sailfish's own edge-swipe
-  gestures (from the screen edges, for the OS) take precedence, so
-  lightbox swipes must start at least 24 px from the left and right
-  edges to be reliable. That is a recommendation, not a measured value.
+  Phase 0 confirmed that a Svelte 5 bundle built for this target mounts
+  and updates on the Sailfish Browser. The feature check there found
+  these missing: `Object.hasOwn`, `structuredClone`,
+  `Array.prototype.findLast`, `Array.prototype.toSorted`, `dvh` units,
+  `:has()`, container queries, CSS nesting, `color-mix()`,
+  `touch-action` and fetch `keepalive`. The list above stands, plus
+  `touch-action` (see Touch) and `keepalive` (not used by the share
+  app).
+- **Touch:** Gecko 91 supports Touch Events and Pointer Events, so the
+  existing swipe code should work, but the Phase 0 feature check found
+  **no `touch-action`** in the Sailfish Browser: the Scrubber and the
+  lightbox must not depend on it to suppress scrolling (call
+  `preventDefault` on the touch events as well). Sailfish's own
+  edge-swipe gestures take every swipe that starts at a screen edge
+  (Phase 0: middle 5/5, edges 0/5), so lightbox swipes must start at
+  least 24 px from the left and right edges.
 - **Rendering cost:** Sailfish devices are often older and slower
   phones. The share grid caps renditions at `thumb` (below), keeps
   overscan to one screen, and avoids blur filters (the lightbox
@@ -1716,6 +1748,64 @@ committed (`tools/shareprobe/static/svelte/probe.js`); rebuild it with
 also lists any post-Gecko-91 APIs in the output (none for Svelte
 5.57.1).
 
+### Phase 0 results
+
+Run on 2026-10-14 against the probe above, on two phones.
+
+**Android Chrome** (one phone):
+
+| Item | Result |
+|---|---|
+| 1 Pairing | **Pass**: the scanned QR's fragment survived the certificate warning, and the cookie was set |
+| 2 Cookie | **Pass** across fetch, navigation, reload and closing and reopening the browser |
+| 3 Cookie on media | **Pass** on `<img>`, `<video>` with Range, and a download |
+| 4 Video | H.264, HEVC MP4, HEVC MOV, VP9, AV1 (WebM and MP4) all play |
+| 5 Svelte 5 | Mounts; no missing features |
+| 6 `.local` | **Pass**: `terra.local` resolved and loaded |
+| 7 Exception after days | Pending |
+| 8 Edge swipes | Lost to the system; the middle works |
+| 9 HTTP cache | **Not used** under the certificate exception: every fetch was a full response |
+| 10 CA install | Not tested |
+
+**Sailfish Browser**, Sailfish OS 5.1 (the UA reports Firefox; Gecko
+ESR 91 as the design assumed):
+
+| Item | Result |
+|---|---|
+| 1 Pairing | **Pass** with the typed fragment URL. `.local` did not resolve, so the user typed the IP. |
+| 2 Cookie | **Pass** across fetch, navigation and reload |
+| 3 Cookie on media | **Pass** on `<img>`, `<video>` with Range, and a download (the file was saved) |
+| 4 Video | H.264, HEVC MP4, HEVC MOV and VP9 play; **AV1 fails** (no decoder) |
+| 5 Svelte 5 | Mounts. Missing: `Object.hasOwn`, `structuredClone`, `Array.prototype.findLast`, `Array.prototype.toSorted`, `dvh` units, `:has()`, container queries, CSS nesting, `color-mix()`, `touch-action`, fetch `keepalive` |
+| 6 `.local` | **Fails**: does not resolve |
+| 7 Exception after days | Pending |
+| 8 Edge swipes | Middle 5/5, edges 0/5 (system gestures) |
+| 9 HTTP cache | **Works** |
+| 10 CA install | Not tested |
+
+**Not tested:**
+
+- **iOS.** The user has no Apple devices. iOS support is best effort:
+  standards-based and untested. The iOS media-process risk (Q5) stays
+  open; Download is the fallback.
+- **CA install (item 10).** Assumed to work as designed. It stays
+  opt-in (Q3) and is not offered until a phone has shown that it
+  enforces the name constraints.
+- **Certificate exception after days (item 7).** Pending a later visit.
+
+What this changes:
+
+- Share URLs and QR codes use the IP address; `.local` is offered only
+  as an extra (Q9). Recommend a DHCP reservation.
+- The cookie works on both phones for every request type, so the `?t=`
+  media URL (Q5) is not needed there.
+- No AV1 assumptions anywhere.
+- HTTP caching under a certificate exception depends on the browser:
+  keep thumbnails small and send sensible `Cache-Control` and ETags
+  anyway.
+- `touch-action` is missing on Sailfish; swipes must start away from
+  the screen edges on both phones.
+
 ## Settled in review
 
 Decisions by the user on the first version of this document (the Q
@@ -1735,7 +1825,9 @@ numbers are the ones used there and in references above):
   app's "Keep sharing on" is set. `serve` shares only with `--share`.
 - **Q5, iOS video:** decided by Phase 0. The certificate install is the
   fix, and Download is the fallback. The `?t=` media URL is built only if
-  cookies turn out to be the problem.
+  cookies turn out to be the problem. Phase 0: cookies reach media and
+  Range requests on Android Chrome and Sailfish; iOS is untested, so the
+  `?t=` URL is not built.
 - **Q7 and Q8, tags, camera filters, map:** not on phones in this
   version. GPS is a per-share capability (`location`), on for library
   shares and off for album shares.
@@ -1777,9 +1869,11 @@ numbers are the ones used there and in references above):
 Q1–Q8 and Q15–Q20 are settled (above). Still open:
 
 9. **Q9. Offer the `.local` URL?**
-   - *Recommendation:* show it as an option after Phase 0 records which
-     phones resolve it: iOS likely, Android and Sailfish unverified.
-   - Default to the IP URL, and recommend a DHCP reservation.
+   - Phase 0: Android Chrome resolves it, the Sailfish Browser does not
+     (iOS is untested, likely yes).
+   - *Recommendation:* the IP URL is the URL (QR codes, the printed
+     line). The `.local` URL is an extra, shown only when `mdns` is on.
+     Recommend a DHCP reservation.
 10. **Q10. Live update of the admin grid when a phone rates?**
     - *Recommendation:* not in this version; a reload shows it.
     - If wanted, add a small SSE stream of `Change` events per library
@@ -1799,10 +1893,10 @@ Q1–Q8 and Q15–Q20 are settled (above). Still open:
     - Sailfish OS 5.1's stock browser is believed to be on Gecko ESR 91,
       with ESR 115 planned for 5.2. This comes from community and Jolla
       forum posts, not from official release notes.
+    - Phase 0: the UA reports Firefox, and the missing APIs match
+      ESR 91.
     - *Recommendation:* target ESR 91 (the build target and polyfills
-      above), confirm the version on the device in Phase 0 from the
-      browser's user-agent, and drop the polyfills when 5.2 is the
-      minimum.
+      above), and drop the polyfills when 5.2 is the minimum.
 14. **Q14. Albums across libraries.** Albums are per library today. If
     cross-library albums ever come, the album scope's key and `visible`
     must be revisited, so that membership never lets a photo of an
