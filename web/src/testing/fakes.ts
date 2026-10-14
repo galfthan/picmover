@@ -1382,3 +1382,301 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;
+
+// ---- The share listener (docs/design/lan-share.md "Share listener: routes") ----
+
+/** An item of the fake share server (library "peter"). */
+export interface ShareItem extends MediaItem {
+  lat?: number;
+  lon?: number;
+}
+
+export interface FakeShareOptions {
+  /** The share's capabilities; the kind's defaults when left out. */
+  capabilities?: Partial<Record<'video' | 'download' | 'rate' | 'location', boolean>>;
+  /** Library shares: the shared libraries (default: peter and penny). */
+  libraries?: string[];
+  /** Whether this browser holds a valid device cookie at the start (default: true). */
+  paired?: boolean;
+}
+
+/**
+ * A stateful fake of the share listener's API for the phone app's tests:
+ * one share of `kind` (a library share "My phone" over peter and penny, or
+ * an album share "Summer guests" of peter's album "Summer"), a cookie that
+ * pairing sets and revocation clears, the share's state (paused, expired,
+ * gone, unavailable), scope and capability checks and redaction as the
+ * design specifies them, and the filter whitelist (anything else is 400).
+ * Pairing: `pairing.tokens` and `pairing.codes` are open (single use);
+ * `pairing.approve` holds a redeem until `approve()`/`deny()`; a paired
+ * browser gets 409 `{current: {share}}` without `replace`.
+ */
+export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts: FakeShareOptions = {}) {
+  const calls: Call[] = [];
+  const all = kind !== 'album';
+  const caps = { video: true, download: all, rate: all, location: all, ...opts.capabilities };
+  const libNames: Record<string, string> = { peter: 'Peter', penny: 'Penny' };
+  const shared = kind === 'album' ? [] : (opts.libraries ?? ['peter', 'penny']);
+  // peter: July 2024 ids 1..6 (3 is a video), June ids 7..8; penny: one item (20).
+  const items: (ShareItem & { lib: string })[] = [];
+  for (let i = 1; i <= 6; i++) {
+    items.push({ id: i, hash: hashOf(i), type: i === 3 ? 'video' : 'image', takenAt: `2024-07-${String(20 - i).padStart(2, '0')}T10:00:00`, w: 4000, h: 3000, thumb: 'ok', thumbAt: 1700000000, lib: 'peter' });
+  }
+  for (let i = 7; i <= 8; i++) items.push({ id: i, hash: hashOf(i), type: 'image', takenAt: `2024-06-${String(20 - i).padStart(2, '0')}T10:00:00`, w: 4000, h: 3000, thumb: 'ok', lib: 'peter' });
+  items.push({ id: 20, hash: hashOf(20), type: 'image', takenAt: '2023-01-05T10:00:00', w: 100, h: 100, thumb: 'ok', lib: 'penny' });
+  const first = items[0]!;
+  first.rating = 4;
+  first.lat = 60.17;
+  first.lon = 24.94;
+  first.gps = true;
+  items[2]!.dur = 7000;
+  /** peter's albums; an album share covers "Summer" (2). */
+  const albums = [
+    { id: 2, name: 'Summer', hashes: [hashOf(1), hashOf(2), hashOf(3)] },
+    { id: 5, name: 'Secret', hashes: [hashOf(7)] },
+  ];
+  const share = {
+    name: kind === 'album' ? 'Summer guests' : 'My phone',
+    expiresAt: kind === 'album' ? '2026-11-13T19:00:00+02:00' : null,
+    /** '' active, else the 403 state. */
+    state: '' as '' | 'paused' | 'expired' | 'gone' | 'unavailable',
+  };
+  const device = { id: 'd_3f9a1c2e7b5d4a10', name: "Anna's phone" };
+  const cookie = { paired: opts.paired ?? true, otherShare: '' };
+  /** Libraries answering 503 (rebuilding, held by another process). */
+  const busy = new Set<string>();
+  /** A move runs: ratings answer 409. */
+  const moving = { on: false };
+  const pairing = {
+    tokens: new Set<string>(['tok_' + 'a'.repeat(40)]),
+    codes: new Set<string>(['K7QM3XRD']),
+    /** Redeems wait for the computer while set. */
+    approve: false,
+    /** Answers 429 to the next redeem. */
+    limited: false,
+    pending: null as null | ((ok: boolean) => void),
+  };
+
+  const visible = () =>
+    items.filter((x) => (kind === 'album' ? x.lib === 'peter' && share.state !== 'gone' && albums[0]!.hashes.includes(x.hash) : shared.includes(x.lib)));
+  const libsJSON = () =>
+    shared.map((id) => ({ id, name: libNames[id] ?? id, cover: items.find((x) => x.lib === id)?.hash ?? null, total: items.filter((x) => x.lib === id).length }));
+  const shareJSON = () => ({
+    name: share.name,
+    kind,
+    capabilities: { ...caps },
+    expiresAt: share.expiresAt,
+    ...(kind === 'album'
+      ? { album: { name: albums[0]!.name, count: visible().length, cover: albums[0]!.hashes[0] } }
+      : { libraries: libsJSON() }),
+  });
+  const itemJSON = (x: ShareItem & { lib: string }): Record<string, unknown> => {
+    const { lib: _l, lat: _a, lon: _o, rating, gps, ...rest } = x;
+    return { ...rest, ...(caps.rate && rating ? { rating } : {}), ...(caps.location && gps ? { gps } : {}) };
+  };
+  const ym = (x: ShareItem) => {
+    const m = /^(\d{4})-(\d{2})/.exec(x.takenAt ?? '');
+    return m ? [Number(m[1]), Number(m[2])] : [0, 0];
+  };
+  const notFound = () => json({ error: 'not found' }, 404);
+  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'year', 'month', 'v', 'download']);
+
+  function select(lib: string, q: URLSearchParams): (ShareItem & { lib: string })[] | Response {
+    for (const k of q.keys()) if (!ALLOWED.has(k)) return json({ error: `filter ${k} not allowed` }, 400);
+    if (q.has('rating') && !caps.rate) return json({ error: 'filter rating not allowed' }, 400);
+    if (q.has('album') && kind === 'album') return json({ error: 'filter album not allowed' }, 400);
+    let list = visible().filter((x) => kind === 'album' || x.lib === lib);
+    const aid = Number(q.get('album'));
+    if (aid) {
+      const a = lib === 'peter' ? albums.find((x) => x.id === aid) : undefined;
+      if (!a) return notFound();
+      list = list.filter((x) => a.hashes.includes(x.hash));
+    }
+    const t = q.get('type');
+    if (t) list = list.filter((x) => x.type === t);
+    const rating = Number(q.get('rating'));
+    if (rating) list = list.filter((x) => (x.rating ?? 0) >= rating);
+    const from = q.get('from');
+    if (from) list = list.filter((x) => (x.takenAt ?? '') >= from);
+    const to = q.get('to');
+    if (to) list = list.filter((x) => (x.takenAt ?? '9999') < to);
+    return list;
+  }
+
+  /** Device → share → scope, as shareScoped: the library key, or a refusal. */
+  function auth(): Response | null {
+    if (!cookie.paired) return json({ error: 'not paired', paired: false }, 401);
+    if (share.state) return json({ error: `share ${share.state}`, state: share.state }, 403);
+    return null;
+  }
+
+  async function redeem(body: Record<string, unknown>): Promise<Response> {
+    if (pairing.limited) {
+      pairing.limited = false;
+      return json({ error: 'too many requests' }, 429);
+    }
+    const token = typeof body.token === 'string' ? body.token : null;
+    const code = typeof body.code === 'string' ? body.code.toUpperCase().replace(/-/g, '') : null;
+    if ((token === null) === (code === null) || typeof body.name !== 'string') return json({ error: 'bad request' }, 400);
+    const set = token !== null ? pairing.tokens : pairing.codes;
+    const key = token ?? code ?? '';
+    if (!set.has(key)) return json({ error: 'This pairing code has expired or was already used. Show a new one on the computer.' }, 410);
+    if (share.state) return json({ error: `This share is ${share.state}.` }, 410);
+    if (cookie.paired && body.replace !== true) return json({ error: 'already paired', current: { share: cookie.otherShare || share.name } }, 409);
+    set.delete(key);
+    if (pairing.approve) {
+      const ok = await new Promise<boolean>((resolve) => (pairing.pending = resolve));
+      pairing.pending = null;
+      if (!ok) return json({ error: 'not approved' }, 403);
+    }
+    cookie.paired = true;
+    cookie.otherShare = '';
+    device.name = body.name.trim() || 'Phone';
+    return json({ device: { ...device }, share: shareJSON() });
+  }
+
+  function libRoute(lib: string, rest: string, q: URLSearchParams, method: string, body: Record<string, unknown>): Response {
+    const refused = auth();
+    if (refused) return refused;
+    if (kind === 'album' ? lib !== 'album' : !shared.includes(lib)) return notFound();
+    const real = kind === 'album' ? 'peter' : lib;
+    if (busy.has(real)) return json({ error: 'This library is not available right now.' }, 503);
+    const inScope = (x: ShareItem & { lib: string }) => visible().includes(x) && x.lib === real;
+    if (method === 'GET' && rest === 'library') {
+      if (kind === 'album') return notFound();
+      const l = items.filter((x) => x.lib === real);
+      return json({ id: lib, name: libNames[lib] ?? lib, summary: { total: l.length, images: l.filter((x) => x.type !== 'video').length, raw: 0, videos: l.filter((x) => x.type === 'video').length, earliest: null, latest: null } });
+    }
+    if (method === 'GET' && rest === 'albums') {
+      if (kind === 'album') return notFound();
+      return json({ albums: real === 'peter' ? albums.map((a) => ({ id: a.id, name: a.name, count: a.hashes.length, cover: a.hashes[0] ?? null })) : [] });
+    }
+    if (method === 'GET' && rest === 'timeline') {
+      const list = select(lib, q);
+      if (list instanceof Response) return list;
+      const m = new Map<string, { year: number; month: number; count: number }>();
+      for (const x of list) {
+        const [y, mo] = ym(x) as [number, number];
+        const b = m.get(`${y}-${mo}`) ?? { year: y, month: mo, count: 0 };
+        b.count++;
+        m.set(`${y}-${mo}`, b);
+      }
+      return json({ buckets: [...m.values()].sort((a, b) => b.year - a.year || b.month - a.month) });
+    }
+    if (method === 'GET' && rest === 'media') {
+      const list = select(lib, q);
+      if (list instanceof Response) return list;
+      const y = Number(q.get('year'));
+      const mo = Number(q.get('month'));
+      return json({ items: list.filter((x) => ym(x)[0] === y && ym(x)[1] === mo).map(itemJSON) });
+    }
+    const mm = /^media\/(\d+)$/.exec(rest);
+    if (method === 'GET' && mm) {
+      const x = items.find((i) => i.id === Number(mm[1]));
+      if (!x || !inScope(x)) return notFound();
+      const d: Record<string, unknown> = {
+        id: x.id,
+        hash: x.hash,
+        type: x.type,
+        takenAt: x.takenAt,
+        offset: 7200,
+        w: x.w,
+        h: x.h,
+        dur: x.dur ?? 0,
+        size: 2048,
+        ext: x.type === 'video' ? '.mp4' : '.jpg',
+        fileName: `IMG_${x.id}.${x.type === 'video' ? 'mp4' : 'jpg'}`,
+        cameraMake: 'Canon',
+        cameraModel: 'Canon EOS R6',
+        lens: '',
+        displayable: caps.download,
+        thumbAt: x.thumbAt,
+      };
+      if (caps.location && x.lat !== undefined) Object.assign(d, { lat: x.lat, lon: x.lon });
+      if (caps.rate) d.rating = x.rating ?? 0;
+      if (kind !== 'album') d.albums = albums.filter((a) => a.hashes.includes(x.hash)).map((a) => ({ id: a.id, name: a.name }));
+      return json(d);
+    }
+    const rm = /^(thumb|preview|large)\/([0-9a-f]+)$/.exec(rest);
+    if (method === 'GET' && rm) {
+      const x = items.find((i) => i.hash === rm[2]);
+      if (!x || !inScope(x)) return notFound();
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg' } });
+    }
+    const fm = /^file\/(\d+)$/.exec(rest);
+    if (method === 'GET' && fm) {
+      const x = items.find((i) => i.id === Number(fm[1]));
+      if (!x || !inScope(x)) return notFound();
+      const need = q.get('download') === '1' || x.type !== 'video' ? caps.download : caps.video;
+      if (!need) return json({ error: 'not allowed in this share' }, 403);
+      return new Response(new Uint8Array([0]), { headers: { 'Content-Type': 'application/octet-stream' } });
+    }
+    if (method === 'POST' && rest === 'ratings') {
+      if (!caps.rate) return json({ error: 'not allowed in this share' }, 403);
+      const hashes = Array.isArray(body.hashes) ? body.hashes : [];
+      if (hashes.length !== 1) return json({ error: 'one hash' }, 400);
+      if (moving.on) return json({ error: 'a move is running on this library' }, 409);
+      const x = items.find((i) => i.hash === hashes[0]);
+      if (!x || !inScope(x)) return notFound();
+      const r = Number(body.rating);
+      if (r > 0) x.rating = r;
+      else delete x.rating;
+      return json({ updated: 1 });
+    }
+    return notFound();
+  }
+
+  async function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = new URL(String(input), 'https://192.168.1.20:7443');
+    const method = init?.method ?? 'GET';
+    const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    calls.push({ method, path: url.pathname + url.search, body: method === 'POST' ? body : null });
+    const p = url.pathname;
+    if (method === 'POST') {
+      const h = new Headers(init?.headers);
+      if (h.get('X-Picmover') !== '1' || h.get('Content-Type') !== 'application/json') return json({ error: 'forbidden' }, 403);
+    }
+    if (p === '/api/session' && method === 'GET') {
+      return auth() ?? json({ device: { ...device }, computer: 'laptop', share: shareJSON() });
+    }
+    if (p === '/api/pair' && method === 'POST') return redeem(body);
+    if (p === '/api/libraries' && method === 'GET') {
+      const refused = auth();
+      if (refused) return refused;
+      if (kind === 'album') return notFound();
+      return json({ libraries: libsJSON() });
+    }
+    const m = /^\/api\/l\/([^/]+)\/(.+)$/.exec(p);
+    if (m) return libRoute(decodeURIComponent(m[1] ?? ''), m[2] ?? '', url.searchParams, method, body);
+    return notFound();
+  }
+
+  function install() {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'Date'] });
+    vi.setSystemTime(new Date('2026-10-10T12:00:00'));
+    vi.stubGlobal('fetch', vi.fn(fetchImpl));
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+  }
+
+  /** Requests to a path (with its query), in order. */
+  const requests = (prefix: string) => calls.filter((c) => c.path.startsWith(prefix));
+
+  return {
+    calls,
+    items,
+    albums,
+    caps,
+    share,
+    device,
+    cookie,
+    busy,
+    moving,
+    pairing,
+    install,
+    requests,
+    approve: () => pairing.pending?.(true),
+    deny: () => pairing.pending?.(false),
+  };
+}
+
+export type FakeShareServer = ReturnType<typeof fakeShareServer>;
