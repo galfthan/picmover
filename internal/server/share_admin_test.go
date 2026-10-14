@@ -259,16 +259,21 @@ func TestSharePairingFlows(t *testing.T) {
 		wantStatus(t, pair(fmt.Sprintf(`{"token": %q, "name": "Late"}`, tok), ""), http.StatusGone)
 	})
 	t.Run("wrong codes", func(t *testing.T) {
+		// Five wrong codes block their address only (S2): the open
+		// pairing stays, with a notice, and works from another address.
 		tok := f.issue(ls.ID)
 		for i := 0; i < 5; i++ {
-			wantStatus(t, pair(`{"code": "2222-2222", "name": "x"}`, ""), http.StatusGone)
+			wantStatus(t, f.phoneFrom("10.1.1.1", http.MethodPost, "/api/pair", `{"code": "2222-2222", "name": "x"}`, ""),
+				http.StatusGone)
 		}
-		wantStatus(t, pair(fmt.Sprintf(`{"token": %q, "name": "Anna"}`, tok), ""), http.StatusGone)
+		wantStatus(t, f.phoneFrom("10.1.1.1", http.MethodPost, "/api/pair",
+			fmt.Sprintf(`{"token": %q, "name": "x"}`, tok), ""), http.StatusTooManyRequests)
 		for _, s := range f.status().Shares {
-			if s.ID == ls.ID && (s.Notice == "" || s.Pairing != nil) {
+			if s.ID == ls.ID && (!strings.Contains(s.Notice, "10.1.1.1") || s.Pairing == nil) {
 				t.Fatalf("notice %+v", s)
 			}
 		}
+		wantStatus(t, pair(fmt.Sprintf(`{"token": %q, "name": "Anna"}`, tok), ""), http.StatusOK)
 	})
 	t.Run("replace", func(t *testing.T) {
 		old := f.pair(ls.ID, "Owner")

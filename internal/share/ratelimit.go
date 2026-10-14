@@ -93,18 +93,21 @@ func NewLockout(perMinute int, dur time.Duration, now func() time.Time) *Lockout
 }
 
 // Locked reports whether key is locked out now.
-func (l *Lockout) Locked(key string) bool {
+func (l *Lockout) Locked(key string) bool { return l.LockedFor(key) > 0 }
+
+// LockedFor is how long key stays locked out (0: it is not).
+func (l *Lockout) LockedFor(key string) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	t, ok := l.until[key]
 	if !ok {
-		return false
+		return 0
 	}
-	if l.now().Before(t) {
-		return true
+	if d := t.Sub(l.now()); d > 0 {
+		return d
 	}
 	delete(l.until, key)
-	return false
+	return 0
 }
 
 // Fail records a failure of key, locking it out when over the limit.

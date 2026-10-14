@@ -136,8 +136,12 @@ func TestConfigDamagedFile(t *testing.T) {
 	if len(cfg.Shares) != 0 || cfg.KeepOn {
 		t.Fatalf("damaged file gave %+v", cfg)
 	}
-	if _, err := os.Stat(p + ".damaged"); err != nil {
-		t.Fatalf("damaged file not kept: %v", err)
+	// Set aside by the next writer, under the lock (R14).
+	if err := m.Update(func(c *Config, _ time.Time) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := filepath.Glob(p + ".damaged-*"); len(list) != 1 {
+		t.Fatalf("damaged file not kept: %v", list)
 	}
 	// A newer format is refused, not overwritten.
 	if err := os.WriteFile(p, []byte(`{"version":2}`), 0o600); err != nil {
@@ -264,6 +268,14 @@ func TestDevicesVerifyRevoke(t *testing.T) {
 		id + "." + base64.RawURLEncoding.EncodeToString([]byte("short"))} {
 		if _, ok := m.Verify(c); ok {
 			t.Errorf("verified %q", c)
+		}
+	}
+	// Only a malformed value or a wrong secret of an existing device is
+	// suspect (R1): an unknown device is what a revoked phone sends.
+	for c, want := range map[string]bool{id + "." + string(bad): true, "x": true, "": true,
+		"d_0000000000000000." + enc: false, val: false} {
+		if _, _, suspect := m.VerifyCookie(c); suspect != want {
+			t.Errorf("VerifyCookie(%q) suspect %v", c, suspect)
 		}
 	}
 	// share.json never holds a secret.

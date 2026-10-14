@@ -293,7 +293,7 @@ func (a *app) main(ctx context.Context) error {
 	// serve, which shares only with --share).
 	if run.KeepSharingOn() {
 		go func() {
-			if err := run.StartSharing(0); err != nil {
+			if err := run.StartSharingKept(); err != nil {
 				a.log.Warn("cannot share on Wi-Fi (Keep sharing on)", "err", err)
 			}
 		}()

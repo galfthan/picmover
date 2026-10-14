@@ -42,22 +42,24 @@ func (s SharingShare) Line() string {
 	return fmt.Sprintf("%s: %s; %d %s", s.Name, s.Scope, s.Phones, phones)
 }
 
-// StartSharing turns sharing on with the existing shares (serve --share,
-// the tray, "Keep sharing on"). port, when not 0, is saved as the share
-// port first. It fails when sharing could not start; Status says why.
+// StartSharing turns sharing on with the existing shares by the user's
+// hand (serve --share, the tray): the current network becomes the home
+// network. port, when not 0, is the port of this run (serve
+// --share-port); it is not saved. It fails when sharing could not start;
+// Status says why.
 func (r *Running) StartSharing(port int) error {
 	sh := r.srv.share
 	if port != 0 {
-		m, err := sh.manager()
-		if err != nil {
-			return err
-		}
-		if err := m.Update(func(c *share.Config, _ time.Time) error { c.Port = port; return nil }); err != nil {
-			return err
-		}
+		sh.setPortOnce(port)
 	}
 	return sh.Start()
 }
+
+// StartSharingKept turns sharing on at the app's launch ("Keep sharing
+// on"): only on the saved home network. On another network sharing is
+// paused until the user resumes it; before the LAN is up it waits and
+// starts once the home network is there.
+func (r *Running) StartSharingKept() error { return r.srv.share.StartKept() }
 
 // StopSharing turns sharing off.
 func (r *Running) StopSharing() { r.srv.share.Stop() }
@@ -94,11 +96,13 @@ func (r *Running) SharingStatus() SharingStatus {
 	}
 	ctx := context.Background()
 	for _, x := range cfg.Shares {
-		if s.shareState(ctx, x) != share.StateActive {
+		// adminShare's state is shareState's (gone included): one look at
+		// the libraries per share.
+		a := s.adminShare(ctx, x)
+		if a.State != share.StateActive {
 			continue
 		}
-		out.Shares = append(out.Shares, SharingShare{Name: x.Name, Scope: scopeLine(s.adminShare(ctx, x)),
-			Phones: len(x.Devices)})
+		out.Shares = append(out.Shares, SharingShare{Name: x.Name, Scope: scopeLine(a), Phones: len(x.Devices)})
 	}
 	return out
 }

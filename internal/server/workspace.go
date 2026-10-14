@@ -101,6 +101,11 @@ type libEntry struct {
 	lockInfo os.FileInfo // the lock file as it was when the lock was taken
 	stale    bool        // the folder was replaced: close the handles once inflight drops to 0
 	inflight int         // requests using the handles
+	// phoneOpened: a phone's request opened the library and the admin side
+	// has not used it since; it is closed after phoneIdle without phones
+	// (closePhoneLibraries). phoneAt is the last phone request.
+	phoneOpened bool
+	phoneAt     time.Time
 
 	// retired is set (under mu) when the entry left the registry in a
 	// workspace switch, or was never registered because its listing came
@@ -283,6 +288,9 @@ type workspace struct {
 	closed bool                 // shut down: nothing opens any more
 	libs   map[string]*libEntry // by id
 	peeks  map[string]peekEntry // by library folder
+	// userPeeks caches LibraryID and album reads of closed libraries by
+	// user.db path (peekUser).
+	userPeeks map[string]userPeek
 }
 
 // wsConf is what a workspace serves.
@@ -582,11 +590,21 @@ func (ws *workspace) peek(ctx context.Context, dbPath string) (catalog.Peek, err
 	return p, nil
 }
 
-// open opens the library of e: the lock (reused when this process holds
-// it), the catalog (never created), the thumbnail store (read-only,
+// open opens the library of e for the admin side (openEntry): it stays
+// open, also when a phone had opened it.
+func (ws *workspace) open(ctx context.Context, e *libEntry) error {
+	if err := ws.openEntry(ctx, e); err != nil {
+		return err
+	}
+	e.adminUse()
+	return nil
+}
+
+// openEntry opens the library of e: the lock (reused when this process
+// holds it), the catalog (never created), the thumbnail store (read-only,
 // created empty when absent) and user.db. On failure the entry's state
 // says why (busy, error).
-func (ws *workspace) open(ctx context.Context, e *libEntry) error {
+func (ws *workspace) openEntry(ctx context.Context, e *libEntry) error {
 	if ws.isClosed() {
 		return errClosed
 	}

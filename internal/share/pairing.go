@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"math/big"
 	"slices"
 	"strings"
@@ -18,15 +19,19 @@ import (
 // to type, both single use, valid 2 minutes, kept in memory only and only
 // as SHA-256 hashes.
 const (
-	PairingTTL       = 2 * time.Minute
-	maxOpenPerShare  = 3
-	maxOpenTotal     = 10
-	maxWrongCodes    = 5
-	tokenBytes       = 32
-	codeLen          = 8
-	codeAlphabet     = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
-	maxPendingAsks   = 10
-	TooManyWrongCode = "Too many wrong codes; show a new one."
+	PairingTTL      = 2 * time.Minute
+	maxOpenPerShare = 3
+	maxOpenTotal    = 10
+	maxWrongCodes   = 5
+	tokenBytes      = 32
+	codeLen         = 8
+	codeAlphabet    = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+	maxPendingAsks  = 10
+	// CodeBlockFor is how long an address that typed maxWrongCodes wrong
+	// codes is refused pairing.
+	CodeBlockFor = 10 * time.Minute
+	// maxWrongAddrs bounds the per-address counters of wrong codes.
+	maxWrongAddrs = 1024
 )
 
 // Errors of Redeem and Decide.
@@ -62,7 +67,14 @@ type pairing struct {
 	code      [32]byte // SHA-256 of the code
 	expiresAt time.Time
 	used      bool
-	wrong     int // wrong code attempts while this pairing was open
+}
+
+// wrongCodes counts an address's wrong codes: after maxWrongCodes the
+// address is refused pairing until until. The count starts again once
+// CodeBlockFor has passed since the last wrong code.
+type wrongCodes struct {
+	n           int
+	last, until time.Time
 }
 
 // Pairings are the open pairings and pending approval requests of a
@@ -71,9 +83,10 @@ type Pairings struct {
 	now func() time.Time
 
 	mu      sync.Mutex
-	open    []*pairing          // oldest first
-	notices map[string]string   // share id -> message for the Share page
-	asks    map[string]*Request // pending approval requests by id
+	open    []*pairing             // oldest first
+	notices map[string]string      // share id -> message for the Share page
+	asks    map[string]*Request    // pending approval requests by id
+	wrong   map[string]*wrongCodes // wrong codes by remote address
 }
 
 // NewPairings returns an empty registry with the clock now (nil: time.Now).
@@ -81,7 +94,7 @@ func NewPairings(now func() time.Time) *Pairings {
 	if now == nil {
 		now = time.Now
 	}
-	return &Pairings{now: now, notices: map[string]string{}, asks: map[string]*Request{}}
+	return &Pairings{now: now, notices: map[string]string{}, asks: map[string]*Request{}, wrong: map[string]*wrongCodes{}}
 }
 
 // newToken is 32 random bytes, base64url (43 characters).
@@ -184,8 +197,8 @@ func (p *Pairings) Open(shareID string) (expiresAt time.Time, ok bool) {
 	return expiresAt, ok
 }
 
-// Notice is a message about shareID's pairings for the Share page (too
-// many wrong codes), or "".
+// Notice is a message about shareID's pairings for the Share page (an
+// address refused after too many wrong codes), or "".
 func (p *Pairings) Notice(shareID string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -199,10 +212,12 @@ type Claim struct {
 }
 
 // Find looks up the open pairing of a token or a code without using it
-// up. A wrong code counts against every open pairing; after 5 wrong codes
-// all open pairings are cancelled. A malformed value is ErrMalformed, an
-// unknown or expired one ErrPairingGone.
-func (p *Pairings) Find(token, code string) (Claim, error) {
+// up. A wrong code counts against the address addr that sent it: after 5
+// it is refused pairing for CodeBlockFor (Blocked), and the shares with
+// open pairings get a notice. Nobody else's pairing is affected. A
+// malformed value is ErrMalformed, an unknown or expired one
+// ErrPairingGone.
+func (p *Pairings) Find(token, code, addr string) (Claim, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
@@ -230,20 +245,62 @@ func (p *Pairings) Find(token, code string) (Claim, error) {
 				return Claim{ShareID: x.shareID, p: x}, nil
 			}
 		}
-		cancel := false
-		for _, x := range p.open {
-			x.wrong++
-			cancel = cancel || x.wrong >= maxWrongCodes
-		}
-		if cancel {
-			for _, x := range p.open {
-				p.notices[x.shareID] = TooManyWrongCode
-			}
-			p.open = nil
-		}
+		p.wrongCodeLocked(addr, now)
 		return Claim{}, ErrPairingGone
 	}
 	return Claim{}, ErrMalformed
+}
+
+// wrongCodeLocked counts a wrong code of addr and blocks it after
+// maxWrongCodes.
+func (p *Pairings) wrongCodeLocked(addr string, now time.Time) {
+	if len(p.wrong) >= maxWrongAddrs {
+		for k, w := range p.wrong {
+			if now.Sub(w.last) >= CodeBlockFor && !now.Before(w.until) {
+				delete(p.wrong, k)
+			}
+		}
+		if len(p.wrong) >= maxWrongAddrs {
+			return // a flood of addresses: the global limit still holds
+		}
+	}
+	w := p.wrong[addr]
+	if w == nil || (now.Sub(w.last) >= CodeBlockFor && !now.Before(w.until)) {
+		w = &wrongCodes{}
+		p.wrong[addr] = w
+	}
+	w.n++
+	w.last = now
+	if w.n >= maxWrongCodes {
+		w.until, w.n = now.Add(CodeBlockFor), 0
+		msg := WrongCodesNotice(addr)
+		for _, x := range p.open {
+			p.notices[x.shareID] = msg
+		}
+	}
+}
+
+// WrongCodesNotice is the Share page's notice for an address refused
+// after too many wrong codes.
+func WrongCodesNotice(addr string) string {
+	return fmt.Sprintf("Too many wrong codes were typed from %s; that address cannot pair for %d minutes. "+
+		"The code shown still works.", addr, int(CodeBlockFor/time.Minute))
+}
+
+// Blocked reports whether addr is refused pairing after too many wrong
+// codes.
+func (p *Pairings) Blocked(addr string) bool { return p.BlockedFor(addr) > 0 }
+
+// BlockedFor is how long addr stays refused pairing (0: it is not).
+func (p *Pairings) BlockedFor(addr string) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w := p.wrong[addr]; w != nil {
+		if d := w.until.Sub(p.now()); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // Use marks a claimed pairing used: an atomic swap, so of two concurrent
@@ -269,7 +326,7 @@ type Request struct {
 	Address string    `json:"address"`
 	At      time.Time `json:"at"`
 
-	decided chan bool // buffered: one decision
+	decided chan error // buffered: one decision (nil: approved)
 }
 
 // ErrNotApproved: the computer did not decide in time.
@@ -277,6 +334,14 @@ var ErrNotApproved = errors.New("Not approved in time. Show a new code on the co
 
 // ErrDenied: the computer denied the pairing.
 var ErrDenied = errors.New("The computer did not allow this phone.")
+
+// ErrSharingOff: sharing was turned off (or paused, or picmover quit)
+// while the request waited for approval.
+var ErrSharingOff = errors.New("Sharing was turned off on the computer. Try again when it is on.")
+
+// ErrShareDropped: the share was paused, ended or deleted while the
+// request waited for approval (the caller reads the share's state).
+var ErrShareDropped = errors.New("the share no longer takes phones")
 
 // Ask records a pending approval request (its pairing is already used).
 func (p *Pairings) Ask(shareID, name, browser, addr string) *Request {
@@ -292,17 +357,18 @@ func (p *Pairings) Ask(shareID, name, browser, addr string) *Request {
 			}
 		}
 		delete(p.asks, oldest.ID)
-		oldest.decided <- false
+		oldest.decided <- ErrNotApproved
 	}
 	r := &Request{ID: newID("r_"), ShareID: shareID, Name: name, Browser: browser, Address: addr,
-		At: p.now().Truncate(time.Second), decided: make(chan bool, 1)}
+		At: p.now().Truncate(time.Second), decided: make(chan error, 1)}
 	p.asks[r.ID] = r
 	return r
 }
 
 // Wait waits for the decision on r, at most timeout or until ctx is done:
-// nil when approved, ErrDenied, ErrNotApproved (timeout), or ctx's error.
-// The request is gone afterwards in every case.
+// nil when approved, ErrDenied, ErrNotApproved (timeout, or pushed out by
+// newer requests), ErrSharingOff (Reset), ErrShareDropped (DropShare), or
+// ctx's error. The request is gone afterwards in every case.
 func (p *Pairings) Wait(ctx context.Context, r *Request, timeout time.Duration) error {
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -312,11 +378,8 @@ func (p *Pairings) Wait(ctx context.Context, r *Request, timeout time.Duration) 
 		p.mu.Unlock()
 	}()
 	select {
-	case ok := <-r.decided:
-		if ok {
-			return nil
-		}
-		return ErrDenied
+	case err := <-r.decided:
+		return err
 	case <-t.C:
 		return ErrNotApproved
 	case <-ctx.Done():
@@ -347,12 +410,16 @@ func (p *Pairings) Decide(shareID, id string, approve bool) error {
 		return ErrNoRequest
 	}
 	delete(p.asks, id)
-	r.decided <- approve
+	if approve {
+		r.decided <- nil
+	} else {
+		r.decided <- ErrDenied
+	}
 	return nil
 }
 
-// DropShare cancels the pairings and denies the pending requests of a
-// share (deleted, paused, revoked).
+// DropShare cancels the pairings and ends the pending requests of a share
+// (deleted, paused, ended) with ErrShareDropped.
 func (p *Pairings) DropShare(shareID string) {
 	p.Cancel(shareID)
 	p.mu.Lock()
@@ -360,12 +427,14 @@ func (p *Pairings) DropShare(shareID string) {
 	for id, r := range p.asks {
 		if r.ShareID == shareID {
 			delete(p.asks, id)
-			r.decided <- false
+			r.decided <- ErrShareDropped
 		}
 	}
 }
 
-// Reset drops everything (sharing turned off).
+// Reset drops the pairings and ends the pending requests with
+// ErrSharingOff (sharing turned off or paused, picmover quitting). The
+// per-address wrong-code counters are kept.
 func (p *Pairings) Reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -373,6 +442,6 @@ func (p *Pairings) Reset() {
 	p.notices = map[string]string{}
 	for id, r := range p.asks {
 		delete(p.asks, id)
-		r.decided <- false
+		r.decided <- ErrSharingOff
 	}
 }

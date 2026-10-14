@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"picmover/internal/share"
@@ -178,8 +179,17 @@ func (s *Server) adminShare(ctx context.Context, sh *share.Share) adminShareJSON
 
 // shareStatusJSON is GET /api/share.
 type shareStatusJSON struct {
-	State            string            `json:"state"`
-	Reason           string            `json:"reason,omitempty"`
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
+	// Waiting: paused without a LAN address; sharing resumes by itself on
+	// the home network (absent when false).
+	Waiting bool `json:"waiting,omitempty"`
+	// Phones counts the paired phones of every share: the Share page warns
+	// before an address or port change that affects them.
+	Phones int `json:"phones"`
+	// Notice says what a POST /api/share change means for the paired
+	// phones (absent when nothing; only in the POST's answer).
+	Notice           string            `json:"notice,omitempty"`
 	URL              string            `json:"url,omitempty"`
 	MDNSURL          string            `json:"mdnsUrl,omitempty"`
 	Port             int               `json:"port"`
@@ -199,6 +209,8 @@ type shareAddrJSON struct {
 	Iface   string `json:"iface"`
 	Subnet  string `json:"subnet"`
 	Virtual bool   `json:"virtual,omitempty"`
+	// Wireless: a Wi-Fi interface (always present; false when unknown).
+	Wireless bool `json:"wireless"`
 }
 
 type shareFingerprints struct {
@@ -220,6 +232,7 @@ type managedJSON struct {
 type shareSummaryStatusJSON struct {
 	State            string       `json:"state"`
 	Reason           string       `json:"reason,omitempty"`
+	Waiting          bool         `json:"waiting,omitempty"`
 	URL              string       `json:"url,omitempty"`
 	Shares           int          `json:"shares"` // active shares
 	Phones           int          `json:"phones"` // devices of active shares
@@ -278,16 +291,16 @@ func (s *Server) managedBy(m *share.Manager) *managedJSON {
 func (s *Server) shareStatus(ctx context.Context, m *share.Manager, cfg *share.Config) shareStatusJSON {
 	sh := s.share
 	snap := sh.snapshot()
-	out := shareStatusJSON{State: snap.state, Reason: snap.reason, Port: cfg.Port, KeepOn: cfg.KeepOn, MDNS: cfg.MDNS,
-		AutoOff: autoOff(cfg.AutoOff, snap.autoAt), Addresses: []shareAddrJSON{}, Shares: []adminShareJSON{},
-		ManagedElsewhere: s.managedBy(m)}
+	out := shareStatusJSON{State: snap.state, Reason: snap.reason, Waiting: snap.waiting, Port: cfg.Port,
+		KeepOn: cfg.KeepOn, MDNS: cfg.MDNS, AutoOff: autoOff(cfg.AutoOff, snap.autoAt), Addresses: []shareAddrJSON{},
+		Shares: []adminShareJSON{}, ManagedElsewhere: s.managedBy(m), Phones: phonesOf(cfg)}
 	cands, _ := sh.netif.Candidates()
 	for _, c := range cands {
 		out.Addresses = append(out.Addresses, shareAddrJSON{IP: c.IP.String(), Iface: c.Iface, Subnet: c.Subnet.String(),
-			Virtual: c.Virtual})
+			Virtual: c.Virtual, Wireless: c.Wireless})
 	}
 	subnet := ""
-	if snap.state == shareOn || snap.state == sharePaused {
+	if (snap.state == shareOn || snap.state == sharePaused) && snap.bound.IP != nil {
 		out.Address, out.Port = snap.bound.IP.String(), snap.port
 		subnet = snap.bound.Subnet.String()
 	} else if c, ok := share.Choose(cands, cfg.Interface, sh.netif.DefaultIP()); ok {
@@ -309,6 +322,15 @@ func (s *Server) shareStatus(ctx context.Context, m *share.Manager, cfg *share.C
 		out.Shares = append(out.Shares, s.adminShare(ctx, x))
 	}
 	return out
+}
+
+// phonesOf counts the paired phones of every share.
+func phonesOf(cfg *share.Config) int {
+	n := 0
+	for _, x := range cfg.Shares {
+		n += len(x.Devices)
+	}
+	return n
 }
 
 // certsLoaded returns the certificates when sharing has loaded them.
@@ -354,7 +376,7 @@ func (s *Server) handleShareStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.share.snapshot()
-	out := shareSummaryStatusJSON{State: snap.state, Reason: snap.reason, URL: s.share.host.Load().url(),
+	out := shareSummaryStatusJSON{State: snap.state, Reason: snap.reason, Waiting: snap.waiting, URL: s.share.host.Load().url(),
 		AutoOff: autoOff(cfg.AutoOff, snap.autoAt), ManagedElsewhere: s.managedBy(m)}
 	for _, x := range cfg.Shares {
 		if s.baseState(x, s.share.now()) == share.StateActive {
@@ -374,9 +396,20 @@ type shareSettingsBody struct {
 	MDNS    *bool   `json:"mdns"`
 }
 
+// Notices of POST /api/share for the paired phones.
+const (
+	noticeAddress = "The sharing address changed: phones paired at the old address must be paired again " +
+		"(their sign-in belongs to the address; a phone that opened the .local name keeps it)."
+	noticePort = "The sharing port changed: phones must open the new address (bookmarks of the old one stop " +
+		"working). They normally stay paired; a phone that shows \"Not paired\" must be paired again."
+)
+
 // handleShareSet is POST /api/share: settings, then the switch. Turning
 // sharing on that fails (busy port, no address) answers 200 with state
-// error and the reason; another sharing process is 409.
+// error and the reason; another sharing process is 409. A changed address
+// or port listens again once (when on); the answer's notice says what it
+// means for paired phones, and it is logged. A changed mdns applies
+// without listening again.
 func (s *Server) handleShareSet(w http.ResponseWriter, r *http.Request) {
 	var body shareSettingsBody
 	if !decodeBody(w, r, &body) {
@@ -410,17 +443,27 @@ func (s *Server) handleShareSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, `autoOff: want "never", "1h", "4h" or "quit"`)
 		return
 	}
-	relisten := false
+	snap := sh.snapshot()
+	var movedAddr, movedPort, mdnsChanged bool
+	phones := 0
 	if body.Address != nil || body.Port != nil || body.KeepOn != nil || body.AutoOff != nil || body.MDNS != nil {
 		err := m.Update(func(c *share.Config, _ time.Time) error {
+			phones = phonesOf(c)
 			if body.Address != nil && c.Interface != iface {
-				c.Interface, relisten = iface, true
+				c.Interface = iface
+				movedAddr = snap.bound.IP == nil || snap.bound.Iface != iface
 			}
-			if body.Port != nil && c.Port != *body.Port {
-				c.Port, relisten = *body.Port, true
+			if body.Port != nil {
+				// The running port may be serve --share-port's.
+				cur := c.Port
+				if snap.state == shareOn || snap.state == sharePaused {
+					cur = snap.port
+				}
+				movedPort = cur != *body.Port && cur != 0
+				c.Port = *body.Port
 			}
 			if body.MDNS != nil && c.MDNS != *body.MDNS {
-				c.MDNS, relisten = *body.MDNS, true
+				c.MDNS, mdnsChanged = *body.MDNS, true
 			}
 			if body.KeepOn != nil {
 				c.KeepOn = *body.KeepOn
@@ -435,17 +478,25 @@ func (s *Server) handleShareSet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.Port != nil {
+		sh.setPortOnce(0) // the Share page's port replaces serve --share-port
+	}
+	if mdnsChanged {
+		sh.setMDNS(*body.MDNS)
+	}
 	if body.AutoOff != nil {
 		sh.mu.Lock()
-		if sh.state == shareOn {
+		if sh.state == shareOn || sh.state == sharePaused {
 			sh.setAutoOffLocked(*body.AutoOff)
 		}
 		sh.mu.Unlock()
 	}
+	relisten := movedAddr || movedPort
 	switch {
 	case body.Enabled != nil && !*body.Enabled:
 		sh.Stop()
-	case body.Enabled != nil && *body.Enabled:
+	case body.Enabled != nil && *body.Enabled && !(relisten && snap.state == shareOn):
+		// Start listens with the new settings: once.
 		if err := sh.Start(); err != nil {
 			var me *share.ErrManaged
 			if errors.As(err, &me) || errors.Is(err, errAdminNotLoopback) {
@@ -454,13 +505,26 @@ func (s *Server) handleShareSet(w http.ResponseWriter, r *http.Request) {
 			}
 			// state error: the body says why.
 		}
-		if relisten {
-			_ = sh.restart()
-		}
 	case relisten:
 		_ = sh.restart()
 	}
-	s.handleShareGet(w, r)
+	var notice []string
+	if phones > 0 && movedAddr {
+		notice = append(notice, noticeAddress)
+	}
+	if phones > 0 && movedPort {
+		notice = append(notice, noticePort)
+	}
+	for _, n := range notice {
+		sh.log.Warn(n, "phones", phones)
+	}
+	m2, cfg, ok := s.shareConfig(w, r)
+	if !ok {
+		return
+	}
+	out := s.shareStatus(r.Context(), m2, cfg)
+	out.Notice = strings.Join(notice, " ")
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleShareRenew(w http.ResponseWriter, r *http.Request) {
@@ -553,10 +617,13 @@ func (s *Server) resolveLibraryKey(ctx context.Context, id string) (share.Librar
 	}
 	lid, err := s.libraryIDOf(ctx, li)
 	if err == nil && lid == "" {
+		// Never opened by this picmover: opening creates user.db and its
+		// LibraryID. A library opened just for that is closed again.
 		var l *libHandles
 		if l, err = s.shareAcquire(ctx, id); err == nil {
 			lid, err = l.user.LibraryID(ctx)
 			l.entry.release()
+			s.closePhoneLibrary(l.entry)
 		}
 	}
 	if err != nil {
@@ -884,6 +951,9 @@ func (s *Server) handlePairingIssue(w http.ResponseWriter, r *http.Request) {
 func (sh *sharing) issuePairing(ctx context.Context, x *share.Share) (pairingJSON, error) {
 	host := sh.host.Load()
 	if host == nil {
+		if snap := sh.snapshot(); snap.state == sharePaused {
+			return pairingJSON{}, fmt.Errorf("sharing on Wi-Fi is paused (%s); resume it first", snap.reason)
+		}
 		return pairingJSON{}, errors.New("sharing on Wi-Fi is off; turn it on first")
 	}
 	if st := sh.s.shareState(ctx, x); st != share.StateActive {

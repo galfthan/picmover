@@ -68,6 +68,8 @@ type Config struct {
 	Home      *Home  `json:"home"`
 	// Shares: never nil after load.
 	Shares []*Share `json:"shares"`
+
+	extra extra // members of a newer picmover, kept on rewrite
 }
 
 // defaultConfig is the configuration when there is no file.
@@ -321,7 +323,7 @@ func Open(dir string, log *slog.Logger) (*Manager, error) {
 		}
 	}
 	m := &Manager{dir: dir, log: log, now: time.Now}
-	cfg, err := m.read()
+	cfg, err := m.read(false)
 	if err != nil {
 		return nil, err
 	}
@@ -348,8 +350,16 @@ func (m *Manager) Dir() string { return m.dir }
 
 func (m *Manager) path() string { return filepath.Join(m.dir, ConfigName) }
 
-// read loads share.json (defaults when absent or damaged).
-func (m *Manager) read() (*Config, error) {
+// maxDamaged is how many damaged copies of share.json are kept.
+const maxDamaged = 5
+
+// read loads share.json (defaults when absent or damaged). A damaged file
+// (not JSON, or without a format version: "{}" is not a settings file) is
+// set aside as share.json.damaged-<time> only when setAside is set, which
+// the callers do under share.lock; a reader without the lock just sees no
+// shares (failing closed) and leaves the file to the next writer. The
+// last maxDamaged copies are kept.
+func (m *Manager) read(setAside bool) (*Config, error) {
 	p := m.path()
 	b, err := os.ReadFile(p)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -361,20 +371,46 @@ func (m *Manager) read() (*Config, error) {
 	var probe struct {
 		Version int `json:"version"`
 	}
-	if json.Unmarshal(b, &probe) == nil && probe.Version > configVersion {
+	perr := json.Unmarshal(b, &probe)
+	if perr == nil && probe.Version > configVersion {
 		return nil, fmt.Errorf("%s was written by a newer picmover (format %d); upgrade picmover", p, probe.Version)
 	}
 	cfg := defaultConfig()
-	if err := json.Unmarshal(b, cfg); err != nil {
+	err = perr
+	if err == nil && probe.Version < 1 {
+		err = errors.New("no format version")
+	}
+	if err == nil {
+		err = json.Unmarshal(b, cfg)
+	}
+	if err != nil {
+		if !setAside {
+			m.log.Debug("share settings are damaged; read as no shares until the next change", "path", p, "err", err)
+			return defaultConfig(), nil
+		}
+		kept := p + damaged + "-" + m.now().UTC().Format("20060102T150405.000Z")
 		m.log.Error("share settings are damaged; sharing starts from no shares (phones must pair again)",
-			"path", p, "kept", p+damaged, "err", err)
-		if rerr := os.Rename(p, p+damaged); rerr != nil {
+			"path", p, "kept", kept, "err", err)
+		if rerr := os.Rename(p, kept); rerr != nil {
 			return nil, fmt.Errorf("%s is damaged (%v) and cannot be set aside: %w", p, err, rerr)
 		}
+		m.pruneDamaged()
 		return defaultConfig(), nil
 	}
 	cfg.normalize()
 	return cfg, nil
+}
+
+// pruneDamaged removes all but the newest maxDamaged damaged copies.
+func (m *Manager) pruneDamaged() {
+	list, _ := filepath.Glob(m.path() + damaged + "-*")
+	slices.Sort(list) // the time stamps sort by time
+	for len(list) > maxDamaged {
+		if err := os.Remove(list[0]); err != nil {
+			m.log.Warn("cannot remove an old damaged copy of the share settings", "path", list[0], "err", err)
+		}
+		list = list[1:]
+	}
 }
 
 // write saves cfg (0600, atomically).
@@ -386,20 +422,43 @@ func (m *Manager) write(cfg *Config) error {
 	return WriteFileAtomic(m.path(), append(b, '\n'), 0o600)
 }
 
-// lock takes share.lock for cmd. Another holder is an *ErrManaged; a file
+// briefCmd names a brief hold of share.lock for one change (Update by a
+// process that does not share).
+const briefCmd = "share-settings"
+
+// Retries of lock while another process holds share.lock briefly.
+const (
+	lockRetries = 40
+	lockPause   = 25 * time.Millisecond
+)
+
+// lock takes share.lock for cmd. Another holder is an *ErrManaged; a brief
+// holder (another process's single change, an older picmover's probe, or
+// a holder still writing its name) is waited for up to a second. A file
 // system without locking goes on without it (a warning in the log).
 func (m *Manager) lock(cmd string) (func(), error) {
-	unlock, err := library.LockFile(filepath.Join(m.dir, LockName), cmd)
-	var locked *library.ErrLocked
-	switch {
-	case errors.As(err, &locked):
-		return nil, &ErrManaged{PID: locked.PID, Cmd: locked.Cmd}
-	case errors.Is(err, library.ErrLockUnsupported):
-		m.log.Warn("cannot lock the share settings; going on without the lock", "err", err)
-		return unlock, nil
+	for i := 0; ; i++ {
+		unlock, err := library.LockFile(filepath.Join(m.dir, LockName), cmd)
+		var locked *library.ErrLocked
+		switch {
+		case errors.As(err, &locked):
+			if briefHolder(locked.Cmd) && i < lockRetries {
+				time.Sleep(lockPause)
+				continue
+			}
+			return nil, &ErrManaged{PID: locked.PID, Cmd: locked.Cmd}
+		case errors.Is(err, library.ErrLockUnsupported):
+			m.log.Warn("cannot lock the share settings; going on without the lock", "err", err)
+			return unlock, nil
+		}
+		return unlock, err
 	}
-	return unlock, err
 }
+
+// briefHolder reports a holder of share.lock that keeps it only for a
+// moment: one change (briefCmd), an older picmover's "probe", or a holder
+// that has not written its name yet.
+func briefHolder(cmd string) bool { return cmd == briefCmd || cmd == "probe" || cmd == "" }
 
 // Hold takes share.lock for the sharing process (cmd names it to the
 // others), reloads share.json and sweeps expired shares and idle devices.
@@ -414,22 +473,41 @@ func (m *Manager) Hold(cmd string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := m.read()
+	cfg, err := m.read(true)
 	if err != nil {
 		unlock()
 		return err
 	}
 	m.cfg, m.unlock = cfg, unlock
-	if removed := cfg.Sweep(m.now()); len(removed) > 0 {
-		for _, r := range removed {
-			m.log.Info("share settings: removed " + r)
-		}
-		if err := m.write(cfg); err != nil {
-			m.log.Error("cannot save the share settings", "err", err)
-		}
-	}
+	m.sweepLocked()
 	m.flushed = m.now()
 	return nil
+}
+
+// Sweep deletes, while this process holds share.lock, the shares expired
+// for more than 30 days and the devices unused for 400 days, and saves.
+// The sharing process runs it at Hold and then once a minute.
+func (m *Manager) Sweep() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unlock != nil {
+		m.sweepLocked()
+	}
+}
+
+func (m *Manager) sweepLocked() {
+	removed := m.cfg.Sweep(m.now())
+	if len(removed) == 0 {
+		return
+	}
+	for _, r := range removed {
+		m.log.Info("share settings: removed " + r)
+	}
+	if err := m.write(m.cfg); err != nil {
+		m.log.Error("cannot save the share settings", "err", err)
+		return
+	}
+	m.dirty = false
 }
 
 // Release saves pending device activity and releases share.lock.
@@ -451,23 +529,24 @@ func (m *Manager) Holding() bool {
 	return m.unlock != nil
 }
 
-// Managed returns the other process holding share.lock, or nil when it is
-// free or held by this process. It probes by taking the lock briefly.
+// Managed returns the other process sharing (holding share.lock), or nil
+// when none is or this process is. It never takes the lock (a probe that
+// did collided with the real holder's changes): it reads the holder's
+// name from the lock file, which the holder empties when it lets go, and
+// checks that its process is alive (a crashed holder leaves its name
+// behind). A brief holder (one change) is not sharing.
 func (m *Manager) Managed() *ErrManaged {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.unlock != nil {
+	holding := m.unlock != nil
+	m.mu.Unlock()
+	if holding {
 		return nil
 	}
-	unlock, err := m.lock("probe")
-	var me *ErrManaged
-	if errors.As(err, &me) {
-		return me
+	h, ok := library.PeekHolder(filepath.Join(m.dir, LockName))
+	if !ok || briefHolder(h.Cmd) || (h.PID > 0 && !processAlive(h.PID)) {
+		return nil
 	}
-	if unlock != nil {
-		unlock()
-	}
-	return nil
+	return &ErrManaged{PID: h.PID, Cmd: h.Cmd}
 }
 
 // Snapshot returns a copy of the settings: the in-memory ones while this
@@ -477,7 +556,7 @@ func (m *Manager) Snapshot() (*Config, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.unlock == nil {
-		cfg, err := m.read()
+		cfg, err := m.read(false)
 		if err != nil {
 			return nil, err
 		}
@@ -496,12 +575,12 @@ func (m *Manager) Update(f func(c *Config, now time.Time) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.unlock == nil {
-		unlock, err := m.lock("share settings")
+		unlock, err := m.lock(briefCmd)
 		if err != nil {
 			return err
 		}
 		defer unlock()
-		cfg, err := m.read()
+		cfg, err := m.read(true)
 		if err != nil {
 			return err
 		}
@@ -530,17 +609,29 @@ type Verified struct {
 // value, an unknown device or a wrong secret. It reads the in-memory
 // settings (the sharing process's).
 func (m *Manager) Verify(cookie string) (Verified, bool) {
+	v, ok, _ := m.VerifyCookie(cookie)
+	return v, ok
+}
+
+// VerifyCookie is Verify that also tells a suspect failure, which counts
+// against the address's lockout: a malformed value, or the wrong secret
+// for a device that exists. A well-formed cookie of an unknown device (a
+// revoked phone whose page still loads thumbnails) is not suspect.
+func (m *Manager) VerifyCookie(cookie string) (v Verified, ok, suspect bool) {
 	id, secret, ok := parseCookie(cookie)
 	if !ok {
-		return Verified{}, false
+		return Verified{}, false, true
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, d := m.cfg.Device(id)
-	if d == nil || !secretMatches(secret, d.SecretSHA256) {
-		return Verified{}, false
+	if d == nil {
+		return Verified{}, false, false
 	}
-	return Verified{Device: *d, Share: *s.clone()}, true
+	if !secretMatches(secret, d.SecretSHA256) {
+		return Verified{}, false, true
+	}
+	return Verified{Device: *d, Share: *s.clone()}, true, false
 }
 
 // clone deep-copies a share.
