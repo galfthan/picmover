@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"picmover/internal/catalog"
 	"picmover/internal/imaging"
 	"picmover/internal/library"
 	"picmover/internal/thumbs"
@@ -169,6 +170,13 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, l *libHandle
 	if !ok {
 		return
 	}
+	s.serveOriginal(w, r, l, m, download, "private, max-age=3600")
+}
+
+// serveOriginal answers with the original of row m (openOriginal),
+// inline or as an attachment, with Range support and the given
+// Cache-Control.
+func (s *Server) serveOriginal(w http.ResponseWriter, r *http.Request, l *libHandles, m catalog.Media, download bool, cache string) {
 	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
 	if isMissing(err) {
 		s.log.Debug("file not available", "id", m.ID, "rel_path", m.RelPath, "err", err)
@@ -193,7 +201,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, l *libHandle
 	h.Set("Content-Type", contentType(m.Ext))
 	h.Set("Content-Disposition", mime.FormatMediaType(disp, map[string]string{"filename": path.Base(m.RelPath)}))
 	h.Set("ETag", fmt.Sprintf(`"%016x-%d"`, m.Hash, st.Size()))
-	h.Set("Cache-Control", "private, max-age=3600")
+	h.Set("Cache-Control", cache)
 	http.ServeContent(w, r, "", st.ModTime(), f)
 }
 

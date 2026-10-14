@@ -49,6 +49,10 @@ type StartOptions struct {
 	CatalogLogger *slog.Logger
 	// App enables the desktop app's endpoints (nil for serve).
 	App *AppHooks
+	// ShareDir and ShareCmd are passed to Options (sharing on the home
+	// Wi-Fi); sharing starts only through StartSharing or the Share page.
+	ShareDir string
+	ShareCmd string
 
 	static fs.FS // tests: Options.Static
 }
@@ -333,7 +337,7 @@ func Start(ctx context.Context, opts StartOptions) (*Running, error) {
 		}
 	}()
 
-	srvOpts := Options{App: opts.App, Static: opts.static}
+	srvOpts := Options{App: opts.App, Static: opts.static, ShareDir: opts.ShareDir, ShareCmd: opts.ShareCmd}
 	switch {
 	case opts.Path == "":
 		srvOpts.Unset = true
@@ -459,6 +463,8 @@ func (r *Running) Workspace() string { return r.srv.ws.root() }
 // if any (not http.ErrServerClosed). Later calls return the same.
 func (r *Running) Shutdown(ctx context.Context) error {
 	r.shutOnce.Do(func() {
+		// The share listener first (StopJobs stops it): phones are cut
+		// off before the job stops and the libraries close.
 		jobErr := r.srv.StopJobs(ctx)
 		if jobErr != nil {
 			fmt.Fprintf(r.errOut, "Warning: %v\n", jobErr)
