@@ -1807,3 +1807,202 @@ Q1–Q8 and Q15–Q20 are settled (above). Still open:
     cross-library albums ever come, the album scope's key and `visible`
     must be revisited, so that membership never lets a photo of an
     unshared library through.
+
+## As implemented (frontend)
+
+Built against this document's API, in parallel with the backend, so
+every answer is parsed leniently (missing fields defaulted, malformed
+entries dropped) and tested against the fakes in
+`web/src/testing/fakes.ts` (`fakeServer().sharing` for the admin API,
+`fakeShareServer(kind, opts)` for the share listener).
+
+### What is built
+
+- **Admin UI** (`#/share`, `pages/Share.svelte`, `ShareDialog`,
+  `PairDialog`, `ShareCapabilities`, `SharePill`, `lib/sharing.svelte.ts`,
+  `lib/sharetext.ts`): the global switch, network address choice, port,
+  auto-off, "Keep sharing on" (app only), the `.local` name as an extra,
+  the leaf and CA fingerprints with "Renew certificate", the firewall
+  hint; share cards with scope, state ("Album deleted", "Library
+  missing", "Library busy"), expiry, capability toggles with the guest
+  rating and video saving warnings, Pair a phone (the server's QR as an
+  `<img>` of `qrSvg`, the code, the countdown, the firewall hint after
+  30 s, the paired phone with Rename and Revoke), Edit, Pause/Resume,
+  Extend 30 days, Revoke all, Delete, devices (last seen, address,
+  browser, Rename, Revoke) and approval requests (Approve, Deny);
+  "Share libraries…" and "Share album…"; `managedElsewhere` disables
+  every control. The album page has "Share…", or "Shared (n)" linking to
+  `#/share?album=<lib>:<aid>`, which marks that album's shares. The top
+  bar shows "Sharing · N shares · M phones" (amber when paused, red when
+  failed) on every page. The Share page polls every 2 s, the pill every
+  10 s while on and 30 s while off; a 404 from `GET /api/share` (an
+  older server) hides it all.
+- **Phone app** (`web/share.html`, `web/src/share/`): `main.ts` (imports
+  `polyfills.ts` first, sets `--app-h` from `innerHeight` instead of
+  `dvh`), `ShareApp.svelte` (shell, top bar, menu, filter sheet, the
+  replacing screens), `Pair.svelte`, `ShareLibraries.svelte`,
+  `ShareAlbums.svelte`, `ShareGrid.svelte`, `ShareLightbox.svelte`,
+  `routes.ts`, `gestures.ts`, `session.svelte.ts`, `shareapi.ts`,
+  `share.css`. Routes as in "Routes" above. Reused from the admin app:
+  `Tile` (with a `viewer` prop, no check box without `onselect`),
+  `Scrubber`, `RatingStars` (44 px targets under a coarse pointer), the
+  hash router, `timeline.ts`, `rendition.ts` (`renditionFor(…, cap)`,
+  `shareGridCap`) and `format.ts`.
+- **Build:** Vite builds `index.html` and `share.html` into `web/dist`
+  with `target: ['es2020', 'firefox91', 'safari15', 'chrome100']` for
+  both. `npm run build` runs `scripts/check-share-apis.mjs`, which
+  follows `dist/share.html` into every chunk it loads and fails on the
+  runtime APIs and CSS in `scripts/share-compat.mjs` (`Object.hasOwn`,
+  `structuredClone`, `findLast`, `toSorted`/`toReversed`/`toSpliced`,
+  `with`, `fetch` `keepalive`, `<dialog>`, `randomUUID`,
+  `AbortSignal.timeout`, …; `dvh`/`svh`/`lvh`, `:has()`, container
+  queries, nesting, `color-mix()`, `@layer`) unless `polyfills.ts`
+  lists them in `POLYFILLED`, and on admin API URLs (`/api/jobs`,
+  `/api/fs`, `/api/share`, `/api/app`) in a share chunk.
+  `touch-action` is reported as tolerated: every use has a touch-event
+  fallback. Today the share bundle needs no polyfill. At the time of
+  writing the phone loads `share.html` plus three files: the share
+  chunk (about 49 KiB, 18 KiB gzipped), the common chunk with the Svelte
+  runtime and the shared components (about 63 KiB, 24 KiB gzipped) and
+  two stylesheets (about 18 KiB together); the admin entry is about
+  318 KiB plus Leaflet.
+
+### Shapes relied on
+
+Phone app (share listener):
+
+- `GET /api/session` → 200 `{device: {id, name}, computer, share}`;
+  `computer` is a string (an object with `name` is also read). 401 →
+  the "Not paired" screen (or "This phone was removed…" when the page
+  had a session). 403 `{state}` → the state's screen; `state` is one of
+  `paused`, `expired`, `gone`, `unavailable` (anything else gets a
+  generic "not available" screen).
+- `shareJSON` (`share` above): `{name, kind, capabilities: {video,
+  download, rate, location}, expiresAt}`, plus `libraries: [{id, name,
+  cover, total}]` (library share) or `album: {name, count, cover}`
+  (album share). `kind` missing is inferred from `album`. A capability
+  is granted only by an explicit `true`. `cover` is an item hash (16 hex
+  digits; anything else is ignored), shown as
+  `/api/l/{lib}/thumb/{cover}`; `total` falls back to `count`.
+- `POST /api/pair` with `X-Picmover: 1` and JSON `{token, name}` or
+  `{code, name}`, plus `replace: true` on the second try → 200 `{device,
+  share}` (read like the session) and the cookie. Errors: 409
+  `{error, current: {share}}` → the replace question; 410 `{error}` →
+  the server's message, and the token form falls back to the code; 403
+  → "The computer did not approve this phone" (also falls back to the
+  code); 429 → "Too many tries"; any other `{error}` is shown as is. A
+  request still open after 1.5 s shows "Waiting for the computer…" (the
+  approval long poll). The code is sent upper-case without dashes or
+  spaces ("K7QM3XRD").
+- `GET /api/libraries` → `{libraries: [shareLib]}` (a bare array is also
+  read). Never requested in an album share.
+- `GET /api/l/{lib}/timeline?…` → `{buckets: [{year, month, count}]}`.
+- `GET /api/l/{lib}/media?…&year=Y&month=M` → `{items: [item]}`, item
+  as the admin list item: `id`, `hash`, `type`, `takenAt`, `w`, `h`,
+  `dur`, `thumb`, `thumbAt`, `rating`, `gps`. Items without a positive
+  `id` or a hash are dropped; `rating` is used only with `rate`, `gps`
+  only with `location`.
+- `GET /api/l/{lib}/media/{id}` → the redacted detail: `id, hash, type,
+  takenAt, offset, w, h, dur, size, ext, fileName, cameraMake,
+  cameraModel, lens, displayable, thumbAt`, plus `lat`/`lon` (shown only
+  with `location`), `rating` (only with `rate`) and `albums: [{id,
+  name}]` (library share; linked to `#/l/{lib}/albums/{id}`).
+  `displayable` counts only with `download`. `fileName` is cut to its
+  base name. 404 → "This photo is no longer in the library" ("… in this
+  album" in an album share) and the grid reloads.
+- `GET /api/l/{lib}/thumb|preview|large/{hash}?v={thumbAt}`; the grid
+  asks for `thumb` (`large` only at 1–2 columns), the lightbox for
+  `preview`. `GET /api/l/{lib}/file/{id}` for the player and the 1:1
+  original, `?download=1` for Download.
+- `GET /api/l/{lib}/albums` → `{albums: [{id, name, count, cover}]}`.
+  Never requested in an album share.
+- `POST /api/l/{lib}/ratings {hashes: [hash], rating}` → `{updated}`.
+  409 → "Ratings are paused while photos are being moved on the
+  computer"; 404 → the "no longer in" text; 403 without `state` →
+  "Ratings are no longer allowed in this share" and the session is read
+  again (the stars go once `rate` is off).
+- 503 on a list → "This library is not available right now (the
+  computer is busy with it). Try again later." with Try again.
+- Query parameters sent: `type` (`image` or `video`), `from`, `to`
+  (YYYY-01-01, `to` exclusive), `rating` (only with `rate`), `album`
+  (library share only), `year`, `month`. `recur` and `months` are never
+  sent. The `{lib}` key is a library id of the session's `libraries`,
+  or `album` in an album share.
+- Every 401, and every 403 with a `state`, from any request replaces the
+  page with the matching screen.
+
+Admin UI (admin listener):
+
+- `GET /api/share` → `{state, reason, url, mdnsUrl, mdns?, port,
+  address, addresses: [{ip, iface, subnet}], fingerprint: {leaf, ca},
+  keepOn, autoOff: {mode, until} (a bare mode string is also read),
+  managedElsewhere: {pid, cmd} | null, firewallHint, shares: [share]}`.
+  `firewallHint` may be a string, a list of lines or an object of
+  `{label: command}`. `mdns` missing is inferred from `mdnsUrl`. 404 →
+  sharing is not offered.
+- `POST /api/share {enabled?, address?, port?, keepOn?, autoOff?,
+  mdns?}` and `POST /api/share/cert/renew {}` → the GET body.
+- Admin `share`: `{id, name, kind, scope: {libraries: [{id, name,
+  missing?}]} | {library: {id, name, missing?}, album: {id, name, count,
+  missing?}}, capabilities, expiresAt, state, approve, createdAt,
+  devices: [{id, name, pairedAt, lastSeen, lastAddress, browser}]}`.
+  The scope's parts are also read from the top level; library entries
+  may be plain id strings; an answer wrapped as `{share: …}` is
+  unwrapped. Missing capabilities take the kind's defaults (admin side
+  only).
+- `POST /api/share/shares {name, scope: {kind: "libraries", libraries}
+  | {kind: "album", library, album}, capabilities, approve, expiresIn
+  (seconds) | expiresAt (RFC 3339 or null)}` → share.
+- `POST /api/share/shares/{sid} {name?, libraries?, capabilities?,
+  expiresAt?, paused?, approve?}` → share (Extend sends `expiresAt` 30
+  days ahead; Pause/Resume send `paused`).
+- `POST …/{sid}/delete {}`, `…/{sid}/revoke-all {}` (→ share),
+  `…/{sid}/pairings {}` → `{url, code, qrSvg, expiresAt}` (409 → the
+  dialog shows the server's message), `…/{sid}/pairings/cancel {}` when
+  the dialog closes before a phone paired.
+- `GET …/{sid}/requests` → `[{id, name, browser, address, at}]` (or
+  `{requests: […]}`; numeric ids are read too), polled only for shares
+  with `approve` while the Share page or the pairing dialog is open;
+  `POST …/{sid}/requests/{rid} {approve}` (404 or 410 means the phone
+  gave up, and the request is dropped).
+- `POST /api/share/devices/{did} {name}` → device (`{device: …}` is
+  unwrapped); `POST /api/share/devices/{did}/revoke {}`.
+- Share, device and request ids must match `[A-Za-z0-9_-]{1,80}` to be
+  put in a URL.
+
+### Deviations
+
+- `Grid` and `Lightbox` are not reused in a `mode="share"`: the admin
+  ones import the selection, jobs, moves, tags, albums, toasts and view
+  memory, which would all land in the phone's bundle. `ShareGrid` and
+  `ShareLightbox` are small read-only components built on the reused
+  `Tile`, `Scrubber`, `RatingStars` and layout code.
+- The lightbox route keeps the grid it was opened from in its path
+  (`#/l/<id>/albums/<aid>/view/<mid>` besides `#/l/<id>/view/<mid>` and
+  `#/view/<mid>`), so a reload reopens it over the same grid. Opening
+  from a tile pushes a history entry, so the phone's Back closes it.
+- The filter sheet's "Photos" is `type=image` (RAW files are under
+  All); the year range is two year fields.
+- Swipes count only when they start 32 px or more from the left and
+  right edges (the document suggested 24 px; Phase 0 showed the system
+  takes edge swipes on Android and Sailfish). Without `touch-action` on
+  Gecko 91 the lightbox's touch listeners are non-passive and cancel
+  panning while one finger drags; two fingers are left to the browser.
+  A swipe on a video that starts in its bottom 72 px is left to the
+  player's controls.
+- Svelte's `inert` and CSS `touch-action` are used but not relied on
+  (Gecko 91 ignores both).
+- The share chunk check is `scripts/check-share-apis.mjs` with the rules
+  in `scripts/share-compat.mjs` (shared with `src/share/compat.test.ts`);
+  it also refuses admin API URLs in share chunks.
+
+### Left to do
+
+- Serving `share.html` and `/assets/*` on the share listener (backend).
+- The opt-in certificate install (Q3) and the `?t=` media URL (Q5), if
+  Phase 0 calls for them.
+- Approval requests show only while the Share page or a pairing dialog
+  is open; there is no prompt elsewhere in the admin UI.
+- Pinch to change the grid's columns; the tray item and `keepOn` wiring
+  in the desktop app; `make e2e-share`; the manual device checklist (iOS
+  is untested).
