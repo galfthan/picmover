@@ -1069,9 +1069,9 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     port: 7443,
     address: '192.168.1.20',
     addresses: [
-      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24' },
-      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24' },
-    ] as { ip: string; iface: string; subnet: string; virtual?: boolean }[],
+      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24', wireless: true },
+      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24', wireless: false },
+    ] as { ip: string; iface: string; subnet: string; virtual?: boolean; wireless?: boolean }[],
     fingerprint: { leaf: 'AB:CD:EF:01:23:45:67:89', ca: '12:34:56:78:9A:BC:DE:F0' },
     keepOn: false,
     mdns: false,

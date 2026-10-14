@@ -126,6 +126,29 @@ describe('sharing (admin)', () => {
     expect(shown()).toBe('Sharing · 1 share · 3 phones');
   });
 
+  it('labels the addresses Wi-Fi or wired, and suggests the Wi-Fi one while a wired one is chosen', async () => {
+    server.sharing.address = '10.0.0.5';
+    await start();
+    const sel = document.querySelector<HTMLSelectElement>('select[aria-label="Network address"]')!;
+    expect([...sel.options].map((o) => o.textContent)).toEqual(['192.168.1.20 (Wi-Fi, wlp3s0, 192.168.1.0/24)', '10.0.0.5 (wired, enp0s31f6, 10.0.0.0/24)']);
+    expect(document.body.textContent).toContain('Phones must be on the same network as this address.');
+    expect(document.body.textContent).toContain('This address is wired. Phones are usually on the Wi-Fi: the Wi-Fi address is 192.168.1.20.');
+    // A suggestion only: the saved choice stays until the user takes it.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(posts('/api/share')).toHaveLength(0);
+    expect(sel.value).toBe('10.0.0.5');
+    click(button('Use 192.168.1.20 (Wi-Fi)')!);
+    await settle();
+    expect(posts('/api/share').at(-1)?.body).toEqual({ address: '192.168.1.20' });
+    expect(document.body.textContent).not.toContain('This address is wired');
+    // An older server says nothing about Wi-Fi: no labels, no advice.
+    for (const a of server.sharing.addresses) delete a.wireless;
+    server.sharing.address = '10.0.0.5';
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect([...sel.options].map((o) => o.textContent)).toEqual(['192.168.1.20 (wlp3s0, 192.168.1.0/24)', '10.0.0.5 (enp0s31f6, 10.0.0.0/24)']);
+    expect(document.body.textContent).not.toContain('This address is wired');
+  });
+
   it('has no pill and says so on a server without sharing', async () => {
     server.sharing.supported = false;
     await start('#/share');

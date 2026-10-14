@@ -1,7 +1,7 @@
 // Texts and small pure helpers of the admin Share page and ShareDialog
 // (docs/design/lan-share.md "Entry points"); see sharetext.test.ts.
 
-import type { Share, ShareKind, SharingSummary } from './api';
+import type { Share, ShareAddress, ShareKind, SharingSummary } from './api';
 import { formatAgo } from './format';
 
 /** "Album: Summer 2026 in peter, 48 photos" / "Libraries: peter, penny". */
@@ -104,6 +104,34 @@ export function deviceNameProblem(raw: string): string | null {
 
 /** Share names: 1–60 characters, no control characters; null when fine. */
 export const shareNameProblem = deviceNameProblem;
+
+/** "Wi-Fi", "wired", or "" when the server did not say. */
+export function linkKind(a: Pick<ShareAddress, 'wireless'>): string {
+  return a.wireless === true ? 'Wi-Fi' : a.wireless === false ? 'wired' : '';
+}
+
+/** "Wi-Fi, wlp3s0, 192.168.1.0/24": what is known of an address besides its ip. */
+export function addressDetail(a: ShareAddress): string {
+  return [linkKind(a), a.iface, a.subnet, a.virtual ? 'virtual' : ''].filter((x) => x !== '').join(', ');
+}
+
+/** "192.168.1.20 (Wi-Fi, wlp3s0, 192.168.1.0/24)": an address as the Network choice lists it. */
+export function addressLabel(a: ShareAddress): string {
+  const d = addressDetail(a);
+  return d ? `${a.ip} (${d})` : a.ip;
+}
+
+/**
+ * A Wi-Fi address to suggest when the chosen one is wired (phones are on
+ * the Wi-Fi, and a wired network is often another one); null when the
+ * choice is Wi-Fi, unknown, or there is no Wi-Fi address. Only a
+ * suggestion: a saved choice is never switched by itself.
+ */
+export function wifiSuggestion(addresses: ShareAddress[], chosen: string): ShareAddress | null {
+  const cur = addresses.find((a) => a.ip === chosen);
+  if (!cur || cur.wireless !== false) return null;
+  return addresses.find((a) => a.wireless === true && !a.virtual) ?? null;
+}
 
 /** One way to write the top-bar pill: its text, and the auto-off timer ("52 min left"; "" leaves it out). */
 export interface PillVariant {
