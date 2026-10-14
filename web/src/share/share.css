@@ -7,8 +7,14 @@
      for browsers whose toolbars resize the viewport (no dvh in Gecko 91). */
   height: var(--app-h, 100%);
 }
+/* No overscroll in either axis: a sideways drag on a bar or a sheet must
+   not become the browser's back/forward gesture (Chrome on Android), nor
+   a pull-to-refresh. Gecko 91 has overscroll-behavior. */
+html,
 body {
-  overscroll-behavior-y: none;
+  overscroll-behavior: none;
+}
+body {
   -webkit-text-size-adjust: 100%;
   -webkit-tap-highlight-color: transparent;
 }
