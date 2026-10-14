@@ -575,6 +575,12 @@ describe('phone app', () => {
       const video = lightbox()!.querySelector('video')!;
       expect(video.hasAttribute('playsinline')).toBe(true);
       expect(video.getAttribute('src')).toBe('/api/l/peter/file/3');
+      // Between the bars (layout.test.ts checks the inset), and a tap on it is the player's, not ours.
+      expect(video.parentElement?.classList.contains('video')).toBe(true);
+      touch(video, 'touchstart', 200, 300);
+      touch(video, 'touchend', 200, 300);
+      await settle();
+      expect(lightbox()!.classList.contains('bare')).toBe(false);
       video.dispatchEvent(new Event('error'));
       await settle();
       expect(lightbox()!.textContent).toContain('This video cannot be played in this browser');

@@ -324,7 +324,7 @@
       </div>
     {:else if item}
       {#key item.id}
-        <div class="media" style:transform={dragStyle} style:opacity={dragY ? Math.max(0.3, 1 - dragY / 400) : null}>
+        <div class="media" class:video={playable && !!d && !videoFailed} style:transform={dragStyle} style:opacity={dragY ? Math.max(0.3, 1 - dragY / 400) : null}>
           {#if playable && d && !videoFailed}
             <!-- svelte-ignore a11y_media_has_caption -->
             <video controls playsinline preload="metadata" src={client.fileUrl(d.id)} poster={client.previewUrl(d)} onerror={() => (videoFailed = true)}></video>
@@ -443,6 +443,7 @@
 
 <style>
   .lightbox {
+    --bar-h: 52px;
     position: fixed;
     top: 0;
     left: 0;
@@ -487,6 +488,14 @@
   }
   .preview.loaded {
     opacity: 1;
+  }
+  /* A playing video sits between the bars, never under them: the
+     player's own controls (seek bar, time, play) stay reachable, and a
+     tap meant for them cannot land on a star. The bars keep their own
+     height (see .bar); the inset matches it. */
+  .media.video {
+    top: calc(var(--bar-h) + env(safe-area-inset-top, 0px));
+    bottom: calc(var(--bar-h) + env(safe-area-inset-bottom, 0px));
   }
   video {
     position: absolute;
@@ -549,7 +558,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    min-height: 52px;
+    min-height: var(--bar-h);
     padding-left: calc(6px + env(safe-area-inset-left, 0px));
     padding-right: calc(6px + env(safe-area-inset-right, 0px));
     background: rgba(0, 0, 0, 0.55);
