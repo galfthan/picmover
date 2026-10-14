@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aspectOf, renditionFor } from './rendition';
+import { aspectOf, renditionFor, shareGridCap } from './rendition';
 
 const R32 = 3 / 2;
 const R169 = 16 / 9;
@@ -50,6 +50,27 @@ describe('renditionFor', () => {
     expect(renditionFor(Number.NaN, 2)).toBe('thumb');
     expect(renditionFor(200, 1, Number.NaN)).toBe('thumb');
     expect(renditionFor(200, 1, 0.5)).toBe('thumb');
+  });
+});
+
+describe('the share grid cap', () => {
+  it('never goes above the cap', () => {
+    // A 3-column grid on a 390 px phone at DPR 3: about 390 device px per tile.
+    expect(renditionFor(126, 3)).toBe('large');
+    expect(renditionFor(126, 3, 1, 'thumb')).toBe('thumb');
+    expect(renditionFor(300, 3)).toBe('preview');
+    expect(renditionFor(300, 3, 1, 'large')).toBe('large');
+    expect(renditionFor(300, 3, 1, 'thumb')).toBe('thumb');
+    expect(renditionFor(300, 2, 1, 'large')).toBe('large');
+    // Below the cap the usual choice stands.
+    expect(renditionFor(100, 1, 1, 'large')).toBe('thumb');
+    expect(renditionFor(Number.NaN, 2, 1, 'thumb')).toBe('thumb');
+  });
+  it('is the thumb from three columns and the large for one or two', () => {
+    expect(shareGridCap(3)).toBe('thumb');
+    expect(shareGridCap(5)).toBe('thumb');
+    expect(shareGridCap(2)).toBe('large');
+    expect(shareGridCap(1)).toBe('large');
   });
 });
 

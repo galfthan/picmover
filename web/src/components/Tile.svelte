@@ -1,6 +1,19 @@
+<script lang="ts" module>
+  import type { LibApi } from '../lib/api';
+
+  /** What a tile needs of a library client: the admin LibApi, or the phone app's share client. */
+  export type TileApi = Pick<LibApi, 'id' | 'thumbUrl' | 'largeUrl' | 'previewUrl'>;
+
+  /** Where a tile opens its item; the admin viewer (#/l/<id>/view/<mid>) when not given. */
+  export interface TileViewer {
+    href(id: number): string;
+    open(id: number): void;
+  }
+</script>
+
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { LibApi, MediaItem } from '../lib/api';
+  import type { MediaItem } from '../lib/api';
   import { formatAgo, formatDuration, formatWallDate, parseLocalWallClock } from '../lib/format';
   import { openViewer, viewerHref } from '../lib/viewer';
   import type { Rendition } from '../lib/rendition';
@@ -10,7 +23,7 @@
     left: number;
     top: number;
     size: number;
-    api: LibApi;
+    api: TileApi;
     selected?: boolean;
     /** A selection exists: checkboxes stay visible. */
     selecting?: boolean;
@@ -22,8 +35,10 @@
     now?: number;
     /** Which stored rendition to show (the grid picks it from the tile size and pixel ratio). */
     rendition?: Rendition;
+    /** Read-only grids (the phone app) open the item elsewhere; without `onselect` there is no check box. */
+    viewer?: TileViewer;
   }
-  let { item, left, top, size, api, selected = false, selecting = false, onselect, trash = false, now = 0, rendition = 'thumb' }: Props = $props();
+  let { item, left, top, size, api, selected = false, selecting = false, onselect, trash = false, now = 0, rendition = 'thumb', viewer }: Props = $props();
 
   // Rows whose thumbnails cannot exist are not requested at all.
   const requestable = $derived(item.thumb !== 'unsupported' && item.thumb !== 'error');
@@ -93,7 +108,8 @@
     }
     if (e.ctrlKey || e.metaKey || e.shiftKey) return; // new tab / window
     e.preventDefault();
-    openViewer(api.id, item.id);
+    if (viewer) viewer.open(item.id);
+    else openViewer(api.id, item.id);
   }
 
   // Shift+mousedown would extend the page's text selection to the tile.
@@ -106,6 +122,7 @@
   class="cell"
   class:selected
   class:selecting
+  class:checkable={!!onselect}
   style:left="{left}px"
   style:top="{top}px"
   style:width="{size}px"
@@ -114,7 +131,7 @@
   <a
     class="tile"
     class:loaded
-    href={viewerHref(api.id, item.id)}
+    href={viewer ? viewer.href(item.id) : viewerHref(api.id, item.id)}
     onclick={open}
     onmousedown={noTextSelection}
     aria-label={label}
@@ -245,7 +262,7 @@
     font-weight: 600;
   }
   .selecting .rating,
-  .cell:hover .rating {
+  .checkable:hover .rating {
     left: 32px;
   }
   .deleted {
@@ -280,6 +297,12 @@
   }
   .selected img {
     transform: scale(0.92);
+  }
+  /* Touch screens have no hover: the date stays visible. */
+  @media (hover: none) {
+    .date {
+      opacity: 1;
+    }
   }
   @media (prefers-reduced-motion: reduce) {
     img,

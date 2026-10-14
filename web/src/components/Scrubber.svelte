@@ -70,6 +70,19 @@
     if (!dragging) hoverY = null;
   }
 
+  // Browsers without `touch-action` (Sailfish Browser, Gecko 91) would pan
+  // the page under a dragging finger and cancel the pointer: a non-passive
+  // touchmove keeps the drag here.
+  $effect(() => {
+    const node = el;
+    if (!node) return;
+    const hold = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+    };
+    node.addEventListener('touchmove', hold, { passive: false });
+    return () => node.removeEventListener('touchmove', hold);
+  });
+
   // Keyboard: Up/Down and PageUp/PageDown jump a year, Home/End to the ends.
   const allMarks = $derived(yearMarks(timeline.buckets));
   const currentLabel = $derived.by(() => {

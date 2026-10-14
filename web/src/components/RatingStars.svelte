@@ -63,4 +63,15 @@
   .ro .star {
     padding: 0;
   }
+  /* Touch: 44 px hit targets. */
+  @media (pointer: coarse) {
+    button.star {
+      min-width: 44px;
+      min-height: 44px;
+      font-size: 24px;
+    }
+    .small button.star {
+      font-size: 18px;
+    }
+  }
 </style>

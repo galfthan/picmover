@@ -1456,6 +1456,329 @@ export async function appOpen(): Promise<void> {
   await postJSON<unknown>('/api/app/open', {});
 }
 
+// ---- Sharing on the home Wi-Fi (docs/design/lan-share.md "Admin API") ----
+//
+// The admin side of sharing: the global switch (the share listener), the
+// shares with their devices, pairing and approval requests. The answers are
+// parsed leniently (missing fields defaulted) because the server and this
+// client were written in parallel against the design document.
+
+export type ShareKind = 'libraries' | 'album';
+export type ShareCapability = 'video' | 'download' | 'rate' | 'location';
+export type ShareCapabilities = Record<ShareCapability, boolean>;
+export const SHARE_CAPABILITIES: readonly ShareCapability[] = ['video', 'download', 'rate', 'location'];
+
+/** The kind's defaults: everything for a library share; only video for an album share. */
+export function defaultCapabilities(kind: ShareKind | string): ShareCapabilities {
+  const all = kind !== 'album';
+  return { video: true, download: all, rate: all, location: all };
+}
+
+/** "active", or why the share's phones are refused. */
+export type ShareStateName = 'active' | 'paused' | 'expired' | 'gone' | 'unavailable';
+
+export interface ShareDevice {
+  id: string;
+  name: string;
+  /** RFC 3339 instants; null when unknown. */
+  pairedAt: string | null;
+  lastSeen: string | null;
+  lastAddress: string;
+  /** A coarse label from the User-Agent at pairing time ("Chrome on Android"). */
+  browser: string;
+}
+
+export interface ShareLibRef {
+  id: string;
+  name: string;
+  /** The library folder is gone, or holds another library (LibraryID mismatch). */
+  missing: boolean;
+}
+
+export interface ShareAlbumRef {
+  id: number;
+  name: string;
+  count: number;
+  /** The album was deleted (or its id reused). */
+  missing: boolean;
+}
+
+/** A share as the admin API describes it. */
+export interface Share {
+  id: string;
+  name: string;
+  kind: ShareKind | string;
+  /** The libraries of a library share (empty for an album share). */
+  libraries: ShareLibRef[];
+  /** The library and album of an album share (null for a library share). */
+  library: ShareLibRef | null;
+  album: ShareAlbumRef | null;
+  capabilities: ShareCapabilities;
+  /** RFC 3339; null: never expires. */
+  expiresAt: string | null;
+  state: ShareStateName | string;
+  approve: boolean;
+  createdAt: string | null;
+  devices: ShareDevice[];
+}
+
+export interface ShareAddress {
+  ip: string;
+  iface: string;
+  subnet: string;
+}
+
+export type AutoOffMode = 'never' | '1h' | '4h' | 'quit';
+
+/** GET /api/share: the global switch, the listener's address and the shares. */
+export interface SharingStatus {
+  state: 'off' | 'on' | 'paused' | 'error' | string;
+  /** Why it is paused or failed ("network changed", "Port 7443 is in use…"); "" when none. */
+  reason: string;
+  /** https://<ip>:<port>/ while on; "" otherwise. */
+  url: string;
+  /** https://<host>.local:<port>/ when the mDNS name is on; "" otherwise. */
+  mdnsUrl: string;
+  /** Whether the .local name is offered (the `mdns` setting; else inferred from `mdnsUrl`). */
+  mdns: boolean;
+  port: number;
+  address: string;
+  addresses: ShareAddress[];
+  fingerprint: { leaf: string; ca: string };
+  keepOn: boolean;
+  autoOff: { mode: AutoOffMode | string; until: string | null };
+  managedElsewhere: { pid: number; cmd: string } | null;
+  /** The commands to open the firewall, as text (one or more lines). */
+  firewallHint: string;
+  shares: Share[];
+}
+
+export interface SharingPatch {
+  enabled?: boolean;
+  address?: string;
+  port?: number;
+  keepOn?: boolean;
+  autoOff?: AutoOffMode;
+  mdns?: boolean;
+}
+
+export type ShareScopeRequest = { kind: 'libraries'; libraries: string[] } | { kind: 'album'; library: string; album: number };
+
+export interface ShareCreate {
+  name: string;
+  scope: ShareScopeRequest;
+  capabilities?: ShareCapabilities;
+  /** Seconds from now; or `expiresAt` (null: never). */
+  expiresIn?: number;
+  expiresAt?: string | null;
+  approve?: boolean;
+}
+
+export interface ShareUpdate {
+  name?: string;
+  /** Library shares only. */
+  libraries?: string[];
+  capabilities?: ShareCapabilities;
+  /** null: never expires. */
+  expiresAt?: string | null;
+  paused?: boolean;
+  approve?: boolean;
+}
+
+/** A pairing for one share: the QR (an SVG of `url`) and the typed code, valid until `expiresAt`. */
+export interface Pairing {
+  url: string;
+  code: string;
+  qrSvg: string;
+  expiresAt: string | null;
+}
+
+/** A phone waiting for approval (the share's `approve` setting). */
+export interface PairRequest {
+  id: string;
+  name: string;
+  browser: string;
+  address: string;
+  at: string | null;
+}
+
+const bool = (v: unknown): boolean => v === true;
+
+function toCapabilities(v: unknown, kind: string): ShareCapabilities {
+  const out = defaultCapabilities(kind);
+  if (!isRecord(v)) return out;
+  for (const c of SHARE_CAPABILITIES) {
+    const x = v[c];
+    if (typeof x === 'boolean') out[c] = x;
+  }
+  return out;
+}
+
+function toShareLib(v: unknown): ShareLibRef | null {
+  if (typeof v === 'string' && v !== '') return { id: v, name: v, missing: false };
+  if (!isRecord(v) || typeof v.id !== 'string' || v.id === '') return null;
+  return { id: v.id, name: str(v.name) || v.id, missing: bool(v.missing) };
+}
+
+export function toShareDevice(v: unknown): ShareDevice {
+  const r = isRecord(v) ? (isRecord(v.device) ? v.device : v) : {};
+  return {
+    id: str(r.id),
+    name: str(r.name),
+    pairedAt: instant(r.pairedAt),
+    lastSeen: instant(r.lastSeen),
+    lastAddress: str(r.lastAddress),
+    browser: str(r.browser),
+  };
+}
+
+/** A share object with every field present; the scope's parts are read from `scope` (or the top level). */
+export function toShare(v: unknown): Share {
+  const r = isRecord(v) ? (isRecord(v.share) ? v.share : v) : {};
+  const scope = isRecord(r.scope) ? r.scope : r;
+  const kind = str(r.kind) || str(scope.kind) || (isRecord(scope.album) ? 'album' : 'libraries');
+  const libs = Array.isArray(scope.libraries) ? scope.libraries.map(toShareLib).filter((x): x is ShareLibRef => x !== null) : [];
+  const a = isRecord(scope.album) ? scope.album : null;
+  return {
+    id: str(r.id),
+    name: str(r.name),
+    kind,
+    libraries: kind === 'album' ? [] : libs,
+    library: kind === 'album' ? toShareLib(scope.library) : null,
+    album: a ? { id: num(a.id), name: str(a.name), count: count(a.count), missing: bool(a.missing) } : null,
+    capabilities: toCapabilities(r.capabilities, kind),
+    expiresAt: instant(r.expiresAt),
+    state: str(r.state) || 'active',
+    approve: bool(r.approve),
+    createdAt: instant(r.createdAt),
+    devices: Array.isArray(r.devices) ? r.devices.map(toShareDevice).filter((d) => d.id !== '') : [],
+  };
+}
+
+function hintText(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string').join('\n');
+  if (isRecord(v)) {
+    return Object.entries(v)
+      .filter((e): e is [string, string] => typeof e[1] === 'string' && e[1] !== '')
+      .map(([k, c]) => `${k}: ${c}`)
+      .join('\n');
+  }
+  return '';
+}
+
+/** The GET /api/share body (also every POST /api/share answer) with every field present. */
+export function toSharingStatus(v: unknown): SharingStatus {
+  const r = isRecord(v) ? v : {};
+  const fp = isRecord(r.fingerprint) ? r.fingerprint : {};
+  const ao = isRecord(r.autoOff) ? r.autoOff : { mode: r.autoOff };
+  const me = isRecord(r.managedElsewhere) ? r.managedElsewhere : null;
+  const mdnsUrl = str(r.mdnsUrl);
+  return {
+    state: str(r.state) || 'off',
+    reason: str(r.reason),
+    url: str(r.url),
+    mdnsUrl,
+    mdns: typeof r.mdns === 'boolean' ? r.mdns : mdnsUrl !== '',
+    port: count(r.port),
+    address: str(r.address),
+    addresses: Array.isArray(r.addresses)
+      ? r.addresses
+          .filter(isRecord)
+          .map((a) => ({ ip: str(a.ip), iface: str(a.iface), subnet: str(a.subnet) }))
+          .filter((a) => a.ip !== '')
+      : [],
+    fingerprint: { leaf: str(fp.leaf), ca: str(fp.ca) },
+    keepOn: bool(r.keepOn),
+    autoOff: { mode: str(ao.mode) || 'quit', until: instant(ao.until) },
+    managedElsewhere: me ? { pid: count(me.pid), cmd: str(me.cmd) } : null,
+    firewallHint: hintText(r.firewallHint),
+    shares: Array.isArray(r.shares) ? r.shares.map(toShare).filter((x) => x.id !== '') : [],
+  };
+}
+
+export function toPairing(v: unknown): Pairing {
+  const r = isRecord(v) ? v : {};
+  return { url: str(r.url), code: str(r.code), qrSvg: str(r.qrSvg), expiresAt: instant(r.expiresAt) };
+}
+
+/** The approval requests, as a bare list or under `requests`; malformed entries are dropped. */
+export function toPairRequests(v: unknown): PairRequest[] {
+  const list: unknown[] = Array.isArray(v) ? v : isRecord(v) && Array.isArray(v.requests) ? v.requests : [];
+  return list.filter(isRecord).flatMap((x) => {
+    const id = typeof x.id === 'number' ? String(x.id) : str(x.id);
+    return id ? [{ id, name: str(x.name), browser: str(x.browser), address: str(x.address), at: instant(x.at) }] : [];
+  });
+}
+
+const SHARE_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+
+/** Share, device and request ids are short tokens ("s_8c1f…"); anything else never reaches a URL. */
+function encShareId(id: string): string {
+  if (!SHARE_ID_RE.test(id)) throw new ApiError(400, `invalid id ${JSON.stringify(id)}`);
+  return id;
+}
+
+/** The sharing state, or null when the server has no sharing (404: an older picmover). */
+export async function getSharing(signal?: AbortSignal): Promise<SharingStatus | null> {
+  try {
+    return toSharingStatus(await getJSON<unknown>('/api/share', signal));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+export async function setSharing(patch: SharingPatch): Promise<SharingStatus> {
+  return toSharingStatus(await postJSON<unknown>('/api/share', patch));
+}
+
+/** A new leaf certificate (the CA is kept). */
+export async function renewShareCert(): Promise<SharingStatus> {
+  return toSharingStatus(await postJSON<unknown>('/api/share/cert/renew', {}));
+}
+
+export async function createShare(req: ShareCreate): Promise<Share> {
+  return toShare(await postJSON<unknown>('/api/share/shares', req));
+}
+
+export async function updateShare(id: string, patch: ShareUpdate): Promise<Share> {
+  return toShare(await postJSON<unknown>(`/api/share/shares/${encShareId(id)}`, patch));
+}
+
+export async function deleteShare(id: string): Promise<void> {
+  await postJSON<unknown>(`/api/share/shares/${encShareId(id)}/delete`, {});
+}
+
+export async function revokeAllDevices(id: string): Promise<Share> {
+  return toShare(await postJSON<unknown>(`/api/share/shares/${encShareId(id)}/revoke-all`, {}));
+}
+
+/** A new pairing for the share; ApiError 409 while sharing is off or the share is not active. */
+export async function startPairing(id: string): Promise<Pairing> {
+  return toPairing(await postJSON<unknown>(`/api/share/shares/${encShareId(id)}/pairings`, {}));
+}
+
+export async function cancelPairing(id: string): Promise<void> {
+  await postJSON<unknown>(`/api/share/shares/${encShareId(id)}/pairings/cancel`, {});
+}
+
+export async function getPairRequests(id: string, signal?: AbortSignal): Promise<PairRequest[]> {
+  return toPairRequests(await getJSON<unknown>(`/api/share/shares/${encShareId(id)}/requests`, signal));
+}
+
+export async function answerPairRequest(id: string, request: string, approve: boolean): Promise<void> {
+  await postJSON<unknown>(`/api/share/shares/${encShareId(id)}/requests/${encShareId(request)}`, { approve });
+}
+
+export async function renameDevice(id: string, name: string): Promise<ShareDevice> {
+  return toShareDevice(await postJSON<unknown>(`/api/share/devices/${encShareId(id)}`, { name }));
+}
+
+export async function revokeDevice(id: string): Promise<void> {
+  await postJSON<unknown>(`/api/share/devices/${encShareId(id)}/revoke`, {});
+}
+
 // ---- Directory browser ----
 
 export async function listDir(path: string, signal?: AbortSignal): Promise<FsListing> {

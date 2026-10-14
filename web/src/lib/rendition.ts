@@ -20,19 +20,33 @@ export function aspectOf(w: number | undefined, h: number | undefined): number {
   return Math.max(w, h) / Math.min(w, h);
 }
 
+const ORDER: readonly Rendition[] = ['thumb', 'large', 'preview'];
+
 /**
  * The rendition for a tile of `tileCssPx` CSS px at `devicePixelRatio`
  * showing an item of aspect ratio `aspect` (long / short; missing or
- * bogus counts as square).
+ * bogus counts as square). `cap` is the largest rendition allowed: the
+ * phone grid (docs/design/lan-share.md "Performance") caps tiles at the
+ * thumb, so scrolling never makes the computer derive large renditions.
  */
-export function renditionFor(tileCssPx: number, devicePixelRatio: number, aspect = 1): Rendition {
+export function renditionFor(tileCssPx: number, devicePixelRatio: number, aspect = 1, cap: Rendition = 'preview'): Rendition {
   const dpr = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
   const ar = Number.isFinite(aspect) && aspect >= 1 ? aspect : 1;
-  if (!Number.isFinite(tileCssPx)) return 'thumb';
-  const px = tileCssPx * dpr;
-  if (px <= THUMB_PX / ar) return 'thumb';
-  if (px <= LARGE_PX / ar) return 'large';
-  return 'preview';
+  let r: Rendition;
+  if (!Number.isFinite(tileCssPx)) r = 'thumb';
+  else {
+    const px = tileCssPx * dpr;
+    r = px <= THUMB_PX / ar ? 'thumb' : px <= LARGE_PX / ar ? 'large' : 'preview';
+  }
+  return ORDER.indexOf(r) > ORDER.indexOf(cap) ? cap : r;
+}
+
+/**
+ * The cap of the phone grid: the thumb for three or more columns, the
+ * large only for one or two (docs/design/lan-share.md "Performance").
+ */
+export function shareGridCap(columns: number): Rendition {
+  return columns <= 2 ? 'large' : 'thumb';
 }
 
 /** The window's current device pixel ratio (1 when unknown). */
