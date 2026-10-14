@@ -122,6 +122,7 @@
   class="cell"
   class:selected
   class:selecting
+  class:checkable={!!onselect}
   style:left="{left}px"
   style:top="{top}px"
   style:width="{size}px"
@@ -261,7 +262,7 @@
     font-weight: 600;
   }
   .selecting .rating,
-  .cell:hover .rating {
+  .checkable:hover .rating {
     left: 32px;
   }
   .deleted {
