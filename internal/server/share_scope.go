@@ -189,6 +189,11 @@ func (s albumScope) restrict(_ context.Context, _ *libHandles, _ *catalog.Filter
 	if uf.album != 0 {
 		return &errFilter{msg: "invalid album: this share is one album"}
 	}
+	// Tags are the owner's labels on the whole library: a guest learns
+	// none (docs/design/lan-share.md, "Settled in review", Q7).
+	if len(uf.tags) > 0 {
+		return &errFilter{msg: "invalid tag: this share is one album"}
+	}
 	uf.album = s.album.ID
 	return nil
 }

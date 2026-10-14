@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -28,6 +30,7 @@ var shareRouteGolden = []string{
 	"library GET /api/l/{lib}/library",
 	"library GET /api/l/{lib}/timeline",
 	"library GET /api/l/{lib}/media",
+	"library GET /api/l/{lib}/facets",
 	"library GET /api/l/{lib}/media/{id}",
 	"library GET /api/l/{lib}/thumb/{hash}",
 	"library GET /api/l/{lib}/preview/{hash}",
@@ -131,6 +134,7 @@ func (f *shareFixture) phoneAPIRoutes(lib string) [][2]string {
 		{"GET", "/api/l/" + lib + "/media/" + id}, {"GET", "/api/l/" + lib + "/thumb/" + h},
 		{"GET", "/api/l/" + lib + "/preview/" + h}, {"GET", "/api/l/" + lib + "/large/" + h},
 		{"GET", "/api/l/" + lib + "/file/" + id}, {"GET", "/api/l/" + lib + "/albums"},
+		{"GET", "/api/l/" + lib + "/facets"},
 		{"POST", "/api/l/" + lib + "/ratings"},
 	}
 }
@@ -330,11 +334,12 @@ func TestShareRouteScopeMatrix(t *testing.T) {
 			t.Fatalf("album filter %v, want %v", got, want)
 		}
 		wantStatus(t, f.phone("GET", "/api/l/peter/timeline?album=999", "", c), http.StatusNotFound)
-		for _, path := range []string{"/api/libraries", "/api/l/peter/library", "/api/l/peter/albums", "/api/l/penny/albums"} {
+		for _, path := range []string{"/api/libraries", "/api/l/peter/library", "/api/l/peter/albums", "/api/l/penny/albums",
+			"/api/l/peter/facets", "/api/l/penny/facets"} {
 			wantStatus(t, f.phone("GET", path, "", c), http.StatusOK)
 		}
 		for _, path := range []string{"/api/l/other/library", "/api/l/other/timeline", "/api/l/album/timeline",
-			"/api/l/nothing/albums", "/api/l/..%2fother/timeline"} {
+			"/api/l/nothing/albums", "/api/l/..%2fother/timeline", "/api/l/other/facets", "/api/l/album/facets"} {
 			wantStatus(t, f.phone("GET", path, "", c), http.StatusNotFound)
 		}
 		libs := decode[struct {
@@ -379,9 +384,11 @@ func TestShareRouteScopeMatrix(t *testing.T) {
 		}
 		wantStatus(t, f.phone("GET", fmt.Sprintf("/api/l/album/timeline?album=%d", f.albums["peter/Other"]), "", c),
 			http.StatusBadRequest)
+		wantStatus(t, f.phone("GET", "/api/l/album/timeline?tag=1", "", c), http.StatusBadRequest)
+		wantStatus(t, f.phone("GET", "/api/l/peter/facets", "", c), http.StatusNotFound)
 		// No response names the folder or the album id.
 		for _, path := range []string{"/api/session", "/api/l/album/timeline", "/api/l/album/media?year=2024&month=7",
-			"/api/l/album/media/" + id("peter/a.jpg")} {
+			"/api/l/album/media/" + id("peter/a.jpg"), "/api/l/album/facets"} {
 			w := f.phone("GET", path, "", c)
 			wantStatus(t, w, http.StatusOK)
 			if b := w.Body.String(); strings.Contains(b, "peter") || strings.Contains(b, `"albums"`) ||
@@ -395,17 +402,167 @@ func TestShareRouteScopeMatrix(t *testing.T) {
 func TestShareFilterWhitelist(t *testing.T) {
 	f := newShareFixture(t)
 	c := f.pair(f.libraryShare().ID, "Anna")
-	for _, q := range []string{"type=video", "from=2024-01-01&to=2025-01-01", "recur=07-01..07-31", "months=7",
-		"rating=3"} {
+	for _, q := range []string{"type=video", "type=image_raw", "from=2024-01-01&to=2025-01-01", "recur=07-01..07-31",
+		"months=7", "months=1,7,12", "rating=3", "album=1", "tag=1", "tag=1&tag=2", "camera=EOS+R5", "gps=1",
+		"minpx=10", "maxpx=4000", "minpx=10&maxpx=20"} {
 		wantStatus(t, f.phone("GET", "/api/l/peter/timeline?"+q, "", c), http.StatusOK)
+		wantStatus(t, f.phone("GET", "/api/l/peter/media?year=2024&month=7&"+q, "", c), http.StatusOK)
 	}
-	for _, q := range []string{"trashed=1", "import=1", "session=1", "tag=1", "camera=EOS", "gps=1", "minpx=10", "foo=1"} {
+	for _, q := range []string{"trashed=1", "trashed=0", "import=1", "session=1", "foo=1", "year=2024",
+		// Malformed values of allowed keys.
+		"type=raw", "gps=2", "minpx=0", "minpx=20&maxpx=10", "tag=x", "months=13", "recur=13-01", "rating=6",
+		"camera=" + strings.Repeat("x", maxShareCamera+1)} {
 		wantStatus(t, f.phone("GET", "/api/l/peter/timeline?"+q, "", c), http.StatusBadRequest)
-		wantStatus(t, f.phone("GET", "/api/l/peter/media?year=2024&month=7&"+q, "", c), http.StatusBadRequest)
+		if q != "year=2024" {
+			wantStatus(t, f.phone("GET", "/api/l/peter/media?year=2024&month=7&"+q, "", c), http.StatusBadRequest)
+		}
+	}
+	// The facets take no parameters at all.
+	for _, q := range []string{"type=video", "foo=1", "trashed=1"} {
+		wantStatus(t, f.phone("GET", "/api/l/peter/facets?"+q, "", c), http.StatusBadRequest)
 	}
 	if got := f.listHashes(c, "peter", "?rating=4"); !slices.Equal(got, f.hexes("peter/a.jpg")) {
 		t.Fatalf("rating filter %v", got)
 	}
+	if got := f.listHashes(c, "peter", "?gps=1"); !slices.Equal(got, f.hexes("peter/a.jpg")) {
+		t.Fatalf("gps filter %v", got)
+	}
+	if got := f.listHashes(c, "peter", "?camera=EOS+R5"); !slices.Equal(got,
+		f.hexes("peter/a.jpg", "peter/b.jpg", "peter/c.jpg", "peter/d.jpg")) {
+		t.Fatalf("camera filter %v", got)
+	}
+	if got := f.listHashes(c, "peter", "?minpx=60&maxpx=70"); !slices.Equal(got,
+		f.hexes("peter/a.jpg", "peter/b.jpg", "peter/c.jpg", "peter/d.jpg")) {
+		t.Fatalf("size filter %v", got)
+	}
+	if got := f.listHashes(c, "peter", "?months=8"); len(got) != 0 {
+		t.Fatalf("months filter %v", got)
+	}
+}
+
+// facets reads a phone's facets of lib.
+func (f *shareFixture) facets(cookie, lib string) (shareFacetsJSON, map[string]any) {
+	f.t.Helper()
+	w := f.phone("GET", "/api/l/"+lib+"/facets", "", cookie)
+	wantStatus(f.t, w, http.StatusOK)
+	return decode[shareFacetsJSON](f.t, w), jsonMap(f.t, w)
+}
+
+func TestShareFacets(t *testing.T) {
+	ctx := context.Background()
+	f := newShareFixture(t)
+	h := func(n string) string { return hexHash(f.hashes[n]) }
+	// Cameras that only photos outside the album have, and tags: "beach"
+	// (a, c), "gone" (only the trashed t), "unused" (none).
+	lib, err := library.Open(filepath.Join(f.root, "peter"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", lib.DBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	for n, cam := range map[string]string{"peter/c.jpg": "Secret Cam", "peter/d.jpg": "Other Cam"} {
+		if _, err := raw.ExecContext(ctx, "UPDATE media SET camera_model = ? WHERE hash = ?", cam, int64(f.hashes[n])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tag := func(name string, names ...string) int64 {
+		var hs []string
+		for _, n := range names {
+			hs = append(hs, fmt.Sprintf("%q", h(n)))
+		}
+		w := f.admin(http.MethodPost, "/api/l/peter/media/tags", fmt.Sprintf(`{"hashes": [%s], "create": [%q]}`,
+			strings.Join(hs, ", "), name))
+		wantStatus(t, w, http.StatusOK)
+		w = f.admin("GET", "/api/l/peter/tags", "")
+		for _, tg := range decode[tagsJSON](t, w).Tags {
+			if tg.Name == name {
+				return tg.ID
+			}
+		}
+		t.Fatalf("tag %s not created", name)
+		return 0
+	}
+	wantStatus(t, f.admin(http.MethodPost, "/api/libraries/peter/open", "{}"), http.StatusOK)
+	beach := tag("beach", "peter/a.jpg", "peter/c.jpg")
+	tag("gone", "peter/t.jpg")
+	wantStatus(t, f.admin(http.MethodPost, "/api/l/peter/tags", `{"name": "unused"}`), http.StatusCreated)
+	wantStatus(t, f.admin(http.MethodPost, "/api/l/peter/albums", `{"name": "Empty"}`), http.StatusCreated)
+
+	t.Run("libraries", func(t *testing.T) {
+		c := f.pair(f.libraryShare().ID, "Anna")
+		got, m := f.facets(c, "peter")
+		want := shareFacetsJSON{Total: 5, Types: shareTypesJSON{Image: 4, Video: 1},
+			Years: []shareYearJSON{{2024, 5}}, Cameras: []cameraJSON{{"Canon", "EOS R5", 2}, {"Canon", "Other Cam", 1},
+				{"Canon", "Secret Cam", 1}}, GPS: ptr(int64(1)),
+			Tags:   &[]shareFacetJSON{{beach, "beach", 2}},
+			Albums: &[]shareFacetJSON{{f.albums["peter/Other"], "Other", 1}, {f.albums["peter/Summer"], "Summer", 3}}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("peter facets\n got  %s\n want %s", asJSON(got), asJSON(want))
+		}
+		if len(m) != 8 {
+			t.Fatalf("keys %v", m)
+		}
+		// Penny's own user.db: no tags, no albums.
+		got, _ = f.facets(c, "penny")
+		if got.Total != 1 || got.Tags == nil || len(*got.Tags) != 0 || got.Albums == nil || len(*got.Albums) != 0 {
+			t.Fatalf("penny facets %s", asJSON(got))
+		}
+		// Every facet value finds what it counts.
+		if n := len(f.listHashes(c, "peter", fmt.Sprintf("?tag=%d", beach))); n != 2 {
+			t.Fatalf("tag filter: %d", n)
+		}
+		if got := f.listHashes(c, "peter", "?camera=Secret+Cam"); !slices.Equal(got, f.hexes("peter/c.jpg")) {
+			t.Fatalf("camera filter %v", got)
+		}
+	})
+
+	t.Run("album", func(t *testing.T) {
+		sh := f.albumShare()
+		c := f.pair(sh.ID, "Mia")
+		got, m := f.facets(c, "album")
+		want := shareFacetsJSON{Total: 3, Types: shareTypesJSON{Image: 2, Video: 1}, Years: []shareYearJSON{{2024, 3}},
+			Cameras: []cameraJSON{{"Canon", "EOS R5", 2}}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("album facets\n got  %s\n want %s", asJSON(got), asJSON(want))
+		}
+		for _, k := range []string{"gps", "tags", "albums"} {
+			if _, ok := m[k]; ok {
+				t.Fatalf("album share facets have %q: %v", k, m)
+			}
+		}
+		for _, q := range []string{"tag=" + fmt.Sprint(beach), "gps=1", "album=1", "rating=1"} {
+			wantStatus(t, f.phone("GET", "/api/l/album/timeline?"+q, "", c), http.StatusBadRequest)
+		}
+		if got := f.listHashes(c, "album", "?camera=Secret+Cam"); len(got) != 0 {
+			t.Fatalf("camera outside the album: %v", got)
+		}
+		// With location: the album's gps count only.
+		f.update(sh.ID, `{"capabilities": {"video": true, "download": false, "rate": false, "location": true}}`)
+		got, _ = f.facets(c, "album")
+		if got.GPS == nil || *got.GPS != 1 {
+			t.Fatalf("album gps %s", asJSON(got))
+		}
+		if got := f.listHashes(c, "album", "?gps=1"); !slices.Equal(got, f.hexes("peter/a.jpg")) {
+			t.Fatalf("album gps filter %v", got)
+		}
+		// Removed from the album, or trashed: gone from the facets at once.
+		wantStatus(t, f.admin(http.MethodPost, fmt.Sprintf("/api/l/peter/albums/%d/items", f.albums["peter/Summer"]),
+			fmt.Sprintf(`{"remove": [%q]}`, h("peter/v.mp4"))), http.StatusOK)
+		got, _ = f.facets(c, "album")
+		if got.Total != 2 || got.Types.Video != 0 {
+			t.Fatalf("after removal %s", asJSON(got))
+		}
+	})
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func asJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func TestShareCapabilities(t *testing.T) {
@@ -457,6 +614,16 @@ func TestShareCapabilities(t *testing.T) {
 			ratingFilter = http.StatusOK
 		}
 		check("rating filter", f.phone("GET", "/api/l/peter/timeline?rating=1", "", c), ratingFilter)
+		check("rating filter (media)", f.phone("GET", "/api/l/peter/media?year=2024&month=7&rating=1", "", c), ratingFilter)
+		gpsFilter := http.StatusBadRequest
+		if caps.Location {
+			gpsFilter = http.StatusOK
+		}
+		check("gps filter", f.phone("GET", "/api/l/peter/timeline?gps=1", "", c), gpsFilter)
+		check("gps filter (media)", f.phone("GET", "/api/l/peter/media?year=2024&month=7&gps=1", "", c), gpsFilter)
+		if _, m := f.facets(c, "peter"); (m["gps"] != nil) != caps.Location {
+			t.Fatalf("%s facets %v", name, m)
+		}
 
 		it := items()[ha]
 		if (it.Rating == 4) != caps.Rate || it.GPS != caps.Location {
