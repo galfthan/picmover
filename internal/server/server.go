@@ -72,6 +72,14 @@ type Options struct {
 	// answer 404, as under "picmover serve").
 	App *AppHooks
 
+	// ShareDir is the directory of the sharing settings, devices and
+	// certificates; "" is the per-user default (share.DefaultDir), which
+	// is created only when sharing is first used.
+	ShareDir string
+	// ShareCmd names this process in share.lock while it shares ("serve",
+	// "picmover-app"); "" is "serve".
+	ShareCmd string
+
 	// unlock, in single mode, releases the library lock when the library
 	// is closed (Close, or a workspace switch); nil: the caller keeps the
 	// lock (cmd/serve before Start).
@@ -90,6 +98,11 @@ type Server struct {
 	ffmpeg  string
 	log     *slog.Logger
 	static  fs.FS // nil: the frontend is not built
+	dist    fs.FS // the built frontend as given (the phone app's files); nil: none
+	share   *sharing
+	// adminPatterns are the admin mux's patterns (routes), for the share
+	// listener's tests.
+	adminPatterns []string
 
 	guard   *guard
 	jobs    *jobManager
@@ -159,16 +172,19 @@ func New(opts Options) (*Server, error) {
 	switch {
 	case s.static == nil:
 		if dist, ok := web.Dist(); ok {
-			s.static = dist
+			s.static, s.dist = dist, dist
 		}
 	default:
+		s.dist = s.static
 		if _, err := fs.Stat(s.static, "index.html"); err != nil {
 			s.static = nil // an override without index.html: not built
 		}
 	}
 	s.jobs = newJobManager(ws, s.ffmpeg, log, opts.jobOptions)
 	ws.ownedImports = s.jobs.ownedImports
+	s.share = newSharing(s, opts.ShareDir, opts.ShareCmd)
 	s.handler = s.middleware(s.routes())
+	s.share.handler = s.share.middleware(s.shareMux())
 	return s, nil
 }
 
@@ -253,6 +269,7 @@ func (ws *workspace) newSingleEntry(lib *library.Library, db *catalog.DB, store 
 // still in flight (a trash batch) finish against open handles while the
 // HTTP server drains them. Close is the last phase.
 func (s *Server) StopJobs(ctx context.Context) error {
+	s.share.shutdown() // phones first: nothing new reaches the libraries
 	ctx, cancel := context.WithTimeout(ctx, jobShutdownTimeout)
 	defer cancel()
 	return s.jobs.shutdown(ctx)
@@ -262,6 +279,7 @@ func (s *Server) StopJobs(ctx context.Context) error {
 // drained: it closes every library (catalog, store, user.db) and releases
 // the locks it took. Library routes answer 503 afterwards.
 func (s *Server) Close() {
+	s.share.shutdown()
 	s.ws.closeAll()
 }
 
@@ -282,8 +300,19 @@ const maxIdleConns = 8
 // jobShutdownTimeout bounds how long Shutdown waits for a cancelled job.
 const jobShutdownTimeout = 30 * time.Second
 
+// patternMux is a ServeMux that records its patterns.
+type patternMux struct {
+	*http.ServeMux
+	patterns *[]string
+}
+
+func (m patternMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	*m.patterns = append(*m.patterns, pattern)
+	m.ServeMux.HandleFunc(pattern, h)
+}
+
 func (s *Server) routes() *http.ServeMux {
-	mux := http.NewServeMux()
+	mux := patternMux{ServeMux: http.NewServeMux(), patterns: &s.adminPatterns}
 	mux.HandleFunc("GET /api/libraries", s.handleLibraries)
 	mux.HandleFunc("POST /api/libraries", s.needWorkspace(s.handleLibraryCreate))
 	mux.HandleFunc("POST /api/libraries/{lib}/open", s.needWorkspace(s.handleLibraryOpen))
@@ -352,8 +381,9 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/app/open", s.appOnly(s.handleAppOpen))
 	mux.HandleFunc("POST /api/app/show", s.appOnly(s.handleAppShow))
 	mux.HandleFunc("POST /api/app/quit", s.appOnly(s.handleAppQuit))
+	s.shareAdminRoutes(mux.HandleFunc)
 	mux.HandleFunc("/", s.handleStatic)
-	return mux
+	return mux.ServeMux
 }
 
 // scoped wraps a library-scoped handler: the {lib} path value must name

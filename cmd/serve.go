@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -39,6 +40,9 @@ func newServeCmd() *cobra.Command {
 		verbose     bool
 		workspace   bool
 		corsOrigins []string
+		shareOn     bool
+		sharePort   int
+		pair        string
 	)
 	c := &cobra.Command{
 		Use:   "serve <library-or-workspace>",
@@ -67,7 +71,14 @@ rebuild <dir>' first). While serving, the library is locked: other
 picmover commands that write it (import, rebuild, thumbs, update-metadata)
 refuse to run until the server stops. Imports
 started from the browser write their log to <library>/.picmover/logs/ like
-the CLI.`,
+the CLI.
+
+--share also shares on the home Wi-Fi for this run: phones paired with
+the shares of this folder ('picmover share create', or the Share page)
+browse them over HTTPS on a second listener (port 7443, or --share-port),
+with what each share allows and nothing else. --pair SHARE prints a QR
+code and a one-time code to pair a phone with that share (Enter prints a
+new one). Without --share, serve never shares.`,
 		Args: exactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			addrGiven := cmd.Flags().Changed("addr")
@@ -84,8 +95,18 @@ the CLI.`,
 				}
 				corsOrigins[i] = n
 			}
+			if !shareOn && (pair != "" || cmd.Flags().Changed("share-port")) {
+				return usageError(cmd, errors.New("--pair and --share-port need --share"))
+			}
+			if shareOn && !server.IsLoopbackAddr(addr) {
+				return usageError(cmd, errors.New("--share needs the default loopback --addr; the shared view has its own listener"))
+			}
+			if sharePort < 0 || sharePort > 65535 {
+				return usageError(cmd, fmt.Errorf("invalid --share-port %d", sharePort))
+			}
 			return runServe(cmd, args[0], serveParams{addr: addr, addrGiven: addrGiven, noOpen: noOpen,
-				verbose: verbose, corsOrigins: corsOrigins, workspace: workspace})
+				verbose: verbose, corsOrigins: corsOrigins, workspace: workspace,
+				share: shareOn, sharePort: sharePort, pair: pair})
 		},
 	}
 	f := c.Flags()
@@ -94,6 +115,9 @@ the CLI.`,
 	f.StringArrayVar(&corsOrigins, "cors-origin", nil, "allow this origin to call the API cross-origin (repeatable; for frontend development, e.g. http://localhost:5173)")
 	f.BoolVar(&verbose, "verbose", false, "log every request to stderr")
 	f.BoolVar(&workspace, "workspace", false, "serve the folder as a workspace of libraries (its subfolders), even when it has none yet")
+	f.BoolVar(&shareOn, "share", false, "also share on the home Wi-Fi with the phones of this folder's shares")
+	f.IntVar(&sharePort, "share-port", 0, "the port of the shared view (default: the saved one, 7443)")
+	f.StringVar(&pair, "pair", "", "print a QR code and a one-time code to pair a phone with this share (name or id)")
 	return c
 }
 
@@ -104,6 +128,9 @@ type serveParams struct {
 	verbose     bool
 	workspace   bool
 	corsOrigins []string
+	share       bool
+	sharePort   int
+	pair        string
 }
 
 // Serve modes chosen by serveMode (server.ServeMode).
@@ -143,6 +170,8 @@ func runServe(cmd *cobra.Command, dir string, p serveParams) error {
 		CORSOrigins: p.corsOrigins, Version: Version, ErrOut: errOut,
 		Logger:        slog.New(slog.NewTextHandler(errOut, &slog.HandlerOptions{Level: level})),
 		CatalogLogger: stderrLogger(),
+		ShareDir:      shareDir,
+		ShareCmd:      "serve",
 	})
 	if err != nil {
 		var me *server.ModeError
@@ -152,8 +181,26 @@ func runServe(cmd *cobra.Command, dir string, p serveParams) error {
 		return err
 	}
 
+	if p.share {
+		if err := startSharing(cmd, run, p); err != nil {
+			run.Shutdown(context.Background())
+			return err
+		}
+	}
 	url := run.URL()
 	fmt.Fprintf(out, "%s at %s\n", run.Banner(), url)
+	if p.share {
+		printSharing(out, run)
+	}
+	if p.pair != "" {
+		pairing, err := run.Pair(p.pair)
+		if err != nil {
+			run.Shutdown(context.Background())
+			return &exitError{code: 1, msg: err.Error()}
+		}
+		printPairing(out, pairing)
+		go repair(ctx, cmd.InOrStdin(), out, errOut, run, p.pair)
+	}
 	if !p.noOpen && isTerminal(out) {
 		if err := openBrowser(url); err != nil {
 			fmt.Fprintf(errOut, "Could not open the browser (%v); open %s yourself.\n", err, url)
@@ -174,4 +221,47 @@ func runServe(cmd *cobra.Command, dir string, p serveParams) error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	return nil
+}
+
+// startSharing turns sharing on for serve --share: it needs shares of the
+// folder served.
+func startSharing(cmd *cobra.Command, run *server.Running, p serveParams) error {
+	n, err := run.SharesHere()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return &exitError{code: 1, msg: "no shares for this folder; create one with 'picmover share create' or on the Share page"}
+	}
+	if err := run.StartSharing(p.sharePort); err != nil {
+		return &exitError{code: 1, msg: "cannot share on Wi-Fi: " + err.Error()}
+	}
+	return nil
+}
+
+// printSharing prints the sharing URL, the certificate fingerprint and a
+// line per active share.
+func printSharing(out io.Writer, run *server.Running) {
+	st := run.SharingStatus()
+	fmt.Fprintf(out, "Sharing on Wi-Fi at %s; certificate SHA-256 %s\n", st.URL, st.Fingerprint)
+	for _, s := range st.Shares {
+		fmt.Fprintln(out, "  "+s.Line())
+	}
+}
+
+// repair prints a new pairing for share each time a line is read from
+// in (Enter), until ctx is done or in ends.
+func repair(ctx context.Context, in io.Reader, out, errOut io.Writer, run *server.Running, share string) {
+	sc := bufio.NewScanner(in)
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		p, err := run.Pair(share)
+		if err != nil {
+			fmt.Fprintf(errOut, "Cannot pair: %v\n", err)
+			continue
+		}
+		printPairing(out, p)
+	}
 }
