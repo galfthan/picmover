@@ -1901,3 +1901,381 @@ Q1–Q8 and Q15–Q20 are settled (above). Still open:
     cross-library albums ever come, the album scope's key and `visible`
     must be revisited, so that membership never lets a photo of an
     unshared library through.
+
+## As implemented (backend)
+
+Branch `feat/lan-share-backend`. Everything above holds except where
+this section says otherwise. The JSON below is exact: field names, which
+fields can be absent, and the status codes.
+
+### Code
+
+```
+internal/share/config.go          share.json (Manager: Open, Hold/Release of share.lock, Snapshot, Update, Verify, Seen, AddDevice), Sweep
+internal/share/shares.go          Share, Device, states, cookie format, CleanName, BrowserLabel
+internal/share/scope.go           Scope (unknown kinds kept byte for byte), LibraryKey, AlbumKey, Capabilities and their defaults
+internal/share/pairing.go         Pairings: Issue, Find, Use, Cancel, Ask/Wait/Decide (approval), notices
+internal/share/ratelimit.go       Limiter (token buckets), Lockout
+internal/share/tlscert.go         NewCA, NewLeaf, Certs (Ensure, TLSConfig, Fingerprints), WriteFileAtomic
+internal/share/netif.go           Candidates, Choose, Compare (home network), FilterListener; gateway_*.go per OS
+internal/share/qr.go              QRSVG, QRTerminal (rsc.io/qr)
+internal/server/share.go          sharing: the listener's lifecycle (Start, Stop, restart, watch, checkNetwork, auto-off)
+internal/server/share_routes.go   shareRouteTable, shareMux, the share middleware, device auth, shareScoped, shareAcquire
+internal/server/share_scope.go    scopeAuth with librariesScope and albumScope
+internal/server/share_api.go      the phone's handlers (session, libraries, library, timeline, media, detail, file, albums, ratings)
+internal/server/share_pair.go     POST /api/pair, Server.shareState
+internal/server/share_static.go   the phone app's files and the "not built" page
+internal/server/share_admin.go    /api/share/* (admin listener)
+internal/server/share_public.go   Running.StartSharing/StopSharing/SharingStatus/SharesHere/Pair/KeepSharingOn, ShareWorkspace
+internal/catalog/manage.go        LiveByHash
+internal/userdata/albums.go       AlbumHas; peek.go: PeekAlbums (PeekLibraryID now reads through the same open)
+cmd/serve.go                      --share, --share-port, --pair
+cmd/share.go                      picmover share list|create|set|revoke|delete
+internal/shell/tray.go            "Share on Wi-Fi"; shell.go: Keep sharing on at launch
+tools/shareprobe                  now uses internal/share for its certificates and QR codes
+```
+
+### Phone API (share listener)
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy:
+same-origin`, `Cross-Origin-Opener-Policy: same-origin` and
+`Permissions-Policy: camera=(), microphone=(), geolocation=()`; never
+HSTS or CORS. JSON and errors are `Cache-Control: no-store`.
+
+Refusals before routing: wrong Host **421** (plain text); an address
+locked out after 30 failed authentications a minute **429** `{"error"}`
+for 5 minutes, *on every path including the static files*; a foreign
+`Origin` (anything but `https://<accepted host>`), `Sec-Fetch-Site:
+cross-site` or `same-site`, or a POST without `Content-Type:
+application/json` and `X-Picmover: 1` **403** `{"error"}`; a body over
+4 KiB **413**. Anything not in the table (every admin path, an allowed
+path with another method, an unknown file) is **404**
+`{"error":"not found"}`, the same body as every scope refusal.
+
+Device authentication (every `/api/` route but `POST /api/pair`):
+
+- no, malformed, unknown or revoked cookie: **401**
+  `{"error": "This phone is not paired with picmover. Show a pairing code on the computer.", "paired": false}`
+- more than 30 requests a second (burst 100) from one device: **429** `{"error"}`
+- share not active: **403** `{"error", "state"}` with `state` one of
+  `"paused"` ("This share is paused."), `"expired"` ("This share has
+  ended."), `"gone"` ("This album is no longer shared."),
+  `"unavailable"` ("This share is not available on the computer right
+  now."; another workspace is served, or a scope kind this picmover does
+  not know). `gone` is known once the album share's library is opened,
+  so it comes from `session` and the library routes.
+- a renewed cookie (older than 7 days) comes back as `Set-Cookie` on any
+  authenticated response.
+
+`GET /api/session` → 200 (library share):
+
+```json
+{"device": {"id": "d_3f9a1c2e7b5d4a10", "name": "Anna's iPhone"},
+ "computer": "terra",
+ "share": {"name": "My phone", "kind": "libraries",
+           "capabilities": {"video": true, "download": true, "rate": true, "location": true},
+           "expiresAt": null,
+           "libraries": [{"id": "peter", "name": "peter", "cover": "00000000c0ffee00", "total": 5123},
+                         {"id": "penny", "name": "penny", "cover": null, "total": 0}]}}
+```
+
+Album share: no `libraries`; `album` instead, with the live member
+count and a cover hash (load it as `/api/l/album/thumb/<cover>`);
+`expiresAt` is RFC 3339 in the computer's zone:
+
+```json
+{"device": {"id": "d_…", "name": "Mia's phone"}, "computer": "terra",
+ "share": {"name": "Summer guests", "kind": "album",
+           "capabilities": {"video": true, "download": false, "rate": false, "location": false},
+           "expiresAt": "2026-11-13T19:00:00+02:00",
+           "album": {"name": "Summer 2026", "count": 48, "cover": "9f3a0c11d2e4b6a8"}}}
+```
+
+An album share's session answers **503** `{"error": "This library is not
+available right now."}` when its library is busy, and **403** `gone` when
+the album or library is not the one shared. A library share lists only
+the libraries that are there with the shared `LibraryID` (a missing one
+is left out, never marked).
+
+`POST /api/pair` `{"token": "<43 chars>"}` or `{"code": "K7QM-3XRD"}`
+(case, dashes and spaces ignored), plus `"name"` and optional
+`"replace": true`:
+
+- **200** `{"device": {"id", "name"}, "share": <the session's share object>}`
+  and `Set-Cookie: __Host-picmover=<id>.<secret>; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=34560000`
+- **400** `{"error"}`: malformed JSON, neither token nor code, or a
+  token/code of the wrong shape
+- **410** `{"error": "This pairing code has expired or was already used. Show a new one on the computer."}`:
+  unknown, used, expired or cancelled; also after approval timed out
+  (`"Not approved in time. …"`). When the pairing exists but its share
+  is not active, **410** `{"error": "This share is paused.", "state": "paused"}`
+  (`state` as above).
+- **409** `{"error": "This phone is already paired with \"My phone\".", "current": {"share": "My phone"}}`:
+  the request carried a valid device cookie and no `replace`; the token
+  is not used up. With `replace: true` the old device is removed in the
+  same save.
+- **409** `{"error"}`: the share already has 20 phones.
+- **403** `{"error": "The computer did not allow this phone."}` (no `state`): denied on the computer.
+- **429** `{"error"}`: 5 a minute per address, 20 in total.
+
+With approval on, the request blocks up to 60 s.
+
+`GET /api/libraries` (library share; **404** in an album share):
+`{"libraries": [shareLib]}` as in the session.
+
+`GET /api/l/{lib}/library` (library share): 
+
+```json
+{"id": "peter", "name": "peter",
+ "summary": {"total": 5123, "images": 4900, "raw": 100, "videos": 123,
+             "earliest": "2003-05-01T10:00:00", "latest": "2026-10-01T18:22:10"}}
+```
+
+`GET /api/l/{lib}/timeline` and `GET /api/l/{lib}/media?year&month`:
+the admin shapes (`{"buckets": [...]}`, `{"items": [...]}`). Items keep
+`thumb` and `thumbAt`; `rating` is absent without `rate` (and when 0, as
+on the admin side), `gps` absent without `location`; `deletedAt` never
+appears. Query keys allowed: `type`, `from`, `to`, `recur`, `months`,
+`rating`, `album` (and `year`, `month` on `media`); anything else is
+**400** `{"error": "invalid filter \"<key>\""}`. `rating` without `rate`
+is **400**, `album` in an album share **400**, an `album` that is not an
+album of `{lib}` **404**.
+
+`GET /api/l/{lib}/media/{id}`: exactly these keys (`dur` and `thumbAt`
+are always present, 0 when none; `takenAt`, `offset` may be null):
+
+```json
+{"id": 12, "hash": "9f3a0c11d2e4b6a8", "type": "image", "takenAt": "2024-07-14T13:05:22", "offset": 10800,
+ "w": 4032, "h": 3024, "dur": 0, "size": 2345678, "ext": "jpg", "fileName": "IMG_1234.jpg",
+ "cameraMake": "Apple", "cameraModel": "iPhone 12", "lens": "", "displayable": true, "thumbAt": 1781092800,
+ "lat": 60.1699, "lon": 24.9384, "rating": 4, "albums": [{"id": 3, "name": "Summer"}]}
+```
+
+`lat`/`lon` only with `location` (and a position), `rating` (0 when
+unrated) only with `rate`, `albums` only in a library share.
+`displayable` is false without `download`.
+
+`GET /api/l/{lib}/thumb|preview|large/{hash}`: as the admin, after the
+row check. `GET /api/l/{lib}/file/{id}[?download=1]`: inline video
+needs `video`, an image or any `?download=1` needs `download` (**403**
+`{"error": "not allowed in this share"}`), `Cache-Control: private,
+no-store`, Range → 206.
+
+`GET /api/l/{lib}/albums` (library share): `{"albums": [{"id", "name",
+"count", "cover"}]}` (count and cover over live members; cover null when
+none).
+
+`POST /api/l/{lib}/ratings` `{"hashes": ["<one hash>"], "rating": 0..5}`
+→ **200** `{"updated": 1}`. Not exactly one hash, a malformed hash or a
+rating outside 0–5: **400**. Not visible: **404**. Without `rate`:
+**403**. A move on the library: **409** `{"error": "a move is running on
+this library; try again when it has finished"}`.
+
+Malformed `{id}` and `{hash}` path values are **404** here (the admin
+answers 400): nothing is learned from the difference.
+
+Static: `/` and `/share.html` serve `share.html` with the share CSP;
+`/assets/*`, `/icons/*`, `/favicon.png`, `/manifest.webmanifest` from
+the same `web/dist`; never `index.html`. When the binary has no
+`share.html`, `/` is a 200 HTML page "The phone app is not built into
+this picmover…".
+
+### Admin API (admin listener)
+
+All of `/api/share*` answers **403** `{"error"}` unless the admin
+listener and the request's peer are loopback. A change while another
+process shares is **409**
+`{"error": "sharing is managed by picmover pid 4242 (picmover-app); use its Share page", "managedElsewhere": {"pid": 4242, "cmd": "picmover-app"}}`.
+
+`GET /api/share`:
+
+```json
+{"state": "on", "url": "https://192.168.1.20:7443/", "mdnsUrl": "https://terra.local:7443/",
+ "port": 7443, "address": "192.168.1.20",
+ "addresses": [{"ip": "192.168.1.20", "iface": "wlp3s0", "subnet": "192.168.1.0/24"},
+               {"ip": "172.17.0.1", "iface": "docker0", "subnet": "172.17.0.0/16", "virtual": true}],
+ "fingerprint": {"leaf": "AB:CD:…", "ca": "12:34:…"},
+ "keepOn": false, "mdns": true,
+ "autoOff": {"mode": "1h", "until": "2026-10-14T20:00:00+03:00"},
+ "firewallHint": "If the phone cannot connect, allow the port in the firewall (and undo it when done):\nufw: …\nfirewalld: …",
+ "shares": [adminShare]}
+```
+
+- `state`: `"off"`, `"on"`, `"paused"` (`reason: "network changed"`, or
+  why a rebind failed), `"error"` (`reason`, e.g. "Port 7443 is in use
+  by another program; choose another port on the Share page", "no Wi-Fi
+  or LAN address found; …"). `reason`, `url`, `mdnsUrl` and
+  `managedElsewhere` are absent when empty. `address` is the bound
+  address while on or paused, else the one that would be chosen ("" when
+  none). `fingerprint.leaf` and `.ca` are "" until sharing has been on
+  once (the CA is created at the first start, not by this GET).
+- **Addition:** `mdns` (the setting).
+- `firewallHint` is **one plain-text string** (lines separated by
+  `\n`): the ufw and firewalld commands for the subnet and port on Linux,
+  one paragraph on Windows and macOS.
+- `autoOff.until` only while a 1h/4h timer runs. `"never"` and `"quit"`
+  behave the same (no timer).
+
+**Addition:** `GET /api/share/status`, for the top-bar pill (cheap: no
+library is looked at):
+`{"state": "on", "url": "https://…/", "shares": 2, "phones": 3, "autoOff": {"mode": "quit"}}`
+(`shares` counts shares that are not paused, expired, of another
+workspace or of an unknown kind; `phones` their devices; `reason` and
+`managedElsewhere` as above).
+
+`adminShare`:
+
+```json
+{"id": "s_8c1f04a9d2e37b65", "name": "Summer guests", "kind": "album",
+ "scope": {"library": {"id": "peter", "name": "peter"},
+           "album": {"id": 12, "name": "Summer 2026", "count": 48}},
+ "capabilities": {"video": true, "download": false, "rate": false, "location": false},
+ "expiresAt": "2026-11-13T19:00:00+02:00", "state": "active", "approve": false,
+ "createdAt": "2026-10-14T19:00:00+03:00",
+ "devices": [{"id": "d_…", "name": "Mia's phone", "pairedAt": "…", "lastSeen": "…" , "lastAddress": "192.168.1.34",
+              "browser": "Chrome on Android"}],
+ "pairing": {"expiresAt": "2026-10-14T19:02:00+03:00"}, "requests": 0}
+```
+
+- A library share has `"scope": {"libraries": [{"id": "peter", "name": "peter"}, {"id": "penny", "name": "penny", "missing": true}]}`.
+- `missing: true` (library not there or another `LibraryID`; for the
+  album: deleted or its id reused) and **addition** `busy: true` on a
+  library (locked by another process or rebuilding: phones get 503) are
+  absent when false.
+- `album.count` is the member count from `user.db` (trashed members
+  included; the phone's count is live members only).
+- `state`: `active`, `paused`, `expired`, `gone` (album share with a
+  missing library or album), `unavailable` (another workspace, or an
+  unknown kind: `kind` is then the unknown value and `scope` is `{}`).
+- `device.lastSeen` is null before the first request.
+- **Additions:** `pairing` (the open pairing's expiry, null when none),
+  `notice` (absent or "Too many wrong codes; show a new one."),
+  `requests` (pending approval requests).
+
+`POST /api/share` `{enabled?, address?, port?, keepOn?, autoOff?, mdns?}`
+→ the GET body. Turning on that fails for a busy port or no address is
+**200** with `state: "error"`. `address` must be one of `addresses[].ip`
+(it records that interface), `port` 1–65535, `autoOff` one of the four
+values (**400** otherwise). A changed address, port or `mdns` re-listens
+when on. `enabled: true` while paused resumes and records the current
+network as home.
+
+`POST /api/share/cert/renew` `{}` → the GET body.
+
+`POST /api/share/shares`:
+
+```json
+{"name": "Summer guests", "scope": {"kind": "album", "library": "peter", "album": 12},
+ "capabilities": {"video": true, "download": false, "rate": false, "location": false},
+ "expiresIn": 2592000, "approve": false}
+```
+
+→ **201** adminShare. `capabilities`, when given, is taken whole (give
+all four). Expiry: `expiresIn` (seconds > 0), or `expiresAt` (RFC 3339,
+or `null` for never), or neither (album: 30 days; libraries: never).
+**400**: unknown library or album, empty list, bad kind, empty name;
+**409**: name taken (case-insensitive), 50 shares, or no workspace
+served. A library that has no `user.db` yet is opened once to create it.
+
+`POST /api/share/shares/{sid}` `{name?, libraries?: [id], capabilities?, expiresAt?: time|null, paused?, approve?}`
+→ adminShare. Any `kind`, `scope` or `album` key is **400**; `libraries`
+on an album share or empty is **400**; unknown sid **404**; name taken
+**409**. Pausing also cancels the share's pairings.
+
+`POST …/delete` → **204**; `…/revoke-all` → adminShare;
+`…/pairings` → `{"url": "https://192.168.1.20:7443/#/pair/<token>", "mdnsUrl"?: "https://terra.local:7443/#/pair/<token>", "code": "K7QM-3XRD", "qrSvg": "<svg …>", "expiresAt": "…"}`
+(the QR encodes `url`; **409** `{"error"}` when sharing is off or the
+share is not active); `…/pairings/cancel` → **204**; `GET …/requests` →
+`[{"id": "r_…", "name", "browser", "address", "at"}]`;
+`POST …/requests/{rid}` `{"approve": bool}` → **204** (**404** unknown);
+`POST /api/share/devices/{did}` `{"name"}` → device JSON;
+`…/revoke` → **204**.
+
+### Deviations and decisions
+
+- **`scopeAuth` has a sixth method, `bind(ctx, l)`,** run right after
+  the library is acquired: the `LibraryID` check (and, for an album, id
+  plus `created_at`) lives in the scope, which decides whether a
+  mismatch is a 404 (one library of a library share) or `gone` (the album
+  share). Routes still never switch on the kind.
+- **Unknown scope kinds** are `unavailable` to their phones (they never
+  authorize anything) and to the Share page.
+- **Session and pair are counted** against the auth-failure lockout
+  when they answer 401; static files are not, but a locked-out address
+  gets 429 for them too.
+- **Workspace key.** `serve <library>` keys shares by the library root
+  (links resolved) with the folder name as id (`singleID`, "library"
+  for a drive root); `picmover share create --workspace <library>` does
+  the same (`server.ShareWorkspace`).
+- **Leaf SANs** are the bound address, every non-virtual candidate,
+  127.0.0.1 and `<hostname>.local` (always, when the hostname is a valid
+  label; the `mdns` setting only decides whether that Host is accepted
+  and the URL shown).
+- **Network watch:** every 15 s; leaf renewal near expiry happens there
+  too; expiry is logged once a minute ("Share \"x\" has ended").
+- **One sharing process:** the process that starts sharing holds
+  `share.lock` until it stops (also while paused); a failed start
+  releases it. The non-sharing process reads `share.json` per request
+  and changes it under a brief lock.
+- **CLI:** `--expires` takes `Nd`, `Nh`, `never` or `YYYY-MM-DD` (the
+  share ends at the start of the next day, local time); `--album` names
+  are matched case-insensitively; `--library` repeats or takes a comma
+  list. `share create` refuses a library without `user.db` (never
+  opened) instead of creating one. `share list --json` prints the shares
+  without `secretSha256`.
+- **`serve --share`** fails (exit 1) with "no shares for this folder; …"
+  and when sharing cannot start; `--pair` and `--share-port` need
+  `--share` (usage error). Lines printed:
+  `Sharing on Wi-Fi at https://192.168.1.20:7443/; certificate SHA-256 AB:…`,
+  then `  My phone: libraries peter, penny; 2 phones` per active share;
+  pairings, revocations, pauses and expiry go to the log (stderr).
+- **Tray:** "Share on Wi-Fi" is a checkbox, titled "Share on Wi-Fi
+  (192.168.1.20)" while on and "Share on Wi-Fi (paused: network
+  changed)" while paused; it follows the Share page within 5 s. With no
+  shares, or when sharing cannot start, it opens `#/share`. "Keep
+  sharing on" (`keepOn`) is honoured at the app's launch only.
+- **`userdata.PeekLibraryID`** now opens read-only (not immutable) first,
+  so it sees a running server's `-wal`; it falls back to the immutable
+  open as before.
+
+### Not done
+
+- The CA install step (Q3: `/ca.crt`, the "Install the certificate"
+  page): not built, as decided, until a phone has shown it enforces
+  the name constraints.
+- The `?t=` media URL (Q5): not built.
+- The e2e target, the web side (`web/share.html`, the Share page) and
+  the README section: not in this branch.
+- Windows `GetIpForwardTable2` and macOS `route -n get default` are
+  compiled and vetted but untested on those systems.
+
+### Tests
+
+`internal/share`: config round trip, damaged file, modes, the lock,
+unknown kinds, devices and verification, limits, expiry and sweep,
+scope validation, pairing (single use, TTL, concurrency, codes, limits,
+approval), rate limits, CA and leaf (constraints, SANs, verification,
+reissue), candidates, home-network comparison, the connection filter,
+QR. `internal/server/share_*_test.go`: the golden route table; every
+admin pattern 404 on the share handler with a valid cookie; 401 for
+missing, malformed, wrong-secret and revoked cookies on every route,
+the exact `Set-Cookie`; paused, expired and unavailable on every route;
+the route × scope matrix (in scope, other album, unshared library,
+trashed, removed between requests, nonexistent, malformed) with list
+results checked against `AlbumHashes ∩ live`; the filter whitelist;
+the capability matrix; ratings (one hash, 409 during a move, the log
+line); redaction (exact detail keys, no paths); headers, CSP, no HSTS,
+Range; middleware (Host, Origin, Sec-Fetch-Site, mutation headers, body
+cap, lockout, pair limit, mDNS host); album identity (rename, empty,
+delete with id reuse, another `LibraryID`); a busy library (503, then
+opened on demand); management (loopback only, wildcard admin address,
+create/update validation, filled-in keys, devices, revoke-all, delete,
+`share.json` without secrets); pairing flows (token once, code, expiry,
+wrong codes, replace, approve/deny/timeout, paused share, restart); the
+lifecycle over real TLS and HTTP/2 (off/on, rebind to 127.0.0.2,
+pause on another subnet or gateway, busy port, auto-off, the pill
+status); one sharing process; shutdown flushing last seen; cookie
+renewal. `cmd`: `picmover share` end to end (including the ambiguous
+album and the refusal while held), `--expires` parsing, `serve --share`
+refusals and the printed URL, fingerprint, share line and pairing.
