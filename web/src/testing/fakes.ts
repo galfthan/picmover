@@ -1537,7 +1537,8 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     approve: false,
     /** Answers 429 to the next redeem. */
     limited: false,
-    pending: null as null | ((ok: boolean) => void),
+    /** The waiting redeem: approved (true), denied (false), or sharing turned off meanwhile ('off'). */
+    pending: null as null | ((r: boolean | 'off') => void),
   };
 
   const visible = () =>
@@ -1675,12 +1676,14 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 410);
     if (cookie.paired && body.replace !== true) {
       const cur = cookie.otherShare || share.name;
-      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur } }, 409);
+      // `sameShare`: the cookie's device is of the pairing's own share (asked of the backend in the review).
+      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur, ...(cookie.otherShare ? {} : { sameShare: true }) } }, 409);
     }
     set.delete(key);
     if (pairing.approve) {
-      const ok = await new Promise<boolean>((resolve) => (pairing.pending = resolve));
+      const ok = await new Promise<boolean | 'off'>((resolve) => (pairing.pending = resolve));
       pairing.pending = null;
+      if (ok === 'off') return json({ error: 'Sharing was turned off on the computer.', state: 'off' }, 410);
       if (!ok) return json({ error: 'The computer did not allow this phone.' }, 403);
     }
     if (pairing.full) return json({ error: 'this share has 20 phones; revoke one first' }, 409);
@@ -1847,6 +1850,8 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     requests,
     approve: () => pairing.pending?.(true),
     deny: () => pairing.pending?.(false),
+    /** Sharing turned off while a redeem waits for approval. */
+    turnOff: () => pairing.pending?.('off'),
   };
 }
 

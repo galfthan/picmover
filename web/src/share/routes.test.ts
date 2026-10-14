@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseHash } from '../lib/router';
-import { gridPath, normaliseCode, pairToken, phoneName, resolveRoute } from './routes';
+import { codeProblem, gridPath, normaliseCode, pairToken, phoneName, resolveRoute } from './routes';
 import { toShareInfo, type ShareInfo } from './shareapi';
 
 const libShare = (ids: string[]): ShareInfo => toShareInfo({ name: 'My phone', kind: 'libraries', libraries: ids.map((id) => ({ id, name: id })) });
@@ -57,6 +57,15 @@ describe('share routes', () => {
     expect(normaliseCode(' K7QM 3XRD ')).toBe('K7QM3XRD');
     expect(normaliseCode('K7QM-3XR')).toBeNull();
     expect(normaliseCode('K7QM-3XR0')).toBeNull(); // no 0, O, 1, I, L
+  });
+
+  it('says what is wrong with a code while it is typed', () => {
+    for (const ok of ['', 'k7', 'K7QM-', 'k7qm 3xrd', 'K7QM-3XRD']) expect(codeProblem(ok)).toBe('');
+    for (const misread of ['K7QM-3XR0', 'k7qo', '1', 'kil']) expect(codeProblem(misread)).toBe('Codes don’t use 0, 1, I, L or O. Check the code on the computer.');
+    expect(codeProblem('K7QM_3XRD')).toBe('Codes have only letters and digits.');
+    expect(codeProblem('K7QM3XRDA')).toBe('The code has 8 characters.');
+    // The hint agrees with what is accepted: every character it lets through is in the alphabet.
+    for (const ch of '23456789ABCDEFGHJKMNPQRSTUVWXYZ') expect(normaliseCode(ch.repeat(8))).not.toBeNull();
   });
 
   it('names the phone from the browser', () => {

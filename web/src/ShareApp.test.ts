@@ -158,6 +158,41 @@ describe('phone app', () => {
       expect(document.querySelector('.topbar .title')?.textContent).toBe('Summer guests');
     });
 
+    it('a phone already paired with this very share is told so and carries on', async () => {
+      setup('libraries');
+      await start('#/pair/tok_' + 'a'.repeat(40));
+      click(button('Pair')!);
+      await settle();
+      expect(text()).toContain('This phone is already paired with this share (“My phone”).');
+      expect(text()).not.toContain('instead');
+      expect(button('Pair with this share')).toBeUndefined();
+      click(button('Continue')!);
+      await settle();
+      expect(location.hash).toBe('#/');
+      expect(server.calls.filter((c) => c.path === '/api/pair')).toHaveLength(1);
+      expect(text()).toContain('Penny');
+    });
+
+    it('hints at misread characters as the code is typed, with a keyboard set up for codes', async () => {
+      setup('libraries', { paired: false });
+      await start('#/');
+      const code = document.querySelector<HTMLInputElement>('input[aria-label="Pairing code"]')!;
+      expect(code.getAttribute('autocapitalize')).toBe('characters');
+      expect(code.getAttribute('autocorrect')).toBe('off');
+      expect(code.getAttribute('spellcheck')).toBe('false');
+      expect(code.getAttribute('inputmode')).toBe('text');
+      const hint = () => document.getElementById('code-hint')?.textContent ?? '';
+      type(code, 'k7qm-3x');
+      expect(hint()).toBe('');
+      type(code, 'k7qm-3xr0');
+      expect(hint()).toBe('Codes don’t use 0, 1, I, L or O. Check the code on the computer.');
+      expect(code.getAttribute('aria-invalid')).toBe('true');
+      expect((button('Pair') as HTMLButtonElement).disabled).toBe(true);
+      type(code, 'k7qm-3xrd');
+      expect(hint()).toBe('');
+      expect((button('Pair') as HTMLButtonElement).disabled).toBe(false);
+    });
+
     it('keeps the current share when the phone says no', async () => {
       setup('album');
       server.cookie.otherShare = 'My phone';
@@ -189,6 +224,30 @@ describe('phone app', () => {
       await settle();
       expect(location.hash).toBe('#/');
       expect(text()).toContain('Penny');
+    });
+
+    it('says when sharing was turned off while the computer was asked, and starts over', async () => {
+      setup('libraries', { paired: false });
+      server.pairing.approve = true;
+      await start('#/pair/tok_' + 'a'.repeat(40));
+      click(button('Pair')!);
+      await settle();
+      expect(text()).toContain('Waiting for the computer');
+      server.turnOff();
+      await settle();
+      expect(text()).toContain('Sharing was turned off on the computer');
+      expect(text()).not.toContain('did not approve');
+      click(button('Start over')!);
+      await settle();
+      // The token went with it: the code form, empty.
+      const code = document.querySelector<HTMLInputElement>('input[aria-label="Pairing code"]')!;
+      expect(code.value).toBe('');
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      type(code, 'K7QM3XRD');
+      server.pairing.approve = false;
+      click(button('Pair')!);
+      await settle();
+      expect(location.hash).toBe('#/');
     });
 
     it("shows the server's message for a share that refuses phones (410 with a state) or is full (409 without current)", async () => {
