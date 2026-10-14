@@ -115,17 +115,23 @@ describe('management flows', () => {
     expect(tiles()).toHaveLength(5);
   });
 
-  it('shows a Shift-clicked checkbox of a selected tile as checked', async () => {
+  it('deselects a Shift range ending on a selected checkbox and shows the real box states', async () => {
     await start();
-    click(tile(2), { ctrlKey: true });
-    click(tile(4), { ctrlKey: true });
+    click(check(1));
     await settle();
-    // Shift on tile 2's box selects 2..4; tile 2 stays selected although the browser flipped its box.
-    click(check(2), { shiftKey: true });
+    click(check(4), { shiftKey: true });
     await settle();
-    expect(document.querySelector('.selbar')?.textContent).toContain('3 selected');
-    expect(tile(2).parentElement?.classList.contains('selected')).toBe(true);
-    expect(check(2).checked).toBe(true);
+    expect(document.querySelector('.selbar')?.textContent).toContain('4 selected');
+    expect([1, 2, 3, 4].map((id) => check(id).checked)).toEqual([true, true, true, true]);
+    click(tile(6), { ctrlKey: true });
+    await settle();
+    // Tile 3 was selected: Shift on its box deselects 3..6 (the anchor 6 included).
+    click(check(3), { shiftKey: true });
+    await settle();
+    expect(document.querySelector('.selbar')?.textContent).toContain('2 selected');
+    expect([1, 2, 3, 4, 5, 6].map((id) => check(id).checked)).toEqual([true, true, false, false, false, false]);
+    expect(tile(3).parentElement?.classList.contains('selected')).toBe(false);
+    expect(location.hash).toBe('#/l/peter/');
   });
 
   it('forgets the selection bar message with the selection', async () => {

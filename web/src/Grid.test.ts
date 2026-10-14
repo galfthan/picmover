@@ -485,4 +485,130 @@ describe('grid', () => {
     // Focus goes to the tile of the item shown last, not to <body>.
     expect(document.activeElement?.getAttribute('href')).toBe('#/l/Photos/view/2');
   });
+
+  // ---- Shift-click ranges ----
+
+  const tileOf = (id: number) => document.querySelector<HTMLAnchorElement>(`a.tile[href="#/l/Photos/view/${id}"]`)!;
+  const checkOf = (id: number) => tileOf(id).parentElement!.querySelector<HTMLInputElement>('input.check')!;
+  const selectedIds = () =>
+    [...document.querySelectorAll('.cell.selected a.tile')].map((a) => Number(a.getAttribute('href')!.split('/').pop()));
+  const barText = () => document.querySelector('.selbar')?.textContent ?? '';
+  /** Dispatches a mousedown and a click like a real Shift/Ctrl-click; returns whether the mousedown was cancelled. */
+  function press(el: Element, init: MouseEventInit = {}): boolean {
+    const down = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, ...init });
+    el.dispatchEvent(down);
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, ...init }));
+    return down.defaultPrevented;
+  }
+
+  /** July 2024: 11, 12, 13; June 2024: 21, 22, 23 (display order). */
+  function twoMonths() {
+    timeline = [{ year: 2024, month: 7, count: 3 }, { year: 2024, month: 6, count: 3 }];
+    media = new Map([
+      ['2024-7', [item(11, '2024-07-14T10:00:00'), item(12, '2024-07-10T10:00:00'), item(13, '2024-07-01T10:00:00')]],
+      ['2024-6', [item(21, '2024-06-14T10:00:00'), item(22, '2024-06-10T10:00:00'), item(23, '2024-06-01T10:00:00')]],
+    ]);
+  }
+
+  it('selects Shift ranges forward and backward across months without opening the viewer', async () => {
+    twoMonths();
+    await start();
+    // Forward: the checkbox sets the anchor, Shift-click on a tile in the next month ends the range.
+    press(checkOf(12));
+    await settle();
+    expect(press(tileOf(22), { shiftKey: true })).toBe(true); // no text selection
+    await settle();
+    expect(location.hash).toBe('#/l/Photos/');
+    expect(selectedIds()).toEqual([12, 13, 21, 22]);
+    expect(barText()).toContain('4 selected');
+
+    // Backward: from a new anchor upwards, again across the month boundary.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await settle();
+    expect(selectedIds()).toEqual([]);
+    press(tileOf(23), { ctrlKey: true });
+    await settle();
+    press(checkOf(13), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([13, 21, 22, 23]);
+    expect([11, 12, 13, 21].map((id) => checkOf(id).checked)).toEqual([false, false, true, true]);
+    expect(location.hash).toBe('#/l/Photos/');
+    // A plain click still opens the viewer.
+    tileOf(11).click();
+    await settle();
+    expect(location.hash).toBe('#/l/Photos/view/11');
+  });
+
+  it('deselects the range when the Shift-clicked tile was selected', async () => {
+    twoMonths();
+    await start();
+    press(tileOf(11), { ctrlKey: true });
+    press(tileOf(23), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([11, 12, 13, 21, 22, 23]);
+    // Anchor 23; 13 is selected, so 13..23 are deselected and 13 becomes the anchor.
+    press(tileOf(13), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([11, 12]);
+    // 21 is not selected: the range from 13 is selected again.
+    press(checkOf(21), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([11, 12, 13, 21]);
+    expect(checkOf(21).checked).toBe(true);
+  });
+
+  it('forgets the anchor when the filters change', async () => {
+    twoMonths();
+    await start();
+    press(tileOf(11), { ctrlKey: true });
+    await settle();
+    await go('#/l/Photos/?gps=1');
+    expect(selectedIds()).toEqual([]);
+    // No anchor: Shift-click toggles the tile alone.
+    press(tileOf(22), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([22]);
+    press(tileOf(12), { shiftKey: true });
+    await settle();
+    expect(selectedIds()).toEqual([12, 13, 21, 22]);
+  });
+
+  it('loads the months a Shift range spans that were never on screen', async () => {
+    timeline = [
+      { year: 2024, month: 7, count: 100 },
+      { year: 2023, month: 5, count: 100 },
+      { year: 2022, month: 1, count: 100 },
+    ];
+    for (const b of timeline) {
+      media.set(
+        `${b.year}-${b.month}`,
+        Array.from({ length: 100 }, (_, i) => item(b.year * 1000 + i, `${b.year}-${String(b.month).padStart(2, '0')}-01T10:00:00`)),
+      );
+    }
+    await start();
+    const loaded = () => mediaRequests().map((r) => new URLSearchParams(r.split('?')[1]).get('year'));
+    expect(loaded()).toEqual(['2024']);
+    press(checkOf(2024005));
+    await settle();
+
+    // Jump to the end: 2022 loads, May 2023 stays unloaded.
+    const scrub = document.querySelector<HTMLElement>('.scrubber')!;
+    scrub.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }));
+    await settle();
+    expect(loaded()).toEqual(['2024', '2022']);
+    expect(tileOf(2024005)).toBeNull();
+
+    press(tileOf(2022099), { shiftKey: true });
+    await settle();
+    expect(loaded()).toEqual(['2024', '2022', '2023']);
+    // 2024: items 5..99, all of 2023, all of 2022; nothing skipped.
+    expect(barText()).toContain('295 selected');
+    expect(barText()).not.toContain('skipped');
+    expect(location.hash).toBe('#/l/Photos/');
+
+    // The new anchor (2022's last item) is selected and so is item 70: 70..99 are deselected.
+    press(tileOf(2022070), { shiftKey: true });
+    await settle();
+    expect(barText()).toContain('265 selected');
+  });
 });

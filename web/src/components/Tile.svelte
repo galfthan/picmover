@@ -95,6 +95,11 @@
     e.preventDefault();
     openViewer(api.id, item.id);
   }
+
+  // Shift+mousedown would extend the page's text selection to the tile.
+  function noTextSelection(e: MouseEvent) {
+    if (onselect && e.shiftKey) e.preventDefault();
+  }
 </script>
 
 <div
@@ -111,6 +116,7 @@
     class:loaded
     href={viewerHref(api.id, item.id)}
     onclick={open}
+    onmousedown={noTextSelection}
     aria-label={label}
   >
     {#if requestable && !failed}
@@ -141,6 +147,7 @@
       type="checkbox"
       checked={selected}
       aria-label="Select {label}"
+      onmousedown={noTextSelection}
       onclick={(e) => {
         const box = e.currentTarget;
         onselect(item, e.shiftKey);

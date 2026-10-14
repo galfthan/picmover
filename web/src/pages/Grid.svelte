@@ -276,9 +276,42 @@
     });
   }
 
-  function onSelect(item: MediaItem, range: boolean) {
+  /** The anchor's capture date, to find its month again after an in-place reload dropped it. */
+  let anchorAt: { hash: string; takenAt: string | null } | null = null;
+  const RANGE_FETCHES = 4;
+
+  function bucketIndexOf(hash: string): number {
+    return buckets.findIndex((b) => items.get(bkey(b.year, b.month))?.some((x) => x.hash === hash));
+  }
+
+  /**
+   * Loads every month from the anchor's to the target's that is not loaded
+   * yet (the same filtered bucket requests as scrolling there), so a range
+   * covers items that were never on screen.
+   */
+  async function loadRange(anchor: string, target: string) {
+    let ai = bucketIndexOf(anchor);
+    if (ai < 0 && anchorAt?.hash === anchor) ai = bucketIndexFor(anchorAt.takenAt);
+    const ti = bucketIndexOf(target);
+    if (ai < 0 || ti < 0) return;
+    const queue = buckets.slice(Math.min(ai, ti), Math.max(ai, ti) + 1).filter((b) => !items.has(bkey(b.year, b.month)));
+    const worker = async () => {
+      for (let b = queue.shift(); b; b = queue.shift()) await loadBucket(b.year, b.month);
+    };
+    await Promise.all(Array.from({ length: Math.min(RANGE_FETCHES, queue.length) }, worker));
+  }
+
+  async function onSelect(item: MediaItem, range: boolean) {
+    const a = selection.anchor;
+    if (range && a !== null && a !== item.hash) {
+      const g = gen;
+      await loadRange(a, item.hash);
+      // The timeline was reloaded meanwhile (filters changed, or a job finished): drop the click.
+      if (g !== gen || selection.anchor !== a) return;
+    }
     if (range) selection.selectRange(segments(), item.hash);
     else selection.toggle(item.hash);
+    anchorAt = { hash: item.hash, takenAt: item.takenAt };
   }
 
   /** The rating every selected loaded item shares, else 0. */
