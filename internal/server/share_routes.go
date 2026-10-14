@@ -40,8 +40,13 @@ func (s *Server) shareRouteTable() []shareRoute {
 	lib := func(pattern string, h shareLibHandler) shareRoute {
 		return shareRoute{pattern, shareRouteLibrary, s.shareScoped(h)}
 	}
-	static := func(pattern string) shareRoute {
-		return shareRoute{pattern, shareRouteStatic, s.handleShareStatic}
+	// A static route serves one file, or (dir) a file named by the
+	// {file...} wildcard under that folder of the frontend.
+	static := func(pattern, name string) shareRoute {
+		return shareRoute{pattern, shareRouteStatic, s.handleShareStatic(name)}
+	}
+	staticDir := func(pattern, dir string) shareRoute {
+		return shareRoute{pattern, shareRouteStatic, s.handleShareStaticDir(dir)}
 	}
 	return []shareRoute{
 		{"GET /api/session", shareRoutePublic, s.handleShareSession},
@@ -58,12 +63,12 @@ func (s *Server) shareRouteTable() []shareRoute {
 		lib("GET /api/l/{lib}/file/{id}", s.handleShareFile),
 		lib("GET /api/l/{lib}/albums", s.handleShareAlbums),
 		lib("POST /api/l/{lib}/ratings", s.handleShareRating),
-		static("GET /{$}"),
-		static("GET /share.html"),
-		static("GET /assets/{file...}"),
-		static("GET /favicon.png"),
-		static("GET /icons/{file...}"),
-		static("GET /manifest.webmanifest"),
+		static("GET /{$}", shareAppFile),
+		static("GET /share.html", shareAppFile),
+		staticDir("GET /assets/{file...}", "assets"),
+		static("GET /favicon.png", "favicon.png"),
+		staticDir("GET /icons/{file...}", "icons"),
+		static("GET /manifest.webmanifest", "manifest.webmanifest"),
 	}
 }
 
