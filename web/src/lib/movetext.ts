@@ -48,8 +48,8 @@ export function planLines(p: TransferPlan, target: string): { headline: string; 
   if (p.move.count > 0) {
     lines.push(
       p.sameVolume
-        ? 'Same drive: no copying; each file is checked, then renamed.'
-        : `Copies ${formatBytes(p.move.bytes)} across drives, then puts the originals in this library's trash.`,
+        ? 'Same drive: the photos are moved directly, so this is quick.'
+        : `Different drive: copies ${formatBytes(p.move.bytes)}, then puts the originals in this library's trash.`,
     );
   }
   return { headline: `Move ${photos(n)}${size} to ${target}.`, lines };

@@ -350,9 +350,9 @@ func printMovePlan(w io.Writer, from, to transfer.Side, pl transfer.Plan) {
 	fmt.Fprintf(w, "Move %d %s (%s) from %s to %s\n", pl.Move, plural(pl.Move, "photo", "photos"), humanSize(pl.MoveBytes), from.Name, to.Name)
 	if pl.Move > 0 {
 		if pl.SameVolume {
-			fmt.Fprintln(w, "  Same drive: each file is checked and renamed.")
+			fmt.Fprintln(w, "  Same drive: the photos are moved directly, so this is quick.")
 		} else {
-			fmt.Fprintf(w, "  Different drives: each file is copied and verified, then the original goes to %s's trash.\n", from.Name)
+			fmt.Fprintf(w, "  Different drive: copies %s, then puts the originals in %s's trash.\n", humanSize(pl.MoveBytes), from.Name)
 			if pl.Free >= 0 {
 				fmt.Fprintf(w, "  Free in %s: %s (needs %s with a 1 GiB margin)\n", to.Name, humanSize(pl.Free), humanSize(pl.Need))
 			}

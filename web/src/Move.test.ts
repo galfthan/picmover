@@ -129,7 +129,7 @@ describe('move to library', () => {
     expect(plans()).toEqual([{ to: 'kids', hashes: [hashOf(1), hashOf(2)] }]);
     const d = dialog()!;
     expect(text(d)).toContain('Move 2 photos (2.0 KiB) to kids.');
-    expect(text(d)).toContain('Same drive: no copying; each file is checked, then renamed.');
+    expect(text(d)).toContain('Same drive: the photos are moved directly, so this is quick.');
     expect(text(d)).toContain("This library's backups keep the moved files until they are pruned.");
 
     const librariesBefore = gets('libraries');
@@ -176,7 +176,7 @@ describe('move to library', () => {
     await start('#/l/peter/');
     await select(1, 2);
     await moveTo('kids');
-    expect(text(dialog())).toContain("Copies 2.0 KiB across drives, then puts the originals in this library's trash.");
+    expect(text(dialog())).toContain("Different drive: copies 2.0 KiB, then puts the originals in this library's trash.");
     expect(button(dialog(), 'Move')!.disabled).toBe(false);
 
     // Back, less space, plan again.

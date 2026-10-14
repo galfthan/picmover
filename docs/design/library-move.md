@@ -180,8 +180,8 @@ Before anything moves, a plan reads both catalogs and the file system
 - counts and bytes of: to move, already in B, trashed in B (restore),
   not movable (trashed in A, not in A's catalog, bad path);
 - `sameVolume`: whether A's and B's roots are on one volume (device id;
-  on Windows the volume serial), so the UI can say "instant" or "copies
-  X GB";
+  on Windows the volume serial), so the UI can say "moved directly" or
+  "copies X GB";
 - for other volumes: free space on B's volume; the run is refused when
   `bytes to copy + 1 GiB` exceeds it;
 - interrupted moves involving A or B, which must be finished first.
@@ -250,8 +250,9 @@ workspace, is 400; single-library mode has no target and is 400.
 - **Move dialog:** pick the target (library cards like the switcher,
   closed ones included; busy ones disabled with the holder). Then the
   plan: "Move 312 photos (4.1 GB) to Penny. 12 are already there; their
-  copies here go to the trash." / "Copies across drives, then puts the
-  originals in this library's trash." / "Same drive: instant." /
+  copies here go to the trash." / "Different drive: copies 4.1 GB, then
+  puts the originals in this library's trash." / "Same drive: the photos
+  are moved directly, so this is quick." /
   "Not enough space in Penny: 4.1 GB needed, 2.0 GB free." Confirm.
 - Progress via the job pill and the dialog (files, bytes, rate, ETA).
   The result lists failures with reasons; "Open in Penny" goes to the
@@ -675,9 +676,11 @@ progress: files, bytes, rate, ETA, current file, Cancel),
 
 ### After review (frontend)
 
-- **Wording**: a same-drive plan says "Same drive: no copying; each file
-  is checked, then renamed." (not "instant": each file is hashed and
-  journalled, about 10 ms a file).
+- **Wording**: a same-drive plan says "Same drive: the photos are moved
+  directly, so this is quick." (not "instant": each file is hashed and
+  journalled, about 10 ms a file); another drive's says "Different drive:
+  copies 4.1 GB, then puts the originals in this library's trash." The
+  CLI plan uses the same words, naming the source library's trash.
 - **Originals still here**: `TransferResult.sourcePending` is parsed and
   summed into the run's totals. A job that ends with exit 2 keeps the
   server's `error` in the run's `notes`; the dialog shows each as an

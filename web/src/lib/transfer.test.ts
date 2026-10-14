@@ -184,14 +184,14 @@ describe('move wording', () => {
     expect(movable(p)).toBe(312);
     expect(planLines(p, 'Penny')).toEqual({
       headline: 'Move 312 photos (4.1 GiB) to Penny.',
-      lines: ['12 are already there; their copies here go to the trash.', 'Same drive: no copying; each file is checked, then renamed.'],
+      lines: ['12 are already there; their copies here go to the trash.', 'Same drive: the photos are moved directly, so this is quick.'],
     });
     expect(planLines(plan({ move: { count: 1, bytes: 2048 }, existing: { count: 1 }, restore: { count: 3 }, sameVolume: false, free: 10 * GiB }), 'Penny')).toEqual({
       headline: 'Move 5 photos (2.0 KiB) to Penny.',
       lines: [
         '1 is already there; its copy here goes to the trash.',
         "3 are in Penny's trash; they come back there, and their copies here go to the trash.",
-        "Copies 2.0 KiB across drives, then puts the originals in this library's trash.",
+        "Different drive: copies 2.0 KiB, then puts the originals in this library's trash.",
       ],
     });
     // Only duplicates: nothing travels, no size.
