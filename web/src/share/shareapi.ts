@@ -37,12 +37,36 @@ export function isAbort(e: unknown): boolean {
   return e instanceof DOMException && e.name === 'AbortError';
 }
 
-/** Text for anything this module (or fetch) throws; a failed fetch is the network. */
+/**
+ * fetch itself failed (no answer at all: the computer is off, asleep, or
+ * on another network). Only that is "cannot reach"; a TypeError thrown
+ * elsewhere (a bug, a bad answer) keeps its own message.
+ */
+export class NetworkError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = 'NetworkError';
+  }
+}
+
+export const UNREACHABLE = 'Cannot reach the computer. Is it on, and is this phone on the same Wi-Fi?';
+
+/** Text for anything this module throws. */
 export function errorText(e: unknown): string {
   if (e instanceof ShareError) return e.message;
-  if (e instanceof TypeError) return 'Cannot reach the computer. Is it on, and is this phone on the same Wi-Fi?';
+  if (e instanceof NetworkError) return UNREACHABLE;
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+/** fetch, with a failure to get any answer turned into NetworkError (an abort stays an abort). */
+async function request(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (isAbort(e) || init.signal?.aborted) throw e;
+    throw new NetworkError(e);
+  }
 }
 
 // ---- Shapes ----
@@ -362,7 +386,7 @@ async function errorFrom(res: Response): Promise<ShareError> {
 }
 
 async function send(url: string, init: RequestInit, report = true): Promise<unknown> {
-  const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store', ...init });
+  const res = await request(url, { credentials: 'same-origin', cache: 'no-store', ...init });
   if (!res.ok) {
     const e = await errorFrom(res);
     if (report && (e.status === 401 || (e.status === 403 && e.state !== ''))) refusal?.(e.status, e.state, e.message);
@@ -385,6 +409,100 @@ const postJSON = (url: string, body: unknown, signal?: AbortSignal, report = tru
     },
     report,
   );
+
+// ---- Media URLs that failed (an <img> or <video> error carries no status) ----
+
+/** What a media URL answers now: its status (0: no answer) and Retry-After in ms (null: none). */
+export interface UrlCheck {
+  status: number;
+  retryAfter: number | null;
+  /** 403 `{state}` and 401 are reported to the refusal handler; this is the state ("" otherwise). */
+  state: string;
+}
+
+/** Retry-After as milliseconds: delta seconds or an HTTP date; null when absent or unreadable. */
+export function retryAfterMs(h: string | null, now = Date.now()): number | null {
+  if (!h) return null;
+  const v = h.trim();
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? Math.max(0, t - now) : null;
+}
+
+/**
+ * Asks a media URL what it answers, for an image or video that failed to
+ * load: one byte of it (a Range request, and the body is dropped as soon
+ * as the headers are in), so checking a video costs nothing. 401 and 403
+ * `{state}` go to the refusal handler like any API answer, so the shell
+ * switches to "removed" or "paused" from a failed thumbnail too.
+ */
+export async function checkUrl(url: string, signal?: AbortSignal): Promise<UrlCheck> {
+  let res: Response;
+  try {
+    res = await request(url, { credentials: 'same-origin', cache: 'no-store', headers: { Range: 'bytes=0-0' }, signal });
+  } catch (e) {
+    if (e instanceof NetworkError) return { status: 0, retryAfter: null, state: '' };
+    throw e;
+  }
+  const retryAfter = retryAfterMs(res.headers.get('Retry-After'));
+  if (res.ok) {
+    void res.body?.cancel().catch(() => {});
+    return { status: res.status, retryAfter, state: '' };
+  }
+  const e = await errorFrom(res);
+  if (e.status === 401 || (e.status === 403 && e.state !== '')) refusal?.(e.status, e.state, e.message);
+  return { status: e.status, retryAfter, state: e.state };
+}
+
+/** Tries of one failed thumbnail before it stays grey. */
+export const THUMB_RETRIES = 4;
+
+/** Backoff without Retry-After: 1, 2, 4, 8 s (capped at 30 s), plus up to half a second of jitter. */
+export function backoffMs(attempt: number, jitter = Math.random()): number {
+  return Math.min(30_000, 1000 * 2 ** Math.max(0, attempt)) + Math.round(jitter * 500);
+}
+
+/**
+ * When to load a failed thumbnail again (ms), or null to give up: on 429,
+ * 503, other 5xx and no answer after Retry-After or the backoff; at once
+ * when it loads fine now; never on 404 (gone), 401/403 (refused; the shell
+ * takes over) or after THUMB_RETRIES. Many tiles fail together when the
+ * computer rate-limits the phone, so the client checks one URL at a time
+ * and holds the others until its answer (and any Retry-After) has passed.
+ */
+export function retrier(check: (url: string) => Promise<UrlCheck> = checkUrl, now: () => number = () => Date.now(), jitter: () => number = () => Math.random()) {
+  let coolUntil = 0;
+  let inflight: Promise<UrlCheck> | null = null;
+  const transient = (st: number) => st === 0 || st === 408 || st === 429 || st >= 500;
+  const refused = (st: number) => st === 401 || st === 403;
+  return async (url: string, attempt: number): Promise<number | null> => {
+    if (attempt >= THUMB_RETRIES) return null;
+    if (now() < coolUntil) return coolUntil - now() + Math.round(jitter() * 500);
+    if (inflight) {
+      // Another tile is asking: its answer stands for this one too, except that a 404 is its own.
+      const r = await inflight;
+      if (refused(r.status)) return null;
+      return Math.max(0, coolUntil - now()) + backoffMs(attempt, jitter());
+    }
+    const p = check(url);
+    inflight = p;
+    let r: UrlCheck;
+    try {
+      r = await p;
+    } finally {
+      if (inflight === p) inflight = null;
+    }
+    if (transient(r.status)) {
+      const wait = r.retryAfter !== null ? Math.min(60_000, r.retryAfter) : backoffMs(attempt, jitter());
+      coolUntil = now() + wait;
+      return wait;
+    }
+    return r.status >= 200 && r.status < 300 ? 0 : null;
+  };
+}
+
+/** The phone's one retrier: the rate limit is per phone, so all tiles share it. */
+export const thumbRetryDelay = retrier();
 
 /** The session; ShareError 401 when not paired, 403 `{state}` when the share refuses. Not reported to the handler. */
 export async function getSession(signal?: AbortSignal): Promise<Session> {
@@ -461,6 +579,10 @@ export interface ShareClient {
   getFacets(signal?: AbortSignal): Promise<ShareFacets>;
   /** One visible hash; ShareError 409 while a move runs, 404 when gone, 403 without `rate`. */
   setRating(hash: string, rating: number): Promise<{ updated: number }>;
+  /** A failed thumbnail: when to try it again (ms), or null to give up (see `retrier`). */
+  retryDelay(url: string, attempt: number): Promise<number | null>;
+  /** What a failed media URL (preview, original, video) answers now; see checkUrl. */
+  check(url: string, signal?: AbortSignal): Promise<UrlCheck>;
 }
 
 export function shareClient(id: string, caps: ShareCapabilities): ShareClient {
@@ -501,5 +623,7 @@ export function shareClient(id: string, caps: ShareCapabilities): ShareClient {
       const r = await postJSON(`${base}/ratings`, { hashes: [hash], rating });
       return { updated: isRecord(r) ? count(r.updated) : 0 };
     },
+    retryDelay: (url, attempt) => thumbRetryDelay(url, attempt),
+    check: (url, signal) => checkUrl(url, signal),
   };
 }

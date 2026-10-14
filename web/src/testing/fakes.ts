@@ -1519,6 +1519,15 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   const busy = new Set<string>();
   /** A move runs: ratings answer 409. */
   const moving = { on: false };
+  /** The next `times` requests for an image or file answer `status` (429: rate limited), with Retry-After when set. */
+  const mediaFail = { times: 0, status: 429, retryAfter: '' };
+  function failMedia(): Response | null {
+    if (mediaFail.times <= 0) return null;
+    mediaFail.times--;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (mediaFail.retryAfter) headers['Retry-After'] = mediaFail.retryAfter;
+    return new Response(JSON.stringify({ error: 'too many requests' }), { status: mediaFail.status, headers });
+  }
   const pairing = {
     /** The share has its 20 phones: a redeem is 409 without `current`. */
     full: false,
@@ -1750,12 +1759,16 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     }
     const rm = /^(thumb|preview|large)\/([0-9a-f]+)$/.exec(rest);
     if (method === 'GET' && rm) {
+      const failed = failMedia();
+      if (failed) return failed;
       const x = items.find((i) => i.hash === rm[2]);
       if (!x || !inScope(x)) return notFound();
       return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg' } });
     }
     const fm = /^file\/(\d+)$/.exec(rest);
     if (method === 'GET' && fm) {
+      const failed = failMedia();
+      if (failed) return failed;
       const x = items.find((i) => i.id === Number(fm[1]));
       if (!x || !inScope(x)) return notFound();
       const need = q.get('download') === '1' || x.type !== 'video' ? caps.download : caps.video;
@@ -1828,6 +1841,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     cookie,
     busy,
     moving,
+    mediaFail,
     pairing,
     install,
     requests,

@@ -291,6 +291,30 @@ describe('phone app', () => {
       expect(document.querySelector('.cell input[type="checkbox"]')).toBeNull();
     });
 
+    it('loads a thumbnail again after a 429 (honouring Retry-After), and gives up on a 404', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      const img = (i: number) => tiles()[i]!.querySelector('img');
+      const thumbChecks = () => server.calls.filter((c) => c.path.includes('/thumb/')).length;
+      server.mediaFail.times = 1;
+      server.mediaFail.retryAfter = '3';
+      img(0)!.dispatchEvent(new Event('error'));
+      await settle();
+      // Grey while the computer asked to wait; one check of the URL, not one per tile.
+      expect(img(0)).toBeNull();
+      expect(thumbChecks()).toBe(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(img(0)?.getAttribute('src')).toBe(`/api/l/peter/thumb/${'1'.padStart(16, '0')}?v=1700000000`);
+      // A thumbnail that is gone stays grey.
+      server.mediaFail.times = 1;
+      server.mediaFail.status = 404;
+      server.mediaFail.retryAfter = '';
+      img(1)!.dispatchEvent(new Event('error'));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(img(1)).toBeNull();
+      expect(thumbChecks()).toBe(2);
+    });
+
     it('lists the albums and opens one', async () => {
       setup('libraries');
       await start('#/l/peter/albums');
