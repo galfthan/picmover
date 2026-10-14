@@ -41,6 +41,8 @@ export default defineConfig(({ mode }) => ({
     // idle machine, more than vitest's default 5 s when the CPU is busy
     // (a parallel build, go test). The tests themselves run on fake
     // timers, so the timeout only guards against a hang.
+    // share/layout.test.ts reads share.css as text (`?raw`); vitest empties CSS it does not include.
+    css: { include: [/\/share\/share\.css/] },
     testTimeout: 30_000,
     hookTimeout: 30_000,
   },
