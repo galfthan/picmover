@@ -477,7 +477,13 @@ func (sh *sharing) setAutoOffLocked(mode string) {
 			return
 		}
 		sh.log.Info("Sharing on Wi-Fi turned off (auto-off)")
-		drain = sh.stopLocked()
+		d := sh.stopLocked()
+		drain = func() {
+			if d != nil {
+				d()
+			}
+			sh.s.closePhoneLibraries(0)
+		}
 	})
 }
 
@@ -486,6 +492,7 @@ func (sh *sharing) setAutoOffLocked(mode string) {
 func (sh *sharing) Stop() {
 	sh.mu.Lock()
 	sh.unlockDrain(sh.stopLocked())
+	sh.s.closePhoneLibraries(0) // no phone comes any more
 }
 
 // stopLocked turns sharing off; the caller runs the returned drain after
@@ -578,6 +585,7 @@ func (sh *sharing) watch(stop chan struct{}, every time.Duration) {
 		case <-t.C:
 		}
 		sh.checkNetwork()
+		sh.s.closePhoneLibraries(phoneIdle)
 		if now := sh.now(); now.Sub(lastExpiry) >= shareExpiryEvery {
 			lastExpiry = now
 			sh.checkExpiry()

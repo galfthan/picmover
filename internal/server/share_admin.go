@@ -615,10 +615,13 @@ func (s *Server) resolveLibraryKey(ctx context.Context, id string) (share.Librar
 	}
 	lid, err := s.libraryIDOf(ctx, li)
 	if err == nil && lid == "" {
+		// Never opened by this picmover: opening creates user.db and its
+		// LibraryID. A library opened just for that is closed again.
 		var l *libHandles
 		if l, err = s.shareAcquire(ctx, id); err == nil {
 			lid, err = l.user.LibraryID(ctx)
 			l.entry.release()
+			s.closePhoneLibrary(l.entry)
 		}
 	}
 	if err != nil {

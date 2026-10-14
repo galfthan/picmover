@@ -419,7 +419,8 @@ var errNotAvailable = errors.New("library not available")
 
 // shareAcquire acquires library id for a phone: a closed (or busy)
 // library is opened on demand with the same open and lock as the admin
-// "Open". errLibNotFound when it is not a library of the served
+// "Open", and closed again once phones leave it alone
+// (closePhoneLibraries). errLibNotFound when it is not a library of the served
 // workspace; errNotAvailable or the open error otherwise.
 func (s *Server) shareAcquire(ctx context.Context, id string) (*libHandles, error) {
 	if s.ws.isClosed() || !validLibID(id) {
@@ -438,7 +439,7 @@ func (s *Server) shareAcquire(ctx context.Context, id string) (*libHandles, erro
 	}
 	h, state, ok := e.acquire()
 	if !ok && (state == libClosed || state == libBusy) {
-		if err := s.ws.open(ctx, e); err != nil {
+		if err := s.ws.openForPhone(ctx, e); err != nil {
 			return nil, err
 		}
 		h, _, ok = e.acquire()
@@ -446,5 +447,6 @@ func (s *Server) shareAcquire(ctx context.Context, id string) (*libHandles, erro
 	if !ok {
 		return nil, errNotAvailable
 	}
+	e.notePhone(time.Now())
 	return h, nil
 }

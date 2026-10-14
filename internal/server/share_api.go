@@ -150,7 +150,7 @@ func (s *Server) libraryIDOf(ctx context.Context, li listed) (string, error) {
 			return h.user.LibraryID(ctx)
 		}
 	}
-	return userdata.PeekLibraryID(ctx, filepath.Join(li.path, userdata.FileName))
+	return s.ws.peekLibraryID(ctx, li.path)
 }
 
 // albumOf reads album id of a listed library: from its open user.db,
@@ -166,7 +166,7 @@ func (s *Server) albumOf(ctx context.Context, li listed, id int64) (userdata.Alb
 			return a, err == nil, err
 		}
 	}
-	albums, err := userdata.PeekAlbums(ctx, filepath.Join(li.path, userdata.FileName))
+	albums, err := s.ws.peekAlbums(ctx, li.path)
 	if errors.Is(err, userdata.ErrNoUserDB) {
 		return userdata.Album{}, false, nil
 	}

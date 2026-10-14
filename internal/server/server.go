@@ -446,6 +446,7 @@ func (s *Server) acquire(w http.ResponseWriter, r *http.Request, id string) (*li
 	h, state, ok := e.acquire()
 	switch {
 	case ok:
+		e.adminUse()
 		return h, true
 	case state == libRebuilding:
 		writeJSON(w, http.StatusServiceUnavailable, stateError{Error: "the library is being rebuilt", State: state})

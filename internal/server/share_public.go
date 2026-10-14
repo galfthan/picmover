@@ -96,11 +96,13 @@ func (r *Running) SharingStatus() SharingStatus {
 	}
 	ctx := context.Background()
 	for _, x := range cfg.Shares {
-		if s.shareState(ctx, x) != share.StateActive {
+		// adminShare's state is shareState's (gone included): one look at
+		// the libraries per share.
+		a := s.adminShare(ctx, x)
+		if a.State != share.StateActive {
 			continue
 		}
-		out.Shares = append(out.Shares, SharingShare{Name: x.Name, Scope: scopeLine(s.adminShare(ctx, x)),
-			Phones: len(x.Devices)})
+		out.Shares = append(out.Shares, SharingShare{Name: x.Name, Scope: scopeLine(a), Phones: len(x.Devices)})
 	}
 	return out
 }
