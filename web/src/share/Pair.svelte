@@ -66,9 +66,11 @@
     } catch (err) {
       if (ac.signal.aborted) return;
       phase = 'form';
-      if (err instanceof ShareError && err.status === 409) {
-        const cur = err.body && isRecord(err.body.current) ? err.body.current : null;
-        current = cur && typeof cur.share === 'string' ? cur.share : '';
+      // 409 with `current`: paired with a share already (ask, then replace).
+      // A 409 without it is the share's phone limit: shown as is.
+      const cur = err instanceof ShareError && err.status === 409 && err.body && isRecord(err.body.current) ? err.body.current : null;
+      if (cur) {
+        current = typeof cur.share === 'string' ? cur.share : '';
         phase = 'replace';
         return;
       }

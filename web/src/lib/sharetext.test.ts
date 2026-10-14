@@ -6,12 +6,23 @@ const NOW = Date.parse('2026-10-14T12:00:00Z');
 
 describe('the admin share parsers', () => {
   it('read a share leniently, with the kind defaults for missing capabilities', () => {
-    const lib = toShare({ id: 's_1', name: 'My phone', kind: 'libraries', scope: { libraries: [{ id: 'peter', name: 'Peter' }, 'penny', { id: 'gone', missing: true }, {}] } });
+    const lib = toShare({
+      id: 's_1',
+      name: 'My phone',
+      kind: 'libraries',
+      scope: { libraries: [{ id: 'peter', name: 'Peter', busy: true }, 'penny', { id: 'gone', missing: true }, {}] },
+      pairing: { expiresAt: '2026-10-14T19:02:00+03:00' },
+      notice: 'Too many wrong codes; show a new one.',
+      requests: 2,
+    });
     expect(lib.libraries).toEqual([
-      { id: 'peter', name: 'Peter', missing: false },
-      { id: 'penny', name: 'penny', missing: false },
-      { id: 'gone', name: 'gone', missing: true },
+      { id: 'peter', name: 'Peter', missing: false, busy: true },
+      { id: 'penny', name: 'penny', missing: false, busy: false },
+      { id: 'gone', name: 'gone', missing: true, busy: false },
     ]);
+    expect(lib.pairingUntil).toBe('2026-10-14T19:02:00+03:00');
+    expect(lib.notice).toBe('Too many wrong codes; show a new one.');
+    expect(lib.requests).toBe(2);
     expect(lib.capabilities).toEqual({ video: true, download: true, rate: true, location: true });
     expect(lib.state).toBe('active');
     expect(lib.devices).toEqual([]);
@@ -28,6 +39,9 @@ describe('the admin share parsers', () => {
       },
     });
     expect(album.kind).toBe('album');
+    expect(album.pairingUntil).toBeNull();
+    expect(album.notice).toBe('');
+    expect(album.requests).toBe(0);
     expect(album.album).toEqual({ id: 12, name: 'Summer', count: 48, missing: false });
     expect(album.capabilities).toEqual({ video: true, download: false, rate: true, location: false });
     expect(album.devices).toEqual([{ id: 'd_1', name: 'Mia', pairedAt: null, lastSeen: '2026-10-14T10:00:00Z', lastAddress: '', browser: 'Sailfish Browser' }]);
@@ -65,10 +79,12 @@ describe('share texts', () => {
   it('name why a share does not work', () => {
     expect(stateText(base)).toBe('');
     expect(stateText({ ...base, state: 'gone' })).toBe('Album deleted');
-    expect(stateText({ ...base, state: 'gone', library: { id: 'peter', name: 'peter', missing: true } })).toBe('Library missing');
+    expect(stateText({ ...base, state: 'gone', library: { id: 'peter', name: 'peter', missing: true, busy: false } })).toBe('Library missing');
     expect(stateText({ ...base, state: 'expired' })).toBe('Expired');
     expect(stateText({ ...base, state: 'paused' })).toBe('Paused');
     expect(stateText({ ...base, state: 'unavailable' })).toBe('Not in this workspace');
+    // A kind this picmover does not know: unavailable, with an empty scope.
+    expect(stateText(toShare({ id: 's_9', kind: 'dates', scope: {}, state: 'unavailable' }))).toBe('Needs a newer picmover');
   });
 
   it('describe and compute the expiry', () => {

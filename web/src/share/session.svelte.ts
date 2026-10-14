@@ -6,7 +6,8 @@
 
 import { errorText, getSession, setRefusalHandler, ShareError, type Session } from './shareapi';
 
-export type SessionStatus = 'loading' | 'ready' | 'unpaired' | 'blocked' | 'offline';
+/** 'offline': the computer did not answer; 'busy': it answered 503 (an album share's library is busy). */
+export type SessionStatus = 'loading' | 'ready' | 'unpaired' | 'blocked' | 'offline' | 'busy';
 
 class ShareSession {
   status = $state<SessionStatus>('loading');
@@ -45,7 +46,10 @@ class ShareSession {
     } catch (e) {
       if (g !== this.#gen) return;
       if (e instanceof ShareError && (e.status === 401 || (e.status === 403 && e.state))) this.refused(e.status, e.state);
-      else {
+      else if (e instanceof ShareError && e.status === 503) {
+        this.error = e.message;
+        this.status = 'busy';
+      } else {
         this.error = errorText(e);
         this.status = 'offline';
       }

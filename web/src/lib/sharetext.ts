@@ -29,7 +29,7 @@ export function stateText(s: Share): string {
       if (s.kind === 'album') return s.library?.missing ? 'Library missing' : 'Album deleted';
       return 'Library missing';
     case 'unavailable':
-      return 'Not in this workspace';
+      return s.kind === 'album' || s.kind === 'libraries' ? 'Not in this workspace' : 'Needs a newer picmover';
     default:
       return s.state;
   }

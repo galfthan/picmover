@@ -1,8 +1,9 @@
 // Sharing on the home Wi-Fi, admin side (docs/design/lan-share.md
 // "Turning sharing on and off"): the state of GET /api/share, polled while
 // someone looks at it. The Share page polls every 2 s (a phone that just
-// scanned the QR shows up at once); the top-bar pill polls slowly. Changes
-// go through here so every view sees the answer at once.
+// scanned the QR shows up at once). The top-bar pill polls the cheap
+// GET /api/share/status slowly (it opens no library). Changes go through
+// here so every view sees the answer at once.
 
 import { SvelteMap } from 'svelte/reactivity';
 import {
@@ -13,6 +14,7 @@ import {
   errorMessage,
   getPairRequests,
   getSharing,
+  getSharingSummary,
   renameDevice,
   renewShareCert,
   revokeAllDevices,
@@ -24,6 +26,7 @@ import {
   type ShareCreate,
   type SharingPatch,
   type SharingStatus,
+  type SharingSummary,
   type ShareUpdate,
 } from './api';
 
@@ -34,6 +37,8 @@ export const POLL_OFF_MS = 30_000;
 
 class SharingStore {
   status = $state.raw<SharingStatus | null>(null);
+  /** The pill's summary (GET /api/share/status). */
+  summary = $state.raw<SharingSummary | null>(null);
   /** false once the server answered 404 (no sharing in this picmover). */
   supported = $state(true);
   loaded = $state(false);
@@ -45,6 +50,10 @@ class SharingStore {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #inflight: Promise<void> | null = null;
   #gen = 0;
+  #pillWatchers = 0;
+  #pillTimer: ReturnType<typeof setTimeout> | null = null;
+  #pillInflight: Promise<void> | null = null;
+  #pillGen = 0;
 
   get on(): boolean {
     return this.status?.state === 'on';
@@ -52,11 +61,6 @@ class SharingStore {
 
   get shares(): Share[] {
     return this.status?.shares ?? [];
-  }
-
-  /** Paired devices over all shares. */
-  get phones(): number {
-    return this.shares.reduce((n, s) => n + s.devices.length, 0);
   }
 
   /** The controls are disabled while another picmover process manages sharing. */
@@ -106,6 +110,11 @@ class SharingStore {
     for (const id of [...this.requests.keys()]) if (!want.some((s) => s.id === id)) this.requests.delete(id);
     await Promise.all(
       want.map(async (s) => {
+        // The share's `requests` count says whether any phone waits.
+        if (s.requests === 0) {
+          this.requests.set(s.id, []);
+          return;
+        }
         try {
           this.requests.set(s.id, await getPairRequests(s.id));
         } catch {
@@ -151,7 +160,72 @@ class SharingStore {
     }, ms);
   }
 
+  /** Fetches the pill's summary now; concurrent calls share one request. */
+  refreshSummary(): Promise<void> {
+    if (this.#pillInflight) return this.#pillInflight;
+    const g = this.#pillGen;
+    const p = (async () => {
+      try {
+        const sum = await getSharingSummary();
+        if (g !== this.#pillGen) return;
+        if (sum === null) {
+          this.supported = false;
+          this.summary = null;
+        } else {
+          this.supported = true;
+          this.summary = sum;
+        }
+      } catch {
+        // keep the last summary; the next poll tries again
+      } finally {
+        this.#pillInflight = null;
+      }
+    })();
+    this.#pillInflight = p;
+    return p;
+  }
+
+  /**
+   * Polls the pill's summary while the returned function has not been
+   * called: every 10 s while sharing is on (or paused), every 30 s while it
+   * is off. A server without sharing is not polled again.
+   */
+  watchSummary(): () => void {
+    this.#pillWatchers++;
+    this.#schedulePill(0);
+    let stopped = false;
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      if (--this.#pillWatchers === 0 && this.#pillTimer !== null) {
+        clearTimeout(this.#pillTimer);
+        this.#pillTimer = null;
+      }
+    };
+  }
+
+  #schedulePill(ms: number): void {
+    if (this.#pillTimer !== null) clearTimeout(this.#pillTimer);
+    this.#pillTimer = null;
+    if (this.#pillWatchers === 0) return;
+    this.#pillTimer = setTimeout(() => {
+      this.#pillTimer = null;
+      void this.refreshSummary().then(() => {
+        if (!this.supported) return;
+        const on = this.summary?.state === 'on' || this.summary?.state === 'paused';
+        this.#schedulePill(on ? POLL_ON_MS : POLL_OFF_MS);
+      });
+    }, ms);
+  }
+
+  /** After a change: the pill follows at once (when someone shows it). */
+  #changed(): void {
+    this.#pillGen++;
+    if (this.#pillWatchers > 0) this.#schedulePill(0);
+  }
+
   #apply(st: SharingStatus): SharingStatus {
+    this.#changed();
     this.#gen++;
     this.status = st;
     this.supported = true;
@@ -161,6 +235,7 @@ class SharingStore {
 
   /** Replaces one share in the state (the answer of a share change). */
   #put(s: Share): Share {
+    this.#changed();
     const st = this.status;
     if (st) {
       this.#gen++;
@@ -190,6 +265,7 @@ class SharingStore {
 
   async remove(id: string): Promise<void> {
     await deleteShare(id);
+    this.#changed();
     const st = this.status;
     if (st) {
       this.#gen++;
@@ -214,6 +290,7 @@ class SharingStore {
 
   async revokeDevice(id: string): Promise<void> {
     await revokeDevice(id);
+    this.#changed();
     const st = this.status;
     if (!st) return;
     this.#gen++;
@@ -229,6 +306,7 @@ class SharingStore {
     }
     const list = this.requests.get(share);
     if (list) this.requests.set(share, list.filter((r) => r.id !== request));
+    this.#changed();
     void this.refresh();
   }
 }

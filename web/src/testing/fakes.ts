@@ -177,6 +177,14 @@ export interface FakeShare {
   albumName: string;
   /** The album was deleted or its id reused (the share is broken). */
   albumMissing: boolean;
+  /** Members in user.db, trashed ones included (the admin count); the album's hashes when left out. */
+  albumCount?: number;
+  /** A scope kind this picmover does not know (another version wrote it): state unavailable, scope {}. */
+  unknownKind?: string;
+  /** Another workspace's share: state unavailable. */
+  elsewhere?: boolean;
+  /** Why the share's pairings were cancelled. */
+  notice?: string;
   capabilities: { video: boolean; download: boolean; rate: boolean; location: boolean };
   expiresAt: string | null;
   paused: boolean;
@@ -1063,23 +1071,32 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     addresses: [
       { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24' },
       { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24' },
-    ],
+    ] as { ip: string; iface: string; subnet: string; virtual?: boolean }[],
     fingerprint: { leaf: 'AB:CD:EF:01:23:45:67:89', ca: '12:34:56:78:9A:BC:DE:F0' },
     keepOn: false,
     mdns: false,
     autoOff: { mode: 'quit', until: null as string | null },
     managedElsewhere: null as { pid: number; cmd: string } | null,
-    firewallHint: 'sudo ufw allow from 192.168.1.0/24 to any port 7443 proto tcp',
+    /** One plain-text string, lines separated by \n (as the server sends it on Linux). */
+    firewallHint:
+      'If the phone cannot connect, allow the port in the firewall (and undo it when done):\n' +
+      'ufw:       sudo ufw allow from 192.168.1.0/24 to any port 7443 proto tcp\n' +
+      'firewalld: sudo firewall-cmd --zone=home --add-port=7443/tcp --permanent && sudo firewall-cmd --reload',
+    /** POST {enabled: true} fails with this reason (state error, still 200), e.g. a busy port. */
+    startError: '',
+    /** Libraries held by another process (busy: true on the share's library). */
+    busy: new Set<string>(),
     shares: [] as FakeShare[],
     /** Approval requests per share id. */
     requests: new Map<string, { id: string; name: string; browser: string; address: string; at: string }[]>(),
     /** Open pairings per share id (the token's tail), as issued. */
-    pairings: new Map<string, string>(),
+    pairings: new Map<string, { token: string; expiresAt: string }>(),
     nextId: 1,
   };
 
   const sharingNow = () => new Date().toISOString();
   function shareStateOf(s: FakeShare): string {
+    if (s.unknownKind || s.elsewhere) return 'unavailable';
     if (s.paused) return 'paused';
     if (s.expiresAt && Date.parse(s.expiresAt) <= Date.now()) return 'expired';
     if (s.kind === 'album' && (s.albumMissing || !albums.some((a) => a.id === s.album))) return 'gone';
@@ -1087,29 +1104,50 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     return 'active';
   }
   function shareJSON(s: FakeShare) {
+    // The server names libraries by their folder id; busy and missing are absent when false.
     const libRef = (id: string) => {
       const l = libs.find((x) => x.id === id);
-      return l ? { id, name: l.name } : { id, name: id, missing: true };
+      return l ? { id, name: id, ...(sharing.busy.has(id) ? { busy: true } : {}) } : { id, name: id, missing: true };
     };
     const a = albums.find((x) => x.id === s.album);
     const scope =
       s.kind === 'album'
         ? {
             library: libRef(s.libraries[0] ?? ''),
-            album: a && !s.albumMissing ? { id: a.id, name: a.name, count: a.hashes.length } : { id: s.album, name: s.albumName, count: 0, missing: true },
+            album: a && !s.albumMissing ? { id: a.id, name: a.name, count: s.albumCount ?? a.hashes.length } : { id: s.album, name: '', count: 0, missing: true },
           }
         : { libraries: s.libraries.map(libRef) };
+    const open = sharing.pairings.get(s.id);
     return {
       id: s.id,
       name: s.name,
-      kind: s.kind,
-      scope,
+      kind: s.unknownKind ?? s.kind,
+      scope: s.unknownKind ? {} : scope,
       capabilities: { ...s.capabilities },
       expiresAt: s.expiresAt,
       state: shareStateOf(s),
       approve: s.approve,
       createdAt: s.createdAt,
       devices: s.devices.map((d) => ({ ...d })),
+      pairing: open ? { expiresAt: open.expiresAt } : null,
+      ...(s.notice ? { notice: s.notice } : {}),
+      requests: (sharing.requests.get(s.id) ?? []).length,
+    };
+  }
+  /** GET /api/share/status: the pill's counts over the shares phones can use now. */
+  function sharingSummaryJSON() {
+    const active = sharing.shares.filter((s) => {
+      const st = shareStateOf(s);
+      return st === 'active' || st === 'gone';
+    });
+    return {
+      state: sharing.state,
+      ...(sharing.reason ? { reason: sharing.reason } : {}),
+      ...(sharing.state === 'on' ? { url: `https://${sharing.address}:${sharing.port}/` } : {}),
+      shares: active.length,
+      phones: active.reduce((n, s) => n + s.devices.length, 0),
+      autoOff: sharing.autoOff.until ? sharing.autoOff : { mode: sharing.autoOff.mode },
+      ...(sharing.managedElsewhere ? { managedElsewhere: sharing.managedElsewhere } : {}),
     };
   }
   function sharingJSON() {
@@ -1124,6 +1162,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
       addresses: sharing.addresses,
       fingerprint: sharing.fingerprint,
       keepOn: sharing.keepOn,
+      mdns: sharing.mdns,
       autoOff: sharing.autoOff.until ? sharing.autoOff : { mode: sharing.autoOff.mode },
       ...(sharing.managedElsewhere ? { managedElsewhere: sharing.managedElsewhere } : {}),
       firewallHint: sharing.firewallHint,
@@ -1131,10 +1170,12 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     };
   }
   const CAPS = ['video', 'download', 'rate', 'location'] as const;
+  /** The kind's defaults without `v`; with it, `v` taken whole (a missing capability is off), as the server does. */
   function capsFrom(v: unknown, kind: string): FakeShare['capabilities'] {
     const all = kind !== 'album';
-    const c = { video: true, download: all, rate: all, location: all };
-    if (v && typeof v === 'object') for (const k of CAPS) if (typeof (v as Record<string, unknown>)[k] === 'boolean') c[k] = (v as Record<string, boolean>)[k]!;
+    if (!v || typeof v !== 'object') return { video: true, download: all, rate: all, location: all };
+    const c = { video: false, download: false, rate: false, location: false };
+    for (const k of CAPS) c[k] = (v as Record<string, unknown>)[k] === true;
     return c;
   }
   /** Simulates a phone redeeming a pairing of share `sid` (the server side of POST /api/pair on the share listener). */
@@ -1169,18 +1210,29 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   function shareRoute(p: string, method: string, body: Record<string, unknown>): Response {
     if (!sharing.supported) return json({ error: 'not found' }, 404);
     const write = method === 'POST';
-    if (write && sharing.managedElsewhere) return json({ error: `sharing is managed by picmover pid ${sharing.managedElsewhere.pid}` }, 409);
+    if (write && sharing.managedElsewhere) {
+      const me = sharing.managedElsewhere;
+      return json({ error: `sharing is managed by picmover pid ${me.pid} (${me.cmd}); use its Share page`, managedElsewhere: me }, 409);
+    }
     if (p === '/api/share' && method === 'GET') return json(sharingJSON());
+    if (p === '/api/share/status' && method === 'GET') return json(sharingSummaryJSON());
     if (p === '/api/share' && write) {
-      if (typeof body.enabled === 'boolean') sharing.state = body.enabled ? 'on' : 'off';
-      if (body.enabled === true) sharing.reason = '';
       if (typeof body.address === 'string') {
-        if (!sharing.addresses.some((a) => a.ip === body.address)) return json({ error: 'not an address of this computer' }, 400);
+        if (!sharing.addresses.some((a) => a.ip === body.address)) return json({ error: 'address: not a LAN address of this computer' }, 400);
         sharing.address = body.address;
       }
       if (body.port !== undefined) {
-        if (typeof body.port !== 'number' || body.port < 1024 || body.port > 65535) return json({ error: 'port: want 1024-65535' }, 400);
+        if (typeof body.port !== 'number' || body.port < 1 || body.port > 65535) return json({ error: 'port: want 1-65535' }, 400);
         sharing.port = body.port;
+      }
+      if (body.enabled === false) {
+        sharing.state = 'off';
+        sharing.reason = '';
+        sharing.pairings.clear();
+      } else if (body.enabled === true) {
+        // A failed start is still 200: the body's state and reason say why.
+        sharing.state = sharing.startError ? 'error' : 'on';
+        sharing.reason = sharing.startError;
       }
       if (typeof body.keepOn === 'boolean') sharing.keepOn = body.keepOn;
       if (typeof body.mdns === 'boolean') sharing.mdns = body.mdns;
@@ -1198,7 +1250,8 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     if (p === '/api/share/shares' && write) {
       const sc = (body.scope ?? {}) as Record<string, unknown>;
       const name = typeof body.name === 'string' ? body.name.trim() : '';
-      if (!name) return json({ error: 'name is required' }, 400);
+      if (!name) return json({ error: 'invalid name' }, 400);
+      if (sharing.shares.some((x) => x.name.toLowerCase() === name.toLowerCase())) return json({ error: 'a share with this name exists' }, 409);
       let s: FakeShare;
       if (sc.kind === 'libraries') {
         const ids = Array.isArray(sc.libraries) ? (sc.libraries as string[]) : [];
@@ -1207,9 +1260,9 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         s = addShare({ name, kind: 'libraries', libraries: ids });
       } else if (sc.kind === 'album') {
         const a = albums.find((x) => x.id === sc.album);
-        if (sc.library !== 'peter' || !a) return json({ error: 'scope: unknown album' }, 400);
+        if (sc.library !== 'peter' || !a) return json({ error: `unknown album ${String(sc.album)} in library "${String(sc.library)}"` }, 400);
         s = addShare({ name, kind: 'album', libraries: ['peter'], album: a.id, albumName: a.name, expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString() });
-      } else return json({ error: 'scope: unknown kind' }, 400);
+      } else return json({ error: 'scope: kind must be "libraries" or "album"' }, 400);
       s.capabilities = capsFrom(body.capabilities, s.kind);
       if (typeof body.expiresIn === 'number') s.expiresAt = new Date(Date.now() + body.expiresIn * 1000).toISOString();
       else if (body.expiresAt === null) s.expiresAt = null;
@@ -1226,11 +1279,11 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
           s.devices.splice(s.devices.indexOf(d), 1);
           return new Response(null, { status: 204 });
         }
-        if (typeof body.name !== 'string' || !body.name.trim()) return json({ error: 'name is required' }, 400);
+        if (typeof body.name !== 'string' || !body.name.trim()) return json({ error: 'invalid name' }, 400);
         d.name = body.name.trim();
         return json({ ...d });
       }
-      return json({ error: 'no such device' }, 404);
+      return json({ error: 'no such phone' }, 404);
     }
     const m = /^\/api\/share\/shares\/([^/]+)(\/delete|\/revoke-all|\/pairings|\/pairings\/cancel|\/requests(?:\/([^/]+))?)?$/.exec(p);
     if (!m) return json({ error: 'not found' }, 404);
@@ -1241,15 +1294,22 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     if (!write) return json({ error: 'not found' }, 404);
     switch (sub) {
       case '':
-        if (body.kind !== undefined || body.album !== undefined || body.scope !== undefined) return json({ error: 'the kind and album of a share cannot change' }, 400);
-        if (typeof body.name === 'string') s.name = body.name.trim();
+        if (body.kind !== undefined || body.album !== undefined || body.scope !== undefined)
+          return json({ error: "the kind and an album share's album cannot change; create a new share" }, 400);
         if (Array.isArray(body.libraries)) {
-          if (s.kind !== 'libraries') return json({ error: 'libraries: only for a library share' }, 400);
-          s.libraries = body.libraries as string[];
+          if (s.kind !== 'libraries') return json({ error: 'libraries: only a library share has libraries' }, 400);
+          if (body.libraries.length === 0) return json({ error: 'libraries: at least one' }, 400);
         }
+        if (typeof body.name === 'string') {
+          const n = body.name.trim();
+          if (sharing.shares.some((x) => x !== s && x.name.toLowerCase() === n.toLowerCase())) return json({ error: 'a share with this name exists' }, 409);
+          s.name = n;
+        }
+        if (Array.isArray(body.libraries)) s.libraries = body.libraries as string[];
         if (body.capabilities !== undefined) s.capabilities = capsFrom(body.capabilities, s.kind);
         if ('expiresAt' in body) s.expiresAt = (body.expiresAt as string | null) ?? null;
         if (typeof body.paused === 'boolean') s.paused = body.paused;
+        if (s.paused) sharing.pairings.delete(s.id);
         if (typeof body.approve === 'boolean') s.approve = body.approve;
         return json(shareJSON(s));
       case '/delete':
@@ -1259,15 +1319,17 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         s.devices = [];
         return json(shareJSON(s));
       case '/pairings': {
-        if (sharing.state !== 'on') return json({ error: 'sharing is off' }, 409);
-        if (shareStateOf(s) !== 'active') return json({ error: `the share is ${shareStateOf(s)}` }, 409);
+        if (sharing.state !== 'on') return json({ error: 'sharing on Wi-Fi is off; turn it on first' }, 409);
+        if (shareStateOf(s) !== 'active') return json({ error: `the share is ${shareStateOf(s)}; phones cannot pair with it now` }, 409);
         const token = `tok${sharing.nextId++}`;
-        sharing.pairings.set(s.id, token);
+        const expiresAt = new Date(Date.now() + 120_000).toISOString();
+        sharing.pairings.set(s.id, { token, expiresAt });
         return json({
           url: `https://${sharing.address}:${sharing.port}/#/pair/${token}`,
+          ...(sharing.mdns ? { mdnsUrl: `https://laptop.local:${sharing.port}/#/pair/${token}` } : {}),
           code: 'K7QM-3XRD',
           qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><path d="M0 0h7v7H0z"/></svg>',
-          expiresAt: new Date(Date.now() + 120_000).toISOString(),
+          expiresAt,
         });
       }
       case '/pairings/cancel':
@@ -1448,6 +1510,8 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   /** A move runs: ratings answer 409. */
   const moving = { on: false };
   const pairing = {
+    /** The share has its 20 phones: a redeem is 409 without `current`. */
+    full: false,
     tokens: new Set<string>(['tok_' + 'a'.repeat(40)]),
     codes: new Set<string>(['K7QM3XRD']),
     /** Redeems wait for the computer while set. */
@@ -1479,12 +1543,13 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     return m ? [Number(m[1]), Number(m[2])] : [0, 0];
   };
   const notFound = () => json({ error: 'not found' }, 404);
-  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'year', 'month', 'v', 'download']);
+  /** The filter whitelist of timeline and media; media adds year and month. */
+  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album']);
 
-  function select(lib: string, q: URLSearchParams): (ShareItem & { lib: string })[] | Response {
-    for (const k of q.keys()) if (!ALLOWED.has(k)) return json({ error: `filter ${k} not allowed` }, 400);
-    if (q.has('rating') && !caps.rate) return json({ error: 'filter rating not allowed' }, 400);
-    if (q.has('album') && kind === 'album') return json({ error: 'filter album not allowed' }, 400);
+  function select(lib: string, q: URLSearchParams, extra: string[] = []): (ShareItem & { lib: string })[] | Response {
+    for (const k of q.keys()) if (!ALLOWED.has(k) && !extra.includes(k)) return json({ error: `invalid filter "${k}"` }, 400);
+    if (q.has('rating') && !caps.rate) return json({ error: 'invalid filter "rating": not allowed in this share' }, 400);
+    if (q.has('album') && kind === 'album') return json({ error: 'invalid filter "album": this share is one album' }, 400);
     let list = visible().filter((x) => kind === 'album' || x.lib === lib);
     const aid = Number(q.get('album'));
     if (aid) {
@@ -1503,35 +1568,46 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     return list;
   }
 
+  const STATE_MSG: Record<string, string> = {
+    paused: 'This share is paused.',
+    expired: 'This share has ended.',
+    gone: 'This album is no longer shared.',
+    unavailable: 'This share is not available on the computer right now.',
+  };
   /** Device → share → scope, as shareScoped: the library key, or a refusal. */
   function auth(): Response | null {
-    if (!cookie.paired) return json({ error: 'not paired', paired: false }, 401);
-    if (share.state) return json({ error: `share ${share.state}`, state: share.state }, 403);
+    if (!cookie.paired) return json({ error: 'This phone is not paired with picmover. Show a pairing code on the computer.', paired: false }, 401);
+    if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 403);
     return null;
   }
 
   async function redeem(body: Record<string, unknown>): Promise<Response> {
     if (pairing.limited) {
       pairing.limited = false;
-      return json({ error: 'too many requests' }, 429);
+      return json({ error: 'Too many pairing attempts; wait a minute and try again.' }, 429);
     }
     const token = typeof body.token === 'string' ? body.token : null;
     const code = typeof body.code === 'string' ? body.code.toUpperCase().replace(/-/g, '') : null;
-    if ((token === null) === (code === null) || typeof body.name !== 'string') return json({ error: 'bad request' }, 400);
+    if ((token === null) === (code === null)) return json({ error: 'want a token or a code' }, 400);
     const set = token !== null ? pairing.tokens : pairing.codes;
     const key = token ?? code ?? '';
     if (!set.has(key)) return json({ error: 'This pairing code has expired or was already used. Show a new one on the computer.' }, 410);
-    if (share.state) return json({ error: `This share is ${share.state}.` }, 410);
-    if (cookie.paired && body.replace !== true) return json({ error: 'already paired', current: { share: cookie.otherShare || share.name } }, 409);
+    // The pairing exists but its share refuses phones: 410 with the state.
+    if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 410);
+    if (cookie.paired && body.replace !== true) {
+      const cur = cookie.otherShare || share.name;
+      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur } }, 409);
+    }
     set.delete(key);
     if (pairing.approve) {
       const ok = await new Promise<boolean>((resolve) => (pairing.pending = resolve));
       pairing.pending = null;
-      if (!ok) return json({ error: 'not approved' }, 403);
+      if (!ok) return json({ error: 'The computer did not allow this phone.' }, 403);
     }
+    if (pairing.full) return json({ error: 'this share has 20 phones; revoke one first' }, 409);
     cookie.paired = true;
     cookie.otherShare = '';
-    device.name = body.name.trim() || 'Phone';
+    device.name = (typeof body.name === 'string' ? body.name.trim() : '') || 'Phone';
     return json({ device: { ...device }, share: shareJSON() });
   }
 
@@ -1564,7 +1640,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       return json({ buckets: [...m.values()].sort((a, b) => b.year - a.year || b.month - a.month) });
     }
     if (method === 'GET' && rest === 'media') {
-      const list = select(lib, q);
+      const list = select(lib, q, ['year', 'month']);
       if (list instanceof Response) return list;
       const y = Number(q.get('year'));
       const mo = Number(q.get('month'));
@@ -1590,7 +1666,8 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
         cameraModel: 'Canon EOS R6',
         lens: '',
         displayable: caps.download,
-        thumbAt: x.thumbAt,
+        // dur and thumbAt are always present (0 when none).
+        thumbAt: x.thumbAt ?? 0,
       };
       if (caps.location && x.lat !== undefined) Object.assign(d, { lat: x.lat, lon: x.lon });
       if (caps.rate) d.rating = x.rating ?? 0;
@@ -1612,13 +1689,16 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       return new Response(new Uint8Array([0]), { headers: { 'Content-Type': 'application/octet-stream' } });
     }
     if (method === 'POST' && rest === 'ratings') {
-      if (!caps.rate) return json({ error: 'not allowed in this share' }, 403);
+      // The server's order: the body, the row (404), the capability (403), a move (409).
       const hashes = Array.isArray(body.hashes) ? body.hashes : [];
-      if (hashes.length !== 1) return json({ error: 'one hash' }, 400);
-      if (moving.on) return json({ error: 'a move is running on this library' }, 409);
+      if (hashes.length !== 1) return json({ error: 'hashes: want exactly one hash' }, 400);
+      if (typeof hashes[0] !== 'string' || !/^[0-9a-f]{16}$/.test(hashes[0])) return json({ error: 'hashes: invalid hash: want 16 lower-case hex digits' }, 400);
+      const r = Number(body.rating);
+      if (typeof body.rating !== 'number' || !Number.isInteger(r) || r < 0 || r > 5) return json({ error: 'rating: want 0-5 (0 clears)' }, 400);
       const x = items.find((i) => i.hash === hashes[0]);
       if (!x || !inScope(x)) return notFound();
-      const r = Number(body.rating);
+      if (!caps.rate) return json({ error: 'not allowed in this share' }, 403);
+      if (moving.on) return json({ error: 'a move is running on this library; try again when it has finished' }, 409);
       if (r > 0) x.rating = r;
       else delete x.rating;
       return json({ updated: 1 });
@@ -1637,7 +1717,9 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       if (h.get('X-Picmover') !== '1' || h.get('Content-Type') !== 'application/json') return json({ error: 'forbidden' }, 403);
     }
     if (p === '/api/session' && method === 'GET') {
-      return auth() ?? json({ device: { ...device }, computer: 'laptop', share: shareJSON() });
+      // An album share's session opens its library: 503 while that is busy.
+      const refused = auth() ?? (kind === 'album' && busy.has('peter') ? json({ error: 'This library is not available right now.' }, 503) : null);
+      return refused ?? json({ device: { ...device }, computer: 'laptop', share: shareJSON() });
     }
     if (p === '/api/pair' && method === 'POST') return redeem(body);
     if (p === '/api/libraries' && method === 'GET') {

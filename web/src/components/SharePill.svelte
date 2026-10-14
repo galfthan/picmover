@@ -3,12 +3,14 @@
   // points"): a plain link to #/share while sharing is off, a green pill
   // "Sharing · 3 shares · 4 phones" while it is on, amber while paused.
   // Sharing must be visible whenever it is on, so this is on every page.
+  // It reads GET /api/share/status (counts of the shares phones can use
+  // now and their phones), which looks at no library.
   import { sharing } from '../lib/sharing.svelte';
   import { route } from '../lib/router';
 
-  $effect(() => sharing.watch());
+  $effect(() => sharing.watchSummary());
 
-  const st = $derived(sharing.status);
+  const st = $derived(sharing.summary);
   const active = $derived(route.current.segments[0] === 'share');
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
@@ -25,7 +27,7 @@
   {#if st && st.state === 'on'}
     <a class="pill on" class:active href="#/share" title={st.url ? `Sharing on Wi-Fi at ${st.url}` : 'Sharing on Wi-Fi'}>
       <span class="dot" aria-hidden="true"></span>
-      <span class="text">Sharing · {plural(st.shares.length, 'share', 'shares')} · {plural(sharing.phones, 'phone', 'phones')}</span>
+      <span class="text">Sharing · {plural(st.shares, 'share', 'shares')} · {plural(st.phones, 'phone', 'phones')}</span>
       {#if left}<span class="left">{left}</span>{/if}
     </a>
   {:else if st && st.state === 'paused'}

@@ -71,12 +71,18 @@ describe('sharing (admin)', () => {
 
     const s = server.addShare({ name: 'My phone', kind: 'libraries' });
     server.addShare({ name: 'Summer guests', kind: 'album', album: 2, albumName: 'Summer' });
+    // A paused share and its phone are not counted.
+    const p = server.addShare({ name: 'Paused', kind: 'libraries', paused: true });
+    server.pairPhone(p.id);
     server.pairPhone(s.id);
     server.sharing.state = 'on';
     // The pill polls slowly while sharing is off.
     await vi.advanceTimersByTimeAsync(30_000);
     expect(pill()?.textContent).toContain('Sharing · 2 shares · 1 phone');
     expect(pill()?.classList.contains('on')).toBe(true);
+    // It reads the cheap summary; the full state (which looks at every library) is not polled.
+    expect(server.calls.filter((c) => c.path === '/api/share/status').length).toBeGreaterThan(1);
+    expect(server.calls.filter((c) => c.path === '/api/share')).toHaveLength(0);
 
     await go('#/l/peter/albums');
     expect(pill()?.textContent).toContain('Sharing · 2 shares · 1 phone');
@@ -97,9 +103,9 @@ describe('sharing (admin)', () => {
     expect(pill()).toBeNull();
     expect(document.body.textContent).toContain('This picmover server cannot share on Wi-Fi.');
     // A 404 is not polled again.
-    const n = server.calls.filter((c) => c.path === '/api/share').length;
+    const n = server.calls.filter((c) => c.path.startsWith('/api/share')).length;
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(server.calls.filter((c) => c.path === '/api/share').length).toBe(n);
+    expect(server.calls.filter((c) => c.path.startsWith('/api/share')).length).toBe(n);
   });
 
   it('turns sharing on and changes the network, port, auto-off, .local name and certificate', async () => {
@@ -405,6 +411,31 @@ describe('sharing (admin)', () => {
     click(button('Share', d)!);
     await settle();
     expect(d.textContent).toContain('Choose at least one library.');
+  });
+
+  it('shows what the server reports: a failed start, busy libraries, notices, unknown kinds, virtual addresses, no certificate yet', async () => {
+    server.sharing.startError = 'Port 7443 is in use by another program; choose another port on the Share page';
+    server.sharing.fingerprint = { leaf: '', ca: '' };
+    server.sharing.addresses.push({ ip: '172.17.0.1', iface: 'docker0', subnet: '172.17.0.0/16', virtual: true });
+    server.sharing.busy.add('peter');
+    server.addShare({ name: 'My phone', kind: 'libraries', notice: 'Too many wrong codes; show a new one.' });
+    server.addShare({ name: 'Future', kind: 'libraries', unknownKind: 'dates' });
+    await start();
+    expect(document.body.textContent).toContain('The certificate is made when sharing is first turned on.');
+    expect([...document.querySelectorAll('select[aria-label="Network address"] option')].map((o) => o.textContent)).toContain(
+      '172.17.0.1 (docker0, 172.17.0.0/16, virtual)',
+    );
+    expect(card('My phone').textContent).toContain('Library busy');
+    expect(card('My phone').textContent).toContain('Too many wrong codes; show a new one.');
+    expect(card('Future').querySelector('.badge')?.textContent).toBe('Needs a newer picmover');
+    expect(card('Future').textContent).toContain('Unknown kind “dates”');
+
+    // Turning on that fails is a 200 with state error and the reason.
+    click(checkbox(document, 'Share on Wi-Fi'));
+    await settle();
+    expect(document.body.textContent).toContain('Port 7443 is in use by another program');
+    expect(document.querySelector('.global .state')?.textContent?.trim()).toBe('Failed');
+    expect(pill()?.textContent).toContain('Sharing failed');
   });
 
   it('disables every control while another process manages sharing', async () => {

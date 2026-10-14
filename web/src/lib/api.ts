@@ -1493,11 +1493,14 @@ export interface ShareLibRef {
   name: string;
   /** The library folder is gone, or holds another library (LibraryID mismatch). */
   missing: boolean;
+  /** Locked by another process or being rebuilt: its phones get "not available right now" (503). */
+  busy: boolean;
 }
 
 export interface ShareAlbumRef {
   id: number;
   name: string;
+  /** Members in user.db, trashed ones included (the phone counts live members only). */
   count: number;
   /** The album was deleted (or its id reused). */
   missing: boolean;
@@ -1520,12 +1523,20 @@ export interface Share {
   approve: boolean;
   createdAt: string | null;
   devices: ShareDevice[];
+  /** The open pairing's expiry (RFC 3339); null when none is open. */
+  pairingUntil: string | null;
+  /** Why the share's pairings were cancelled ("Too many wrong codes; show a new one."); "" when none. */
+  notice: string;
+  /** Phones waiting for approval (shares with `approve`). */
+  requests: number;
 }
 
 export interface ShareAddress {
   ip: string;
   iface: string;
   subnet: string;
+  /** A virtual interface (docker, VPN): rarely the Wi-Fi. */
+  virtual: boolean;
 }
 
 export type AutoOffMode = 'never' | '1h' | '4h' | 'quit';
@@ -1551,6 +1562,19 @@ export interface SharingStatus {
   /** The commands to open the firewall, as text (one or more lines). */
   firewallHint: string;
   shares: Share[];
+}
+
+/** GET /api/share/status: the top-bar pill's cheap summary (no library is looked at). */
+export interface SharingSummary {
+  state: 'off' | 'on' | 'paused' | 'error' | string;
+  reason: string;
+  url: string;
+  /** Shares that phones can use now (not paused, expired, of another workspace or of an unknown kind). */
+  shares: number;
+  /** Phones of those shares. */
+  phones: number;
+  autoOff: { mode: AutoOffMode | string; until: string | null };
+  managedElsewhere: { pid: number; cmd: string } | null;
 }
 
 export interface SharingPatch {
@@ -1615,9 +1639,9 @@ function toCapabilities(v: unknown, kind: string): ShareCapabilities {
 }
 
 function toShareLib(v: unknown): ShareLibRef | null {
-  if (typeof v === 'string' && v !== '') return { id: v, name: v, missing: false };
+  if (typeof v === 'string' && v !== '') return { id: v, name: v, missing: false, busy: false };
   if (!isRecord(v) || typeof v.id !== 'string' || v.id === '') return null;
-  return { id: v.id, name: str(v.name) || v.id, missing: bool(v.missing) };
+  return { id: v.id, name: str(v.name) || v.id, missing: bool(v.missing), busy: bool(v.busy) };
 }
 
 export function toShareDevice(v: unknown): ShareDevice {
@@ -1652,6 +1676,9 @@ export function toShare(v: unknown): Share {
     approve: bool(r.approve),
     createdAt: instant(r.createdAt),
     devices: Array.isArray(r.devices) ? r.devices.map(toShareDevice).filter((d) => d.id !== '') : [],
+    pairingUntil: isRecord(r.pairing) ? instant(r.pairing.expiresAt) : null,
+    notice: str(r.notice),
+    requests: count(r.requests),
   };
 }
 
@@ -1685,7 +1712,7 @@ export function toSharingStatus(v: unknown): SharingStatus {
     addresses: Array.isArray(r.addresses)
       ? r.addresses
           .filter(isRecord)
-          .map((a) => ({ ip: str(a.ip), iface: str(a.iface), subnet: str(a.subnet) }))
+          .map((a) => ({ ip: str(a.ip), iface: str(a.iface), subnet: str(a.subnet), virtual: bool(a.virtual) }))
           .filter((a) => a.ip !== '')
       : [],
     fingerprint: { leaf: str(fp.leaf), ca: str(fp.ca) },
@@ -1694,6 +1721,21 @@ export function toSharingStatus(v: unknown): SharingStatus {
     managedElsewhere: me ? { pid: count(me.pid), cmd: str(me.cmd) } : null,
     firewallHint: hintText(r.firewallHint),
     shares: Array.isArray(r.shares) ? r.shares.map(toShare).filter((x) => x.id !== '') : [],
+  };
+}
+
+export function toSharingSummary(v: unknown): SharingSummary {
+  const r = isRecord(v) ? v : {};
+  const ao = isRecord(r.autoOff) ? r.autoOff : { mode: r.autoOff };
+  const me = isRecord(r.managedElsewhere) ? r.managedElsewhere : null;
+  return {
+    state: str(r.state) || 'off',
+    reason: str(r.reason),
+    url: str(r.url),
+    shares: count(r.shares),
+    phones: count(r.phones),
+    autoOff: { mode: str(ao.mode) || 'quit', until: instant(ao.until) },
+    managedElsewhere: me ? { pid: count(me.pid), cmd: str(me.cmd) } : null,
   };
 }
 
@@ -1723,6 +1765,16 @@ function encShareId(id: string): string {
 export async function getSharing(signal?: AbortSignal): Promise<SharingStatus | null> {
   try {
     return toSharingStatus(await getJSON<unknown>('/api/share', signal));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+/** The pill's summary, or null when the server has no sharing (404: an older picmover). */
+export async function getSharingSummary(signal?: AbortSignal): Promise<SharingSummary | null> {
+  try {
+    return toSharingSummary(await getJSON<unknown>('/api/share/status', signal));
   } catch (e) {
     if (e instanceof ApiError && e.status === 404) return null;
     throw e;

@@ -190,6 +190,25 @@ describe('phone app', () => {
       expect(location.hash).toBe('#/');
       expect(text()).toContain('Penny');
     });
+
+    it("shows the server's message for a share that refuses phones (410 with a state) or is full (409 without current)", async () => {
+      setup('libraries', { paired: false });
+      server.share.state = 'paused';
+      await start('#/pair/tok_' + 'a'.repeat(40));
+      click(button('Pair')!);
+      await settle();
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('This share is paused.');
+      // The token form fell back to the code.
+      const code = document.querySelector<HTMLInputElement>('input[aria-label="Pairing code"]')!;
+      server.share.state = '';
+      server.pairing.full = true;
+      type(code, 'K7QM3XRD');
+      click(button('Pair')!);
+      await settle();
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('this share has 20 phones');
+      expect(text()).not.toContain('already paired');
+      expect(button('Pair with this share')).toBeUndefined();
+    });
   });
 
   describe('screens that replace every page', () => {
@@ -239,6 +258,18 @@ describe('phone app', () => {
       click(button('Try again')!);
       await settle();
       expect(tiles()).toHaveLength(8);
+    });
+
+    it("says an album share's busy library is not available right now (503 on the session)", async () => {
+      setup('album');
+      server.busy.add('peter');
+      await start('#/');
+      expect(text()).toContain('Not available right now');
+      expect(text()).not.toContain('Cannot reach the computer');
+      server.busy.delete('peter');
+      click(button('Try again')!);
+      await settle();
+      expect(tiles()).toHaveLength(3);
     });
 
     it('says when the computer cannot be reached', async () => {

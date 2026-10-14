@@ -39,6 +39,11 @@
   // Sharing (docs/design/lan-share.md "Entry points"): "Share…" opens the
   // share dialog for this album; when shares of it exist the button reads
   // "Shared (n)" and links to them on the Share page.
+  // The pill reads only the summary, so the shares are fetched here once.
+  $effect(() => {
+    void albumId;
+    untrack(() => void sharing.refresh());
+  });
   const shares = $derived(sharing.sharesOfAlbum(api.id, albumId));
   let sharingOpen = $state(false);
   let pairFor = $state<string | null>(null);

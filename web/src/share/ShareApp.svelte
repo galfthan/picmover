@@ -154,6 +154,12 @@
       {#if blocked.text}<p>{blocked.text}</p>{/if}
       <button onclick={() => shareSession.load()}>Try again</button>
     </div>
+  {:else if shareSession.status === 'busy'}
+    <div class="empty" role="alert">
+      <h2>Not available right now</h2>
+      <p>The computer is busy with this library. Try again later.</p>
+      <button onclick={() => shareSession.load()}>Try again</button>
+    </div>
   {:else if shareSession.status === 'offline'}
     <div class="empty" role="alert">
       <h2>Cannot reach the computer</h2>

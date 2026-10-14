@@ -86,13 +86,15 @@
     el.scrollIntoView?.({ block: 'center' });
   });
 
-  /** A shared library that another process holds (Q20): its phones get "not available right now". */
+  /** A shared library that another process holds or that is being rebuilt (Q20): its phones get "not available right now". */
   function busyLibs(s: Share): string[] {
-    const ids = s.kind === 'album' ? (s.library ? [s.library.id] : []) : s.libraries.map((l) => l.id);
-    return ids.filter((id) => {
-      const st = libraries.find(id)?.state;
-      return st === 'busy' || st === 'rebuilding';
-    });
+    const refs = s.kind === 'album' ? (s.library ? [s.library] : []) : s.libraries;
+    return refs
+      .filter((l) => {
+        const st = libraries.find(l.id)?.state;
+        return l.busy || st === 'busy' || st === 'rebuilding';
+      })
+      .map((l) => l.id);
   }
 
   const canPair = (s: Share) => !ro && sharing.on && s.state === 'active';
@@ -192,7 +194,7 @@
                 disabled={ro || working}
                 onchange={(e) => act(() => sharing.set({ address: e.currentTarget.value }))}
               >
-                {#each st.addresses as a (a.ip)}<option value={a.ip}>{a.ip} ({a.iface}{a.subnet ? `, ${a.subnet}` : ''})</option>{/each}
+                {#each st.addresses as a (a.ip)}<option value={a.ip}>{a.ip} ({a.iface}{a.subnet ? `, ${a.subnet}` : ''}{a.virtual ? ', virtual' : ''})</option>{/each}
               </select>
             {:else}
               <span class="mono">{st.address || st.addresses[0]?.ip || 'none found'}</span>
@@ -245,6 +247,7 @@
           <dd>
             {#if st.fingerprint.leaf}<span class="mono fp">SHA-256 {st.fingerprint.leaf}</span>{/if}
             {#if st.fingerprint.ca}<span class="mono fp muted">CA {st.fingerprint.ca}</span>{/if}
+            {#if !st.fingerprint.leaf && !st.fingerprint.ca}<span class="muted small block">The certificate is made when sharing is first turned on.</span>{/if}
             <span class="muted small block">
               On the first visit the phone warns that the connection is not private. Compare the start of the fingerprint in the phone's
               warning or padlock menu with the one here.
@@ -256,7 +259,7 @@
         {#if st.firewallHint}
           <details>
             <summary>If the phone cannot connect</summary>
-            <p class="small">The phone must be on the same Wi-Fi. A firewall on this computer may block it; picmover never changes firewall rules. To open the port:</p>
+            <p class="small">The phone must be on the same Wi-Fi. A firewall on this computer may block it; picmover never changes firewall rules.</p>
             <pre class="mono small">{st.firewallHint}</pre>
           </details>
         {/if}
@@ -297,6 +300,7 @@
             />
           </div>
           {#if s.approve}<p class="muted small">Asks on this computer before a phone is paired.</p>{/if}
+          {#if s.notice}<p class="notice small" role="status">{s.notice}</p>{/if}
 
           <div class="row buttons">
             <button class="primary" disabled={!canPair(s)} title={canPair(s) ? '' : sharing.on ? 'The share is not active' : 'Turn on sharing first'} onclick={() => (pairFor = s.id)}>
