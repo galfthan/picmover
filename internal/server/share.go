@@ -379,6 +379,7 @@ func (sh *sharing) Stop() {
 
 func (sh *sharing) stopLocked() {
 	wasOn := sh.state == shareOn || sh.state == sharePaused
+	sh.pairs.Reset() // first: a redeem waiting for approval ends now
 	sh.closeServerLocked()
 	if sh.stop != nil {
 		close(sh.stop)
@@ -389,7 +390,6 @@ func (sh *sharing) stopLocked() {
 		sh.autoOff = nil
 	}
 	sh.autoAt = time.Time{}
-	sh.pairs.Reset()
 	if sh.mgr != nil {
 		sh.mgr.Release()
 	}
@@ -487,8 +487,8 @@ func (sh *sharing) checkNetwork() {
 // pauseLocked closes the listener after a network change, keeping
 // share.lock: the Share page resumes it.
 func (sh *sharing) pauseLocked(reason string) {
-	sh.closeServerLocked()
 	sh.pairs.Reset()
+	sh.closeServerLocked()
 	sh.state, sh.reason = sharePaused, reason
 	sh.log.Info("Sharing on Wi-Fi paused: " + reason)
 }

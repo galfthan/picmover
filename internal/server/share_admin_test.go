@@ -547,3 +547,26 @@ func TestShareShutdownFlushes(t *testing.T) {
 		t.Fatalf("last seen %v, want %v", d.LastSeen, clk.Now())
 	}
 }
+
+func TestShareCookieRenewal(t *testing.T) {
+	f := newShareFixture(t)
+	c := f.pair(f.libraryShare().ID, "Anna")
+	clk := &fakeClock{t: time.Now()}
+	f.srv.share.now = clk.Now
+	defer func() { f.srv.share.now = time.Now }()
+	w := f.phone("GET", "/api/session", "", c)
+	wantStatus(t, w, http.StatusOK)
+	if sc := w.Header().Get("Set-Cookie"); sc != "" {
+		t.Fatalf("renewed a new cookie: %q", sc)
+	}
+	clk.Add(8 * 24 * time.Hour)
+	w = f.phone("GET", "/api/session", "", c)
+	wantStatus(t, w, http.StatusOK)
+	if sc := w.Header().Get("Set-Cookie"); sc != share.CookieFor(strings.TrimPrefix(c, share.CookieName+"=")) {
+		t.Fatalf("renewal Set-Cookie %q", sc)
+	}
+	w = f.phone("GET", "/api/session", "", c)
+	if sc := w.Header().Get("Set-Cookie"); sc != "" {
+		t.Fatalf("renewed twice: %q", sc)
+	}
+}
