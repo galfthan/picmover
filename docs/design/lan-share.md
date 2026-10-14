@@ -36,7 +36,7 @@ Sailfish OS 5.1 (Gecko-based, see "Browser behaviour").
 | Approval on the computer | Not by default. Each share has a setting "Ask on this computer before a phone is paired". |
 | Certificate install on the phone | Opt-in, offered only after Phase 0 shows the phone enforces the CA's name constraints |
 | After a restart | Sharing is off, unless the desktop app's "Keep sharing on" is set. `serve` shares only with `--share`. |
-| Tags, camera filters, map | Not on phones in this version |
+| Filters, map | Phones filter about as richly as the admin grid, read only and inside the share's scope: type, dates (range and every year), rating, camera, location, album, tags (library shares only) and size ("Filters on the phone"; changed from the first version, see Q7 in "Settled in review"). No map on phones. |
 
 Decisions this document makes (justified below):
 
@@ -346,6 +346,7 @@ All on the share listener only. Every route except `GET /api/session`,
 | GET | `/api/l/{lib}/library` | redacted summary `{id, name, summary: {total, images, raw, videos, earliest, latest}}` | ✓ | 404 (the library's size is not the guest's business) |
 | GET | `/api/l/{lib}/timeline` | as admin, scope-restricted | ✓ | ✓ (album forced) |
 | GET | `/api/l/{lib}/media` | as admin item JSON, scope-restricted, redacted by capability | ✓ | ✓ |
+| GET | `/api/l/{lib}/facets` | the filter sheet's choices, computed inside the scope ("Filters on the phone") | ✓ (with the library's tags and albums) | ✓ (the album's live members only; no tags, no albums) |
 | GET | `/api/l/{lib}/media/{id}` | redacted detail | visible rows | visible rows |
 | GET | `/api/l/{lib}/thumb/{hash}` | as admin | visible rows | visible rows |
 | GET | `/api/l/{lib}/preview/{hash}` | as admin | visible rows | visible rows |
@@ -378,16 +379,19 @@ ext, fileName, cameraMake, cameraModel, lens, displayable, thumbAt}`.
   1:1 view.
 - List items lose `rating` without `rate`, and `gps` without `location`.
 
-Filters accepted (a whitelist; anything else is 400): `type`, `from`,
-`to`, `recur`, `months`. In addition:
+Filters accepted on `timeline` and `media` (a whitelist; anything else
+is 400): `type`, `from`, `to`, `recur`, `months`, `camera`, `minpx`,
+`maxpx`. In addition:
 
-- `rating` needs `rate`;
-- `album` exists only in a library share, and must be an album of
-  `{lib}`;
-- an album share refuses `album` (the scope sets it).
+- `rating` needs `rate`, and `gps` needs `location` (400 without);
+- `album` and `tag` exist only in a library share; an `album` must be an
+  album of `{lib}` (404 otherwise), a `tag` that is not one of `{lib}`'s
+  simply matches nothing;
+- an album share refuses `album` (the scope sets it) and `tag` (tags are
+  the owner's labels on the whole library; see Q7).
 
-Always refused: `trashed`, `import`, `session`, `tag`, `camera`, `gps`,
-and unknown keys.
+Always refused: `trashed`, `import`, `session`, and unknown keys.
+`facets` takes no parameters at all.
 
 There are **no** routes for `/api/fs`, `/api/jobs*`, SSE, `/api/app*`,
 library open or create, tags, albums (write), imports, trash, transfer,
@@ -421,8 +425,9 @@ which libraries, albums or photos exist outside the scope:
    available right now."}`, and the same for rebuilding. The phone never
    sees holder pids or paths.
 4. **Scope check for the route:** library-level routes (`library`,
-   `albums`, and an `album` filter) need `auth.wholeLibrary()`, else
-   404.
+   `albums`) need `auth.wholeLibrary()`, else 404; so do the `album`
+   and `tag` filters (400) and the tags and albums of `facets` (left
+   out).
 5. **Row checks:**
    - `{id}` routes: `GetMedia`;
    - `{hash}` routes and ratings: a new `catalog.LiveByHash(ctx, hash)
@@ -1176,14 +1181,13 @@ Error screens:
 
 - **Top bar** (compact, 48 px). The title is the **share name**
   ("Summer guests"); in a library share, the library name follows it.
-  - In a library share: a Photos/Albums switch, a filter button (a
-    bottom sheet with Photos/Videos/All, rating ≥ 1–5 when `rate` is on,
-    and a year range), and a menu (Libraries, "Paired as Anna's iPhone",
-    Help).
+  - In a library share: a Photos/Albums switch, a **Filter** button
+    with the number of active filters (below), and a menu (Libraries,
+    "Paired as Anna's iPhone", Help).
   - In an album share: no library or album navigation at all. The album
-    name and photo count sit under the title, there is a filter button
-    with Photos/Videos/All and the year range, and the menu has "Paired
-    as …", the expiry ("Available until 13 Nov") and Help.
+    name and photo count sit under the title, there is the same Filter
+    button (filtering within the album), and the menu has "Paired as …",
+    the expiry ("Available until 13 Nov") and Help.
 - **Grid:** the timeline with month headers and the scrubber.
   - Column count by width: 3 in portrait under 500 CSS px, 4–5 in
     landscape or on tablets. Pinch-to-change-columns is later.
@@ -1211,7 +1215,7 @@ Error screens:
     video can still be seen as its poster.
 - **Hidden** (absent from the share bundle, not merely hidden): Import,
   Imports, Library stats, Map, Trash, Similar, Backups, Libraries
-  management, workspace setup, the selection bar, tags, the album editor,
+  management, workspace setup, the selection bar, tag editing, the album editor,
   move, the job pill, toasts about jobs, and the folder picker.
 - **Rating feedback:** optimistic, rolled back on error.
   - A 409 (a move runs on the library) shows "Ratings are paused while
@@ -1220,6 +1224,70 @@ Error screens:
     share, "no longer in this album").
   - A 403 (the capability was turned off meanwhile) re-reads the session
     and hides the stars.
+
+### Filters on the phone
+
+The phone filters about as richly as the admin grid, read only, within
+its share's scope:
+
+| Filter | Query | Library share | Album share |
+|---|---|---|---|
+| Type: All, Photos, Videos, RAW (RAW only when the scope has some) | `type` | ✓ | ✓ |
+| Dates, range: year chips (tap one year, a second for a range, the same again to clear) and From/To month and year pickers | `from`, `to` | ✓ | ✓ |
+| Dates, every year: a month grid, the admin's presets (Today, Christmas, New Year, Midsummer, Summer, This month) and a day range | `months`, `recur` | ✓ | ✓ |
+| Rating at least 1–5 | `rating` | with `rate` | with `rate` |
+| Camera (model) | `camera` | ✓ | ✓ (the album's cameras only) |
+| Has location | `gps` | with `location` | with `location` |
+| Album | `album` | ✓ (not on an album page, which is its album) | no |
+| Tags (every picked tag must match) | `tag` (repeated) | ✓ | no |
+| Size: Any, Small ≤ 1600, Full size ≥ 2000, Large ≥ 4000 | `minpx`, `maxpx` | ✓ | ✓ |
+
+- **Discoverable:** the top bar has a visible **Filter** button (an
+  icon and the word) with a badge counting the active filters. The
+  active filters sit above the grid as chips, one per filter (one per
+  tag), each with a × that removes just that filter; tapping a chip
+  opens the sheet; "Clear all" shows with two or more. An empty result
+  says "Nothing matches these filters" with Clear filters.
+- **The sheet** is a bottom sheet (88 % of the height at most, its own
+  scrolling, the header and the Clear all / Apply bar sticky) with one
+  section per filter. It edits a draft; Apply puts it in the route.
+  Long lists (camera, album, the date pickers) are native `<select>`s,
+  which every phone browser shows with its own picker (the Sailfish
+  Browser included; `<input type="date">` is not relied on). Every
+  target is at least 44 px; nothing needs hover; it fits 360 px.
+- **The route:** filters live in the hash query (`#/l/peter/?type=video&tag=3`,
+  `#/?months=6,7` in an album share), like the admin's, so Back, reload
+  and a link keep them. The lightbox route keeps the query, and the
+  lightbox turns pages within the filtered photos (its neighbours come
+  from the filtered grid). `share/filters.ts` reads the query and drops
+  whatever the share may not use (`rating` without `rate`, `gps`
+  without `location`, `album` and `tag` in an album share), so a stale
+  link never makes a request the server refuses.
+- **Facets:** the choices (types, years, cameras and the location count
+  with their numbers; a library share's tags and albums) come from
+  `GET /api/l/{lib}/facets`, read each time the sheet opens, and when
+  chips need tag or album names.
+
+**Security.** Every facet list is computed inside the share's scope by
+the same `restrict` as the timeline: an album share sees only the types,
+years, cameras and (with `location`) the location count of the album's
+live members, so the sheet never names a camera or a year that only
+photos outside the album have. A library share sees its own library's
+values, counted over live photos: tags and albums are listed only when
+they have live photos (a tag on trashed photos only, or an empty album,
+is left out). Facets are a fixed number of queries per request (three
+`GROUP BY`s over the scope; in a library share one read of every tag and
+album membership and one `LiveHashes` over their hashes), and the lists
+are bounded (100 cameras, 300 tags, 300 albums; the most used are kept).
+
+**Tags in album shares: none.** Tags are the owner's private labels
+on the whole library, like ratings ("blurry", "ex", "tax receipts"), and
+the detail never sends them. Showing the tags present on the album's
+photos would hand each guest the owner's labels for those photos. The
+album itself is the owner's selection, and type, dates, camera and size
+are enough to find things in it. So an album share has no tag section,
+`facets` sends no `tags`, and `tag` is 400. A `tags` capability (like
+`rate` for ratings) is a possible later addition if wanted.
 
 ### Responsive and touch work in shared components
 
@@ -1829,8 +1897,17 @@ numbers are the ones used there and in references above):
   cookies turn out to be the problem. Phase 0: cookies reach media and
   Range requests on Android Chrome and Sailfish; iOS is untested, so the
   `?t=` URL is not built.
-- **Q7 and Q8, tags, camera filters, map:** not on phones in this
-  version. GPS is a per-share capability (`location`), on for library
+- **Q7 and Q8, tags, camera filters, map:** first decided as "not on
+  phones in this version". **Changed afterwards:** the user wants rich
+  filtering on the phone, so phones filter by type, dates (range and
+  every year), rating (`rate`), camera, location (`location`), album
+  and tags (library shares) and size ("Filters on the phone"). Tags are
+  offered in library shares only: an album share gets no tag filter and
+  no tag list, because tags are the owner's private labels (like
+  ratings) and showing the album photos' tags would hand them to every
+  guest; the safe default, with a `tags` capability possible later.
+  Every facet list is computed inside the share's scope. The map stays
+  off phones. GPS is a per-share capability (`location`), on for library
   shares and off for album shares.
 - **Multiple shares** (a structural change, designed in now):
   - A share is a first-class object: a name, a scope, capabilities, an
@@ -1933,13 +2010,15 @@ internal/share/qr.go              QRSVG, QRTerminal (rsc.io/qr)
 internal/server/share.go          sharing: the listener's lifecycle (Start, Stop, restart, watch, checkNetwork, auto-off)
 internal/server/share_routes.go   shareRouteTable, shareMux, the share middleware, device auth, shareScoped, shareAcquire
 internal/server/share_scope.go    scopeAuth with librariesScope and albumScope
-internal/server/share_api.go      the phone's handlers (session, libraries, library, timeline, media, detail, file, albums, ratings)
+internal/server/share_api.go      the phone's handlers (session, libraries, library, timeline, media, detail, file, albums, ratings); the filter whitelist
+internal/server/share_facets.go   GET /api/l/{lib}/facets
 internal/server/share_pair.go     POST /api/pair, Server.shareState
 internal/server/share_static.go   the phone app's files and the "not built" page
 internal/server/share_admin.go    /api/share/* (admin listener)
 internal/server/share_public.go   Running.StartSharing/StopSharing/SharingStatus/SharesHere/Pair/KeepSharingOn, ShareWorkspace
-internal/catalog/manage.go        LiveByHash
-internal/userdata/albums.go       AlbumHas; peek.go: PeekAlbums (PeekLibraryID now reads through the same open)
+internal/catalog/manage.go        LiveByHash; facets.go: Facets (types, location, years, cameras of a filter)
+internal/userdata/albums.go       AlbumHas; peek.go: PeekAlbums (PeekLibraryID now reads through the same open);
+                                  tags.go: TagMembers, AlbumMembers (every membership in one query)
 cmd/serve.go                      --share, --share-port, --pair
 cmd/share.go                      picmover share list|create|set|revoke|delete
 internal/shell/tray.go            "Share on Wi-Fi"; shell.go: Keep sharing on at launch
@@ -1956,8 +2035,9 @@ web/src/components/ShareCapabilities.svelte, SharePill.svelte
 web/src/lib/sharing.svelte.ts           the store: GET /api/share (Share page, 2 s), GET /api/share/status (pill), every change
 web/src/lib/sharetext.ts                texts and expiry helpers; lib/api.ts: the admin types and lenient parsers
 web/share.html, web/src/share/          the phone app: main.ts (polyfills.ts first, --app-h), ShareApp, Pair, ShareLibraries,
-                                        ShareAlbums, ShareGrid, ShareLightbox, routes.ts, gestures.ts, session.svelte.ts,
-                                        shareapi.ts (the only module that knows share URLs), share.css
+                                        ShareAlbums, ShareGrid, ShareLightbox, ShareFilterSheet, ShareFilterChips, routes.ts,
+                                        filters.ts (the filters in the route, chips, date helpers), gestures.ts,
+                                        session.svelte.ts, shareapi.ts (the only module that knows share URLs), share.css
 web/scripts/check-share-apis.mjs        run by npm run build: Gecko 91 API/CSS rules (share-compat.mjs) and no admin URLs in share chunks
 ```
 
@@ -1981,10 +2061,10 @@ follows `dist/share.html` into every chunk it loads and fails on
 (`/api/jobs`, `/api/fs`, `/api/share`, `/api/app`) in a share chunk.
 `touch-action` is tolerated: every use has a touch-event fallback. The
 share bundle needs no polyfill today. The phone loads `share.html` plus
-four files: the share chunk (about 50 KiB, 18 KiB gzipped), the common
-chunk with the Svelte runtime and the shared components (about 64 KiB,
-24 KiB gzipped) and two stylesheets (about 18 KiB together); the admin
-entry is about 328 KiB plus Leaflet.
+four files: the share chunk (about 68 KiB, 24 KiB gzipped, with the
+filter sheet), the common chunk with the Svelte runtime and the shared
+components (about 71 KiB, 27 KiB gzipped) and two stylesheets (about
+22 KiB together); the admin entry is about 322 KiB plus Leaflet.
 
 ### Phone API (share listener)
 
@@ -2111,19 +2191,63 @@ in an album share.
 the admin shapes (`{"buckets": [{year, month, count}]}`, `{"items":
 [...]}`). Items keep `thumb` and `thumbAt`; `rating` is absent without
 `rate` (and when 0, as on the admin side), `gps` absent without
-`location`; `deletedAt` never appears. Query keys allowed: `type`,
-`from`, `to`, `recur`, `months`, `rating`, `album` (and `year`, `month`
-on `media` only); anything else is **400** `{"error": "invalid filter
-\"<key>\""}`. `rating` without `rate` is **400**, `album` in an album
-share **400**, an `album` that is not an album of `{lib}` **404**.
+`location`; `deletedAt` never appears. Query keys allowed: `type`
+(`image`, `image_raw`, `video`), `from`, `to` (YYYY-MM-DD, `to`
+exclusive), `recur` (`MM-DD` or `MM-DD..MM-DD`), `months` (`1,7,12`),
+`rating` (1–5), `album`, `tag` (repeatable, up to 32, all must match),
+`camera` (an exact model, at most 200 bytes), `gps` (`1`), `minpx`,
+`maxpx` (the longer edge, 1–1000000) (and `year`, `month` on `media`
+only); anything else is **400** `{"error": "invalid filter \"<key>\""}`,
+and a malformed value **400** naming the key. `rating` without `rate`
+and `gps` without `location` are **400** `{"error": "invalid filter
+\"rating\": not allowed in this share"}` (`"gps"` likewise); `album` or
+`tag` in an album share **400** `{"error": "invalid filter \"album\":
+this share is one album"}` (`"tag"` likewise); an `album` that is not
+an album of `{lib}` **404**.
 
-Client: sends `type` (`image` or `video`; "Photos" is `type=image`, RAW
-is under All), `from`, `to` (YYYY-01-01, `to` exclusive), `rating` (only
-with `rate`), `album` (library share only), and `year`, `month` on
-`media`; never `recur` or `months`. Items without a positive `id` or a
-hash are dropped. A 503 on a list shows "This library is not available
+Client: sends what the route query holds (`share/filters.ts`), in this
+order: `type`, `from`, `to`, `recur`, `months`, `rating` (only with
+`rate`), `album` (library share only), `camera`, `gps` (only with
+`location`), `tag`… (library share only), `minpx`, `maxpx`, and `year`,
+`month` on `media`. The sheet's From/To pickers set whole months
+(`from` the 1st, `to` the 1st of the next month), the year chips whole
+years. Items without a positive `id` or a hash are dropped. A 503 on a list shows "This library is not available
 right now (the computer is busy with it). Try again later." with Try
 again.
+
+`GET /api/l/{lib}/facets` (no query parameters; any is **400**): the
+filter sheet's choices, computed inside the scope by the same restrict
+as the timeline. A library share:
+
+```json
+{"total": 5123, "types": {"image": 4900, "image_raw": 100, "video": 123},
+ "years": [{"year": 2026, "count": 812}, {"year": 2025, "count": 1490}],
+ "undated": 12,
+ "cameras": [{"make": "Apple", "model": "iPhone 12", "count": 3011},
+             {"make": "Canon", "model": "EOS R5", "count": 1800}],
+ "gps": 2950,
+ "tags": [{"id": 3, "name": "beach", "count": 41}],
+ "albums": [{"id": 2, "name": "Summer", "count": 48}]}
+```
+
+`types`, `years` (newest first, dated photos), `undated` and `cameras`
+(most frequent first, at most 100, photos with a model) count the
+scope's live photos; `gps` (photos with a position) is sent only with
+`location`. `tags` and `albums` are sent only in a library share: the
+library's tags and albums with live photos, with their live counts,
+sorted by name (case-insensitively), at most 300 each (the most used
+kept). An album share's answer, over the album's live members:
+
+```json
+{"total": 48, "types": {"image": 45, "image_raw": 0, "video": 3},
+ "years": [{"year": 2026, "count": 48}], "undated": 0,
+ "cameras": [{"make": "Apple", "model": "iPhone 12", "count": 40}]}
+```
+
+Client: read when the filter sheet opens (and when the route has tags or
+an album, for the chips' names); `gps` is kept only with `location`,
+malformed entries are dropped. A failed read leaves the sheet usable
+with "Could not read the choices".
 
 `GET /api/l/{lib}/media/{id}`: exactly these keys (`dur` and `thumbAt`
 are always present, 0 when none; `takenAt`, `offset` may be null):
@@ -2378,7 +2502,9 @@ Frontend:
   (`#/l/<id>/albums/<aid>/view/<mid>` besides `#/l/<id>/view/<mid>` and
   `#/view/<mid>`), so a reload reopens it over the same grid. Opening
   from a tile pushes a history entry, so the phone's Back closes it.
-- The filter sheet's year range is two year fields.
+- The filter sheet's dates are year chips and month/year pickers
+  (native selects), plus the every-year months, presets and day range
+  ("Filters on the phone"); the first version had two year fields.
 - Swipes count only when they start 32 px or more from the left and
   right edges (the document suggested 24 px; Phase 0 showed the system
   takes edge swipes on Android and Sailfish). Without `touch-action` on
@@ -2452,8 +2578,13 @@ missing, malformed, wrong-secret and revoked cookies on every route,
 the exact `Set-Cookie`; paused, expired and unavailable on every route;
 the route × scope matrix (in scope, other album, unshared library,
 trashed, removed between requests, nonexistent, malformed) with list
-results checked against `AlbumHashes ∩ live`; the filter whitelist;
-the capability matrix; ratings (one hash, 409 during a move, the log
+results checked against `AlbumHashes ∩ live`, `facets` per scope; the
+filter whitelist (every allowed key and malformed values on `timeline`
+and `media`, refused keys, no parameters on `facets`); facets per scope
+(an album share lists only its members' cameras and years and never
+tags or albums; a library share's tags and albums only with live
+photos; removal from the album shows at once); the capability matrix
+(`rating` and `gps` filters, `gps` in facets); ratings (one hash, 409 during a move, the log
 line); redaction (exact detail keys, no paths); headers, CSP, no HSTS,
 Range; middleware (Host, Origin, Sec-Fetch-Site, mutation headers, body
 cap, lockout, pair limit, mDNS host); album identity (rename, empty,
@@ -2468,6 +2599,22 @@ status); one sharing process; shutdown flushing last seen; cookie
 renewal. `cmd`: `picmover share` end to end (including the ambiguous
 album and the refusal while held), `--expires` parsing, `serve --share`
 refusals and the printed URL, fingerprint, share line and pairing.
+
+Filters on the phone (`ShareApp.test.ts`, `share/filters.test.ts`,
+`share/shareapi.test.ts`): the Filter button and the sheet's sections
+per share kind and capability, from the facets; Apply into the route,
+the chips with their count, removing one chip, Clear all, a reload
+keeping them; every year (months, presets); the lightbox keeping the
+query and turning pages within the filtered photos; capability hiding
+(no rating or location sections, those keys dropped from the route); an
+album share's facets (no tags or albums, only the album's cameras) and a
+stale `tag`/`album`/`rating`/`gps` link never reaching the server; the
+query parser, chips, year chips and month pickers; the facets parser.
+The fake share listener answers `facets`, the new filters and their
+400s as the handlers do. A run by hand (headless Chromium at 360×760,
+touch, over the DevTools protocol, a scratch workspace) paired a library
+and an album share and used the sheet, chips and lightbox; no
+horizontal scroll, no console errors.
 
 Web (vitest against the fakes): `Share.test.ts` (the pill from
 `/api/share/status` on every page, counting only active shares and never
