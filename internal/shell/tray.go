@@ -33,6 +33,9 @@ func (a *app) trayHooks() trayHooks {
 		wsChanged: a.wsChanged, stop: a.done,
 		sharing: func() (string, string) {
 			st := a.run.SharingStatus()
+			if st.State == "paused" {
+				return st.State, st.Reason
+			}
 			return st.State, st.Address
 		},
 		setSharing: a.setSharing,
@@ -58,13 +61,16 @@ func (a *app) setSharing(on bool) {
 }
 
 // shareLabel is the "Share on Wi-Fi" item's title and whether it is
-// checked.
-func shareLabel(state, address string) (title string, checked bool) {
+// checked; detail is the address while on, the reason while paused.
+func shareLabel(state, detail string) (title string, checked bool) {
 	switch state {
 	case "on":
-		return "Share on Wi-Fi (" + address + ")", true
+		return "Share on Wi-Fi (" + detail + ")", true
 	case "paused":
-		return "Share on Wi-Fi (paused: network changed)", true
+		if detail == "" || len(detail) > 40 {
+			return "Share on Wi-Fi (paused)", true
+		}
+		return "Share on Wi-Fi (paused: " + detail + ")", true
 	}
 	return "Share on Wi-Fi", false
 }

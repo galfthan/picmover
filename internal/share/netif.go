@@ -178,6 +178,48 @@ func Compare(home Home, iface string, bound net.IP, cands []Candidate, gw net.IP
 	return NetPause, Candidate{}
 }
 
+// Network places of Locate.
+const (
+	NetHome = "home" // a candidate on the home network
+	NetAway = "away" // another network
+	NetNone = "none" // no LAN address at all (Wi-Fi down, asleep): transient
+)
+
+// Locate finds the home network among cands: NetHome with the candidate
+// to bind (on interface iface when it has one), NetAway when a
+// non-virtual candidate is on another network or the gateway differs,
+// NetNone when there is no non-virtual candidate (only container or VPN
+// networks, or nothing). A virtual candidate counts as home only on the
+// interface the user chose.
+func Locate(home Home, iface string, cands []Candidate, gw net.IP) (string, Candidate) {
+	lan := false
+	for _, c := range cands {
+		lan = lan || !c.Virtual
+	}
+	if !sameGateway(home.Gateway, gw) {
+		if lan {
+			return NetAway, Candidate{}
+		}
+		return NetNone, Candidate{}
+	}
+	var found *Candidate
+	for i, c := range cands {
+		if c.Subnet.String() != home.Subnet || (c.Virtual && c.Iface != iface) {
+			continue
+		}
+		if found == nil || (c.Iface == iface && found.Iface != iface) {
+			found = &cands[i]
+		}
+	}
+	switch {
+	case found != nil:
+		return NetHome, *found
+	case lan:
+		return NetAway, Candidate{}
+	}
+	return NetNone, Candidate{}
+}
+
 func sameGateway(home string, gw net.IP) bool {
 	if home == "" || gw == nil {
 		return true

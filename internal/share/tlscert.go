@@ -273,11 +273,31 @@ func LoadCerts(dir, hostname string, now time.Time) (*Certs, error) {
 // and stores a new one; force always reissues (Renew certificate). It
 // reports whether it reissued.
 func (c *Certs) Ensure(ips []net.IP, dns []string, now time.Time, force bool) (bool, error) {
+	if force {
+		return c.issue(ips, dns, now)
+	}
+	return c.EnsureFor(ips, ips, dns, now)
+}
+
+// EnsureFor keeps the leaf when it fits need (the bound address and
+// 127.0.0.1) and dns, else issues one for all (need plus the machine's
+// other LAN addresses). A new interface coming up therefore does not
+// reissue the leaf, which would show every phone the certificate warning
+// again; the bound address changing, the name or expiry does.
+func (c *Certs) EnsureFor(need, all []net.IP, dns []string, now time.Time) (bool, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cur := c.leaf.Load(); cur != nil && !force && LeafFits(*cur, c.CA, ips, dns, now) {
+	cur := c.leaf.Load()
+	c.mu.Unlock()
+	if cur != nil && LeafFits(*cur, c.CA, need, dns, now) {
 		return false, nil
 	}
+	return c.issue(all, dns, now)
+}
+
+// issue makes and stores a new leaf for ips and dns.
+func (c *Certs) issue(ips []net.IP, dns []string, now time.Time) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	leaf, err := NewLeaf(c.CA, c.caKey, ips, dns, now)
 	if err != nil {
 		return false, err

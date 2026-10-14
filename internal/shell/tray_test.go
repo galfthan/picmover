@@ -25,7 +25,9 @@ func TestTrayLabels(t *testing.T) {
 		checked               bool
 	}{
 		{"on", "192.168.1.20", "Share on Wi-Fi (192.168.1.20)", true},
-		{"paused", "192.168.1.20", "Share on Wi-Fi (paused: network changed)", true},
+		{"paused", "network changed", "Share on Wi-Fi (paused: network changed)", true},
+		{"paused", "waiting for the home network", "Share on Wi-Fi (paused: waiting for the home network)", true},
+		{"paused", "turn sharing on once on the Share page to record the home network", "Share on Wi-Fi (paused)", true},
 		{"off", "", "Share on Wi-Fi", false},
 		{"error", "", "Share on Wi-Fi", false},
 	} {
