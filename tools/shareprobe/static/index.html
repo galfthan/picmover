@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>picmover share probe</title>
+<link rel="stylesheet" href="/static/probe.css">
+<script type="application/json" id="cfg">{/*CONFIG*/}</script>
+<script src="/static/probe.js" defer></script>
+<script type="module" src="/static/svelte/probe.js"></script>
+</head>
+<body>
+<header>
+  <h1>picmover share probe</h1>
+  <p id="who" class="muted"></p>
+</header>
+
+<section id="banner" class="banner" hidden></section>
+
+<section id="pairbox" class="panel" hidden>
+  <h2>Pair this browser</h2>
+  <p id="pairmsg"></p>
+  <form id="codeform">
+    <label>Code shown in the terminal
+      <input id="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" maxlength="9">
+    </label>
+    <button type="submit">Pair</button>
+  </form>
+</section>
+
+<section id="later" class="panel" hidden>
+  <h2>Later visit</h2>
+  <p>Answer these when you come back after closing the browser (or after a day or a week).</p>
+  <p id="laterinfo" class="muted"></p>
+  <div class="q">
+    <p><b>Item 2:</b> Did you fully close the browser (swipe it away / quit) and reopen it before opening this page?</p>
+    <button data-answer="2.reopen" data-value="yes">Yes, I reopened it</button>
+    <button data-answer="2.reopen" data-value="no" class="secondary">No</button>
+  </div>
+  <div class="q">
+    <p><b>Item 7:</b> Did the certificate warning appear again just now?</p>
+    <button data-answer="7.cert-persist" data-value="warned">Yes, it warned again</button>
+    <button data-answer="7.cert-persist" data-value="nowarn">No warning</button>
+  </div>
+</section>
+
+<ol id="items" class="items"></ol>
+
+<section class="panel" id="videos-panel">
+  <h2>Item 4: videos</h2>
+  <p class="muted">Each plays muted on its own; tap play if it does not.</p>
+  <div id="videos"></div>
+  <p><a id="dl" class="button" download href="#">Download original (JPEG)</a></p>
+  <div class="q">
+    <p>Did the download save a file (check the browser's downloads)?</p>
+    <button data-answer="4.download" data-value="saved">Saved</button>
+    <button data-answer="4.download" data-value="failed" class="secondary">Did not work</button>
+  </div>
+  <p><img id="img" alt="test image" width="200" height="120"></p>
+</section>
+
+<section class="panel">
+  <h2>Item 5: Svelte 5 bundle</h2>
+  <div id="svelte-root"><p class="muted">(the Svelte component mounts here)</p></div>
+</section>
+
+<section class="panel">
+  <h2>Item 6: <code>.local</code> name</h2>
+  <p><a id="locallink" class="button" href="#">Open the .local page</a></p>
+  <p class="muted">It opens in this tab; it may show a certificate warning (another host name). Come back with Back.</p>
+  <button data-answer="6.local" data-value="noload" class="secondary">It did not load (“server not found”)</button>
+</section>
+
+<section class="panel" id="swipe-panel">
+  <h2>Item 8: swipes</h2>
+  <p>Swipe sideways across the grey box: three times starting at the very <b>left edge</b> of the screen, three times from the <b>middle</b>, three times from the very <b>right edge</b>.</p>
+  <div id="swipe" class="swipe"><span>swipe here</span></div>
+  <p id="swipestat" class="mono"></p>
+  <button id="swipesend">Send swipe results</button>
+</section>
+
+<section class="panel">
+  <h2>Item 10: installed CA and name constraints (optional)</h2>
+  <ol class="steps">
+    <li>Install the CA: <a id="cacrt" href="/ca.crt">ca.crt</a> (iPhone: allow the profile, then Settings → General → VPN &amp; Device Management → install; then Settings → General → About → Certificate Trust Settings → turn on full trust. Android: download it, then Settings → Security → Encryption &amp; credentials → Install a certificate → CA certificate. Sailfish: <a href="/ca.pem">ca.pem</a>, then Settings → Certificates, or the browser's own prompt).</li>
+    <li>Reopen this page: it should now load <b>without</b> a warning.</li>
+    <li>Open <a id="outsidelink" href="#">the constraint page</a>. Its certificate also names <code>constraint-test.example.com</code>, which the CA is not allowed to vouch for: a phone that enforces name constraints <b>must warn</b> there.</li>
+  </ol>
+  <div class="q">
+    <p>After installing, did this page open without a warning?</p>
+    <button data-answer="10.ca-installed" data-value="trusted">No warning (trusted)</button>
+    <button data-answer="10.ca-installed" data-value="warned" class="secondary">Still warned</button>
+  </div>
+  <div class="q">
+    <p>Did the constraint page warn?</p>
+    <button data-answer="10.ca-constraints" data-value="warned">Yes, it warned (good)</button>
+    <button data-answer="10.ca-constraints" data-value="nowarn" class="secondary">No warning (constraints ignored)</button>
+  </div>
+</section>
+
+<section class="panel">
+  <button id="send">Send results again</button>
+  <p id="sent" class="muted"></p>
+  <details><summary>Details</summary><pre id="raw" class="mono"></pre></details>
+</section>
+</body>
+</html>

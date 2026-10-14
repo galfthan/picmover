@@ -1658,6 +1658,64 @@ OS 5.1 phone (Sailfish Browser)**:
    capabilities, the Gecko 91 build target and polyfills. Web tests.
 4. **E2E target and the manual checklist on devices. README section.**
 
+## Phase 0 probe
+
+`tools/shareprobe` is the Phase 0 spike: a separate `main` package in
+the module, never linked into picmover, that serves a self-checking test
+page to the phones. It uses the design's TLS setup (the name-constrained
+P-256 CA and a 397-day leaf for the LAN address, `127.0.0.1` and
+`<hostname>.local`), the planned response headers and CSP, no HSTS, and
+the real `__Host-picmover` cookie. Its only `go.mod` change is
+`rsc.io/qr` v0.2.0 (Q12's recommendation; pure Go, no dependencies),
+which the product would use for its QR codes anyway.
+
+Run it on the computer (ffmpeg on `PATH` makes the test clips):
+
+```
+go build -tags nodynamic ./tools/shareprobe
+./shareprobe -dir ~/.cache/picmover-shareprobe   # keep the dir for the later-visit items
+```
+
+It prints the URLs, both SHA-256 fingerprints, the firewall commands
+(ufw and firewalld, to run by hand and undo afterwards), per-phone steps,
+and a QR code for `https://<ip>:7443/pair#<token>` and the `.local`
+variant (also written to `pair-qr.png`). A phone without a scanner types
+the short `https://<ip>:7443/pair#<code>` instead, which tests the
+fragment the same way. Flags: `-ip` (another interface), `-port`,
+`-clips DIR` (add real iPhone or Android recordings), `-v` (every page
+load and media request), `-qr-invert`.
+
+The page runs the checklist by itself, shows PASS/FAIL per item, and
+posts every snapshot (with the user agent) to the probe, which appends
+it to `<dir>/results.jsonl` and prints a one-line summary. Each media
+request (cookie present, Range header, status) goes to `<dir>/media.log`.
+Devices are kept in `<dir>/devices.json`, so the later-visit items work
+across probe restarts.
+
+| Item | Measures | Settles |
+|---|---|---|
+| 1 | The pairing token in the fragment survives the certificate interstitial; the POST sets the cookie, which comes back and is invisible to script | Redeem step 5 (code form needed as the main path or only as fallback) |
+| 2 | The cookie on a fetch, a scripted top-level navigation, a reload, and (manual) after closing and reopening the browser, with the hours since pairing | "Staying signed in"; the `SameSite=Strict` choice for navigations |
+| 3 | The cookie on `<img>`, `<video>` (and its Range requests) and a download, counted by the server | Q5 (whether the `?t=` media URL is needed) |
+| 4 | H.264/AAC MP4, HEVC MP4 and MOV (`hvc1`), VP9/Opus WebM, AV1 WebM and MP4, each `<video playsinline>` with Range; `canPlayType`, events, errors; `<a download>` of an original | The `<video>` row of the browser table; the iOS media-process risk; the Download fallback |
+| 5 | A Svelte 5 component built with the repo's toolchain for `es2020, firefox91, safari15, chrome100` mounts and updates under the planned CSP; feature detection for `Object.hasOwn`, `structuredClone`, `findLast`, `toSorted`, `dvh`, `:has()`, container queries, nesting, `color-mix()`, observers, pointer and touch events, fetch `keepalive`, `Intl` | Q13 and the Sailfish build target and polyfill list |
+| 6 | The `.local` URL loads (a background fetch, and a link that reports in from the other host) | Q9 |
+| 7 | Whether the certificate warning comes back on a later visit (manual yes/no, kept with the hours since pairing) | "How long the exception lasts" |
+| 8 | Touch starts and completed swipes within 24 px of each screen edge vs the middle | The Sailfish edge-gesture margin |
+| 9 | A thumbnail served `private, max-age=3600` with an ETag: is a second fetch, and a later visit's `<img>`, served from the HTTP cache (the server counts 200s and 304s) | "HTTP cache over an excepted certificate"; rendition caching |
+| 10 | After installing the CA (`/ca.crt`, DER, `application/x-x509-ca-cert`; `/ca.pem` for Sailfish): the page loads without a warning, and port 7444, whose leaf also names `constraint-test.example.com`, still warns | Q3 (offer the install only where constraints are enforced) |
+
+Run on a desktop (headless Chromium with `--ignore-certificate-errors`,
+and with the leaf trusted through `--ignore-certificate-errors-spki-list`),
+every automatic item passed except item 9, which failed with the
+ignore flag and passed with the trusted leaf. That matches the
+expectation that Chrome does not cache over a certificate error. OpenSSL
+(curl) refuses the port 7444 leaf under the CA. The Svelte bundle is
+committed (`tools/shareprobe/static/svelte/probe.js`); rebuild it with
+`(cd web && npm ci) && node tools/shareprobe/svelte/build.mjs`, which
+also lists any post-Gecko-91 APIs in the output (none for Svelte
+5.57.1).
+
 ## Settled in review
 
 Decisions by the user on the first version of this document (the Q
