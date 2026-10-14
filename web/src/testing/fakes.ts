@@ -165,6 +165,26 @@ export interface FakeImport {
   cover?: string | null;
 }
 
+/** A share as the fake admin API keeps it (docs/design/lan-share.md "Shares"). */
+export interface FakeShare {
+  id: string;
+  name: string;
+  kind: 'libraries' | 'album';
+  /** The shared libraries; an album share's one library. */
+  libraries: string[];
+  album: number;
+  /** The album's name when the share was made (shown once the album is gone). */
+  albumName: string;
+  /** The album was deleted or its id reused (the share is broken). */
+  albumMissing: boolean;
+  capabilities: { video: boolean; download: boolean; rate: boolean; location: boolean };
+  expiresAt: string | null;
+  paused: boolean;
+  approve: boolean;
+  createdAt: string;
+  devices: { id: string; name: string; pairedAt: string; lastSeen: string; lastAddress: string; browser: string }[];
+}
+
 interface FakeClass {
   count: number;
   bytes: number;
@@ -1027,6 +1047,247 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     return json({ error: 'not found' }, 404);
   }
 
+  /**
+   * Sharing on the home Wi-Fi, admin side (docs/design/lan-share.md
+   * "Admin API"): the global switch and the shares with their devices, as
+   * the server would keep them. `supported: false` answers 404 (an older
+   * server). Tests pair phones with `pairPhone`, add approval requests to
+   * `requests`, and change shares in place.
+   */
+  const sharing = {
+    supported: true,
+    state: 'off' as 'off' | 'on' | 'paused' | 'error',
+    reason: '',
+    port: 7443,
+    address: '192.168.1.20',
+    addresses: [
+      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24' },
+      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24' },
+    ],
+    fingerprint: { leaf: 'AB:CD:EF:01:23:45:67:89', ca: '12:34:56:78:9A:BC:DE:F0' },
+    keepOn: false,
+    mdns: false,
+    autoOff: { mode: 'quit', until: null as string | null },
+    managedElsewhere: null as { pid: number; cmd: string } | null,
+    firewallHint: 'sudo ufw allow from 192.168.1.0/24 to any port 7443 proto tcp',
+    shares: [] as FakeShare[],
+    /** Approval requests per share id. */
+    requests: new Map<string, { id: string; name: string; browser: string; address: string; at: string }[]>(),
+    /** Open pairings per share id (the token's tail), as issued. */
+    pairings: new Map<string, string>(),
+    nextId: 1,
+  };
+
+  const sharingNow = () => new Date().toISOString();
+  function shareStateOf(s: FakeShare): string {
+    if (s.paused) return 'paused';
+    if (s.expiresAt && Date.parse(s.expiresAt) <= Date.now()) return 'expired';
+    if (s.kind === 'album' && (s.albumMissing || !albums.some((a) => a.id === s.album))) return 'gone';
+    if (s.kind === 'album' && !libs.some((l) => l.id === s.libraries[0])) return 'gone';
+    return 'active';
+  }
+  function shareJSON(s: FakeShare) {
+    const libRef = (id: string) => {
+      const l = libs.find((x) => x.id === id);
+      return l ? { id, name: l.name } : { id, name: id, missing: true };
+    };
+    const a = albums.find((x) => x.id === s.album);
+    const scope =
+      s.kind === 'album'
+        ? {
+            library: libRef(s.libraries[0] ?? ''),
+            album: a && !s.albumMissing ? { id: a.id, name: a.name, count: a.hashes.length } : { id: s.album, name: s.albumName, count: 0, missing: true },
+          }
+        : { libraries: s.libraries.map(libRef) };
+    return {
+      id: s.id,
+      name: s.name,
+      kind: s.kind,
+      scope,
+      capabilities: { ...s.capabilities },
+      expiresAt: s.expiresAt,
+      state: shareStateOf(s),
+      approve: s.approve,
+      createdAt: s.createdAt,
+      devices: s.devices.map((d) => ({ ...d })),
+    };
+  }
+  function sharingJSON() {
+    const on = sharing.state === 'on';
+    return {
+      state: sharing.state,
+      ...(sharing.reason ? { reason: sharing.reason } : {}),
+      ...(on ? { url: `https://${sharing.address}:${sharing.port}/` } : {}),
+      ...(on && sharing.mdns ? { mdnsUrl: `https://laptop.local:${sharing.port}/` } : {}),
+      port: sharing.port,
+      address: sharing.address,
+      addresses: sharing.addresses,
+      fingerprint: sharing.fingerprint,
+      keepOn: sharing.keepOn,
+      autoOff: sharing.autoOff.until ? sharing.autoOff : { mode: sharing.autoOff.mode },
+      ...(sharing.managedElsewhere ? { managedElsewhere: sharing.managedElsewhere } : {}),
+      firewallHint: sharing.firewallHint,
+      shares: sharing.shares.map(shareJSON),
+    };
+  }
+  const CAPS = ['video', 'download', 'rate', 'location'] as const;
+  function capsFrom(v: unknown, kind: string): FakeShare['capabilities'] {
+    const all = kind !== 'album';
+    const c = { video: true, download: all, rate: all, location: all };
+    if (v && typeof v === 'object') for (const k of CAPS) if (typeof (v as Record<string, unknown>)[k] === 'boolean') c[k] = (v as Record<string, boolean>)[k]!;
+    return c;
+  }
+  /** Simulates a phone redeeming a pairing of share `sid` (the server side of POST /api/pair on the share listener). */
+  function pairPhone(sid: string, name = "Anna's iPhone", browser = 'Safari on iPhone') {
+    const s = sharing.shares.find((x) => x.id === sid);
+    if (!s) throw new Error(`no fake share ${sid}`);
+    const d = { id: `d_${(sharing.nextId++).toString(16).padStart(16, '0')}`, name, pairedAt: sharingNow(), lastSeen: sharingNow(), lastAddress: '192.168.1.34', browser };
+    s.devices.push(d);
+    sharing.pairings.delete(sid);
+    return d;
+  }
+  /** Adds a share directly (as `picmover share create` would have). */
+  function addShare(p: Partial<FakeShare> & { name: string; kind: 'libraries' | 'album' }): FakeShare {
+    const s: FakeShare = {
+      id: `s_${(sharing.nextId++).toString(16).padStart(16, '0')}`,
+      libraries: p.kind === 'album' ? ['peter'] : ['peter'],
+      album: 0,
+      albumName: '',
+      albumMissing: false,
+      capabilities: capsFrom(undefined, p.kind),
+      expiresAt: null,
+      paused: false,
+      approve: false,
+      createdAt: sharingNow(),
+      devices: [],
+      ...p,
+    };
+    sharing.shares.push(s);
+    return s;
+  }
+
+  function shareRoute(p: string, method: string, body: Record<string, unknown>): Response {
+    if (!sharing.supported) return json({ error: 'not found' }, 404);
+    const write = method === 'POST';
+    if (write && sharing.managedElsewhere) return json({ error: `sharing is managed by picmover pid ${sharing.managedElsewhere.pid}` }, 409);
+    if (p === '/api/share' && method === 'GET') return json(sharingJSON());
+    if (p === '/api/share' && write) {
+      if (typeof body.enabled === 'boolean') sharing.state = body.enabled ? 'on' : 'off';
+      if (body.enabled === true) sharing.reason = '';
+      if (typeof body.address === 'string') {
+        if (!sharing.addresses.some((a) => a.ip === body.address)) return json({ error: 'not an address of this computer' }, 400);
+        sharing.address = body.address;
+      }
+      if (body.port !== undefined) {
+        if (typeof body.port !== 'number' || body.port < 1024 || body.port > 65535) return json({ error: 'port: want 1024-65535' }, 400);
+        sharing.port = body.port;
+      }
+      if (typeof body.keepOn === 'boolean') sharing.keepOn = body.keepOn;
+      if (typeof body.mdns === 'boolean') sharing.mdns = body.mdns;
+      if (typeof body.autoOff === 'string') {
+        if (!['never', '1h', '4h', 'quit'].includes(body.autoOff)) return json({ error: 'autoOff: want never, 1h, 4h or quit' }, 400);
+        const h = body.autoOff === '1h' ? 1 : body.autoOff === '4h' ? 4 : 0;
+        sharing.autoOff = { mode: body.autoOff, until: h ? new Date(Date.now() + h * 3600_000).toISOString() : null };
+      }
+      return json(sharingJSON());
+    }
+    if (p === '/api/share/cert/renew' && write) {
+      sharing.fingerprint = { ...sharing.fingerprint, leaf: '99:88:77:66:55:44:33:22' };
+      return json(sharingJSON());
+    }
+    if (p === '/api/share/shares' && write) {
+      const sc = (body.scope ?? {}) as Record<string, unknown>;
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!name) return json({ error: 'name is required' }, 400);
+      let s: FakeShare;
+      if (sc.kind === 'libraries') {
+        const ids = Array.isArray(sc.libraries) ? (sc.libraries as string[]) : [];
+        if (!ids.length) return json({ error: 'scope: no libraries' }, 400);
+        if (ids.some((id) => !libs.some((l) => l.id === id))) return json({ error: 'scope: unknown library' }, 400);
+        s = addShare({ name, kind: 'libraries', libraries: ids });
+      } else if (sc.kind === 'album') {
+        const a = albums.find((x) => x.id === sc.album);
+        if (sc.library !== 'peter' || !a) return json({ error: 'scope: unknown album' }, 400);
+        s = addShare({ name, kind: 'album', libraries: ['peter'], album: a.id, albumName: a.name, expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString() });
+      } else return json({ error: 'scope: unknown kind' }, 400);
+      s.capabilities = capsFrom(body.capabilities, s.kind);
+      if (typeof body.expiresIn === 'number') s.expiresAt = new Date(Date.now() + body.expiresIn * 1000).toISOString();
+      else if (body.expiresAt === null) s.expiresAt = null;
+      else if (typeof body.expiresAt === 'string') s.expiresAt = body.expiresAt;
+      s.approve = body.approve === true;
+      return json(shareJSON(s), 201);
+    }
+    const dm = /^\/api\/share\/devices\/([^/]+)(\/revoke)?$/.exec(p);
+    if (dm && write) {
+      for (const s of sharing.shares) {
+        const d = s.devices.find((x) => x.id === dm[1]);
+        if (!d) continue;
+        if (dm[2]) {
+          s.devices.splice(s.devices.indexOf(d), 1);
+          return new Response(null, { status: 204 });
+        }
+        if (typeof body.name !== 'string' || !body.name.trim()) return json({ error: 'name is required' }, 400);
+        d.name = body.name.trim();
+        return json({ ...d });
+      }
+      return json({ error: 'no such device' }, 404);
+    }
+    const m = /^\/api\/share\/shares\/([^/]+)(\/delete|\/revoke-all|\/pairings|\/pairings\/cancel|\/requests(?:\/([^/]+))?)?$/.exec(p);
+    if (!m) return json({ error: 'not found' }, 404);
+    const s = sharing.shares.find((x) => x.id === m[1]);
+    if (!s) return json({ error: 'no such share' }, 404);
+    const sub = m[2] ?? '';
+    if (method === 'GET' && sub === '/requests') return json(sharing.requests.get(s.id) ?? []);
+    if (!write) return json({ error: 'not found' }, 404);
+    switch (sub) {
+      case '':
+        if (body.kind !== undefined || body.album !== undefined || body.scope !== undefined) return json({ error: 'the kind and album of a share cannot change' }, 400);
+        if (typeof body.name === 'string') s.name = body.name.trim();
+        if (Array.isArray(body.libraries)) {
+          if (s.kind !== 'libraries') return json({ error: 'libraries: only for a library share' }, 400);
+          s.libraries = body.libraries as string[];
+        }
+        if (body.capabilities !== undefined) s.capabilities = capsFrom(body.capabilities, s.kind);
+        if ('expiresAt' in body) s.expiresAt = (body.expiresAt as string | null) ?? null;
+        if (typeof body.paused === 'boolean') s.paused = body.paused;
+        if (typeof body.approve === 'boolean') s.approve = body.approve;
+        return json(shareJSON(s));
+      case '/delete':
+        sharing.shares.splice(sharing.shares.indexOf(s), 1);
+        return new Response(null, { status: 204 });
+      case '/revoke-all':
+        s.devices = [];
+        return json(shareJSON(s));
+      case '/pairings': {
+        if (sharing.state !== 'on') return json({ error: 'sharing is off' }, 409);
+        if (shareStateOf(s) !== 'active') return json({ error: `the share is ${shareStateOf(s)}` }, 409);
+        const token = `tok${sharing.nextId++}`;
+        sharing.pairings.set(s.id, token);
+        return json({
+          url: `https://${sharing.address}:${sharing.port}/#/pair/${token}`,
+          code: 'K7QM-3XRD',
+          qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><path d="M0 0h7v7H0z"/></svg>',
+          expiresAt: new Date(Date.now() + 120_000).toISOString(),
+        });
+      }
+      case '/pairings/cancel':
+        sharing.pairings.delete(s.id);
+        return new Response(null, { status: 204 });
+      default: {
+        const rid = m[3];
+        const list = sharing.requests.get(s.id) ?? [];
+        const r = list.find((x) => x.id === rid);
+        if (!r) return json({ error: 'no such request' }, 404);
+        sharing.requests.set(
+          s.id,
+          list.filter((x) => x !== r),
+        );
+        if (body.approve === true) pairPhone(s.id, r.name, r.browser);
+        return new Response(null, { status: 204 });
+      }
+    }
+  }
+
   function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = new URL(String(input), 'http://127.0.0.1:7439');
     const method = init?.method ?? 'GET';
@@ -1037,6 +1298,8 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     const unset = json({ error: 'no workspace', state: 'unset' }, 409);
     if (p === '/api/app' || p.startsWith('/api/app/')) {
       res = appRoute(p, method, body);
+    } else if (p === '/api/share' || p.startsWith('/api/share/')) {
+      res = shareRoute(p, method, body);
     } else if (p === '/api/libraries' && method === 'GET') {
       res = json(listing());
     } else if (ws.mode === 'unset' && (p.startsWith('/api/libraries') || p.startsWith('/api/l/'))) {
@@ -1115,7 +1378,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, transfer, ws, libraryFolders, app, install, posts, finish, finishTransfer };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, transfer, ws, libraryFolders, app, sharing, install, posts, finish, finishTransfer, pairPhone, addShare };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;

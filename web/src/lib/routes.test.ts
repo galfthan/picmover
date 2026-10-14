@@ -28,6 +28,14 @@ describe('app routes', () => {
     expect(app('#/l/peter/view/x')).toEqual(lib('peter', 'view', { viewId: null }));
   });
 
+  it('parse the Share page', () => {
+    expect(app('#/share')).toEqual({ kind: 'share' });
+    expect(app('#/share?album=peter:2')).toEqual({ kind: 'share' });
+    expect(app('#/share/x')).toEqual({ kind: 'notfound' });
+    expect(redirectFor({ kind: 'share' }, parseHash('#/share'), { mode: 'single', singleId: 'peter' })).toBeNull();
+    expect(redirectFor({ kind: 'share' }, parseHash('#/share'), { mode: 'workspace', singleId: null })).toBeNull();
+  });
+
   it('decode the library id', () => {
     expect(app('#/l/my%20photos%231/map')).toEqual(lib('my photos#1', 'map'));
   });

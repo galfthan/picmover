@@ -10,7 +10,10 @@
   import { toasts } from '../lib/toast.svelte';
   import { formatCount } from '../lib/format';
   import { libHref, libPath } from '../lib/routes';
+  import { sharing } from '../lib/sharing.svelte';
   import Grid from './Grid.svelte';
+  import ShareDialog from '../components/ShareDialog.svelte';
+  import PairDialog from '../components/PairDialog.svelte';
 
   interface Props {
     api: LibApi;
@@ -32,6 +35,13 @@
   );
 
   const album = $derived(library.albums.find((a) => a.id === albumId) ?? null);
+
+  // Sharing (docs/design/lan-share.md "Entry points"): "Share…" opens the
+  // share dialog for this album; when shares of it exist the button reads
+  // "Shared (n)" and links to them on the Share page.
+  const shares = $derived(sharing.sharesOfAlbum(api.id, albumId));
+  let sharingOpen = $state(false);
+  let pairFor = $state<string | null>(null);
   let working = $state(false);
 
   async function setCover() {
@@ -57,6 +67,13 @@
       <h1>{album?.name ?? `Album #${albumId}`}</h1>
       {#if album}<span class="muted">{formatCount(album.count)} {album.count === 1 ? 'item' : 'items'}</span>{/if}
       <span class="spacer"></span>
+      {#if sharing.supported && sharing.loaded}
+        {#if shares.length}
+          <a class="btn small" href="#/share?album={encodeURIComponent(`${api.id}:${albumId}`)}" title="Show the shares of this album">Shared ({shares.length})</a>
+        {:else}
+          <button class="small" disabled={sharing.readOnly} onclick={() => (sharingOpen = true)} title="Share this album with phones on your Wi-Fi">Share…</button>
+        {/if}
+      {/if}
       <button
         class="small"
         disabled={selection.size !== 1 || working}
@@ -66,6 +83,12 @@
     </div>
   {/snippet}
 </Grid>
+{#if sharingOpen}
+  <ShareDialog mode={{ kind: 'create', shareKind: 'album', library: api.id, album: albumId }} onclose={() => (sharingOpen = false)} onpair={(s) => (pairFor = s.id)} />
+{/if}
+{#if pairFor}
+  <PairDialog shareId={pairFor} onclose={() => (pairFor = null)} />
+{/if}
 
 <style>
   .ahead {

@@ -12,6 +12,8 @@
   import { viewerClosed } from './lib/viewer';
   import { libApi, setUnavailableHandler, type LibApi } from './lib/api';
   import JobPill from './components/JobPill.svelte';
+  import SharePill from './components/SharePill.svelte';
+  import SharePage from './pages/Share.svelte';
   import Lightbox from './components/Lightbox.svelte';
   import MoveDialog from './components/MoveDialog.svelte';
   import { moves } from './lib/moves.svelte';
@@ -105,6 +107,11 @@
     if (viewBase && viewBase.app.lib === app.lib) return viewBase;
     return { route: parseHash(libHref(app.lib, '')), app: { kind: 'lib', lib: app.lib, page: 'grid', albumId: null, importId: null, viewId: null } };
   });
+  // A page's props keep their last values while it is torn down: a route
+  // that leaves the library (#/, #/share) makes `base` null before the
+  // page's teardown effects (the grid remembering its place) read them.
+  let lastShown: { route: Route; app: LibRoute } | null = null;
+  const shown = $derived.by(() => (base ? (lastShown = base) : lastShown));
   const page = $derived<LibPage | null>(base ? base.app.page : null);
   const viewId = $derived(app.kind === 'lib' && app.page === 'view' ? app.viewId : null);
   const filters = $derived(filtersFromQuery(base ? base.route.query : new URLSearchParams()));
@@ -189,6 +196,7 @@
       </div>
     {/if}
     <div class="spacer"></div>
+    <SharePill />
     <JobPill />
   </header>
 
@@ -200,7 +208,9 @@
   {/if}
 
   <main inert={viewId !== null}>
-    {#if app.kind === 'libraries' || app.kind === 'legacy' || app.kind === 'notfound'}
+    {#if app.kind === 'share'}
+      <SharePage />
+    {:else if app.kind === 'libraries' || app.kind === 'legacy' || app.kind === 'notfound'}
       {#if app.kind === 'libraries' && (libraries.mode === 'workspace' || libraries.mode === 'unset' || (libraries.mode === 'single' && current.query.has(SETUP)))}
         <Libraries />
       {:else if !libraries.error}
@@ -212,7 +222,7 @@
           {#if page === 'grid' || page === 'view'}
             <Grid {api} {filters} {viewId} basePath={libPath(libId, '')} />
           {:else if page === 'map'}
-            <MapPage {api} {filters} query={base.route.query} />
+            <MapPage {api} {filters} query={shown?.route.query ?? new URLSearchParams()} />
           {:else if page === 'import'}
             <Import lib={libId} />
           {:else if page === 'library'}
@@ -221,13 +231,13 @@
             <Albums {api} />
           {:else if page === 'album' && base.app.albumId !== null}
             {#key base.app.albumId}
-              <Album {api} albumId={base.app.albumId} {filters} {viewId} />
+              <Album {api} albumId={shown?.app.albumId ?? 0} {filters} {viewId} />
             {/key}
           {:else if page === 'imports'}
             <Imports {api} />
           {:else if page === 'importrecord' && base.app.importId !== null}
             {#key base.app.importId}
-              <ImportRecord {api} importId={base.app.importId} {filters} {viewId} />
+              <ImportRecord {api} importId={shown?.app.importId ?? 0} {filters} {viewId} />
             {/key}
           {:else if page === 'trash'}
             <Trash {api} {filters} {viewId} />

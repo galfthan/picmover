@@ -25,6 +25,8 @@ export type AppRoute =
   /** A step 3 path without the library prefix ("#/map", "#/view/3", "#/?session=4"). */
   | { kind: 'legacy'; rest: string }
   | { kind: 'lib'; lib: string; page: LibPage; albumId: number | null; importId: number | null; viewId: number | null }
+  /** #/share: sharing on the home Wi-Fi (docs/design/lan-share.md). */
+  | { kind: 'share' }
   | { kind: 'notfound' };
 
 const SIMPLE: Record<string, LibPage> = {
@@ -51,6 +53,7 @@ export function parseAppRoute(r: Route): AppRoute {
   const s = r.segments;
   const first = s[0] ?? '';
   if (first === '') return { kind: 'libraries' };
+  if (first === 'share') return s.length === 1 ? { kind: 'share' } : { kind: 'notfound' };
   if (first !== 'l') return LEGACY.has(first) ? { kind: 'legacy', rest: s.join('/') } : { kind: 'notfound' };
   const lib = s[1];
   if (!lib) return { kind: 'notfound' };
