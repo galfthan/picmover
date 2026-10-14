@@ -217,6 +217,11 @@ func (f *fakeRunner) Addr() string          { return "127.0.0.1:1" }
 func (f *fakeRunner) Banner() string        { return "fake" }
 func (f *fakeRunner) Done() <-chan struct{} { return f.done }
 func (f *fakeRunner) Workspace() string     { return "" }
+
+func (f *fakeRunner) SharingStatus() server.SharingStatus { return server.SharingStatus{State: "off"} }
+func (f *fakeRunner) SharesHere() (int, error)            { return 0, nil }
+func (f *fakeRunner) StartSharing(int) error              { return nil }
+func (f *fakeRunner) StopSharing()                        {}
 func (f *fakeRunner) JobCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

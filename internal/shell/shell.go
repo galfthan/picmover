@@ -72,6 +72,11 @@ type runner interface {
 	JobCount() int
 	Workspace() string
 	Shutdown(ctx context.Context) error
+	// Sharing on the home Wi-Fi (the tray's "Share on Wi-Fi").
+	SharingStatus() server.SharingStatus
+	SharesHere() (int, error)
+	StartSharing(port int) error
+	StopSharing()
 }
 
 // app is one running picmover-app.
@@ -248,6 +253,7 @@ func (a *app) main(ctx context.Context) error {
 			ErrOut:    &logLines{log: a.log},
 			Logger:    a.log,
 			App:       a.hooks(),
+			ShareCmd:  "picmover-app",
 		})
 	}
 	run, err := start(workspace)
@@ -280,6 +286,15 @@ func (a *app) main(ctx context.Context) error {
 	}
 
 	a.startDesktopEntry()
+	// "Keep sharing on": sharing starts again with the app (never with
+	// serve, which shares only with --share).
+	if run.KeepSharingOn() {
+		go func() {
+			if err := run.StartSharing(0); err != nil {
+				a.log.Warn("cannot share on Wi-Fi (Keep sharing on)", "err", err)
+			}
+		}()
+	}
 
 	go func() {
 		select {

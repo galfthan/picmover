@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"picmover/internal/library"
 	"picmover/internal/share"
 )
 
@@ -171,3 +173,36 @@ func (r *Running) Pair(ref string) (Pairing, error) {
 	exp, _ := time.Parse(time.RFC3339, p.ExpiresAt)
 	return Pairing{Share: x.Name, URL: p.URL, Code: p.Code, ExpiresAt: exp, QR: qr}, nil
 }
+
+// ShareWorkspace resolves dir to the workspace key of its shares, as
+// serve would serve it: a library folder (with media.db) is served alone,
+// keyed by its root (links resolved) with SingleLibraryID as the id;
+// any other folder is a workspace keyed by its path with links resolved.
+func ShareWorkspace(dir string) (root string, single bool, err error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false, err
+	}
+	if IsLibraryFolder(abs) {
+		lib, err := library.Attach(abs)
+		if err != nil {
+			return "", false, err
+		}
+		return lib.Root(), true, nil
+	}
+	root, err = checkWorkspaceDir(abs)
+	if err != nil {
+		return "", false, err
+	}
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	return root, false, nil
+}
+
+// SingleLibraryID is the id of the library served alone at root.
+func SingleLibraryID(root string) string { return singleID(root) }
+
+// ValidLibraryID reports whether id can name a library folder of a
+// workspace.
+func ValidLibraryID(id string) bool { return validLibID(id) }
