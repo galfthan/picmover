@@ -1692,10 +1692,31 @@ numbers are the ones used there and in references above):
     album page. The CLI gets `picmover share`.
 - **Q6, per-device library sets:** replaced by multiple shares. A phone
   sees what its share covers; different phones get different shares.
+- **Q15, one cookie per browser:** a browser is paired with one share at
+  a time. Pairing it with another share replaces the first, after asking
+  on the phone. Per-share cookies would need the share in every URL and a
+  share picker; a second browser or a private tab covers the owner
+  testing a guest share.
+- **Q16, ratings for guests:** ratings are visible only with `rate`.
+  Stars are the owner's private judgement. A separate `seeRatings`
+  capability stays a possible one-field addition if ever wanted.
+- **Q17, default expiry:** album shares expire after 30 days by default
+  (changeable in the dialog, including "never"); library shares never
+  expire by default.
+- **Q18, video without download:** accepted that a streamed video can be
+  saved by a determined guest. The share dialog says so next to the
+  checkboxes; turning off `video` is the only real guarantee. No
+  transcoding in this version.
+- **Q19, more scope kinds:** added when needed, each as a new `kind` plus
+  a `scopeAuth` implementation, its admin dialog, and its column in the
+  route × scope test matrix. "Several albums" is the likely first.
+- **Q20, a busy library:** a library locked by another process (or
+  rebuilding) gives the phone 503 "This library is not available right
+  now". The admin share card shows "Library busy" so the owner knows why.
 
 ## Open questions (with recommendations)
 
-Q1–Q8 are settled (above). Still open:
+Q1–Q8 and Q15–Q20 are settled (above). Still open:
 
 9. **Q9. Offer the `.local` URL?**
    - *Recommendation:* show it as an option after Phase 0 records which
@@ -1728,39 +1749,3 @@ Q1–Q8 are settled (above). Still open:
     cross-library albums ever come, the album scope's key and `visible`
     must be revisited, so that membership never lets a photo of an
     unshared library through.
-15. **Q15. One cookie per browser.** A browser is paired with one share
-    at a time; pairing it with another share replaces the first, after
-    asking.
-    - *Recommendation:* keep this. Per-share cookies would need the share
-      in every URL and a share picker on the phone, for a case (the owner
-      testing a guest share on their own phone) that a second browser, or
-      a private tab, covers.
-16. **Q16. Should guests see the owner's ratings without being able to
-    rate?** Today the ratings are visible only with `rate`.
-    - *Recommendation:* keep them tied to `rate`, since stars are the
-      owner's private judgement.
-    - If wanted, a separate `seeRatings` capability is a one-field
-      addition.
-17. **Q17. Default expiry for album shares.**
-    - *Recommendation:* 30 days, changeable in the dialog, including
-      "never".
-    - Library shares (normally the owner's own phones) default to never.
-18. **Q18. "No download" with video on.** A streamed video can be saved
-    by a determined guest.
-    - *Recommendation:* accept this and say so in the dialog. Turning off
-      `video` is the only real guarantee.
-    - Server-side transcoding to a lower-quality stream would be the
-      alternative; it is out of scope for this version.
-19. **Q19. More scope kinds later** (several albums, a date range within
-    a library, a tag).
-    - *Recommendation:* add them as needed, each a new `kind` plus a
-      `scopeAuth` implementation, its admin dialog, and its column in the
-      route × scope test matrix.
-    - "Several albums" is the most likely next one. `visible` would
-      check membership in any of them.
-20. **Q20. An album share for a library locked by another process.** The
-    phone gets 503 while, for example, a CLI import runs on it.
-    - *Recommendation:* accept this, since opening the library is needed
-      to read `user.db`.
-    - The admin card shows "Library busy" so the owner knows why guests
-      see an error.
