@@ -13,7 +13,7 @@
   import { route } from '../lib/router';
   import { formatAgo } from '../lib/format';
   import { toasts } from '../lib/toast.svelte';
-  import { deviceNameProblem, expiryAt, expiryText, scopeText, stateText } from '../lib/sharetext';
+  import { addressDetail, addressLabel, deviceNameProblem, expiryAt, expiryText, scopeText, stateText, wifiSuggestion } from '../lib/sharetext';
   import ConfirmButton from '../components/ConfirmButton.svelte';
   import CopyButton from '../components/CopyButton.svelte';
   import PairDialog from '../components/PairDialog.svelte';
@@ -68,6 +68,8 @@
   }
 
   const until = $derived(st?.autoOff.until ? new Date(st.autoOff.until) : null);
+  /** The chosen address is wired and a Wi-Fi one exists: suggested, never switched to by itself. */
+  const suggest = $derived(st ? wifiSuggestion(st.addresses, st.address) : null);
 
   // ---- Shares ----
 
@@ -194,13 +196,23 @@
                 disabled={ro || working}
                 onchange={(e) => act(() => sharing.set({ address: e.currentTarget.value }))}
               >
-                {#each st.addresses as a (a.ip)}<option value={a.ip}>{a.ip} ({a.iface}{a.subnet ? `, ${a.subnet}` : ''}{a.virtual ? ', virtual' : ''})</option>{/each}
+                {#each st.addresses as a (a.ip)}<option value={a.ip}>{addressLabel(a)}</option>{/each}
               </select>
             {:else}
-              <span class="mono">{st.address || st.addresses[0]?.ip || 'none found'}</span>
-              {#if st.addresses[0]}<span class="muted small">({st.addresses[0].iface}{st.addresses[0].subnet ? `, ${st.addresses[0].subnet}` : ''})</span>{/if}
+              {@const one = st.addresses.find((a) => a.ip === st.address) ?? st.addresses[0]}
+              <span class="mono">{st.address || one?.ip || 'none found'}</span>
+              {#if one && addressDetail(one)}<span class="muted small">({addressDetail(one)})</span>{/if}
             {/if}
-            <span class="muted small block">Phones are paired with this address. Give the computer a fixed address in your router so they stay paired.</span>
+            {#if suggest}
+              <p class="notice small" role="status">
+                This address is wired. Phones are usually on the Wi-Fi: the Wi-Fi address is {suggest.ip}.
+                <button class="small" disabled={ro || working} onclick={() => act(() => sharing.set({ address: suggest.ip }))}>Use {suggest.ip} (Wi-Fi)</button>
+              </p>
+            {/if}
+            <span class="muted small block">
+              Phones must be on the same network as this address. Phones are paired with it: give the computer a fixed address in your router so they
+              stay paired.
+            </span>
           </dd>
 
           <dt>Port</dt>

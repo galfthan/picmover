@@ -1,7 +1,7 @@
 // Texts and small pure helpers of the admin Share page and ShareDialog
 // (docs/design/lan-share.md "Entry points"); see sharetext.test.ts.
 
-import type { Share, ShareKind } from './api';
+import type { Share, ShareAddress, ShareKind, SharingSummary } from './api';
 import { formatAgo } from './format';
 
 /** "Album: Summer 2026 in peter, 48 photos" / "Libraries: peter, penny". */
@@ -104,3 +104,69 @@ export function deviceNameProblem(raw: string): string | null {
 
 /** Share names: 1–60 characters, no control characters; null when fine. */
 export const shareNameProblem = deviceNameProblem;
+
+/** "Wi-Fi", "wired", or "" when the server did not say. */
+export function linkKind(a: Pick<ShareAddress, 'wireless'>): string {
+  return a.wireless === true ? 'Wi-Fi' : a.wireless === false ? 'wired' : '';
+}
+
+/** "Wi-Fi, wlp3s0, 192.168.1.0/24": what is known of an address besides its ip. */
+export function addressDetail(a: ShareAddress): string {
+  return [linkKind(a), a.iface, a.subnet, a.virtual ? 'virtual' : ''].filter((x) => x !== '').join(', ');
+}
+
+/** "192.168.1.20 (Wi-Fi, wlp3s0, 192.168.1.0/24)": an address as the Network choice lists it. */
+export function addressLabel(a: ShareAddress): string {
+  const d = addressDetail(a);
+  return d ? `${a.ip} (${d})` : a.ip;
+}
+
+/**
+ * A Wi-Fi address to suggest when the chosen one is wired (phones are on
+ * the Wi-Fi, and a wired network is often another one); null when the
+ * choice is Wi-Fi, unknown, or there is no Wi-Fi address. Only a
+ * suggestion: a saved choice is never switched by itself.
+ */
+export function wifiSuggestion(addresses: ShareAddress[], chosen: string): ShareAddress | null {
+  const cur = addresses.find((a) => a.ip === chosen);
+  if (!cur || cur.wireless !== false) return null;
+  return addresses.find((a) => a.wireless === true && !a.virtual) ?? null;
+}
+
+/** One way to write the top-bar pill: its text, and the auto-off timer ("52 min left"; "" leaves it out). */
+export interface PillVariant {
+  text: string;
+  left: string;
+}
+
+/**
+ * The pill's texts from the longest to the shortest, and its tooltip (all
+ * of it). The pill shows the longest that fits, so it shortens by whole
+ * parts, never in the middle of a word: the timer goes first, then the
+ * share count, then the word "phones"; "Sharing" always stays. `left` is
+ * the auto-off timer's text ("" without one).
+ */
+export function pillVariants(st: Pick<SharingSummary, 'state' | 'reason' | 'url' | 'shares' | 'phones'>, left: string): { variants: PillVariant[]; title: string } {
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  if (st.state === 'on') {
+    const shares = plural(st.shares, 'share', 'shares');
+    const phones = plural(st.phones, 'phone', 'phones');
+    const full = `Sharing · ${shares} · ${phones}`;
+    const variants: PillVariant[] = left ? [{ text: full, left }] : [];
+    for (const text of [full, `Sharing · ${phones}`, `Sharing · ${st.phones}`, 'Sharing']) variants.push({ text, left: '' });
+    const where = st.url ? `Sharing on Wi-Fi at ${st.url}` : 'Sharing on Wi-Fi';
+    return { variants, title: `${where} · ${shares} · ${phones}${left ? ` · ${left}` : ''}` };
+  }
+  if (st.state === 'paused') {
+    const variants = [{ text: `Sharing paused${st.reason ? `: ${st.reason}` : ''}`, left: '' }];
+    if (st.reason) variants.push({ text: 'Sharing paused', left: '' });
+    return { variants, title: st.reason ? `Sharing paused: ${st.reason}` : 'Sharing is paused' };
+  }
+  return { variants: [{ text: 'Sharing failed', left: '' }], title: st.reason || 'Sharing failed' };
+}
+
+/** The first variant (longest first) whose measured width fits; the last when none does. */
+export function fittingVariant(widths: number[], available: number): number {
+  for (let i = 0; i < widths.length; i++) if ((widths[i] ?? 0) <= available + 0.5) return i;
+  return Math.max(0, widths.length - 1);
+}

@@ -1,5 +1,26 @@
-import { describe, expect, it } from 'vitest';
-import { shareClient, shareFilterParams, toAlbums, toCapabilities, toDetail, toFacets, toItem, toSession, toShareInfo } from './shareapi';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  backoffMs,
+  checkUrl,
+  errorText,
+  isAbort,
+  NetworkError,
+  retrier,
+  retryAfterMs,
+  setRefusalHandler,
+  shareClient,
+  shareFilterParams,
+  THUMB_RETRIES,
+  toAlbums,
+  toCapabilities,
+  toDetail,
+  toFacets,
+  toItem,
+  toSession,
+  toShareInfo,
+  UNREACHABLE,
+  type UrlCheck,
+} from './shareapi';
 
 const none = { video: false, download: false, rate: false, location: false };
 const every = { video: true, download: true, rate: true, location: true };
@@ -108,5 +129,100 @@ describe('share client parsing', () => {
       tags: [],
       albums: [],
     });
+  });
+});
+
+describe('share client errors and failed media', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    setRefusalHandler(null);
+  });
+  const answer = (r: () => Promise<Response>, seen: RequestInit[] = []) =>
+    (globalThis.fetch = ((_u: string, init: RequestInit) => (seen.push(init), r())) as unknown as typeof fetch);
+
+  it('says "cannot reach" only when fetch itself failed', async () => {
+    answer(() => Promise.reject(new TypeError('Failed to fetch')));
+    const e = await shareClient('peter', none)
+      .getAlbums()
+      .catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(NetworkError);
+    expect(errorText(e)).toBe(UNREACHABLE);
+    // A TypeError from anywhere else (a bug) keeps its own message.
+    expect(errorText(new TypeError("Cannot read properties of undefined (reading 'id')"))).toBe("Cannot read properties of undefined (reading 'id')");
+    // An abort stays an abort.
+    answer(() => Promise.reject(new DOMException('aborted', 'AbortError')));
+    const ac = new AbortController();
+    ac.abort();
+    expect(isAbort(await shareClient('peter', none).getAlbums(ac.signal).catch((x: unknown) => x))).toBe(true);
+  });
+
+  it('reads Retry-After as seconds or a date', () => {
+    const now = Date.parse('2026-10-14T12:00:00Z');
+    expect(retryAfterMs('3', now)).toBe(3000);
+    expect(retryAfterMs('Wed, 14 Oct 2026 12:00:10 GMT', now)).toBe(10_000);
+    expect(retryAfterMs(null, now)).toBeNull();
+    expect(retryAfterMs('soon', now)).toBeNull();
+  });
+
+  it('checks a failed URL with one byte, and reports refusals', async () => {
+    const seen: RequestInit[] = [];
+    const refusals: unknown[] = [];
+    setRefusalHandler((...a) => void refusals.push(a));
+    answer(() => Promise.resolve(new Response('{"error":"slow down"}', { status: 429, headers: { 'Retry-After': '2' } })), seen);
+    expect(await checkUrl('/api/l/peter/file/3')).toEqual({ status: 429, retryAfter: 2000, state: '' });
+    expect(new Headers(seen[0]?.headers).get('Range')).toBe('bytes=0-0');
+    answer(() => Promise.resolve(new Response('{"error":"This share is paused.","state":"paused"}', { status: 403 })));
+    expect(await checkUrl('/api/l/peter/thumb/x')).toEqual({ status: 403, retryAfter: null, state: 'paused' });
+    expect(refusals).toEqual([[403, 'paused', 'This share is paused.']]);
+    answer(() => Promise.resolve(new Response('{"error":"not allowed in this share"}', { status: 403 })));
+    expect((await checkUrl('/api/l/peter/file/3')).status).toBe(403);
+    expect(refusals).toHaveLength(1); // a capability, not a refusal of the phone
+    answer(() => Promise.reject(new TypeError('Failed to fetch')));
+    expect(await checkUrl('/api/l/peter/thumb/x')).toEqual({ status: 0, retryAfter: null, state: '' });
+  });
+
+  it('retries a failed thumbnail after Retry-After or a backoff, a bounded number of times, never a 404', async () => {
+    let t = 0;
+    const answers: UrlCheck[] = [];
+    const checked: string[] = [];
+    const check = async (url: string) => (checked.push(url), answers.shift() ?? { status: 200, retryAfter: null, state: '' });
+    const delay = retrier(check, () => t, () => 0);
+    answers.push({ status: 429, retryAfter: 5000, state: '' });
+    expect(await delay('/a', 0)).toBe(5000);
+    // While cooling down nothing is asked; the others wait it out.
+    t = 1000;
+    expect(await delay('/b', 0)).toBe(4000);
+    expect(checked).toEqual(['/a']);
+    t = 6000;
+    answers.push({ status: 503, retryAfter: null, state: '' });
+    expect(await delay('/a', 1)).toBe(2000); // backoff: 1, 2, 4, 8 s
+    t = 9000;
+    answers.push({ status: 0, retryAfter: null, state: '' });
+    expect(await delay('/a', 2)).toBe(4000);
+    t = 20_000;
+    expect(await delay('/a', THUMB_RETRIES)).toBeNull();
+    answers.push({ status: 404, retryAfter: null, state: '' });
+    expect(await delay('/gone', 0)).toBeNull();
+    answers.push({ status: 200, retryAfter: null, state: '' });
+    expect(await delay('/fine-now', 0)).toBe(0);
+    answers.push({ status: 403, retryAfter: null, state: 'paused' });
+    expect(await delay('/refused', 0)).toBeNull();
+    // Retry-After is capped at a minute.
+    answers.push({ status: 429, retryAfter: 3_600_000, state: '' });
+    expect(await delay('/a', 0)).toBe(60_000);
+  });
+
+  it('asks one URL at a time when many tiles fail together', async () => {
+    let release: (r: UrlCheck) => void = () => {};
+    let n = 0;
+    const check = (_url: string) => (n++, new Promise<UrlCheck>((r) => (release = r)));
+    const delay = retrier(check, () => 0, () => 0);
+    const all = [delay('/1', 0), delay('/2', 0), delay('/3', 1)];
+    release({ status: 429, retryAfter: 3000, state: '' });
+    expect(await Promise.all(all)).toEqual([3000, 3000 + 1000, 3000 + 2000]);
+    expect(n).toBe(1);
+    expect(backoffMs(0, 0)).toBe(1000);
+    expect(backoffMs(10, 1)).toBe(30_500);
   });
 });

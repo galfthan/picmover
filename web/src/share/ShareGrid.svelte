@@ -6,9 +6,13 @@
   // Columns follow the width (3 in portrait phones, 4–5 in landscape and
   // on tablets); tiles are capped at the 256 px thumb (the large only for
   // 1–2 columns), so scrolling never makes the computer derive renditions.
-  // A tap opens the lightbox over the grid; the timeline reloads when the
-  // page becomes visible again, so photos trashed or moved meanwhile drop out.
-  import { untrack } from 'svelte';
+  // A tap opens the lightbox over the grid; closing it scrolls the grid to
+  // the photo last shown. When the page becomes visible again the timeline
+  // is read again and the grid reloads only if it changed, so photos
+  // trashed or moved meanwhile drop out without refetching every month.
+  // The grid also reloads (keeping its scroll) when the share's
+  // capabilities change: tiles carry ratings only with `rate`.
+  import { tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import type { MediaItem, TimelineBucket } from '../lib/api';
   import { layoutTimeline } from '../lib/timeline';
@@ -18,7 +22,7 @@
   import Tile, { type TileViewer } from '../components/Tile.svelte';
   import Scrubber from '../components/Scrubber.svelte';
   import ShareLightbox, { type Neighbours } from './ShareLightbox.svelte';
-  import { errorText, ShareError, type ShareClient, type ShareFilters } from './shareapi';
+  import { CAPABILITIES, errorText, ShareError, type ShareClient, type ShareFilters } from './shareapi';
   import { filtersKey } from './filters';
 
   interface Props {
@@ -46,7 +50,7 @@
   const GAP = 2;
   const HEADER = 40;
   const BUCKET_PAD = 8;
-  const SCRUB = 28; // right gutter for the scrubber
+  const SCRUB = 30; // right gutter for the scrubber
 
   let width = $state(0);
   let height = $state(0);
@@ -54,6 +58,8 @@
   let scroller: HTMLDivElement | undefined = $state();
 
   let buckets = $state.raw<TimelineBucket[]>([]);
+  /** The timeline as the server last sent it (buckets may since have been corrected by the lists). */
+  let served: TimelineBucket[] = [];
   let tlStatus = $state<'loading' | 'ready' | 'error'>('loading');
   let tlError = $state('');
   let busy = $state(false);
@@ -137,12 +143,7 @@
     try {
       const b = await client.getTimeline(filters);
       if (g !== gen) return;
-      items.clear();
-      bucketErrors.clear();
-      buckets = b;
-      busy = false;
-      epoch++;
-      tlStatus = 'ready';
+      apply(b);
       if (resetScroll && scroller) {
         scroller.scrollTop = 0;
         scrollTop = 0;
@@ -155,16 +156,63 @@
     }
   }
 
+  function apply(b: TimelineBucket[]) {
+    items.clear();
+    bucketErrors.clear();
+    served = b;
+    buckets = b;
+    busy = false;
+    epoch++;
+    tlStatus = 'ready';
+  }
+
+  const sameTimeline = (a: TimelineBucket[], b: TimelineBucket[]) =>
+    a.length === b.length && a.every((x, i) => x.year === b[i]?.year && x.month === b[i]?.month && x.count === b[i]?.count);
+
+  /**
+   * Back on the page: one timeline request; the months are fetched again
+   * only when it differs from the last one (a photo came, went or moved).
+   * A grid that failed to load simply loads again.
+   */
+  async function recheck() {
+    if (tlStatus !== 'ready') {
+      void loadTimeline(false);
+      return;
+    }
+    const g = gen;
+    try {
+      const b = await client.getTimeline(filters);
+      if (g !== gen || sameTimeline(b, served)) return;
+      gen++;
+      inflight.clear();
+      apply(b);
+      ready = Promise.resolve();
+    } catch {
+      // keep what is shown; a request that matters will say what is wrong
+    }
+  }
+
   const fkey = $derived(`${client.id}|${basePath}|${filtersKey(filters)}`);
   $effect(() => {
     void fkey;
     untrack(() => void loadTimeline(true));
   });
 
+  // Capabilities changed (the session was read again): the items are read
+  // again under the new ones (no ★ without `rate`), where the user is.
+  const capsKey = $derived(CAPABILITIES.filter((c) => client.caps[c]).join(','));
+  let seenCaps = untrack(() => capsKey);
+  $effect(() => {
+    const k = capsKey;
+    if (k === seenCaps) return;
+    seenCaps = k;
+    untrack(() => void loadTimeline(false));
+  });
+
   // Back on the page (the phone was locked, another app was in front): photos may have changed.
   $effect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void loadTimeline(false);
+      if (document.visibilityState === 'visible') void recheck();
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
@@ -312,6 +360,37 @@
     if (viewId === null) openedHere = false;
   });
 
+  // Closing the lightbox (however: ✕, Back, swipe down, a reload that
+  // opened it from a link) shows the grid where the last photo shown is.
+  let lastViewed: number | null = null;
+  $effect(() => {
+    const v = viewId;
+    if (v !== null) {
+      lastViewed = v;
+      return;
+    }
+    const id = lastViewed;
+    lastViewed = null;
+    if (id !== null) untrack(() => void reveal(id));
+  });
+
+  async function reveal(mid: number) {
+    await ready;
+    await tick();
+    const tl = timeline;
+    for (let i = 0; i < tl.buckets.length; i++) {
+      const b = tl.buckets[i];
+      const idx = b ? (items.get(bkey(b.year, b.month))?.findIndex((x) => x.id === mid) ?? -1) : -1;
+      if (idx < 0) continue;
+      const top = tl.tilePosition(i, idx).top;
+      const vh = height || 800;
+      // Already in view (below the sticky month header): leave the scroll alone.
+      if (top >= scrollTop + HEADER && top + tl.tile <= scrollTop + vh) return;
+      scrollToY(top - Math.max(HEADER, (vh - tl.tile) / 2));
+      return;
+    }
+  }
+
   function bucketIndexFor(takenAt: string | null): number {
     const d = parseWallClock(takenAt);
     const y = d ? d.getUTCFullYear() : 0;
@@ -457,7 +536,7 @@
   .canvas {
     position: relative;
     margin-left: 2px;
-    margin-right: 28px;
+    margin-right: 30px;
   }
   .bucket {
     position: absolute;
@@ -497,13 +576,22 @@
     background: var(--placeholder);
     border-radius: 2px;
   }
-  /* The scrubber is narrower on a phone; the year labels still fit. */
+  /* The scrubber is narrower on a phone; the year labels still fit. The
+     position marker is a short bar at the very edge, beside the labels
+     rather than across them (at the top it sat on the first year). */
   .share-grid :global(.scrubber) {
-    width: 28px;
+    width: 30px;
   }
   .share-grid :global(.scrubber .year) {
-    right: 2px;
+    right: 5px;
+    padding: 0 1px;
     font-size: 10px;
+  }
+  .share-grid :global(.scrubber .pos) {
+    right: 0;
+    width: 3px;
+    height: 18px;
+    border-radius: 2px;
   }
   .share-grid :global(.scrubber .hover) {
     right: 32px;

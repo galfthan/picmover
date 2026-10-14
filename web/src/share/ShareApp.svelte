@@ -29,6 +29,26 @@
     void shareSession.load();
   });
 
+  // Capabilities changed on the computer (turned on as well as off) take
+  // effect without a reload: the session is read again when the page comes
+  // back into view, and every few minutes while it is in view.
+  const SESSION_EVERY = 3 * 60_000;
+  $effect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    };
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    }, SESSION_EVERY);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  });
+  /** Something was refused (403 without a state, a failed image or video): the capabilities may have changed. */
+  const recheck = () => shareSession.refresh(5_000);
+
   const share = $derived(shareSession.share);
   const caps = $derived(shareSession.caps);
   const resolved = $derived(resolveRoute(route.current, shareSession.status === 'ready' ? share : null));
@@ -163,7 +183,16 @@
     unavailable: { title: 'This share is not available right now', text: 'The computer is showing other photos at the moment. Try again later.' },
   };
   const blocked = $derived(STATES[shareSession.blocked] ?? { title: 'This share is not available', text: '' });
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key === 'Escape' && menuOpen && !e.defaultPrevented) {
+      e.preventDefault();
+      menuOpen = false;
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onKey} />
 
 <div class="shell">
   {#if route.current.segments[0] === 'pair'}
@@ -201,7 +230,7 @@
   {:else if share && page}
     <header class="topbar">
       <div class="titles">
-        <span class="title">{share.name}{#if libName && share.libraries.length > 1}<span class="sub-inline"> · {libName}</span>{/if}</span>
+        <span class="title">{share.name}{#if libName && share.libraries.length > 1}<span class="sub-inline">{' · '}{libName}</span>{/if}</span>
         {#if share.kind === 'album' && share.album}
           <span class="sub">{share.album.name} · {share.album.count} {share.album.count === 1 ? 'item' : 'items'}</span>
         {/if}
@@ -212,7 +241,7 @@
           <span>Filter</span>{#if chips.length}<span class="badge">{chips.length}</span>{/if}
         </button>
       {/if}
-      <button class="ghost icon" aria-label="Menu" aria-expanded={menuOpen} onclick={() => (menuOpen = !menuOpen)}>
+      <button class="ghost icon" aria-label="Menu" aria-expanded={menuOpen} aria-controls="share-menu" onclick={() => (menuOpen = !menuOpen)}>
         <span aria-hidden="true">⋮</span>
       </button>
     </header>
@@ -251,7 +280,7 @@
           {filtered}
           emptyText="Nothing here yet"
           onclearfilters={clearFilters}
-          onforbidden={() => shareSession.load(true)}
+          onforbidden={recheck}
         />
       {:else if client && page.kind === 'grid'}
         {#key page.lib}
@@ -266,7 +295,7 @@
             albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
             emptyText="No photos yet"
             onclearfilters={clearFilters}
-            onforbidden={() => shareSession.load(true)}
+            onforbidden={recheck}
           />
         {/key}
       {:else if client && page.kind === 'album'}
@@ -282,7 +311,7 @@
             albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
             emptyText="This album is empty"
             onclearfilters={clearFilters}
-            onforbidden={() => shareSession.load(true)}
+            onforbidden={recheck}
           />
         {/key}
       {/if}
@@ -290,13 +319,14 @@
 
     {#if menuOpen}
       <button class="scrim" aria-label="Close the menu" onclick={() => (menuOpen = false)}></button>
-      <div class="menu" role="menu" aria-label="Menu">
+      <!-- A disclosure, not an ARIA menu: it holds text as well as a link and a button. -->
+      <div class="menu" id="share-menu" role="group" aria-label="Menu">
         {#if share.kind === 'libraries' && share.libraries.length > 1}
-          <a role="menuitem" href="#/">Libraries</a>
+          <a href="#/">Libraries</a>
         {/if}
         <p class="item">Paired as <strong>{shareSession.session?.device.name || 'this phone'}</strong>{#if shareSession.session?.computer}<span class="muted"> with {shareSession.session.computer}</span>{/if}</p>
         {#if share.expiresAt}<p class="item muted">{expiryText(share.expiresAt)}</p>{/if}
-        <button role="menuitem" class="ghost" aria-expanded={help} onclick={() => (help = !help)}>Help</button>
+        <button class="ghost" aria-expanded={help} onclick={() => (help = !help)}>Help</button>
         {#if help}
           <div class="help small">
             <p>These photos are shared from picmover on a computer on this Wi-Fi. You can look at them{caps.rate ? ' and give them stars' : ''}{caps.download ? ', and download originals' : ''}; nothing else can be changed from here.</p>

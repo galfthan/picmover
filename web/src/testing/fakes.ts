@@ -1069,9 +1069,9 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     port: 7443,
     address: '192.168.1.20',
     addresses: [
-      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24' },
-      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24' },
-    ] as { ip: string; iface: string; subnet: string; virtual?: boolean }[],
+      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24', wireless: true },
+      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24', wireless: false },
+    ] as { ip: string; iface: string; subnet: string; virtual?: boolean; wireless?: boolean }[],
     fingerprint: { leaf: 'AB:CD:EF:01:23:45:67:89', ca: '12:34:56:78:9A:BC:DE:F0' },
     keepOn: false,
     mdns: false,
@@ -1519,6 +1519,15 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   const busy = new Set<string>();
   /** A move runs: ratings answer 409. */
   const moving = { on: false };
+  /** The next `times` requests for an image or file answer `status` (429: rate limited), with Retry-After when set. */
+  const mediaFail = { times: 0, status: 429, retryAfter: '' };
+  function failMedia(): Response | null {
+    if (mediaFail.times <= 0) return null;
+    mediaFail.times--;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (mediaFail.retryAfter) headers['Retry-After'] = mediaFail.retryAfter;
+    return new Response(JSON.stringify({ error: 'too many requests' }), { status: mediaFail.status, headers });
+  }
   const pairing = {
     /** The share has its 20 phones: a redeem is 409 without `current`. */
     full: false,
@@ -1528,7 +1537,8 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     approve: false,
     /** Answers 429 to the next redeem. */
     limited: false,
-    pending: null as null | ((ok: boolean) => void),
+    /** The waiting redeem: approved (true), denied (false), or sharing turned off meanwhile ('off'). */
+    pending: null as null | ((r: boolean | 'off') => void),
   };
 
   const visible = () =>
@@ -1666,12 +1676,14 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 410);
     if (cookie.paired && body.replace !== true) {
       const cur = cookie.otherShare || share.name;
-      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur } }, 409);
+      // `sameShare`: the cookie's device is of the pairing's own share (asked of the backend in the review).
+      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur, ...(cookie.otherShare ? {} : { sameShare: true }) } }, 409);
     }
     set.delete(key);
     if (pairing.approve) {
-      const ok = await new Promise<boolean>((resolve) => (pairing.pending = resolve));
+      const ok = await new Promise<boolean | 'off'>((resolve) => (pairing.pending = resolve));
       pairing.pending = null;
+      if (ok === 'off') return json({ error: 'Sharing was turned off on the computer.', state: 'off' }, 410);
       if (!ok) return json({ error: 'The computer did not allow this phone.' }, 403);
     }
     if (pairing.full) return json({ error: 'this share has 20 phones; revoke one first' }, 409);
@@ -1750,12 +1762,16 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     }
     const rm = /^(thumb|preview|large)\/([0-9a-f]+)$/.exec(rest);
     if (method === 'GET' && rm) {
+      const failed = failMedia();
+      if (failed) return failed;
       const x = items.find((i) => i.hash === rm[2]);
       if (!x || !inScope(x)) return notFound();
       return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg' } });
     }
     const fm = /^file\/(\d+)$/.exec(rest);
     if (method === 'GET' && fm) {
+      const failed = failMedia();
+      if (failed) return failed;
       const x = items.find((i) => i.id === Number(fm[1]));
       if (!x || !inScope(x)) return notFound();
       const need = q.get('download') === '1' || x.type !== 'video' ? caps.download : caps.video;
@@ -1828,11 +1844,14 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     cookie,
     busy,
     moving,
+    mediaFail,
     pairing,
     install,
     requests,
     approve: () => pairing.pending?.(true),
     deny: () => pairing.pending?.(false),
+    /** Sharing turned off while a redeem waits for approval. */
+    turnOff: () => pairing.pending?.('off'),
   };
 }
 

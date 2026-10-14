@@ -56,6 +56,41 @@ class ShareSession {
     }
   }
 
+  #refreshing: Promise<void> | null = null;
+  #lastRefresh = 0;
+
+  /**
+   * Reads the session again in the background (the page came back into
+   * view, a timer, a media URL or a rating was refused): capabilities
+   * turned on or off on the computer take effect without a reload. Only a
+   * refusal (401, 403 `{state}`) changes the page; a failure to reach the
+   * computer or a busy library keeps what is shown (the next request that
+   * matters says so). An unchanged session keeps its object, so nothing
+   * downstream reloads. With `minGap`, a call within that many ms of the
+   * last one reuses it (many images failing together ask once).
+   */
+  refresh(minGap = 0): Promise<void> {
+    if (this.status !== 'ready') return Promise.resolve();
+    if (this.#refreshing) return this.#refreshing;
+    if (minGap > 0 && Date.now() - this.#lastRefresh < minGap) return Promise.resolve();
+    this.#lastRefresh = Date.now();
+    const g = this.#gen;
+    const p = getSession()
+      .then((s) => {
+        if (g !== this.#gen || this.status !== 'ready') return;
+        if (JSON.stringify(s) !== JSON.stringify(this.session)) this.session = s;
+      })
+      .catch((e: unknown) => {
+        if (g !== this.#gen) return;
+        if (e instanceof ShareError && (e.status === 401 || (e.status === 403 && e.state))) this.refused(e.status, e.state);
+      })
+      .finally(() => {
+        if (this.#refreshing === p) this.#refreshing = null;
+      });
+    this.#refreshing = p;
+    return p;
+  }
+
   /** A successful pairing: the answer is the session. */
   paired(s: Session): void {
     this.#gen++;

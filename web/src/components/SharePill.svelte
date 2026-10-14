@@ -5,14 +5,19 @@
   // Sharing must be visible whenever it is on, so this is on every page.
   // It reads GET /api/share/status (counts of the shares phones can use
   // now and their phones), which looks at no library.
+  //
+  // In a narrow top bar the pill shortens by whole parts (lib/sharetext.ts
+  // pillVariants): it asks for the width of its longest text, measures
+  // every variant, and shows the longest that fits the width it got. The
+  // tooltip always has all of it.
   import { sharing } from '../lib/sharing.svelte';
   import { route } from '../lib/router';
+  import { fittingVariant, pillVariants } from '../lib/sharetext';
 
   $effect(() => sharing.watchSummary());
 
   const st = $derived(sharing.summary);
   const active = $derived(route.current.segments[0] === 'share');
-  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
   /** "52 min left" / "3 h left" of the auto-off timer; "" without one. */
   const left = $derived.by(() => {
@@ -21,24 +26,48 @@
     const min = Math.max(0, Math.round((until - Date.now()) / 60_000));
     return min < 90 ? `${min} min left` : `${Math.round(min / 60)} h left`;
   });
+
+  const label = $derived(st && st.state !== 'off' && st.state !== '' ? pillVariants(st, left) : null);
+  const variants = $derived(label?.variants ?? []);
+  let pick = $state(0);
+  const shown = $derived(variants[Math.min(pick, variants.length - 1)] ?? null);
+
+  let fit: HTMLSpanElement | undefined = $state();
+  let measures: HTMLSpanElement | undefined = $state();
+
+  function measure() {
+    if (!fit || !measures) return;
+    const widths = [...measures.children].map((c) => (c as HTMLElement).offsetWidth);
+    pick = fittingVariant(widths, fit.clientWidth);
+  }
+  // Again whenever the texts change or the room for them does.
+  $effect(() => {
+    void variants;
+    measure();
+  });
+  $effect(() => {
+    const el = fit;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
 </script>
 
+{#snippet body(v: { text: string; left: string })}<span class="text">{v.text}</span>{#if v.left}<span class="left">{v.left}</span>{/if}{/snippet}
+
 {#if sharing.supported}
-  {#if st && st.state === 'on'}
-    <a class="pill on" class:active href="#/share" title={st.url ? `Sharing on Wi-Fi at ${st.url}` : 'Sharing on Wi-Fi'}>
+  {#if st && label && shown && (st.state === 'on' || st.state === 'paused' || st.state === 'error')}
+    <a class="pill" class:on={st.state === 'on'} class:paused={st.state === 'paused'} class:error={st.state === 'error'} class:active href="#/share" title={label.title} aria-label={label.title}>
       <span class="dot" aria-hidden="true"></span>
-      <span class="text">Sharing · {plural(st.shares, 'share', 'shares')} · {plural(st.phones, 'phone', 'phones')}</span>
-      {#if left}<span class="left">{left}</span>{/if}
-    </a>
-  {:else if st && st.state === 'paused'}
-    <a class="pill paused" class:active href="#/share" title={st.reason || 'Sharing is paused'}>
-      <span class="dot" aria-hidden="true"></span>
-      <span class="text">Sharing paused{st.reason ? `: ${st.reason}` : ''}</span>
-    </a>
-  {:else if st && st.state === 'error'}
-    <a class="pill error" class:active href="#/share" title={st.reason || 'Sharing failed'}>
-      <span class="dot" aria-hidden="true"></span>
-      <span class="text">Sharing failed</span>
+      <span class="fit" bind:this={fit}>
+        <!-- Asks for the room of the longest text; the flex row gives what it can. -->
+        <span class="sizer" aria-hidden="true">{@render body(variants[0] ?? shown)}</span>
+        <span class="shown">{@render body(shown)}</span>
+        <span class="measures" aria-hidden="true" bind:this={measures}>
+          {#each variants as v, i (i)}<span>{@render body(v)}</span>{/each}
+        </span>
+      </span>
     </a>
   {:else}
     <a class="plain" class:active href="#/share">Share</a>
@@ -76,12 +105,34 @@
     text-decoration: none;
     background: var(--surface-3);
   }
-  .text {
+  .fit {
+    position: relative;
+    display: block;
     min-width: 0;
     overflow: hidden;
-    text-overflow: ellipsis;
+  }
+  .sizer {
+    display: block;
+    height: 0;
+    visibility: hidden;
+  }
+  .shown {
+    display: block;
+  }
+  .measures {
+    position: absolute;
+    top: 0;
+    left: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .measures > span {
+    position: absolute;
+    top: 0;
+    left: 0;
   }
   .left {
+    margin-left: 8px;
     color: var(--muted);
     font-size: 0.9em;
   }
@@ -111,10 +162,7 @@
   }
   @media (max-width: 900px) {
     .pill {
-      max-width: 200px;
-    }
-    .left {
-      display: none;
+      max-width: 240px;
     }
   }
 </style>

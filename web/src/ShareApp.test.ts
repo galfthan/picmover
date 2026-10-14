@@ -158,6 +158,41 @@ describe('phone app', () => {
       expect(document.querySelector('.topbar .title')?.textContent).toBe('Summer guests');
     });
 
+    it('a phone already paired with this very share is told so and carries on', async () => {
+      setup('libraries');
+      await start('#/pair/tok_' + 'a'.repeat(40));
+      click(button('Pair')!);
+      await settle();
+      expect(text()).toContain('This phone is already paired with this share (“My phone”).');
+      expect(text()).not.toContain('instead');
+      expect(button('Pair with this share')).toBeUndefined();
+      click(button('Continue')!);
+      await settle();
+      expect(location.hash).toBe('#/');
+      expect(server.calls.filter((c) => c.path === '/api/pair')).toHaveLength(1);
+      expect(text()).toContain('Penny');
+    });
+
+    it('hints at misread characters as the code is typed, with a keyboard set up for codes', async () => {
+      setup('libraries', { paired: false });
+      await start('#/');
+      const code = document.querySelector<HTMLInputElement>('input[aria-label="Pairing code"]')!;
+      expect(code.getAttribute('autocapitalize')).toBe('characters');
+      expect(code.getAttribute('autocorrect')).toBe('off');
+      expect(code.getAttribute('spellcheck')).toBe('false');
+      expect(code.getAttribute('inputmode')).toBe('text');
+      const hint = () => document.getElementById('code-hint')?.textContent ?? '';
+      type(code, 'k7qm-3x');
+      expect(hint()).toBe('');
+      type(code, 'k7qm-3xr0');
+      expect(hint()).toBe('Codes don’t use 0, 1, I, L or O. Check the code on the computer.');
+      expect(code.getAttribute('aria-invalid')).toBe('true');
+      expect((button('Pair') as HTMLButtonElement).disabled).toBe(true);
+      type(code, 'k7qm-3xrd');
+      expect(hint()).toBe('');
+      expect((button('Pair') as HTMLButtonElement).disabled).toBe(false);
+    });
+
     it('keeps the current share when the phone says no', async () => {
       setup('album');
       server.cookie.otherShare = 'My phone';
@@ -189,6 +224,30 @@ describe('phone app', () => {
       await settle();
       expect(location.hash).toBe('#/');
       expect(text()).toContain('Penny');
+    });
+
+    it('says when sharing was turned off while the computer was asked, and starts over', async () => {
+      setup('libraries', { paired: false });
+      server.pairing.approve = true;
+      await start('#/pair/tok_' + 'a'.repeat(40));
+      click(button('Pair')!);
+      await settle();
+      expect(text()).toContain('Waiting for the computer');
+      server.turnOff();
+      await settle();
+      expect(text()).toContain('Sharing was turned off on the computer');
+      expect(text()).not.toContain('did not approve');
+      click(button('Start over')!);
+      await settle();
+      // The token went with it: the code form, empty.
+      const code = document.querySelector<HTMLInputElement>('input[aria-label="Pairing code"]')!;
+      expect(code.value).toBe('');
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      type(code, 'K7QM3XRD');
+      server.pairing.approve = false;
+      click(button('Pair')!);
+      await settle();
+      expect(location.hash).toBe('#/');
     });
 
     it("shows the server's message for a share that refuses phones (410 with a state) or is full (409 without current)", async () => {
@@ -289,6 +348,72 @@ describe('phone app', () => {
       // The grid stays on the thumb.
       expect(tiles()[0]?.querySelector('img')?.getAttribute('src')).toBe(`/api/l/peter/thumb/${'1'.padStart(16, '0')}?v=1700000000`);
       expect(document.querySelector('.cell input[type="checkbox"]')).toBeNull();
+    });
+
+    it('loads a thumbnail again after a 429 (honouring Retry-After), and gives up on a 404', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      const img = (i: number) => tiles()[i]!.querySelector('img');
+      const thumbChecks = () => server.calls.filter((c) => c.path.includes('/thumb/')).length;
+      server.mediaFail.times = 1;
+      server.mediaFail.retryAfter = '3';
+      img(0)!.dispatchEvent(new Event('error'));
+      await settle();
+      // Grey while the computer asked to wait; one check of the URL, not one per tile.
+      expect(img(0)).toBeNull();
+      expect(thumbChecks()).toBe(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(img(0)?.getAttribute('src')).toBe(`/api/l/peter/thumb/${'1'.padStart(16, '0')}?v=1700000000`);
+      // A thumbnail that is gone stays grey.
+      server.mediaFail.times = 1;
+      server.mediaFail.status = 404;
+      server.mediaFail.retryAfter = '';
+      img(1)!.dispatchEvent(new Event('error'));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(img(1)).toBeNull();
+      expect(thumbChecks()).toBe(2);
+    });
+
+    it('back on the page, reads the timeline once and refetches the months only when it changed', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      const media = () => server.requests('/api/l/peter/media?').length;
+      const timelines = () => server.requests('/api/l/peter/timeline').length;
+      const [m0, t0] = [media(), timelines()];
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+      await settle();
+      expect(timelines()).toBe(t0 + 1);
+      expect(media()).toBe(m0);
+      expect(tiles()).toHaveLength(8);
+      // A photo went meanwhile: the months are read again.
+      server.items.splice(1, 1);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await settle();
+      expect(media()).toBeGreaterThan(m0);
+      expect(tiles()).toHaveLength(7);
+    });
+
+    it('closing a lightbox opened from a link scrolls the grid to the photo it showed', async () => {
+      setup('libraries');
+      for (let i = 0; i < 90; i++) {
+        const id = 100 + i;
+        server.items.push({ id, hash: id.toString(16).padStart(16, '0'), type: 'image', takenAt: `2023-03-${String(1 + (i % 28)).padStart(2, '0')}T10:00:00`, w: 400, h: 300, thumb: 'ok', lib: 'peter' });
+      }
+      await start('#/l/peter/view/150');
+      const scroller = document.querySelector<HTMLElement>('.share-grid .scroller')!;
+      expect(scroller.scrollTop).toBe(0);
+      click(button('Close')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/');
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+      expect(document.querySelector('a.tile[href="#/l/peter/view/150"]')).not.toBeNull();
+    });
+
+    it('names the library after the share with a spaced dot', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      expect(document.querySelector('.topbar .title')?.textContent).toBe('My phone · Peter');
     });
 
     it('lists the albums and opens one', async () => {
@@ -500,6 +625,101 @@ describe('phone app', () => {
     });
   });
 
+  describe('capabilities changed on the computer', () => {
+    const visible = () => {
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+    const badges = () => document.querySelectorAll('a.tile .rating').length;
+
+    it('drops the stars from tiles and lightbox when ratings are turned off, without a reload', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      expect(badges()).toBe(1);
+      server.caps.rate = false;
+      visible();
+      await settle();
+      expect(badges()).toBe(0);
+      expect(document.querySelector('.topbar .filterbtn')).not.toBeNull();
+      click(tiles()[0]!);
+      await settle();
+      expect(lightbox()!.querySelector('[aria-label="Rating"]')).toBeNull();
+    });
+
+    it('shows what was turned on while the page is open', async () => {
+      setup('album');
+      await start('#/view/1');
+      expect(lightbox()!.querySelector('[aria-label="Rating"]')).toBeNull();
+      expect(badges()).toBe(0);
+      server.caps.rate = true;
+      server.caps.download = true;
+      await vi.advanceTimersByTimeAsync(3 * 60_000);
+      await settle();
+      expect(lightbox()!.querySelectorAll('[aria-label="Rating"] button')).toHaveLength(5);
+      expect([...lightbox()!.querySelectorAll('a')].some((a) => a.textContent?.trim() === 'Download')).toBe(true);
+      expect(badges()).toBe(1);
+    });
+
+    it('a session read in the background that fails keeps the page; a refusal replaces it', async () => {
+      setup('libraries');
+      await start('#/l/peter/');
+      vi.mocked(fetch).mockImplementationOnce(() => Promise.reject(new TypeError('Failed to fetch')));
+      visible();
+      await settle();
+      expect(tiles()).toHaveLength(8);
+      expect(text()).not.toContain('Cannot reach the computer');
+      server.share.state = 'paused';
+      visible();
+      await settle();
+      expect(text()).toContain('This share is paused');
+    });
+
+    it('says videos are no longer allowed when they were turned off during playback', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/3');
+      server.caps.video = false;
+      const sessions = server.requests('/api/session').length;
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(text()).not.toContain('cannot be played in this browser');
+      expect(server.requests('/api/session').length).toBe(sessions + 1);
+      expect(lightbox()!.querySelector('video')).toBeNull();
+      expect(lightbox()!.textContent).toContain('Video not available in this share');
+    });
+
+    it('says when the computer cannot be reached or is busy, rather than blaming the browser', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/3');
+      server.mediaFail.times = 1;
+      server.mediaFail.status = 503;
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.banner')?.textContent).toContain('The computer is busy. Try again in a moment.');
+      click(button('Try again')!);
+      await settle();
+      expect(lightbox()!.querySelector('video')?.getAttribute('src')).toBe('/api/l/peter/file/3');
+      vi.mocked(fetch).mockImplementationOnce(() => Promise.reject(new TypeError('Failed to fetch')));
+      lightbox()!.querySelector('video')!.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.banner')?.textContent).toContain('Cannot reach the computer');
+    });
+
+    it('falls back from an original that is no longer allowed', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/1');
+      lightbox()!.querySelector('.stage')!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      await settle();
+      const img = lightbox()!.querySelector<HTMLImageElement>('.full img')!;
+      expect(img.getAttribute('src')).toBe('/api/l/peter/file/1');
+      server.caps.download = false;
+      img.dispatchEvent(new Event('error'));
+      await settle();
+      expect(lightbox()!.querySelector('.note')?.textContent).toBe('Originals are no longer allowed in this share.');
+      expect(lightbox()!.querySelector('.full img')?.getAttribute('src') ?? lightbox()!.querySelector('img.preview')?.getAttribute('src')).toContain('/preview/');
+      expect([...lightbox()!.querySelectorAll('a')].some((a) => a.textContent?.trim() === 'Download')).toBe(false);
+    });
+  });
+
   describe('album share', () => {
     it('is the album and nothing else: no library or album routes or requests', async () => {
       setup('album');
@@ -520,10 +740,17 @@ describe('phone app', () => {
       // The menu: who this phone is and until when.
       click(button('Menu')!);
       await settle();
-      const menu = document.querySelector('[role="menu"]')!;
+      // A plain disclosure (it holds text): no ARIA menu roles.
+      const menu = document.getElementById('share-menu')!;
+      expect(button('Menu')!.getAttribute('aria-controls')).toBe('share-menu');
+      expect(button('Menu')!.getAttribute('aria-expanded')).toBe('true');
+      expect(document.querySelector('[role="menu"], [role="menuitem"]')).toBeNull();
       expect(menu.textContent).toContain("Paired as Anna's phone");
       expect(menu.textContent).toContain('Available until 13 Nov');
       expect(menu.textContent).not.toContain('Libraries');
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }));
+      await settle();
+      expect(document.getElementById('share-menu')).toBeNull();
     });
   });
 
@@ -575,6 +802,12 @@ describe('phone app', () => {
       const video = lightbox()!.querySelector('video')!;
       expect(video.hasAttribute('playsinline')).toBe(true);
       expect(video.getAttribute('src')).toBe('/api/l/peter/file/3');
+      // Between the bars (layout.test.ts checks the inset), and a tap on it is the player's, not ours.
+      expect(video.parentElement?.classList.contains('video')).toBe(true);
+      touch(video, 'touchstart', 200, 300);
+      touch(video, 'touchend', 200, 300);
+      await settle();
+      expect(lightbox()!.classList.contains('bare')).toBe(false);
       video.dispatchEvent(new Event('error'));
       await settle();
       expect(lightbox()!.textContent).toContain('This video cannot be played in this browser');
@@ -643,6 +876,30 @@ describe('phone app', () => {
       await swipe([500, 200], [510, 450]);
       await vi.waitFor(() => expect(location.hash).toBe('#/l/peter/'));
       expect(lightbox()).toBeNull();
+    });
+
+    it('keeps Tab inside the lightbox (no inert on Gecko 91)', async () => {
+      setup('libraries');
+      await start('#/l/peter/view/2');
+      const lb = lightbox()!;
+      const focusables = [...lb.querySelectorAll<HTMLElement>('a[href], button:not([disabled])')];
+      const tab = (shift = false) => {
+        const e = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: shift, bubbles: true, cancelable: true });
+        (document.activeElement ?? document.body).dispatchEvent(e);
+        return e;
+      };
+      focusables.at(-1)!.focus();
+      expect(tab().defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(focusables[0]);
+      expect(tab(true).defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(focusables.at(-1));
+      // From the page behind (focus escaped somehow): back into the lightbox.
+      document.querySelector<HTMLElement>('.topbar button')!.focus();
+      tab();
+      expect(lb.contains(document.activeElement)).toBe(true);
+      // In the middle, Tab is the browser's.
+      focusables[0]!.focus();
+      expect(tab().defaultPrevented).toBe(false);
     });
 
     it('a tap toggles the bars and a double tap zooms', async () => {

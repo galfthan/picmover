@@ -1537,6 +1537,8 @@ export interface ShareAddress {
   subnet: string;
   /** A virtual interface (docker, VPN): rarely the Wi-Fi. */
   virtual: boolean;
+  /** true: a Wi-Fi interface, false: wired; null: the server did not say (an older one). */
+  wireless: boolean | null;
 }
 
 export type AutoOffMode = 'never' | '1h' | '4h' | 'quit';
@@ -1712,7 +1714,7 @@ export function toSharingStatus(v: unknown): SharingStatus {
     addresses: Array.isArray(r.addresses)
       ? r.addresses
           .filter(isRecord)
-          .map((a) => ({ ip: str(a.ip), iface: str(a.iface), subnet: str(a.subnet), virtual: bool(a.virtual) }))
+          .map((a) => ({ ip: str(a.ip), iface: str(a.iface), subnet: str(a.subnet), virtual: bool(a.virtual), wireless: typeof a.wireless === 'boolean' ? a.wireless : null }))
           .filter((a) => a.ip !== '')
       : [],
     fingerprint: { leaf: str(fp.leaf), ca: str(fp.ca) },

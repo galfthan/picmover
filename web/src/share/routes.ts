@@ -100,6 +100,20 @@ export function normaliseCode(s: string): string | null {
   return /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{8}$/.test(c) ? c : null;
 }
 
+/**
+ * What is wrong with a code being typed, for a hint under the field; ""
+ * while it can still become a code. The alphabet leaves out 0, 1, I, L
+ * and O; since both halves of each look-alike pair are out, a misread
+ * cannot be mapped to the intended character, only pointed out.
+ */
+export function codeProblem(s: string): string {
+  const c = s.toUpperCase().replace(/[\s-]/g, '');
+  if (/[01ILO]/.test(c)) return 'Codes don’t use 0, 1, I, L or O. Check the code on the computer.';
+  if (/[^0-9A-Z]/.test(c)) return 'Codes have only letters and digits.';
+  if (c.length > 8) return 'The code has 8 characters.';
+  return '';
+}
+
 /** A name for this phone from the browser ("iPhone", "Android phone", "Sailfish phone"). */
 export function phoneName(ua: string): string {
   if (/iPhone/.test(ua)) return 'iPhone';

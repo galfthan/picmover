@@ -1,8 +1,15 @@
 <script lang="ts" module>
   import type { LibApi } from '../lib/api';
 
-  /** What a tile needs of a library client: the admin LibApi, or the phone app's share client. */
-  export type TileApi = Pick<LibApi, 'id' | 'thumbUrl' | 'largeUrl' | 'previewUrl'>;
+  /**
+   * What a tile needs of a library client: the admin LibApi, or the phone
+   * app's share client. `retryDelay` (the phone's): when to load a failed
+   * image again (ms), or null to give up; the admin grid has none and
+   * retries only when a job versions the URL.
+   */
+  export type TileApi = Pick<LibApi, 'id' | 'thumbUrl' | 'largeUrl' | 'previewUrl'> & {
+    retryDelay?: (url: string, attempt: number) => Promise<number | null>;
+  };
 
   /** Where a tile opens its item; the admin viewer (#/l/<id>/view/<mid>) when not given. */
   export interface TileViewer {
@@ -74,8 +81,39 @@
   function onError(e: Event) {
     const s = (e.currentTarget as HTMLImageElement).getAttribute('src');
     if (s === bigSrc && s !== thumbSrc) bigFailedSrc = s;
-    else failedSrc = s;
+    else {
+      failedSrc = s;
+      if (s) scheduleRetry(s);
+    }
   }
+
+  // Bounded retries where the client offers them (the phone: a 429 from
+  // the computer's rate limit, or a moment without Wi-Fi, must not leave
+  // grey tiles for good). The <img> is made anew for each try.
+  let attempts = 0;
+  let tries = $state(0);
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let asking = false;
+  let destroyed = false;
+  function scheduleRetry(s: string) {
+    const ask = api.retryDelay;
+    if (!ask || retryTimer || asking) return;
+    asking = true;
+    void ask(s, attempts++).then((ms) => {
+      asking = false;
+      if (ms === null || destroyed || failedSrc !== s) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (failedSrc !== s) return;
+        tries++;
+        failedSrc = null;
+      }, ms);
+    });
+  }
+  $effect(() => () => {
+    destroyed = true;
+    if (retryTimer) clearTimeout(retryTimer);
+  });
   // One more try at an unchanged URL when a fresh copy of the item arrives
   // (the grid refetches buckets after a job), for a server that does not
   // send thumbAt.
@@ -140,7 +178,9 @@
       {#if under}
         <img class="under" src={under} alt="" draggable="false" />
       {/if}
-      <img {src} alt="" loading="lazy" decoding="async" draggable="false" onload={onLoad} onerror={onError} />
+      {#key tries}
+        <img {src} alt="" loading="lazy" decoding="async" draggable="false" onload={onLoad} onerror={onError} />
+      {/key}
     {:else}
       <span class="ph" aria-hidden="true">{isVideo ? '▶' : ''}</span>
     {/if}
