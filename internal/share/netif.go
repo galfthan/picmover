@@ -24,6 +24,9 @@ type Candidate struct {
 	// Virtual marks container, VM and VPN interfaces: listed as "other
 	// networks", never chosen by default.
 	Virtual bool
+	// Wireless marks a Wi-Fi interface (Linux: from /sys/class/net;
+	// elsewhere a guess from the name, false when unknown).
+	Wireless bool
 }
 
 // virtualPrefixes are interface name prefixes of container, VM and VPN
@@ -100,7 +103,11 @@ func (systemNetif) Candidates() ([]Candidate, error) {
 		}
 		list = append(list, Iface{Name: ifc.Name, Flags: ifc.Flags, Addrs: addrs})
 	}
-	return CandidatesFrom(list), nil
+	cands := CandidatesFrom(list)
+	for i := range cands {
+		cands[i].Wireless = isWireless(cands[i].Iface)
+	}
+	return cands, nil
 }
 
 // DefaultIP "dials" UDP to a documentation address, which sends no

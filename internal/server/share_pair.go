@@ -39,6 +39,9 @@ type alreadyPairedJSON struct {
 	Error   string `json:"error"`
 	Current struct {
 		Share string `json:"share"`
+		// SameShare: the browser's device belongs to the share being
+		// paired (absent when false).
+		SameShare bool `json:"sameShare,omitempty"`
 	} `json:"current"`
 }
 
@@ -46,6 +49,10 @@ type alreadyPairedJSON struct {
 // codes.
 var errPairBlocked = fmt.Sprintf("Too many wrong codes from this phone; try again in %d minutes.",
 	int(share.CodeBlockFor/time.Minute))
+
+// pairRetry is the Retry-After of the pairing rate limits (a token
+// refills every 12 s per address).
+const pairRetry = 15 * time.Second
 
 // stateOff is the state of the 410 of a redeem whose approval wait ended
 // because sharing was turned off, paused or picmover quit.
@@ -62,11 +69,13 @@ const stateOff = "off"
 func (s *Server) handleSharePair(w http.ResponseWriter, r *http.Request) {
 	sh := s.share
 	ip := remoteHost(r)
-	if sh.pairs.Blocked(ip) {
+	if d := sh.pairs.BlockedFor(ip); d > 0 {
+		setRetryAfter(w, d)
 		writeError(w, http.StatusTooManyRequests, errPairBlocked)
 		return
 	}
 	if !sh.pairIP.Allow(ip) {
+		setRetryAfter(w, pairRetry)
 		writeError(w, http.StatusTooManyRequests, "Too many pairing attempts; wait a minute and try again.")
 		return
 	}
@@ -83,6 +92,7 @@ func (s *Server) handleSharePair(w http.ResponseWriter, r *http.Request) {
 	// well-formed code takes from it (a token is 256 bits; a malformed
 	// value is refused before any lookup).
 	if body.Token == "" && share.NormalizeCode(body.Code) != "" && !sh.pairAll.Allow("") {
+		setRetryAfter(w, pairRetry)
 		writeError(w, http.StatusTooManyRequests, "Too many pairing attempts; wait a minute and try again.")
 		return
 	}
@@ -115,6 +125,7 @@ func (s *Server) handleSharePair(w http.ResponseWriter, r *http.Request) {
 			var out alreadyPairedJSON
 			out.Error = fmt.Sprintf("This phone is already paired with %q.", cur.Share.Name)
 			out.Current.Share = cur.Share.Name
+			out.Current.SameShare = cur.Share.ID == target.ID
 			writeJSON(w, http.StatusConflict, out)
 			return
 		}

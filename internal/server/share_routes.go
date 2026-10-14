@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -168,7 +169,8 @@ func (sh *sharing) middleware(h http.Handler) http.Handler {
 		// The lockout covers the API, except POST /api/pair (it has its own
 		// limits): the static files load even for a locked-out address, so
 		// a phone that tripped it still gets the page that explains.
-		if lockable(r) && sh.authFail.Locked(remoteHost(r)) {
+		if d := sh.authFail.LockedFor(remoteHost(r)); d > 0 && lockable(r) {
+			setRetryAfter(w, d)
 			sh.reject(w, r, http.StatusTooManyRequests, "too many failed requests; try again in a few minutes")
 			return
 		}
@@ -192,6 +194,12 @@ func (sh *sharing) middleware(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// setRetryAfter sets Retry-After (whole seconds, at least 1) on a 429 of
+// the share listener.
+func setRetryAfter(w http.ResponseWriter, d time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(max(1, int((d+time.Second-1)/time.Second))))
 }
 
 // lockable reports whether a request is subject to the auth-failure
@@ -308,6 +316,7 @@ func (s *Server) shareDeviceAuth(w http.ResponseWriter, r *http.Request, media b
 		limit = sh.perDeviceMedia
 	}
 	if !limit.Allow(v.Device.ID) {
+		setRetryAfter(w, time.Second)
 		writeError(w, http.StatusTooManyRequests, "too many requests")
 		return nil, false
 	}

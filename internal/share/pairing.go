@@ -289,11 +289,18 @@ func WrongCodesNotice(addr string) string {
 
 // Blocked reports whether addr is refused pairing after too many wrong
 // codes.
-func (p *Pairings) Blocked(addr string) bool {
+func (p *Pairings) Blocked(addr string) bool { return p.BlockedFor(addr) > 0 }
+
+// BlockedFor is how long addr stays refused pairing (0: it is not).
+func (p *Pairings) BlockedFor(addr string) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	w := p.wrong[addr]
-	return w != nil && p.now().Before(w.until)
+	if w := p.wrong[addr]; w != nil {
+		if d := w.until.Sub(p.now()); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // Use marks a claimed pairing used: an atomic swap, so of two concurrent

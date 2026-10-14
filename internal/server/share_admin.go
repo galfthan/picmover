@@ -209,6 +209,8 @@ type shareAddrJSON struct {
 	Iface   string `json:"iface"`
 	Subnet  string `json:"subnet"`
 	Virtual bool   `json:"virtual,omitempty"`
+	// Wireless: a Wi-Fi interface (always present; false when unknown).
+	Wireless bool `json:"wireless"`
 }
 
 type shareFingerprints struct {
@@ -295,7 +297,7 @@ func (s *Server) shareStatus(ctx context.Context, m *share.Manager, cfg *share.C
 	cands, _ := sh.netif.Candidates()
 	for _, c := range cands {
 		out.Addresses = append(out.Addresses, shareAddrJSON{IP: c.IP.String(), Iface: c.Iface, Subnet: c.Subnet.String(),
-			Virtual: c.Virtual})
+			Virtual: c.Virtual, Wireless: c.Wireless})
 	}
 	subnet := ""
 	if (snap.state == shareOn || snap.state == sharePaused) && snap.bound.IP != nil {
