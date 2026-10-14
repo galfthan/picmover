@@ -133,6 +133,18 @@ func LockFile(p, name string) (unlock func(), err error) {
 // errWouldBlock is returned by lockFile when another holder has the lock.
 var errWouldBlock = errors.New("lock held")
 
+// PeekHolder reads the holder recorded in the lock file at p without
+// taking the lock: ok is false when the file is missing or empty (no
+// holder; a holder empties it when it lets go). A holder that crashed
+// leaves its record behind, so callers check that its process lives.
+func PeekHolder(p string) (h *ErrLocked, ok bool) {
+	b, err := os.ReadFile(p)
+	if err != nil || len(strings.TrimSpace(string(b))) == 0 {
+		return nil, false
+	}
+	return readHolder(p), true
+}
+
 // readHolder returns an *ErrLocked describing the holder recorded in the
 // lock file at p.
 func readHolder(p string) *ErrLocked {

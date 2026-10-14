@@ -52,6 +52,8 @@ type Device struct {
 	LastAddress    string    `json:"lastAddress,omitempty"`
 	Browser        string    `json:"browser,omitempty"`
 	CookieIssuedAt time.Time `json:"cookieIssuedAt"`
+
+	extra extra // members of a newer picmover, kept on rewrite
 }
 
 // Share is a named, scoped grant with its own devices.
@@ -65,6 +67,8 @@ type Share struct {
 	Approve      bool         `json:"approve"`
 	CreatedAt    time.Time    `json:"createdAt"`
 	Devices      []Device     `json:"devices"`
+
+	extra extra // members of a newer picmover, kept on rewrite
 }
 
 // State is the share's state from its own fields at now: unknown for a

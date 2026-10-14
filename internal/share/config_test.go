@@ -136,8 +136,12 @@ func TestConfigDamagedFile(t *testing.T) {
 	if len(cfg.Shares) != 0 || cfg.KeepOn {
 		t.Fatalf("damaged file gave %+v", cfg)
 	}
-	if _, err := os.Stat(p + ".damaged"); err != nil {
-		t.Fatalf("damaged file not kept: %v", err)
+	// Set aside by the next writer, under the lock (R14).
+	if err := m.Update(func(c *Config, _ time.Time) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := filepath.Glob(p + ".damaged-*"); len(list) != 1 {
+		t.Fatalf("damaged file not kept: %v", list)
 	}
 	// A newer format is refused, not overwritten.
 	if err := os.WriteFile(p, []byte(`{"version":2}`), 0o600); err != nil {

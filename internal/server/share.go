@@ -664,12 +664,14 @@ func (sh *sharing) pauseLocked(reason string, waiting bool) {
 	sh.log.Info("Sharing on Wi-Fi paused: " + reason)
 }
 
-// checkExpiry logs shares that ended since the last check.
+// checkExpiry logs shares that ended since the last check, and sweeps
+// the settings (share.Manager.Sweep).
 func (sh *sharing) checkExpiry() {
 	m := sh.mgr
 	if m == nil {
 		return
 	}
+	m.Sweep() // shares ended 30 days ago, phones unused for 400 days
 	cfg, err := m.Snapshot()
 	if err != nil {
 		return

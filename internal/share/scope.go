@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 // Scope kinds (docs/design/lan-share.md, "Scope kinds"). A new kind is a
@@ -44,6 +45,9 @@ type Scope struct {
 	// raw is the scope as read, for a kind this picmover does not know:
 	// it is written back byte for byte and never authorizes anything.
 	raw json.RawMessage
+	// extra are members of a known kind that a newer picmover added, kept
+	// on rewrite.
+	extra extra
 }
 
 // Known reports whether this picmover understands the scope's kind.
@@ -67,8 +71,11 @@ func (s *Scope) UnmarshalJSON(b []byte) error {
 	*s = Scope{Kind: f.Kind, Workspace: f.Workspace, Libraries: f.Libraries, Library: f.Library, Album: f.Album}
 	if !s.Known() {
 		s.raw = bytes.Clone(b)
+		return nil
 	}
-	return nil
+	x, err := splitExtra(b, reflect.TypeFor[scopeFields]())
+	s.extra = x
+	return err
 }
 
 // MarshalJSON writes the scope; an unknown kind as it was read.
@@ -76,8 +83,12 @@ func (s Scope) MarshalJSON() ([]byte, error) {
 	if !s.Known() && s.raw != nil {
 		return s.raw, nil
 	}
-	return json.Marshal(scopeFields{Kind: s.Kind, Workspace: s.Workspace, Libraries: s.Libraries,
+	b, err := json.Marshal(scopeFields{Kind: s.Kind, Workspace: s.Workspace, Libraries: s.Libraries,
 		Library: s.Library, Album: s.Album})
+	if err != nil {
+		return nil, err
+	}
+	return joinExtra(b, s.extra)
 }
 
 // ErrInvalidScope wraps every scope validation error.
