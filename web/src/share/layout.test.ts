@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import shareCss from './share.css?raw';
 import lightboxSrc from './ShareLightbox.svelte?raw';
 import gridSrc from './ShareGrid.svelte?raw';
+import scrubberSrc from '../components/Scrubber.svelte?raw';
 /** The declarations of the first rule whose selector list is exactly `sel`. */
 function rule(css: string, sel: string): string {
   const esc = sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/,\s*/g, ',\\s*');
@@ -29,16 +30,22 @@ describe('phone layout rules', () => {
     expect(inset).toMatch(/bottom:\s*calc\(var\(--bar-h\) \+ env\(safe-area-inset-bottom/);
   });
 
-  it("keeps the scrubber's position marker beside the year labels, not across them", () => {
-    const style = gridSrc.slice(gridSrc.indexOf('<style>'));
-    const pos = rule(style, '.share-grid :global(.scrubber .pos)');
-    const year = rule(style, '.share-grid :global(.scrubber .year)');
+  it("gives the phone's scrubber a large thumb off the screen's edge, in a gutter the grid leaves free", () => {
     const px = (decls: string, prop: string) => Number(new RegExp(`(?:^|[;\\s])${prop}:\\s*(\\d+)(?:px)?\\b`).exec(decls)?.[1] ?? NaN);
-    // The marker ends where the labels begin.
-    expect(px(pos, 'right') + px(pos, 'width')).toBeLessThanOrEqual(px(year, 'right'));
-    // The labels (4 digits at 10px, about 24px) fit the gutter the canvas leaves.
+    const style = gridSrc.slice(gridSrc.indexOf('<style>'));
+    const scrub = scrubberSrc.slice(scrubberSrc.indexOf('<style>'));
+    const thumb = rule(scrub, '.thumb');
+    // A 44 px target at least, drawn at least 8 px from the edge where the system takes swipes.
+    expect(px(thumb, 'height')).toBeGreaterThanOrEqual(44);
+    expect(px(thumb, 'right')).toBeGreaterThanOrEqual(8);
     const gutter = px(rule(style, '.share-grid :global(.scrubber)'), 'width');
+    expect(px(thumb, 'right') + px(thumb, 'width')).toBeLessThanOrEqual(gutter);
+    // The labels (4 digits at 10px, about 24px) fit the gutter the canvas leaves.
+    const year = rule(style, '.share-grid :global(.scrubber .year)');
     expect(px(year, 'right') + 24).toBeLessThanOrEqual(gutter);
     expect(px(rule(style, '.canvas'), 'margin-right')).toBe(gutter);
+    // The year labels are marks, not targets: a finger on one drags like anywhere on the track.
+    expect(rule(scrub, '.year')).toMatch(/pointer-events:\s*none/);
+    expect(scrubberSrc).not.toMatch(/<button/);
   });
 });

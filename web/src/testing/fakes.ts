@@ -54,6 +54,32 @@ const TINY_WEBP = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00
 
 export const hashOf = (id: number) => id.toString(16).padStart(16, '0');
 
+/**
+ * A large library's timeline, newest first: about 200,000 photos over 15
+ * years (2011–2025) with uneven months, as a family library has them (more
+ * every year, summers and Christmases big, a few empty months, a few big
+ * trips), and an undated bucket. Deterministic.
+ */
+export function bigTimeline(): { year: number; month: number; count: number }[] {
+  let seed = 42;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+  const out: { year: number; month: number; count: number }[] = [];
+  for (let y = 2025; y >= 2011; y--) {
+    const base = 600 + (y - 2011) * 70;
+    for (let m = 12; m >= 1; m--) {
+      let n = base * (0.3 + rnd());
+      if (m === 6 || m === 7) n *= 2.6;
+      if (m === 12) n *= 1.8;
+      if (rnd() < 0.08) n = 0;
+      if (rnd() < 0.04) n *= 4;
+      n = Math.round(n);
+      if (n > 0) out.push({ year: y, month: m, count: n });
+    }
+  }
+  out.push({ year: 0, month: 0, count: 312 });
+  return out;
+}
+
 export interface Item extends MediaItem {
   deletedAt?: string | null;
   tagIds: number[];
@@ -1462,6 +1488,11 @@ export interface FakeShareOptions {
   libraries?: string[];
   /** Whether this browser holds a valid device cookie at the start (default: true). */
   paired?: boolean;
+  /**
+   * peter's timeline instead of its few items: these months (newest
+   * first), their items made up when a month is asked for (unfiltered).
+   */
+  bulk?: { year: number; month: number; count: number }[];
 }
 
 /**
@@ -1712,6 +1743,30 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (method === 'GET' && rest === 'facets') {
       for (const k of q.keys()) return json({ error: `invalid filter "${k}"` }, 400);
       return json(facetsOf(lib, real));
+    }
+    if (opts.bulk && real === 'peter' && method === 'GET' && (rest === 'timeline' || rest === 'media')) {
+      // A large library made up on the fly: the months' counts, items generated per month.
+      if (rest === 'timeline') return json({ buckets: opts.bulk });
+      const y = Number(q.get('year'));
+      const mo = Number(q.get('month'));
+      const b = opts.bulk.find((x) => x.year === y && x.month === mo);
+      let id = 1_000_000;
+      for (const x of opts.bulk) {
+        if (x === b) break;
+        id += x.count;
+      }
+      const day = (i: number, n: number) => String(Math.max(1, 28 - Math.floor((i / n) * 27))).padStart(2, '0');
+      return json({
+        items: Array.from({ length: b?.count ?? 0 }, (_, i) => ({
+          id: id + i,
+          hash: hashOf(id + i),
+          type: 'image',
+          takenAt: `${y}-${String(mo).padStart(2, '0')}-${day(i, b?.count ?? 1)}T10:00:00`,
+          w: 4000,
+          h: 3000,
+          thumb: 'ok',
+        })),
+      });
     }
     if (method === 'GET' && rest === 'timeline') {
       const list = select(lib, q);
