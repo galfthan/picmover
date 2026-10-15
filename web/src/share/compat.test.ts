@@ -1,7 +1,7 @@
 // The Gecko 91 check of the phone bundle (scripts/check-share-apis.mjs,
 // run by `npm run build`): its scanner, and the polyfill module it trusts.
 import { describe, expect, it } from 'vitest';
-import { htmlAssets, JS_RULES, jsImports, scanCSS, scanJS } from '../../scripts/share-compat.mjs';
+import { htmlAssets, JS_RULES, jsImports, jsLazyImports, preloadDeps, scanCSS, scanJS } from '../../scripts/share-compat.mjs';
 import { POLYFILLED } from './polyfills';
 
 describe('share bundle check (Gecko 91)', () => {
@@ -45,6 +45,14 @@ describe('share bundle check (Gecko 91)', () => {
     const html = '<script type="module" crossorigin src="/assets/share-a.js"></script><link rel="modulepreload" crossorigin href="/assets/common-b.js"><link rel="stylesheet" href="/assets/share-c.css">';
     expect(htmlAssets(html)).toEqual(['/assets/share-a.js', '/assets/common-b.js', '/assets/share-c.css']);
     expect(jsImports('import{a as b}from"./common-b.js";import"./x.js";const m=()=>import("./lazy-d.js")')).toEqual(['./common-b.js', './x.js', './lazy-d.js']);
+    expect(jsLazyImports('import{a as b}from"./common-b.js";import"./x.js";const m=()=>import("./lazy-d.js")')).toEqual(['./lazy-d.js']);
+  });
+
+  it('follows a dynamic import into the files Vite preloads with it (the map\'s stylesheets)', () => {
+    const code =
+      'const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/ShareMap-a.js","assets/preload-helper-b.js","assets/ShareMap-c.css","assets/leaflet-d.css"])))=>i.map(i=>d[i]);';
+    expect(preloadDeps(code)).toEqual(['assets/ShareMap-a.js', 'assets/preload-helper-b.js', 'assets/ShareMap-c.css', 'assets/leaflet-d.css']);
+    expect(preloadDeps('const x=1')).toEqual([]);
   });
 
   it('lists only polyfills the check knows by name', () => {

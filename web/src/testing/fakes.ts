@@ -1494,6 +1494,13 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   first.lon = 24.94;
   first.gps = true;
   items[2]!.dur = 7000;
+  // More positions for the map: 2 and the video 3 next to 1 in Helsinki
+  // (all in "Summer"), 7 in Paris (in "Secret"), penny's 20 in New York.
+  const place = (id: number, lat: number, lon: number) => Object.assign(items.find((x) => x.id === id)!, { lat, lon, gps: true });
+  place(2, 60.171, 24.941);
+  place(3, 60.1705, 24.9405);
+  place(7, 48.85, 2.35);
+  place(20, 40.7, -74.0);
   // Cameras: peter's July on the Canon (the video has none), June on a
   // Pixel (outside the album "Summer"), penny on an iPhone.
   for (const x of items) x.camera = x.lib === 'penny' ? 'iPhone 12' : x.takenAt?.startsWith('2024-06') ? 'Pixel 7' : x.type === 'video' ? '' : 'Canon EOS R6';
@@ -1712,6 +1719,41 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (method === 'GET' && rest === 'facets') {
       for (const k of q.keys()) return json({ error: `invalid filter "${k}"` }, 400);
       return json(facetsOf(lib, real));
+    }
+    if (method === 'GET' && (rest === 'geo' || rest === 'geo/items')) {
+      // The map: `location` only; the filter whitelist plus bbox and zoom or limit.
+      if (!caps.location) return json({ error: 'not allowed in this share' }, 403);
+      const list = select(lib, q, rest === 'geo' ? ['bbox', 'zoom'] : ['bbox', 'limit']);
+      if (list instanceof Response) return list;
+      const b = (q.get('bbox') ?? '').split(',').map(Number);
+      if (b.length !== 4 || b.some((x) => !Number.isFinite(x))) return json({ error: 'bbox is required' }, 400);
+      const [w, s, e, n] = b as [number, number, number, number];
+      const inBox = list
+        .filter((x) => x.lat !== undefined && x.lon !== undefined && x.lat >= s && x.lat <= n && (w <= e ? x.lon >= w && x.lon <= e : x.lon >= w || x.lon <= e))
+        .sort((a, b2) => (b2.takenAt ?? '').localeCompare(a.takenAt ?? '') || b2.id - a.id);
+      if (rest === 'geo/items') {
+        const limit = Number(q.get('limit') ?? 200);
+        return json({ items: inBox.slice(0, limit).map(itemJSON), total: inBox.length });
+      }
+      const zoom = Number(q.get('zoom'));
+      if (!Number.isInteger(zoom) || zoom < 0 || zoom > 22) return json({ error: 'zoom is required: an integer 0-22' }, 400);
+      // Cells of 90/2^zoom degrees; the newest photo represents its cell.
+      const d = 90 / 2 ** zoom;
+      const cells = new Map<string, (ShareItem & { lib: string })[]>();
+      for (const x of inBox) {
+        const k = `${Math.floor(x.lat! / d)},${Math.floor(x.lon! / d)}`;
+        cells.set(k, [...(cells.get(k) ?? []), x]);
+      }
+      const clusters = [...cells.values()].map((xs) => {
+        const lat = xs.reduce((t, x) => t + x.lat!, 0) / xs.length;
+        const lon = xs.reduce((t, x) => t + x.lon!, 0) / xs.length;
+        const rep = xs[0]!;
+        const c: Record<string, unknown> = { lat, lon, count: xs.length, hash: rep.hash, ...(rep.thumbAt ? { thumbAt: rep.thumbAt } : {}) };
+        if (xs.length === 1) c.id = rep.id;
+        else c.bounds = [Math.min(...xs.map((x) => x.lon!)), Math.min(...xs.map((x) => x.lat!)), Math.max(...xs.map((x) => x.lon!)), Math.max(...xs.map((x) => x.lat!))];
+        return c;
+      });
+      return json({ clusters: clusters.sort((a, b2) => (b2.count as number) - (a.count as number)) });
     }
     if (method === 'GET' && rest === 'timeline') {
       const list = select(lib, q);

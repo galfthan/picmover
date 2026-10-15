@@ -122,3 +122,33 @@ export function jsImports(code) {
   for (let m = re.exec(code); m; m = re.exec(code)) if (m[1]) out.push(m[1]);
   return out;
 }
+
+/**
+ * The chunks a built JS chunk loads only on demand (dynamic `import()`), as relative specifiers.
+ * @param {string} code
+ * @returns {string[]}
+ */
+export function jsLazyImports(code) {
+  /** @type {string[]} */
+  const out = [];
+  const re = /\bimport\s*\(\s*["'](\.{1,2}\/[^"']+\.js)["']/g;
+  for (let m = re.exec(code); m; m = re.exec(code)) if (m[1]) out.push(m[1]);
+  return out;
+}
+
+/**
+ * The files Vite preloads with a dynamic import (its `__vite__mapDeps`
+ * list: the lazy chunk's own imports and its stylesheets, such as the
+ * map's Leaflet CSS), as paths from the dist root ("assets/x.css").
+ * @param {string} code
+ * @returns {string[]}
+ */
+export function preloadDeps(code) {
+  /** @type {string[]} */
+  const out = [];
+  const lists = /\bm\.f\s*=\s*\[([^\]]*)\]/g;
+  for (let m = lists.exec(code); m; m = lists.exec(code)) {
+    for (const f of (m[1] ?? '').matchAll(/["']([^"']+\.(?:js|css))["']/g)) if (f[1]) out.push(f[1]);
+  }
+  return out;
+}
