@@ -12,16 +12,28 @@
   // trashed or moved meanwhile drop out without refetching every month.
   // The grid also reloads (keeping its scroll) when the share's
   // capabilities change: tiles carry ratings only with `rate`.
+  //
+  // Long timelines (docs/design/lan-share.md "Timeline scrolling"): the
+  // layout comes from the months' counts alone, so it is exact before any
+  // month is loaded and loading never moves the view; when a layout does
+  // change (a month's real length differs, the timeline changed meanwhile,
+  // the phone turned) the photo at the top stays at the top. Only the
+  // months near the view are rendered and loaded; loads for months the
+  // view has left are cancelled, and far months are dropped again past a
+  // budget, so 200k photos over 15 years scroll like 2k. The scrubber
+  // maps proportionally onto the whole timeline, and a tap on a month's
+  // header opens "Jump to a date".
   import { tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import type { MediaItem, TimelineBucket } from '../lib/api';
-  import { layoutTimeline } from '../lib/timeline';
+  import { anchorAt, anchorOffset, layoutTimeline, type Timeline } from '../lib/timeline';
   import { bucketLabel, formatCount, parseWallClock } from '../lib/format';
   import { href, navigate } from '../lib/router';
   import { aspectOf, pixelRatio, renditionFor, shareGridCap } from '../lib/rendition';
   import Tile, { type TileViewer } from '../components/Tile.svelte';
   import Scrubber from '../components/Scrubber.svelte';
   import ShareLightbox, { type Neighbours } from './ShareLightbox.svelte';
+  import ShareJumpSheet from './ShareJumpSheet.svelte';
   import { CAPABILITIES, errorText, ShareError, type ShareClient, type ShareFilters } from './shareapi';
   import { filtersKey } from './filters';
 
@@ -50,7 +62,9 @@
   const GAP = 2;
   const HEADER = 40;
   const BUCKET_PAD = 8;
-  const SCRUB = 30; // right gutter for the scrubber
+  const SCRUB = 40; // right gutter for the scrubber (see the style)
+  /** Loaded items kept at most; the months farthest from the view are dropped first. */
+  const KEEP_ITEMS = 12_000;
 
   let width = $state(0);
   let height = $state(0);
@@ -66,6 +80,8 @@
   const items = new SvelteMap<string, MediaItem[]>();
   const bucketErrors = new SvelteMap<string, string>();
   const inflight = new Map<string, Promise<MediaItem[] | null>>();
+  /** Loads started for the view, cancelled when the view leaves their month. */
+  const viewLoads = new Map<string, AbortController>();
   let gen = 0;
   let epoch = $state(0);
   const bkey = (year: number, month: number) => `${year}-${month}`;
@@ -95,38 +111,82 @@
 
   // ---- Data ----
 
-  function loadBucket(year: number, month: number): Promise<MediaItem[] | null> {
+  /**
+   * Loads a month once (concurrent callers share the request). `forView`
+   * loads may be cancelled when the view moves on (cancelView); anyone
+   * else asking for the same month makes it stay.
+   */
+  function loadBucket(year: number, month: number, forView = false): Promise<MediaItem[] | null> {
     const k = bkey(year, month);
     const have = items.get(k);
     if (have) return Promise.resolve(have);
     const pending = inflight.get(k);
-    if (pending) return pending;
+    if (pending) {
+      if (!forView) viewLoads.delete(k); // the lightbox wants it too: no longer cancellable
+      return pending;
+    }
     const g = gen;
+    const ac = new AbortController();
+    if (forView) viewLoads.set(k, ac);
     const p = client
-      .getBucket(filters, year, month)
+      .getBucket(filters, year, month, ac.signal)
       .then((list) => {
         if (g !== gen) return null;
         items.set(k, list);
         bucketErrors.delete(k);
         fixCount(year, month, list.length);
+        evict();
         return list;
       })
       .catch((e: unknown) => {
-        if (g === gen) bucketErrors.set(k, errorText(e));
+        if (g === gen && !ac.signal.aborted) bucketErrors.set(k, errorText(e));
         return null;
       })
       .finally(() => {
         if (inflight.get(k) === p) inflight.delete(k);
+        if (viewLoads.get(k) === ac) viewLoads.delete(k);
       });
     inflight.set(k, p);
     return p;
+  }
+
+  /** Cancels the view's loads of months not in `keep` (the view went elsewhere). */
+  function cancelView(keep: ReadonlySet<string>) {
+    for (const [k, ac] of viewLoads) {
+      if (keep.has(k)) continue;
+      viewLoads.delete(k);
+      inflight.delete(k);
+      ac.abort();
+    }
+  }
+
+  /** Past the budget, drops the loaded months farthest from the view (not while the lightbox is open). */
+  function evict() {
+    if (viewId !== null) return;
+    let n = 0;
+    for (const list of items.values()) n += list.length;
+    if (n <= KEEP_ITEMS) return;
+    const tl = timeline;
+    const vh = height || 800;
+    const mid = scrollTop + vh / 2;
+    const far = tl.buckets
+      .filter((b) => items.has(bkey(b.year, b.month)))
+      .map((b) => ({ k: bkey(b.year, b.month), d: Math.max(b.top - mid, mid - (b.top + b.height), 0) }))
+      .sort((a, b) => b.d - a.d);
+    for (const f of far) {
+      if (n <= KEEP_ITEMS || f.d <= 2 * vh) break;
+      n -= items.get(f.k)?.length ?? 0;
+      items.delete(f.k);
+    }
   }
 
   /** The fetched list wins over the timeline's count (photos came or went meanwhile). */
   function fixCount(year: number, month: number, n: number) {
     const b = buckets.find((x) => x.year === year && x.month === month);
     if (!b || b.count === n) return;
+    const restore = keepPlace();
     buckets = n > 0 ? buckets.map((x) => (x === b ? { ...x, count: n } : x)) : buckets.filter((x) => x !== b);
+    restore();
   }
 
   let ready: Promise<void> = Promise.resolve();
@@ -138,12 +198,14 @@
 
   async function fetchTimeline(resetScroll: boolean) {
     const g = ++gen;
-    inflight.clear();
+    dropLoads();
     if (resetScroll || !buckets.length) tlStatus = 'loading';
     try {
       const b = await client.getTimeline(filters);
       if (g !== gen) return;
+      const restore = resetScroll ? () => {} : keepPlace();
       apply(b);
+      restore();
       if (resetScroll && scroller) {
         scroller.scrollTop = 0;
         scrollTop = 0;
@@ -154,6 +216,12 @@
       tlError = errorText(e);
       tlStatus = 'error';
     }
+  }
+
+  function dropLoads() {
+    for (const ac of viewLoads.values()) ac.abort();
+    viewLoads.clear();
+    inflight.clear();
   }
 
   function apply(b: TimelineBucket[]) {
@@ -184,8 +252,10 @@
       const b = await client.getTimeline(filters);
       if (g !== gen || sameTimeline(b, served)) return;
       gen++;
-      inflight.clear();
+      dropLoads();
+      const restore = keepPlace();
       apply(b);
+      restore();
       ready = Promise.resolve();
     } catch {
       // keep what is shown; a request that matters will say what is wrong
@@ -248,36 +318,94 @@
     const el = scroller;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
+      // A new width can change the columns: the same photos stay in view.
+      const restore = width > 0 ? keepPlace() : () => {};
       for (const e of entries) {
         width = e.contentRect.width;
         height = e.contentRect.height;
       }
+      restore();
     });
     ro.observe(el);
     return () => ro.disconnect();
   });
 
   let raf = 0;
+  /**
+   * Scrolling faster than anyone can look (a hard fling, a scrubber
+   * drag): new tiles are drawn as grey placeholders, without an image to
+   * fetch and decode, and become photos once the view slows down. Tiles
+   * already shown stay as they are.
+   */
+  let fast = $state(false);
+  const FAST = 6; // px per ms
+  let lastY = 0;
+  let lastT = 0;
+  let slowTimer: ReturnType<typeof setTimeout> | undefined;
   function onScroll() {
     if (raf) return;
-    raf = requestAnimationFrame(() => {
+    raf = requestAnimationFrame((t) => {
       raf = 0;
-      if (scroller) scrollTop = scroller.scrollTop;
+      if (!scroller) return;
+      const y = scroller.scrollTop;
+      const v = Math.abs(y - lastY) / Math.max(1, t - lastT);
+      lastY = y;
+      lastT = t;
+      if (v > FAST || scrubbing) {
+        fast = true;
+        clearTimeout(slowTimer);
+        slowTimer = setTimeout(() => (fast = false), 150);
+      }
+      scrollTop = y;
     });
   }
   $effect(() => () => {
     if (raf) cancelAnimationFrame(raf);
+    clearTimeout(slowTimer);
   });
 
-  function scrollToY(y: number) {
+  function scrollToY(y: number, tl: Timeline = timeline) {
     if (!scroller) return;
-    const max = Math.max(0, timeline.totalHeight - height);
+    const max = Math.max(0, tl.totalHeight - height);
     const t = Math.max(0, Math.min(max, y));
     scroller.scrollTop = t;
     scrollTop = t;
   }
 
+  /**
+   * Remembers the photo row at the top of the view; the returned function
+   * scrolls back to it after the layout changed (a month's count, the
+   * timeline, the columns), so nothing that changes above moves the view.
+   */
+  function keepPlace(): () => void {
+    const a = tlStatus === 'ready' && scrollTop > 0 ? anchorAt(timeline, scrollTop) : null;
+    const before = scrollTop;
+    return () => {
+      if (!a) return;
+      const tl = timeline;
+      const y = anchorOffset(tl, a);
+      if (y === null || Math.abs(y - before) < 0.5) return;
+      scrollTop = y; // render the right rows now; the DOM follows after the update
+      void tick().then(() => scrollToY(y, tl));
+    };
+  }
+
+  // ---- Dragging the scrubber, jumping to a date ----
+
+  let scrubbing = $state(false);
+  let jumpOpen = $state(false);
+  const topBucket = $derived(timeline.buckets[timeline.indexAtOffset(scrollTop + 1)] ?? null);
+
+  function jumpTo(year: number, month: number) {
+    jumpOpen = false;
+    const b = timeline.buckets.find((x) => x.year === year && x.month === month);
+    if (b) scrollToY(b.top);
+  }
+
   // ---- Virtualisation (one screen of overscan: phones are often slow) ----
+
+  /** The photos the last view drew as tiles (kept while flying past). */
+  let shown = new Set<number>();
 
   const view = $derived.by(() => {
     const tl = timeline;
@@ -294,11 +422,16 @@
       const end = Math.min(b.count, r1 * tl.columns);
       for (let idx = r0 * tl.columns; idx < end; idx++) {
         const pos = tl.tilePosition(i, idx);
-        const item = list?.[idx];
+        let item = list?.[idx];
+        // Flying past: photos that were not shown yet stay grey until the view slows down.
+        if (item && fast && !shown.has(item.id)) item = undefined;
         tiles.push({ key: item ? `i${item.id}` : `p${k}-${idx}`, item, left: pos.left, top: pos.top - b.top });
       }
       out.push({ key: k, top: b.top, height: b.height, label: bucketLabel(b.year, b.month), count: b.count, error: bucketErrors.get(k), year: b.year, month: b.month, tiles });
     }
+    const next = new Set<number>();
+    for (const v of out) for (const t of v.tiles) if (t.item) next.add(t.item.id);
+    shown = next;
     return out;
   });
 
@@ -308,13 +441,24 @@
       .map((v) => `${v.year}:${v.month}`)
       .join(','),
   );
+  // The months near the view that are not loaded yet, after a short pause
+  // (months that only flash by in a fling or a scrubber drag are not
+  // fetched); loads the view has left are cancelled.
+  const near = $derived(new Set(view.map((v) => v.key)));
+  $effect(() => {
+    const keep = near;
+    untrack(() => cancelView(keep));
+  });
   $effect(() => {
     void epoch;
     if (!wanted) return;
     const list = wanted.split(',').map((s) => s.split(':').map(Number) as [number, number]);
-    const t = setTimeout(() => {
-      for (const [y, m] of list) void loadBucket(y, m);
-    }, 60);
+    const t = setTimeout(
+      () => {
+        for (const [y, m] of list) void loadBucket(y, m, true);
+      },
+      scrubbing ? 150 : 60,
+    );
     return () => clearTimeout(t);
   });
 
@@ -457,7 +601,9 @@
         {#each view as v (v.key)}
           <section class="bucket" style:top="{v.top}px" style:height="{v.height}px" aria-label={v.label}>
             <h2 class="header">
-              <span>{v.label}</span>
+              <button type="button" class="month" aria-haspopup="dialog" aria-label="{v.label}: jump to a date" onclick={() => (jumpOpen = true)}
+                >{v.label}<span class="chev" aria-hidden="true">▾</span></button
+              >
               <span class="n">{formatCount(v.count)}</span>
               {#if v.error}
                 <span class="berr">
@@ -493,9 +639,13 @@
     {/if}
   </div>
   {#if tlStatus === 'ready' && buckets.length > 0}
-    <Scrubber {timeline} {scrollTop} viewportHeight={height} onjump={scrollToY} />
+    <Scrubber {timeline} {scrollTop} viewportHeight={height} onjump={(y) => scrollToY(y)} touch ondrag={(d) => (scrubbing = d)} />
   {/if}
 </div>
+
+{#if jumpOpen && tlStatus === 'ready'}
+  <ShareJumpSheet {buckets} current={topBucket ? { year: topBucket.year, month: topBucket.month } : null} onpick={jumpTo} onclose={() => (jumpOpen = false)} />
+{/if}
 
 {#if viewId !== null}
   <ShareLightbox
@@ -536,7 +686,7 @@
   .canvas {
     position: relative;
     margin-left: 2px;
-    margin-right: 30px;
+    margin-right: 40px;
   }
   .bucket {
     position: absolute;
@@ -558,6 +708,25 @@
     font-weight: 600;
     background: var(--bg);
   }
+  .month {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-height: 40px;
+    margin-left: -6px;
+    padding: 0 6px;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+  }
+  .month:hover:not(:disabled) {
+    background: transparent;
+  }
+  .chev {
+    color: var(--muted);
+    font-size: 12px;
+  }
   .header .n {
     color: var(--muted);
     font-weight: 400;
@@ -576,24 +745,16 @@
     background: var(--placeholder);
     border-radius: 2px;
   }
-  /* The scrubber is narrower on a phone; the year labels still fit. The
-     position marker is a short bar at the very edge, beside the labels
-     rather than across them (at the top it sat on the first year). */
+  /* The phone's scrubber: a 40 px gutter (the canvas leaves it free), the
+     year labels at its left, the 48 px thumb drawn 8 px off the screen's
+     edge (Scrubber.svelte), so a finger finds it away from the edge where
+     the system takes swipes. */
   .share-grid :global(.scrubber) {
-    width: 30px;
+    width: 40px;
   }
   .share-grid :global(.scrubber .year) {
-    right: 5px;
+    right: 10px;
     padding: 0 1px;
     font-size: 10px;
-  }
-  .share-grid :global(.scrubber .pos) {
-    right: 0;
-    width: 3px;
-    height: 18px;
-    border-radius: 2px;
-  }
-  .share-grid :global(.scrubber .hover) {
-    right: 32px;
   }
 </style>

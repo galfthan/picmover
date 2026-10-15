@@ -22,6 +22,8 @@ type Facets struct {
 	// Cameras are the distinct (make, model) pairs with a model, most
 	// frequent first, at most the limit passed to Facets.
 	Cameras []Camera
+	// NoCamera counts the rows without a camera model (Filter.NoCamera).
+	NoCamera int64
 }
 
 // YearCount is one year of dated rows.
@@ -44,22 +46,23 @@ func (d *DB) Facets(ctx context.Context, f Filter, maxCameras int) (Facets, erro
 	}
 	where := whereClause(conds)
 
-	rows, err := d.QueryContext(ctx, `SELECT file_type, COUNT(*), SUM(lat IS NOT NULL AND lon IS NOT NULL)`+from+where+
-		` GROUP BY file_type`, args...)
+	rows, err := d.QueryContext(ctx, `SELECT file_type, COUNT(*), SUM(lat IS NOT NULL AND lon IS NOT NULL), SUM(camera_model = '')`+
+		from+where+` GROUP BY file_type`, args...)
 	if err != nil {
 		return out, fmt.Errorf("catalog: facets: %w", err)
 	}
 	err = scanRows(rows, func() error {
 		var (
-			t   string
-			n   int64
-			gps sql.NullInt64
+			t        string
+			n        int64
+			gps, cam sql.NullInt64
 		)
-		if err := rows.Scan(&t, &n, &gps); err != nil {
+		if err := rows.Scan(&t, &n, &gps, &cam); err != nil {
 			return err
 		}
 		out.Total += n
 		out.GPS += gps.Int64
+		out.NoCamera += cam.Int64
 		switch t {
 		case FileTypeImage:
 			out.Images += n

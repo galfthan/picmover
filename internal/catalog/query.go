@@ -20,6 +20,7 @@ type Filter struct {
 	FileType       string    // "" | image | image_raw | video
 	HasGPS         bool      // only rows with coordinates
 	CameraModel    string    // exact match on camera_model
+	NoCamera       bool      // only rows without a camera model (camera_model ''); none with CameraModel
 	SessionID      int64     // import_session_id
 	From, To       time.Time // wall-clock bounds on taken_at (To exclusive); zero = open
 	IncludeDeleted bool
@@ -163,6 +164,9 @@ func (f Filter) where() ([]string, []any, error) {
 	if f.CameraModel != "" {
 		conds = append(conds, "camera_model = ?")
 		args = append(args, f.CameraModel)
+	}
+	if f.NoCamera {
+		conds = append(conds, "camera_model = ''")
 	}
 	if f.SessionID != 0 {
 		conds = append(conds, "import_session_id = ?")

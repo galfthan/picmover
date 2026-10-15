@@ -166,6 +166,8 @@ export interface ShareFilters {
   album?: number;
   /** Exact camera model. */
   camera?: string;
+  /** Only photos without a camera model ("Unknown camera"); never with `camera`. */
+  nocamera?: boolean;
   /** Only photos with a location; only with `location`. */
   gps?: boolean;
   /** Library shares only: tag ids, all must match; sorted and unique. */
@@ -184,6 +186,8 @@ export interface ShareFacets {
   undated: number;
   /** Most frequent first. */
   cameras: { make: string; model: string; count: number }[];
+  /** Photos without a camera model. */
+  nocamera: number;
   /** With `location` only; null otherwise. */
   gps: number | null;
   /** Library shares only (empty otherwise): with live photos, by name. */
@@ -345,6 +349,7 @@ export function toFacets(v: unknown, caps: ShareCapabilities): ShareFacets {
       const model = str(c.model);
       return model ? [{ make: str(c.make), model, count: count(c.count) }] : [];
     }),
+    nocamera: count(r.nocamera),
     gps: caps.location && typeof r.gps === 'number' ? count(r.gps) : null,
     tags: toNamedCounts(r.tags),
     albums: toNamedCounts(r.albums),
@@ -597,6 +602,7 @@ export function shareFilterParams(f: ShareFilters, extra?: Record<string, number
   if (f.rating) q.set('rating', String(f.rating));
   if (f.album) q.set('album', String(f.album));
   if (f.camera) q.set('camera', f.camera);
+  else if (f.nocamera) q.set('nocamera', '1');
   if (f.gps) q.set('gps', '1');
   for (const t of f.tags ?? []) q.append('tag', String(t));
   if (f.minPx) q.set('minpx', String(f.minPx));

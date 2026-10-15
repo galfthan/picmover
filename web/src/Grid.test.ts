@@ -396,6 +396,9 @@ describe('grid', () => {
     const scrub = document.querySelector<HTMLElement>('.scrubber')!;
     expect(scrub.getAttribute('role')).toBe('slider');
     expect(scrub.tabIndex).toBe(0);
+    // The year labels are marks: a press on one drags like anywhere on the track.
+    expect(scrub.querySelectorAll('button').length).toBe(0);
+    expect(scrub.querySelectorAll('.year').length).toBe(3);
     expect(scrub.getAttribute('aria-valuetext')).toBe('July 2024');
     scrub.focus();
     scrub.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));

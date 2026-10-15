@@ -10,7 +10,7 @@
   import { describeMonths, describeRecur, formatRecur, normalizeMonths, parseRecur, recurPresets, type MonthDay, type Recur } from '../lib/dates';
   import { describeSize } from '../lib/filters';
   import { monthName } from '../lib/format';
-  import { cleanFilters, dayList, fromMonth, MAX_TAGS, monthEnd, monthStart, ratingLabel, tapYear, toMonth, wholeYears, type FilterScope, type MonthYear } from './filters';
+  import { cameraLabel, cleanFilters, dayList, fromMonth, MAX_TAGS, monthEnd, monthStart, ratingLabel, searchCameras, tapYear, toMonth, UNKNOWN_CAMERA, wholeYears, type FilterScope, type MonthYear } from './filters';
   import type { ShareFacets, ShareFilters } from './shareapi';
 
   interface Props {
@@ -103,7 +103,26 @@
 
   // ---- Rating, camera, location, album, tags, size ----
 
+  // Camera: right under Show, so it is seen without scrolling the sheet.
+  // The most used cameras first, a search over maker and model when there
+  // are many, all of them on request, and "Unknown camera" for the photos
+  // without one (videos often, scans, edited copies).
   const cameras = $derived(facets?.cameras ?? []);
+  const CAMERAS_SHOWN = 5;
+  let camQuery = $state('');
+  let camAll = $state(false);
+  const camMatches = $derived(searchCameras(cameras, camQuery));
+  const camList = $derived.by(() => {
+    if (camQuery || camAll) return camMatches;
+    const top = cameras.slice(0, CAMERAS_SHOWN);
+    const sel = cameras.find((c) => c.model === draft.camera);
+    return sel && !top.includes(sel) ? [...top, sel] : top;
+  });
+  const noCamera = $derived(facets?.nocamera ?? 0);
+  const showCameras = $derived(cameras.length > 0 || noCamera > 0 || !!draft.camera || !!draft.nocamera);
+  function setCamera(model: string | null, unknown = false) {
+    set({ camera: model ?? undefined, nocamera: unknown || undefined });
+  }
   const showLocation = $derived(scope.location);
   const albums = $derived(scope.library && !albumImplied ? (facets?.albums ?? []) : []);
   const tags = $derived(scope.library ? (facets?.tags ?? []) : []);
@@ -163,6 +182,41 @@
       {/each}
     </div>
   </section>
+
+  {#if showCameras}
+    <section aria-labelledby="fs-camera">
+      <h3 id="fs-camera">Camera</h3>
+      {#if cameras.length > CAMERAS_SHOWN}
+        <input class="search" type="search" placeholder="Search {cameras.length} cameras" aria-label="Search cameras" autocomplete="off" bind:value={camQuery} />
+      {/if}
+      <div class="cams" class:all={camAll || !!camQuery} role="radiogroup" aria-labelledby="fs-camera">
+        {#if !camQuery}
+          <button type="button" role="radio" aria-checked={!draft.camera && !draft.nocamera} class:on={!draft.camera && !draft.nocamera} onclick={() => setCamera(null)}>
+            <span class="name">Any camera</span>
+          </button>
+        {/if}
+        {#each camList as c (c.make + '\u0000' + c.model)}
+          <button type="button" role="radio" aria-checked={draft.camera === c.model} class:on={draft.camera === c.model} onclick={() => setCamera(c.model)}>
+            <span class="name">{cameraLabel(c.make, c.model)}</span><span class="count">{n(c.count)}</span>
+          </button>
+        {/each}
+        {#if draft.camera && !cameras.some((c) => c.model === draft.camera)}
+          <button type="button" role="radio" aria-checked="true" class="on"><span class="name">{draft.camera}</span></button>
+        {/if}
+        {#if (noCamera > 0 || draft.nocamera) && (!camQuery || 'unknown camera'.includes(camQuery.trim().toLowerCase()))}
+          <button type="button" role="radio" aria-checked={!!draft.nocamera} class:on={!!draft.nocamera} onclick={() => setCamera(null, true)}>
+            <span class="name">{UNKNOWN_CAMERA}</span>{#if noCamera > 0}<span class="count">{n(noCamera)}</span>{/if}
+          </button>
+        {/if}
+        {#if camQuery && camMatches.length === 0}
+          <p class="hint">No camera matches “{camQuery}”.</p>
+        {/if}
+      </div>
+      {#if !camQuery && !camAll && cameras.length > CAMERAS_SHOWN}
+        <button type="button" class="ghost wide" onclick={() => (camAll = true)}>All {cameras.length} cameras</button>
+      {/if}
+    </section>
+  {/if}
 
   <section aria-labelledby="fs-dates">
     <h3 id="fs-dates">Dates</h3>
@@ -245,21 +299,6 @@
           >
         {/each}
       </div>
-    </section>
-  {/if}
-
-  {#if cameras.length || draft.camera}
-    <section aria-labelledby="fs-camera">
-      <h3 id="fs-camera">Camera</h3>
-      <select class="full" aria-label="Camera" value={draft.camera ?? ''} onchange={(e) => set({ camera: e.currentTarget.value || undefined })}>
-        <option value="">Any camera</option>
-        {#each cameras as c (c.make + '\u0000' + c.model)}
-          <option value={c.model}>{c.model} ({n(c.count)})</option>
-        {/each}
-        {#if draft.camera && !cameras.some((c) => c.model === draft.camera)}
-          <option value={draft.camera}>{draft.camera}</option>
-        {/if}
-      </select>
     </section>
   {/if}
 
@@ -465,6 +504,46 @@
     width: 100%;
     min-height: 44px;
     font-size: 16px;
+  }
+  .search {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 44px;
+    margin-bottom: 6px;
+    font-size: 16px;
+  }
+  .cams {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .cams.all {
+    max-height: 264px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+  .cams button {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 44px;
+    padding: 0 12px;
+    text-align: left;
+  }
+  .cams button.on {
+    background: var(--accent-strong);
+    border-color: var(--accent-strong);
+    color: #fff;
+  }
+  .cams .name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cams .count {
+    flex: none;
   }
   .wide {
     width: 100%;

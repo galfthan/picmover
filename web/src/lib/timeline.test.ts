@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { columnsFor, layoutTimeline, yearMarks, type Bucket } from './timeline';
+import { anchorAt, anchorOffset, columnsFor, layoutTimeline, scrubScale, yearMarks, type Bucket } from './timeline';
+import { bigTimeline } from '../testing/fakes';
 
 const P = { width: 4 * 100 + 3 * 4, tileSize: 100, gap: 4, headerHeight: 40 };
 // 4 columns of exactly 100 px, row pitch 104.
@@ -134,5 +135,87 @@ describe('yearMarks', () => {
       [0, 4],
     ]);
     expect(marks[1]!.top).toBe(t.buckets[2]!.top);
+  });
+});
+
+describe('a large library (200k photos over 15 years)', () => {
+  const months = bigTimeline();
+  const total = months.reduce((n, b) => n + b.count, 0);
+  // The phone: 3 columns in 348 px, 40 px headers, 8 px after each month.
+  const PHONE = { width: 348, tileSize: (348 - 2 * 2) / 3 - 0.01, gap: 2, headerHeight: 40, bucketPadding: 8 };
+
+  it('is laid out exactly from the counts, without any month loaded, in no time', () => {
+    expect(total).toBeGreaterThan(190_000);
+    expect(new Set(months.map((b) => b.year)).size).toBe(16); // 15 years and the undated
+    const t0 = performance.now();
+    const t = layoutTimeline(months, PHONE);
+    const ms = performance.now() - t0;
+    expect(ms).toBeLessThan(50);
+    expect(t.columns).toBe(3);
+    // Every month's height is its header, its rows and the padding: known before it is loaded.
+    let y = 0;
+    t.buckets.forEach((b, i) => {
+      expect(b.top).toBe(y);
+      expect(b.height).toBe(40 + Math.ceil((months[i]?.count ?? 0) / 3) * t.rowPitch + 8);
+      y += b.height;
+    });
+    expect(t.totalHeight).toBe(y);
+  });
+
+  it('maps the scrubber monotonically and proportionally onto the photos', () => {
+    const t = layoutTimeline(months, PHONE);
+    const vh = 700;
+    const s = scrubScale(t.totalHeight, vh, 8, 48);
+    const lo = 8 + 24;
+    const travel = vh - 16 - 48;
+    let prev = -1;
+    let prevIndex = 0;
+    const seen = new Set<number>();
+    for (let px = lo; px <= lo + travel; px += 0.5) {
+      const y = s.toTimeline(px);
+      expect(y).toBeGreaterThanOrEqual(prev);
+      prev = y;
+      // Linear: the share of the scroll range is the share of the track.
+      expect(y / s.maxScroll).toBeCloseTo((px - lo) / travel, 9);
+      expect(s.toTrack(y)).toBeCloseTo(px, 6);
+      // Month by month: the month under the thumb never goes back, and half a
+      // pixel never skips a month of more than a pixel's worth of photos.
+      const i = t.indexAtOffset(y);
+      expect(i).toBeGreaterThanOrEqual(prevIndex);
+      for (let k = prevIndex + 1; k < i; k++) expect(t.buckets[k]!.height).toBeLessThan(s.maxScroll / travel);
+      prevIndex = i;
+      seen.add(i);
+    }
+    expect(seen.size).toBeGreaterThan(months.length * 0.9);
+    // Halfway down the track, about half of the photos are above (headers aside).
+    const mid = t.indexAtOffset(s.toTimeline(lo + travel / 2));
+    const above = months.slice(0, mid).reduce((n, b) => n + b.count, 0);
+    expect(Math.abs(above / total - 0.5)).toBeLessThan(0.02);
+    // Clamped at both ends.
+    expect(s.toTimeline(-50)).toBe(0);
+    expect(s.toTimeline(10_000)).toBe(s.maxScroll);
+  });
+
+  it('keeps the photo at the top when the columns or a month above change', () => {
+    const t = layoutTimeline(months, PHONE);
+    const b = t.buckets[60]!;
+    const y = b.rowsTop + 40 * t.rowPitch + 0.25 * t.rowPitch;
+    const a = anchorAt(t, y)!;
+    expect(a).toMatchObject({ year: b.year, month: b.month, index: 120 });
+    expect(anchorOffset(t, a)).toBeCloseTo(y, 6);
+    // Turned to landscape: 5 columns; item 120 is the first of row 24.
+    const wide = layoutTimeline(months, { ...PHONE, width: 700, tileSize: (700 - 8) / 5 - 0.01 });
+    const nb = wide.buckets[60]!;
+    expect(anchorOffset(wide, a)).toBeCloseTo(nb.rowsTop + 24 * wide.rowPitch + 0.25 * wide.rowPitch, 6);
+    // A month above lost photos (its list was shorter than its count): the place follows.
+    const fewer = months.map((m, i) => (i === 10 ? { ...m, count: m.count - 300 } : m));
+    const t2 = layoutTimeline(fewer, PHONE);
+    expect(anchorOffset(t2, a)).toBeCloseTo(y - 100 * t.rowPitch, 6);
+    // In a header: the offset into it.
+    const h = anchorAt(t, b.top + 10)!;
+    expect(h.index).toBe(-1);
+    expect(anchorOffset(t2, h)).toBe(t2.buckets[60]!.top + 10);
+    // The month is gone.
+    expect(anchorOffset(layoutTimeline(months.filter((_, i) => i !== 60), PHONE), a)).toBeNull();
   });
 });

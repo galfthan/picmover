@@ -48,6 +48,7 @@ export function filtersFromQuery(q: URLSearchParams, scope: FilterScope): ShareF
   if (scope.rate && r && /^[1-5]$/.test(r)) f.rating = Number(r);
   const cam = q.get('camera');
   if (cam && new TextEncoder().encode(cam).length <= MAX_CAMERA) f.camera = cam;
+  else if (q.get('nocamera') === '1') f.nocamera = true;
   if (scope.location && q.get('gps') === '1') f.gps = true;
   if (scope.library) {
     const album = positiveInt(q.get('album'));
@@ -125,6 +126,7 @@ export function filterChips(f: ShareFilters, names: FilterNames = NO_NAMES): Chi
   if (dates) out.push({ id: 'dates', label: dates, without: drop({ from: undefined, to: undefined, recur: undefined, months: undefined }) });
   if (f.rating) out.push({ id: 'rating', label: ratingLabel(f.rating), without: drop({ rating: undefined }) });
   if (f.camera) out.push({ id: 'camera', label: f.camera, without: drop({ camera: undefined }) });
+  else if (f.nocamera) out.push({ id: 'camera', label: UNKNOWN_CAMERA, without: drop({ nocamera: undefined }) });
   if (f.gps) out.push({ id: 'gps', label: 'Has location', without: drop({ gps: undefined }) });
   if (f.album) out.push({ id: 'album', label: `Album: ${names.albums.get(f.album) ?? `#${f.album}`}`, without: drop({ album: undefined }) });
   for (const t of f.tags ?? []) {
@@ -137,6 +139,42 @@ export function filterChips(f: ShareFilters, names: FilterNames = NO_NAMES): Chi
 /** The number on the Filter button. */
 export function countFilters(f: ShareFilters): number {
   return filterChips(f).length;
+}
+
+// ---- Cameras ----
+
+export const UNKNOWN_CAMERA = 'Unknown camera';
+
+/** Maker suffixes that only make a camera's name longer. */
+const MAKER_SUFFIX = /[\s,]+(corporation|corp\.?|co\.?,?\s*ltd\.?|ltd\.?|inc\.?|imaging|optical|electronics|company)\b\.?/gi;
+
+/**
+ * A camera's name for people: the maker and the model ("Apple iPhone 12",
+ * "Samsung SM-G991B"), the model alone when it already starts with the
+ * maker ("Canon EOS R6", "NIKON D750" from "NIKON CORPORATION"), without
+ * the maker's company suffixes; a maker in lower case is capitalised.
+ */
+export function cameraLabel(make: string, model: string): string {
+  let mk = make.replace(MAKER_SUFFIX, '').trim();
+  if (mk && mk === mk.toLowerCase()) mk = mk.charAt(0).toUpperCase() + mk.slice(1);
+  const md = model.trim();
+  if (!mk) return md;
+  const first = mk.split(/\s+/)[0]!.toLowerCase();
+  if (md.toLowerCase().startsWith(first)) return md;
+  return `${mk} ${md}`;
+}
+
+/**
+ * The cameras matching a search: every word of it in the camera's name
+ * (maker and model, any case), in the given order (most used first).
+ */
+export function searchCameras<T extends { make: string; model: string }>(cameras: readonly T[], query: string): T[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return [...cameras];
+  return cameras.filter((c) => {
+    const hay = `${c.make} ${c.model} ${cameraLabel(c.make, c.model)}`.toLowerCase();
+    return words.every((w) => hay.includes(w));
+  });
 }
 
 // ---- Date range by month (the sheet's From and To) ----
