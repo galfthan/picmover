@@ -1517,7 +1517,7 @@ budget apply unchanged:
   - Tap a **single photo** → the lightbox, turning pages within the
     photos in view (the first 200, newest first).
   - Tap a **cluster** → a bottom sheet with a strip of its photos'
-    thumbnails ("12 photos here", up to 200, newest first), **Zoom in**
+    thumbnails ("12 photos here", up to 200, newest first), **Zoom in here**
     (to the cluster's bounds; not offered at the deepest zoom) and
     Close. Tap a thumbnail → the lightbox, turning pages within the
     sheet's photos.
@@ -3036,6 +3036,140 @@ and "Sharing · 1" at 700 px, never cut; the Share page showed the
 same-network sentence (that run's server did not send `wireless` yet; the merged
 backend does).
 
+### Map on the phone (as implemented)
+
+Built on `feat/share-map` after the rest; "Map on the phone" above is
+the design, and this is what differs or is exact.
+
+Code:
+
+```
+internal/server/share_geo.go     GET /api/l/{lib}/geo and geo/items: location check, shareFilter, shareCluster
+internal/server/api_geo.go       geoCells: the admin's clustering, now with the cell size and the cell limit as
+                                 parameters, a representative (newest) and the members' bounds per cell
+internal/catalog/query.go        GeoPoint.ThumbAt (the marker thumbnail's ?v=)
+internal/server/share_routes.go  the two routes in shareRouteTable; shareTileOrigin in shareCSP
+web/src/share/ShareMap.svelte    the map (lazy, with Leaflet): markers, the sheet, Show all photos, the lightbox
+web/src/share/routes.ts          the map routes, mapPath, mapViewFromQuery, mapQuery
+web/src/share/shareapi.ts        getGeo, getGeoItems, toClusters
+web/src/share/ShareApp.svelte    the Map/Grid switch, the map page (a dynamic import), filters on the map
+web/scripts/share-compat.mjs     jsLazyImports, preloadDeps: the build check follows the map's chunks and CSS
+```
+
+`GET /api/l/{lib}/geo?bbox=w,s,e,n&zoom=0..22[&filters]` (needs
+`location`, else **403** `{"error": "not allowed in this share"}`, before
+anything else is looked at):
+
+```json
+{"clusters": [
+  {"lat": 60.1712, "lon": 24.9401, "count": 14, "hash": "9f3a0c11d2e4b6a8", "thumbAt": 1781092800,
+   "bounds": [24.9306, 60.1654, 24.9462, 60.1744]},
+  {"lat": 48.8566, "lon": 2.3522, "count": 1, "hash": "51aa4c08206609cc", "thumbAt": 1781092800, "id": 812}
+]}
+```
+
+Most populated first; `thumbAt` absent when the representative has no
+renditions; `id` only with `count` 1, `bounds` only with `count` > 1.
+80 px cells, at most 1024 per answer. A missing or malformed `bbox`, a
+`zoom` outside 0–22 or missing, any key outside the whitelist (`year`,
+`limit`, `trashed`, …) is **400**; `rating` without `rate`, and `album`
+or `tag` in an album share, **400** as on the timeline; an `album` of
+another library **404**.
+
+`GET /api/l/{lib}/geo/items?bbox=w,s,e,n[&limit=1..500][&filters]` (needs
+`location`): `{"items": [<the media list's items>], "total": n}`, newest
+first, `limit` 200 by default; the same 400s (`zoom` is not a key here).
+
+The longitude of a box is now kept exactly when it is in range
+(`wrapLon`): the modulo turned 24.94 into 24.939999999999998, so a box
+made of a cluster's bounds lost the photos on its east edge (found by
+the tests). The admin map gains the same exactness.
+
+Client: the switch is a link (`a.modebtn`, "Map" or "Grid") beside
+Filter, shown with `location` on a library's grid, an album page and an
+album share. On the map the Photos/Albums tabs are left out (the map
+gets their height). The sheet's button is **Zoom in here** (Leaflet's
+own + button is called "Zoom in"). The admin map's dark-mode filter on
+the tiles is not used on the phone (a CSS filter over every tile costs
+older phones). The position is written to the route on every `moveend`
+with `replaceState`; the lightbox of a map photo is
+`…/map/view/<mid>?<filters>&at=…&z=…`, and closing it goes back to the
+map with the sheet as it was. A 403 from either route reads the session
+again; the map route then redirects to the grid.
+
+**Bundle** (Vite build, `npm run build`): the phone's first load is the
+same four files as before, JS 149.7 KiB (54.1 KiB gzipped) against
+142.5 KiB (51.4 KiB) before the map: +7.1 KiB (+2.7 KiB gzipped) for the
+routes, the client calls and the switch, plus Vite's preload helper in
+the common chunk; CSS unchanged at 21.6 KiB. Opening the map fetches
+four more files: Leaflet 1.9.4 (146.5 KiB, 42.2 KiB gzipped, the same
+chunk the admin map uses), the map view (10.2 KiB, 4.6 KiB gzipped)
+and their stylesheets (Leaflet's 15.2 KiB, the map's 3.1 KiB; 7.3 KiB
+gzipped together). `check-share-apis.mjs` now follows dynamic imports
+and the stylesheets Vite preloads with them and prints both
+("share.html loads 4 files …", "on demand (the map): 4 more files …");
+Leaflet passes the Gecko 91 rules; its CSS uses `touch-action`
+(tolerated: Leaflet uses Touch Events with non-passive listeners where
+the browser has them, as Gecko 91 does).
+
+Tests: Go `share_geo_test.go` (a library share's clusters and items:
+every live photo with a position and never the trashed one, the
+newest as the representative, bounds, singles at zoom 22, the cluster's
+bounds as a box returning exactly its photos, every filter of the
+whitelist including `album`, `rating`, dates, size and camera, another
+library 404, an album of another library 404, the refused keys and bad
+box, zoom and limit, no path or file name in any answer; an album
+share: 403 without `location` (its default), only the album's live
+members, no rating without `rate`, the folder key 404, `album`/`tag`/
+`rating` 400, boxes around photos outside the album empty, a photo
+taken out of the album gone at once, `location` turned off 403 at the
+next request; `shareCluster` bounded at 1024 for 20 000 points at zoom
+0 to 22 and the representative's tie rules; the CSP's one outside
+host), plus the geo routes in the golden table, the authentication
+test (401, paused, expired, unavailable, revoked on both) and the
+capability matrix (both routes 403 without `location`). Web:
+`ShareMap.test.ts` with the real Leaflet in jsdom (the switch only with
+`location`, in both share kinds; the map routes redirecting without it;
+fit to all from the world at zoom 0; the position in the route and a
+reload at it; a cluster's sheet with the newest first, its lightbox
+turning pages within the sheet and closing back to the sheet; Zoom in
+here; a single photo's lightbox and Back; filters on the map and Apply
+keeping the position; "Nothing matches" with Clear filters; an album
+share's map never asking for `album` or `tag`; `location` turned off
+while the map is open; the tile error note; `navigator.geolocation`
+never touched), the map routes and the query helpers in
+`routes.test.ts`, `toClusters` in `shareapi.test.ts`, and the build
+check's new followers in `compat.test.ts`. The fake share listener
+answers `geo` and `geo/items` with a simple grid clustering; it gives
+four more items positions, so the album share's location count is 3.
+
+End to end (by hand over the DevTools protocol, not in `make check`):
+the binary built from this branch, a scratch `HOME` and
+`XDG_CONFIG_HOME`, a workspace with one library of 46 generated JPEGs
+(41 with GPS EXIF in Helsinki, Espoo, Tampere, Paris, Rome, Sydney and
+New York; Paris shot on a "Pixel 7"), an album "Trip" (Paris, Rome and
+three of Helsinki), the library share "My phone" (all capabilities)
+and an album share "Trip guests" with `location`; `serve --share` on
+the LAN address, and two headless Chromium 153 instances at 390×844
+with touch emulation and a mobile user agent. All 24 checks passed:
+the switch on the grid; the map fitted to all 41 photos over OSM tiles
+loaded under the share CSP (exact header checked with curl); no script
+errors; a one-finger drag pans and the route follows; a two-finger
+pinch zooms in (1 → 3); a Helsinki cluster's sheet with its thumbnails;
+a thumbnail opens the lightbox over the map, a swipe turns to the
+sheet's next photo, closing returns to the sheet; Zoom in here (10 →
+16); a single photo marker opens the lightbox; the camera filter on the
+map keeps the position and leaves only Paris (8); Show all photos fits
+them (zoom 15); a reload keeps position and filters; with
+`tile.openstreetmap.org` blocked the plain background, the note and a
+working marker; `location` turned off on the computer sends the map
+route to the grid and removes the switch; the album share's map holds
+the album's 14 photos only, under `/api/l/album/` without `album` or
+`tag`, and a box around New York (photos in the library, none in the
+album) is empty. The Sailfish Browser itself was not available: pinch
+and drag on Gecko 91 are covered by Leaflet's Touch Events path, not by
+a device run (manual device checklist).
+
 ### Not done
 
 - The CA install step (Q3: `/ca.crt`, the "Install the certificate"
@@ -3048,7 +3182,8 @@ backend does).
 - Approval requests show only while the Share page or a pairing dialog
   is open; there is no prompt elsewhere in the admin UI.
 - Pinch to change the grid's columns.
-- The manual device checklist (iOS is untested).
+- The manual device checklist (iOS is untested), including the phone
+  map's pinch and drag on the Sailfish Browser.
 - Windows `GetIpForwardTable2` and macOS `route -n get default` are
   compiled and vetted but untested on those systems.
 
