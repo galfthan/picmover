@@ -191,6 +191,30 @@ export interface ShareFacets {
   albums: { id: number; name: string; count: number }[];
 }
 
+/** A map box: west, south, east, north (west > east crosses the antimeridian). */
+export interface GeoBox {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+}
+
+/**
+ * A cluster of the map (GET /api/l/{lib}/geo, only with `location`): its
+ * mean position, how many photos, and its representative (the newest
+ * photo) for the marker. One photo has its `id`; several have the
+ * `bounds` of their positions.
+ */
+export interface ShareCluster {
+  lat: number;
+  lon: number;
+  count: number;
+  hash: string;
+  thumbAt?: number;
+  id: number | null;
+  bounds: GeoBox | null;
+}
+
 // ---- Lenient parsers ----
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
@@ -325,6 +349,35 @@ export function toFacets(v: unknown, caps: ShareCapabilities): ShareFacets {
     tags: toNamedCounts(r.tags),
     albums: toNamedCounts(r.albums),
   };
+}
+
+const coord = (v: unknown, limit: number): number | null => (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= limit ? v : null);
+
+/** The map's clusters; entries without a position, a count or a representative are dropped. */
+export function toClusters(v: unknown): ShareCluster[] {
+  const list = isRecord(v) && Array.isArray(v.clusters) ? v.clusters : [];
+  return list.filter(isRecord).flatMap((c) => {
+    const lat = coord(c.lat, 90);
+    const lon = coord(c.lon, 180);
+    const n = count(c.count);
+    const hash = hashOrNull(c.hash);
+    if (lat === null || lon === null || n < 1 || hash === null) return [];
+    const b = Array.isArray(c.bounds) && c.bounds.length === 4 ? c.bounds : null;
+    const w = coord(b?.[0], 180);
+    const so = coord(b?.[1], 90);
+    const e = coord(b?.[2], 180);
+    const no = coord(b?.[3], 90);
+    const out: ShareCluster = {
+      lat,
+      lon,
+      count: n,
+      hash,
+      id: n === 1 ? positiveId(c.id) : null,
+      bounds: n > 1 && w !== null && so !== null && e !== null && no !== null && so <= no ? { west: w, south: so, east: e, north: no } : null,
+    };
+    if (typeof c.thumbAt === 'number' && Number.isFinite(c.thumbAt) && c.thumbAt > 0) out.thumbAt = c.thumbAt;
+    return [out];
+  });
 }
 
 function toSummary(v: unknown, key: string): ShareLibrarySummary {
@@ -557,6 +610,11 @@ function withQuery(path: string, q: URLSearchParams): string {
   return s ? `${path}?${s}` : path;
 }
 
+/** "w,s,e,n", each number exactly (a cluster's bounds sent back must keep the photos on their edges). */
+function bboxParam(b: GeoBox): string {
+  return [b.west, b.south, b.east, b.north].map(String).join(',');
+}
+
 interface ThumbRef {
   hash: string;
   thumbAt?: number;
@@ -577,6 +635,10 @@ export interface ShareClient {
   getAlbums(signal?: AbortSignal): Promise<ShareAlbum[]>;
   /** The filter sheet's choices within the share's scope. */
   getFacets(signal?: AbortSignal): Promise<ShareFacets>;
+  /** The map's clusters of a box at a zoom (`location` only; 403 without). */
+  getGeo(f: ShareFilters, box: GeoBox, zoom: number, signal?: AbortSignal): Promise<ShareCluster[]>;
+  /** The photos of a box, newest first (at most `limit`), and how many there are (`location` only). */
+  getGeoItems(f: ShareFilters, box: GeoBox, limit: number, signal?: AbortSignal): Promise<{ items: MediaItem[]; total: number }>;
   /** One visible hash; ShareError 409 while a move runs, 404 when gone, 403 without `rate`. */
   setRating(hash: string, rating: number): Promise<{ updated: number }>;
   /** A failed thumbnail: when to try it again (ms), or null to give up (see `retrier`). */
@@ -618,6 +680,21 @@ export function shareClient(id: string, caps: ShareCapabilities): ShareClient {
     },
     async getFacets(signal) {
       return toFacets(await getJSON(`${base}/facets`, signal), caps);
+    },
+    async getGeo(f, box, zoom, signal) {
+      const q = shareFilterParams(f);
+      q.set('bbox', bboxParam(box));
+      q.set('zoom', String(Math.max(0, Math.min(22, Math.round(zoom)))));
+      return toClusters(await getJSON(withQuery(`${base}/geo`, q), signal));
+    },
+    async getGeoItems(f, box, limit, signal) {
+      const q = shareFilterParams(f);
+      q.set('bbox', bboxParam(box));
+      q.set('limit', String(limit));
+      const r = await getJSON(withQuery(`${base}/geo/items`, q), signal);
+      const list = isRecord(r) && Array.isArray(r.items) ? r.items : [];
+      const items = list.map((x) => toItem(x, caps)).filter((x): x is MediaItem => x !== null);
+      return { items, total: Math.max(items.length, isRecord(r) ? count(r.total) : 0) };
     },
     async setRating(hash, rating) {
       const r = await postJSON(`${base}/ratings`, { hashes: [hash], rating });

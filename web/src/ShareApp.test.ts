@@ -615,13 +615,13 @@ describe('phone app', () => {
       await start('#/');
       await openSheet();
       expect(sections()).toContain('Location');
-      expect(inSheet('Has location')?.textContent).toBe('Has location1');
+      expect(inSheet('Has location')?.textContent).toBe('Has location3');
       click(inSheet('Has location')!);
       flushSync();
       click(inSheet('Apply')!);
       await settle();
       expect(location.hash).toBe('#/?gps=1');
-      expect(tiles()).toHaveLength(1);
+      expect(tiles()).toHaveLength(3);
     });
   });
 

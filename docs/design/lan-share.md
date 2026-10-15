@@ -37,7 +37,7 @@ Sailfish OS 5.1 (Gecko-based, see "Browser behaviour").
 | Approval on the computer | Not by default. Each share has a setting "Ask on this computer before a phone is paired". |
 | Certificate install on the phone | Opt-in, offered only after Phase 0 shows the phone enforces the CA's name constraints |
 | After a restart | Sharing is off, unless the desktop app's "Keep sharing on" is set. `serve` shares only with `--share`. |
-| Filters, map | Phones filter about as richly as the admin grid, read only and inside the share's scope: type, dates (range and every year), rating, camera, location, album, tags (library shares only) and size ("Filters on the phone"; changed from the first version, see Q7 in "Settled in review"). No map on phones. |
+| Filters, map | Phones filter about as richly as the admin grid, read only and inside the share's scope: type, dates (range and every year), rating, camera, location, album, tags (library shares only) and size ("Filters on the phone"; changed from the first version, see Q7 in "Settled in review"). A map mode with the `location` capability ("Map on the phone"; requested by the user after the first version). |
 
 Decisions this document makes (justified below):
 
@@ -354,6 +354,8 @@ All on the share listener only. Every route except `GET /api/session`,
 | GET | `/api/l/{lib}/large/{hash}` | as admin | visible rows | visible rows |
 | GET | `/api/l/{lib}/file/{id}` | as admin, Range, `?download=1`; `Cache-Control: private, no-store` | visible rows, per `video`/`download` | same |
 | GET | `/api/l/{lib}/albums` | `{albums: [{id, name, count, cover}]}` | ✓ | 404 |
+| GET | `/api/l/{lib}/geo` | map clusters inside the scope ("Map on the phone") | needs `location` | needs `location` (the album's live members) |
+| GET | `/api/l/{lib}/geo/items` | the photos of a map box, newest first | needs `location` | needs `location` |
 | POST | `/api/l/{lib}/ratings` | `{hashes: [h], rating: 0..5}` → `{updated}` | needs `rate`; one visible hash; `notMoving` → 409 | same |
 | GET | `/`, `/share.html`, `/assets/*`, `/favicon.png`, `/icons/*`, `/manifest.webmanifest` | the share SPA | no auth | no auth |
 
@@ -396,7 +398,8 @@ Always refused: `trashed`, `import`, `session`, and unknown keys.
 
 There are **no** routes for `/api/fs`, `/api/jobs*`, SSE, `/api/app*`,
 library open or create, tags, albums (write), imports, trash, transfer,
-similar, backups, geo, cover, or `/api/share/*`. All of those are 404 on
+similar, backups, cover, or `/api/share/*` (`geo` and `geo/items` came
+later with the phone's map, behind `location`). All of those are 404 on
 the share listener, because the share mux has no pattern for them.
 
 ### Per-request authorization (`shareScoped`)
@@ -527,8 +530,9 @@ containment, `EvalSymlinks`, `Lstat`, `SameFile`), unchanged.
   - The HTML gets a CSP of `default-src 'self'; img-src 'self' data:
     blob:; media-src 'self' blob:; connect-src 'self'; style-src 'self'
     'unsafe-inline'; script-src 'self'; frame-ancestors 'none';
-    base-uri 'none'; form-action 'none'`. There are no OSM hosts (no
-    map).
+    base-uri 'none'; form-action 'none'`, plus exactly one outside
+    host in `img-src`, `https://tile.openstreetmap.org`, for the map's
+    tiles ("Map on the phone").
   - **No HSTS.** With a self-signed certificate, HSTS would turn the
     click-through warning into a hard failure in every browser that
     honours it on `.local` names, and could lock the phone out of the
@@ -1238,7 +1242,8 @@ Error screens:
     video cannot be played in this browser". A failed original falls
     back to the preview.
 - **Hidden** (absent from the share bundle, not merely hidden): Import,
-  Imports, Library stats, Map, Trash, Similar, Backups, Libraries
+  Imports, Library stats, the admin Map page (the phone has its own
+  map, "Map on the phone"), Trash, Similar, Backups, Libraries
   management, workspace setup, the selection bar, tag editing, the album editor,
   move, the job pill, toasts about jobs, and the folder picker.
 - **Rating feedback:** optimistic, rolled back on error.
@@ -1384,6 +1389,155 @@ are enough to find things in it. So an album share has no tag section,
   overscan to one screen, and avoids blur filters (the lightbox
   blur-up uses a scaled thumbnail without `filter: blur` under
   `prefers-reduced-motion` or in share mode).
+
+## Map on the phone
+
+Added after the first version at the user's request (see "Settled in
+review"). The phone gets a map mode beside its grid: the share's photos
+with a position, clustered, over map tiles, filtered like the grid.
+
+### When there is a map
+
+- **Only with the `location` capability.** Positions are exactly what
+  `location` grants (`lat`/`lon` in the detail, `gps` in items), so the
+  map needs nothing new from the owner and is gone the moment `location`
+  is turned off: no map button and no map route on the phone, and the
+  server answers 403 `{"error": "not allowed in this share"}` on both
+  map routes (a route that needs a capability, like `file` and
+  `ratings`; the `gps` filter's 400 is the answer for a filter key). The
+  phone treats that 403 like any capability refusal: it reads the
+  session again, and the map route then sends it to the grid.
+- **Library shares and album shares.** The map of a library, of an
+  album page in a library share, and of an album share. It never shows
+  more than the grid: an album share's map is the album's live members
+  that have a position, and nothing else of the library.
+- **Location is never asked of the phone.** The map shows where the
+  photos are, not where the phone is: no "my location" button, no
+  `navigator.geolocation`, and the share listener's
+  `Permissions-Policy: geolocation=()` refuses it anyway.
+
+### API (share listener)
+
+Two routes, both behind `shareScoped` like every library route, so the
+`{lib}` key, the scope, the library's identity and the per-device
+budget apply unchanged:
+
+- `GET /api/l/{lib}/geo?bbox=w,s,e,n&zoom=z[&filters]` → `{"clusters":
+  [...]}`. The server reads the positions inside the box with the
+  admin map's query (`catalog.GeoPoints`: the `media_latlon` index, or
+  a parallel scan for a large box) and clusters them on the
+  web-mercator grid of the zoom (the admin's clustering, `geoCells`,
+  with phone-sized cells: 80 px, and at most 1024 cells per answer; a
+  larger box gets coarser cells, never more). So a 200 000-photo
+  library answers a world view with at most 1024 small objects, and a
+  phone screen with about a hundred.
+- Each cluster: `{lat, lon, count, hash, thumbAt?}` plus `id` when it is
+  one photo, or `bounds: [w, s, e, n]` (its members' extent) when it is
+  several. `hash` is the cluster's **representative**, its newest photo
+  (by taken time, then id; undated counts as oldest), shown as the
+  marker's thumbnail through the usual `thumb/{hash}` route (which
+  checks the row against the scope).
+- `GET /api/l/{lib}/geo/items?bbox=w,s,e,n[&limit=1..500][&filters]` →
+  `{"items": [...], "total": n}`: the photos of a box, newest first, as
+  the media list's items (the same redaction: `rating` only with `rate`,
+  no `deletedAt`). The bottom sheet asks it for a cluster's `bounds`.
+- **Filters:** the phone's whitelist (`shareFilter`): `type`, `from`,
+  `to`, `recur`, `months`, `camera`, `minpx`, `maxpx`, `gps`; `rating`
+  with `rate`; `album` and `tag` in library shares only. Plus `bbox`
+  and `zoom` (`geo`) or `limit` (`geo/items`); anything else is 400.
+  The scope's `restrict` narrows the query exactly as for the timeline,
+  so the map can only ever contain rows the grid could list.
+- **No new leak:** positions of photos in the scope only, with
+  `location` only; no paths, file names, albums or tags; an album share
+  learns nothing about photos outside the album (a box around them is
+  empty, like an empty month).
+- "Fit to all" needs no route of its own: `geo` at zoom 0 over the
+  whole world returns a handful of clusters whose `bounds` (or
+  positions, for single photos) together are the extent of every photo.
+
+### Tiles, privacy and the CSP
+
+- **Source:** the admin map's tiles, OpenStreetMap's standard layer,
+  from the one host `https://tile.openstreetmap.org/{z}/{x}/{y}.png`
+  (OSM asks clients to use that host now rather than the old `a.`/`b.`/
+  `c.` subdomains; with HTTP/2 they gain nothing). The share listener's
+  CSP gets exactly that origin in `img-src` and nothing else: no
+  `connect-src`, no scripts, no styles from outside. A Go test checks
+  the CSP, and the phone app has the URL in one constant.
+- **What the phone reveals by loading tiles.** The phone fetches the
+  tiles itself, so OpenStreetMap's servers see the phone's requests: the
+  home's public IP address (the phone is on the home Wi-Fi), the phone's
+  browser, and which tiles it asks for, which is roughly the area being
+  looked at, and since the map shows where the photos are, roughly
+  where the photos were taken. The tile request carries a referrer of
+  the share's origin only (`https://192.168.1.20:7443/`, a LAN address;
+  `strict-origin-when-cross-origin` on the tile images, as the admin map
+  does, because OSM's tile policy wants one); never a path, a filter or
+  a photo. The admin map on the computer reveals the same to the same
+  server. It is also why the map is tied to `location`: an owner who
+  does not want positions (or tile requests) on a share turns
+  `location` off.
+- **No per-share tile setting in this version.** A setting "Map tiles
+  from tile.openstreetmap.org" (or a choice of hosts) would have to
+  reach the CSP, the admin dialog and the CLI for one switch whose "off"
+  is already available as `location` off. It is listed under "Open
+  questions" (Q21) as a possible global switch.
+- **Not proxied through picmover.** Proxying would hide nothing from OSM
+  (the computer has the same public IP), would make the share listener
+  an internet client that phones can drive (an outbound fetch per
+  request, the tile policy's caching and identification duties, a new
+  failure and abuse path on a listener that today never leaves the
+  LAN), and would only help a phone without internet, which a phone on
+  the home Wi-Fi rarely is.
+- **Without tiles** (no internet, OSM refusing, a blocker): the map
+  keeps working on a plain background. Markers, clusters, the sheet,
+  the lightbox and "Fit to all" need only the share listener. The
+  phone says "No map background: the map tiles need the internet" once
+  a tile has failed and none has loaded since.
+
+### Phone UI
+
+- **Entry:** with `location`, the top bar of a grid (a library's
+  photos, an album page, an album share) gets a **Map** button; on the
+  map it is a **Grid** button. Without `location` neither the button
+  nor the route exists.
+- **Routes** (filters in the query as on the grid, and the map's
+  position as `at=<lat>,<lon>&z=<zoom>`):
+  - `#/l/<id>/map`, `#/l/<id>/albums/<aid>/map`, `#/map` (album share),
+  - each with `/view/<mid>` for the lightbox over the map.
+
+  The position is replaced (not pushed) while the map moves, so Back
+  leaves the map in one step and a reload or a shared link opens the
+  same view. Without `at` the map fits all the photos.
+- **The map fills the screen** under the top bar (and the filter chips
+  when some are on). Leaflet 1.9.4, the admin map's library, does pinch,
+  drag, double-tap zoom and the +/− buttons.
+- **Markers:** every cluster shows its representative's thumbnail
+  (48 px), with the count as a badge when there are several.
+  - Tap a **single photo** → the lightbox, turning pages within the
+    photos in view (the first 200, newest first).
+  - Tap a **cluster** → a bottom sheet with a strip of its photos'
+    thumbnails ("12 photos here", up to 200, newest first), **Zoom in here**
+    (to the cluster's bounds; not offered at the deepest zoom) and
+    Close. Tap a thumbnail → the lightbox, turning pages within the
+    sheet's photos.
+  - The lightbox is the grid's (stars, Download, Info, video as the
+    capabilities allow); closing it returns to the map with the sheet
+    still open.
+- **Filter** works on the map as on the grid: the same button, sheet
+  and chips; applying keeps the map's position. With nothing to show:
+  "No photos with a location" (with Clear filters when filters are on).
+- **Fit to all**: a button on the map that zooms to every photo
+  matching the filters.
+- **Sailfish Browser (Gecko 91):** Leaflet 1.9 uses Touch Events where
+  the browser has them (Gecko 91 does) and cancels the browser's own
+  panning with non-passive listeners on the map, so it does not depend
+  on `touch-action`, which the Sailfish Browser lacks (Leaflet's CSS
+  sets it, which the build check already tolerates).
+- **Bundle:** Leaflet and the map view load only when the map is
+  opened (a dynamic import), so the grid, which every phone uses, does
+  not grow. The build check follows the map's chunks and stylesheets
+  too.
 
 ## Concurrency with the admin UI and jobs
 
@@ -1941,8 +2095,8 @@ numbers are the ones used there and in references above):
   no tag list, because tags are the owner's private labels (like
   ratings) and showing the album photos' tags would hand them to every
   guest; the safe default, with a `tags` capability possible later.
-  Every facet list is computed inside the share's scope. The map stays
-  off phones. GPS is a per-share capability (`location`), on for library
+  Every facet list is computed inside the share's scope. The map stayed
+  off phones in that version; see "Map on the phone" below. GPS is a per-share capability (`location`), on for library
   shares and off for album shares.
 - **Multiple shares** (a structural change, designed in now):
   - A share is a first-class object: a name, a scope, capabilities, an
@@ -1953,6 +2107,12 @@ numbers are the ones used there and in references above):
     straight into its album and is titled with the share name.
   - The admin UI lists the shares, and "Share album…" is also on the
     album page. The CLI gets `picmover share`.
+- **Map on the phone (requested by the user after the first
+  version):** the phone gets a map mode beside the grid, only with the
+  `location` capability, for library and album shares, within the
+  share's scope and with the phone's filters; server-side clustering,
+  OpenStreetMap tiles allowed by the CSP (one host), no tile proxy, a
+  plain background when tiles fail. Designed in "Map on the phone".
 - **Q6, per-device library sets:** replaced by multiple shares. A phone
   sees what its share covers; different phones get different shares.
 - **Q15, one cookie per browser:** a browser is paired with one share at
@@ -2010,7 +2170,13 @@ Q1–Q8 and Q15–Q20 are settled (above). Still open:
       ESR 91.
     - *Recommendation:* target ESR 91 (the build target and polyfills
       above), and drop the polyfills when 5.2 is the minimum.
-14. **Q14. Albums across libraries.** Albums are per library today. If
+14. **Q21. A switch for the map's tiles?** The phone's map loads
+    OpenStreetMap tiles directly ("Map on the phone"). *Recommendation:*
+    none until asked for; `location` off removes the map. If wanted, a
+    global "Map background from OpenStreetMap" switch on the Share page
+    that drops the host from the CSP and gives every phone the plain
+    background.
+15. **Q14. Albums across libraries.** Albums are per library today. If
     cross-library albums ever come, the album scope's key and `visible`
     must be revisited, so that membership never lets a photo of an
     unshared library through.
@@ -2870,6 +3036,140 @@ and "Sharing · 1" at 700 px, never cut; the Share page showed the
 same-network sentence (that run's server did not send `wireless` yet; the merged
 backend does).
 
+### Map on the phone (as implemented)
+
+Built on `feat/share-map` after the rest; "Map on the phone" above is
+the design, and this is what differs or is exact.
+
+Code:
+
+```
+internal/server/share_geo.go     GET /api/l/{lib}/geo and geo/items: location check, shareFilter, shareCluster
+internal/server/api_geo.go       geoCells: the admin's clustering, now with the cell size and the cell limit as
+                                 parameters, a representative (newest) and the members' bounds per cell
+internal/catalog/query.go        GeoPoint.ThumbAt (the marker thumbnail's ?v=)
+internal/server/share_routes.go  the two routes in shareRouteTable; shareTileOrigin in shareCSP
+web/src/share/ShareMap.svelte    the map (lazy, with Leaflet): markers, the sheet, Show all photos, the lightbox
+web/src/share/routes.ts          the map routes, mapPath, mapViewFromQuery, mapQuery
+web/src/share/shareapi.ts        getGeo, getGeoItems, toClusters
+web/src/share/ShareApp.svelte    the Map/Grid switch, the map page (a dynamic import), filters on the map
+web/scripts/share-compat.mjs     jsLazyImports, preloadDeps: the build check follows the map's chunks and CSS
+```
+
+`GET /api/l/{lib}/geo?bbox=w,s,e,n&zoom=0..22[&filters]` (needs
+`location`, else **403** `{"error": "not allowed in this share"}`, before
+anything else is looked at):
+
+```json
+{"clusters": [
+  {"lat": 60.1712, "lon": 24.9401, "count": 14, "hash": "9f3a0c11d2e4b6a8", "thumbAt": 1781092800,
+   "bounds": [24.9306, 60.1654, 24.9462, 60.1744]},
+  {"lat": 48.8566, "lon": 2.3522, "count": 1, "hash": "51aa4c08206609cc", "thumbAt": 1781092800, "id": 812}
+]}
+```
+
+Most populated first; `thumbAt` absent when the representative has no
+renditions; `id` only with `count` 1, `bounds` only with `count` > 1.
+80 px cells, at most 1024 per answer. A missing or malformed `bbox`, a
+`zoom` outside 0–22 or missing, any key outside the whitelist (`year`,
+`limit`, `trashed`, …) is **400**; `rating` without `rate`, and `album`
+or `tag` in an album share, **400** as on the timeline; an `album` of
+another library **404**.
+
+`GET /api/l/{lib}/geo/items?bbox=w,s,e,n[&limit=1..500][&filters]` (needs
+`location`): `{"items": [<the media list's items>], "total": n}`, newest
+first, `limit` 200 by default; the same 400s (`zoom` is not a key here).
+
+The longitude of a box is now kept exactly when it is in range
+(`wrapLon`): the modulo turned 24.94 into 24.939999999999998, so a box
+made of a cluster's bounds lost the photos on its east edge (found by
+the tests). The admin map gains the same exactness.
+
+Client: the switch is a link (`a.modebtn`, "Map" or "Grid") beside
+Filter, shown with `location` on a library's grid, an album page and an
+album share. On the map the Photos/Albums tabs are left out (the map
+gets their height). The sheet's button is **Zoom in here** (Leaflet's
+own + button is called "Zoom in"). The admin map's dark-mode filter on
+the tiles is not used on the phone (a CSS filter over every tile costs
+older phones). The position is written to the route on every `moveend`
+with `replaceState`; the lightbox of a map photo is
+`…/map/view/<mid>?<filters>&at=…&z=…`, and closing it goes back to the
+map with the sheet as it was. A 403 from either route reads the session
+again; the map route then redirects to the grid.
+
+**Bundle** (Vite build, `npm run build`): the phone's first load is the
+same four files as before, JS 149.7 KiB (54.1 KiB gzipped) against
+142.5 KiB (51.4 KiB) before the map: +7.1 KiB (+2.7 KiB gzipped) for the
+routes, the client calls and the switch, plus Vite's preload helper in
+the common chunk; CSS unchanged at 21.6 KiB. Opening the map fetches
+four more files: Leaflet 1.9.4 (146.5 KiB, 42.2 KiB gzipped, the same
+chunk the admin map uses), the map view (10.2 KiB, 4.6 KiB gzipped)
+and their stylesheets (Leaflet's 15.2 KiB, the map's 3.1 KiB; 7.3 KiB
+gzipped together). `check-share-apis.mjs` now follows dynamic imports
+and the stylesheets Vite preloads with them and prints both
+("share.html loads 4 files …", "on demand (the map): 4 more files …");
+Leaflet passes the Gecko 91 rules; its CSS uses `touch-action`
+(tolerated: Leaflet uses Touch Events with non-passive listeners where
+the browser has them, as Gecko 91 does).
+
+Tests: Go `share_geo_test.go` (a library share's clusters and items:
+every live photo with a position and never the trashed one, the
+newest as the representative, bounds, singles at zoom 22, the cluster's
+bounds as a box returning exactly its photos, every filter of the
+whitelist including `album`, `rating`, dates, size and camera, another
+library 404, an album of another library 404, the refused keys and bad
+box, zoom and limit, no path or file name in any answer; an album
+share: 403 without `location` (its default), only the album's live
+members, no rating without `rate`, the folder key 404, `album`/`tag`/
+`rating` 400, boxes around photos outside the album empty, a photo
+taken out of the album gone at once, `location` turned off 403 at the
+next request; `shareCluster` bounded at 1024 for 20 000 points at zoom
+0 to 22 and the representative's tie rules; the CSP's one outside
+host), plus the geo routes in the golden table, the authentication
+test (401, paused, expired, unavailable, revoked on both) and the
+capability matrix (both routes 403 without `location`). Web:
+`ShareMap.test.ts` with the real Leaflet in jsdom (the switch only with
+`location`, in both share kinds; the map routes redirecting without it;
+fit to all from the world at zoom 0; the position in the route and a
+reload at it; a cluster's sheet with the newest first, its lightbox
+turning pages within the sheet and closing back to the sheet; Zoom in
+here; a single photo's lightbox and Back; filters on the map and Apply
+keeping the position; "Nothing matches" with Clear filters; an album
+share's map never asking for `album` or `tag`; `location` turned off
+while the map is open; the tile error note; `navigator.geolocation`
+never touched), the map routes and the query helpers in
+`routes.test.ts`, `toClusters` in `shareapi.test.ts`, and the build
+check's new followers in `compat.test.ts`. The fake share listener
+answers `geo` and `geo/items` with a simple grid clustering; it gives
+four more items positions, so the album share's location count is 3.
+
+End to end (by hand over the DevTools protocol, not in `make check`):
+the binary built from this branch, a scratch `HOME` and
+`XDG_CONFIG_HOME`, a workspace with one library of 46 generated JPEGs
+(41 with GPS EXIF in Helsinki, Espoo, Tampere, Paris, Rome, Sydney and
+New York; Paris shot on a "Pixel 7"), an album "Trip" (Paris, Rome and
+three of Helsinki), the library share "My phone" (all capabilities)
+and an album share "Trip guests" with `location`; `serve --share` on
+the LAN address, and two headless Chromium 153 instances at 390×844
+with touch emulation and a mobile user agent. All 24 checks passed:
+the switch on the grid; the map fitted to all 41 photos over OSM tiles
+loaded under the share CSP (exact header checked with curl); no script
+errors; a one-finger drag pans and the route follows; a two-finger
+pinch zooms in (1 → 3); a Helsinki cluster's sheet with its thumbnails;
+a thumbnail opens the lightbox over the map, a swipe turns to the
+sheet's next photo, closing returns to the sheet; Zoom in here (10 →
+16); a single photo marker opens the lightbox; the camera filter on the
+map keeps the position and leaves only Paris (8); Show all photos fits
+them (zoom 15); a reload keeps position and filters; with
+`tile.openstreetmap.org` blocked the plain background, the note and a
+working marker; `location` turned off on the computer sends the map
+route to the grid and removes the switch; the album share's map holds
+the album's 14 photos only, under `/api/l/album/` without `album` or
+`tag`, and a box around New York (photos in the library, none in the
+album) is empty. The Sailfish Browser itself was not available: pinch
+and drag on Gecko 91 are covered by Leaflet's Touch Events path, not by
+a device run (manual device checklist).
+
 ### Not done
 
 - The CA install step (Q3: `/ca.crt`, the "Install the certificate"
@@ -2882,7 +3182,8 @@ backend does).
 - Approval requests show only while the Share page or a pairing dialog
   is open; there is no prompt elsewhere in the admin UI.
 - Pinch to change the grid's columns.
-- The manual device checklist (iOS is untested).
+- The manual device checklist (iOS is untested), including the phone
+  map's pinch and drag on the Sailfish Browser.
 - Windows `GetIpForwardTable2` and macOS `route -n get default` are
   compiled and vetted but untested on those systems.
 

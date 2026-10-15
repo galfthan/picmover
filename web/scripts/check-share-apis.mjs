@@ -2,13 +2,15 @@
 // everything it loads) use runtime APIs or CSS that the Sailfish Browser
 // (Gecko ESR 91) lacks and src/share/polyfills.ts does not install, or
 // contain admin code (docs/design/lan-share.md "Sailfish Browser
-// specifics"). It also prints the share bundle's size.
+// specifics"). It follows dynamic imports and their preloaded files too
+// (the map's Leaflet chunk and stylesheet), and prints the share bundle's
+// size: what the first page load fetches, and what loads on demand.
 //
 //   node scripts/check-share-apis.mjs [distDir]
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { htmlAssets, jsImports, scanCSS, scanJS } from './share-compat.mjs';
+import { htmlAssets, jsImports, jsLazyImports, preloadDeps, scanCSS, scanJS } from './share-compat.mjs';
 
 const web = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = process.argv[2] ?? join(web, 'dist');
@@ -23,31 +25,40 @@ const polySrc = readFileSync(join(web, 'src', 'share', 'polyfills.ts'), 'utf8');
 const listed = /POLYFILLED[^=]*=\s*\[([^\]]*)\]/.exec(polySrc);
 const polyfilled = listed ? [...(listed[1] ?? '').matchAll(/'([^']+)'/g)].map((m) => m[1] ?? '') : [];
 
-const seen = new Set();
-const queue = htmlAssets(readFileSync(page, 'utf8')).map((p) => p.replace(/^\//, ''));
+// Breadth first: the files of the first load (the page's own and their
+// static imports) come before anything reached only by a dynamic import.
+const seen = new Map(); // path -> lazy
+const queue = htmlAssets(readFileSync(page, 'utf8')).map((p) => ({ rel: p.replace(/^\//, ''), lazy: false }));
 const errors = [];
 const tolerated = new Set();
-let jsBytes = 0;
-let cssBytes = 0;
+const bytes = { first: { js: 0, css: 0, n: 0 }, lazy: { js: 0, css: 0, n: 0 } };
 while (queue.length) {
-  const rel = queue.shift();
-  if (!rel || seen.has(rel)) continue;
-  seen.add(rel);
+  queue.sort((a, b) => Number(a.lazy) - Number(b.lazy));
+  const next = queue.shift();
+  if (!next || seen.has(next.rel)) continue;
+  const { rel, lazy } = next;
+  seen.set(rel, lazy);
   const code = readFileSync(join(dist, rel), 'utf8');
+  const b = lazy ? bytes.lazy : bytes.first;
+  b.n++;
   if (rel.endsWith('.css')) {
-    cssBytes += Buffer.byteLength(code);
+    b.css += Buffer.byteLength(code);
     const r = scanCSS(rel, code);
     errors.push(...r.errors);
     for (const t of r.tolerated) tolerated.add(t.rule);
     continue;
   }
-  jsBytes += Buffer.byteLength(code);
+  b.js += Buffer.byteLength(code);
   errors.push(...scanJS(rel, code, polyfilled));
-  for (const imp of jsImports(code)) queue.push(posix.normalize(posix.join(posix.dirname(rel), imp)));
+  const dynamic = new Set(jsLazyImports(code));
+  for (const imp of jsImports(code)) queue.push({ rel: posix.normalize(posix.join(posix.dirname(rel), imp)), lazy: lazy || dynamic.has(imp) });
+  for (const dep of preloadDeps(code)) queue.push({ rel: posix.normalize(dep), lazy: true });
 }
 
 const kb = (n) => `${(n / 1024).toFixed(1)} KiB`;
-console.log(`check-share-apis: share.html loads ${seen.size} files, JS ${kb(jsBytes)}, CSS ${kb(cssBytes)}`);
+const { first, lazy } = bytes;
+console.log(`check-share-apis: share.html loads ${first.n} files, JS ${kb(first.js)}, CSS ${kb(first.css)}`);
+if (lazy.n) console.log(`check-share-apis: on demand (the map): ${lazy.n} more files, JS ${kb(lazy.js)}, CSS ${kb(lazy.css)}`);
 if (tolerated.size) console.log(`check-share-apis: tolerated (with fallbacks): ${[...tolerated].join(', ')}`);
 if (errors.length) {
   for (const e of errors) console.error(`check-share-apis: ${e.file}: ${e.rule} (${e.since})`);

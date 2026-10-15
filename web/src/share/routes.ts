@@ -10,6 +10,12 @@
 //   #/l/<id>/albums                         library share: the albums
 //   #/l/<id>/albums/<aid>                   library share: one album
 //   #/l/<id>/albums/<aid>/view/<mid>        … with the lightbox
+//   #/l/<id>/map, #/l/<id>/albums/<aid>/map the map of a library or an album page (with `location` only)
+//   #/map                                   album share: the album's map (with `location` only)
+//   …/map/view/<mid>                        … with the lightbox
+//
+// The map's position is in the query (`at=<lat>,<lon>&z=<zoom>`) beside
+// the filters; without `location` a map route goes to its grid.
 //
 // The lightbox route keeps the grid it was opened from in its path, so a
 // reload or a shared link reopens it over the same grid. Filters live in
@@ -24,7 +30,9 @@ export type SharePage =
   | { kind: 'albumshare'; viewId: number | null }
   | { kind: 'grid'; lib: string; viewId: number | null }
   | { kind: 'albums'; lib: string }
-  | { kind: 'album'; lib: string; albumId: number; viewId: number | null };
+  | { kind: 'album'; lib: string; albumId: number; viewId: number | null }
+  /** The map of a grid: a library (albumId null), an album page, or an album share (lib "album"). */
+  | { kind: 'map'; lib: string; albumId: number | null; albumShare: boolean; viewId: number | null };
 
 const ID_RE = /^[1-9]\d{0,15}$/;
 const id = (s: string | undefined): number | null => (s !== undefined && ID_RE.test(s) ? Number(s) : null);
@@ -35,9 +43,16 @@ export function resolveRoute(r: Route, share: ShareInfo | null): { page: SharePa
   if (s[0] === 'pair') return s.length === 1 ? { page: { kind: 'pair' } } : { redirect: '#/pair' };
   if (!share) return { redirect: '#/' };
   const home = { redirect: '#/' };
+  const maps = share.capabilities.location;
   if (share.kind === 'album') {
     // No library or album navigation at all in an album share.
     if (s.length === 0) return { page: { kind: 'albumshare', viewId: null } };
+    if (s[0] === 'map') {
+      if (!maps) return home;
+      if (s.length === 1) return { page: { kind: 'map', lib: 'album', albumId: null, albumShare: true, viewId: null } };
+      const mv = s[1] === 'view' && s.length === 3 ? id(s[2]) : null;
+      return mv !== null ? { page: { kind: 'map', lib: 'album', albumId: null, albumShare: true, viewId: mv } } : home;
+    }
     const v = s[0] === 'view' && s.length === 2 ? id(s[1]) : null;
     return v !== null ? { page: { kind: 'albumshare', viewId: v } } : home;
   }
@@ -53,10 +68,18 @@ export function resolveRoute(r: Route, share: ShareInfo | null): { page: SharePa
   const rest = s.slice(2);
   if (rest.length === 0) return { page: { kind: 'grid', lib, viewId: null } };
   if (rest[0] === 'view' && rest.length === 2 && id(rest[1]) !== null) return { page: { kind: 'grid', lib, viewId: id(rest[1]) } };
+  if (rest[0] === 'map') {
+    const m = mapPage(lib, null, rest.slice(1), maps);
+    if (m) return m;
+  }
   if (rest[0] === 'albums') {
     if (rest.length === 1) return { page: { kind: 'albums', lib } };
     const aid = id(rest[1]);
     if (aid !== null && rest.length === 2) return { page: { kind: 'album', lib, albumId: aid, viewId: null } };
+    if (aid !== null && rest[2] === 'map') {
+      const m = mapPage(lib, aid, rest.slice(3), maps);
+      if (m) return m;
+    }
     if (aid !== null && rest.length === 4 && rest[2] === 'view' && id(rest[3]) !== null) {
       return { page: { kind: 'album', lib, albumId: aid, viewId: id(rest[3]) } };
     }
@@ -64,16 +87,75 @@ export function resolveRoute(r: Route, share: ShareInfo | null): { page: SharePa
   return { redirect: href(`l/${lib}/`) };
 }
 
-/** The router path of a page's grid, without the lightbox ("l/peter", "l/peter/albums/3", ""). */
+/** A map route's page from what follows "map" (`[]` or `['view', mid]`); without `location`, its grid. */
+function mapPage(lib: string, albumId: number | null, rest: string[], maps: boolean): { page: SharePage } | { redirect: string } | null {
+  const grid = albumId === null ? `l/${lib}/` : `l/${lib}/albums/${albumId}`;
+  if (!maps) return { redirect: href(grid) };
+  if (rest.length === 0) return { page: { kind: 'map', lib, albumId, albumShare: false, viewId: null } };
+  const v = rest[0] === 'view' && rest.length === 2 ? id(rest[1]) : null;
+  return v !== null ? { page: { kind: 'map', lib, albumId, albumShare: false, viewId: v } } : null;
+}
+
+/** The router path of a page's grid, without the lightbox ("l/peter", "l/peter/albums/3", ""); a map's is its grid's. */
 export function gridPath(p: SharePage): string {
   switch (p.kind) {
     case 'grid':
       return `l/${p.lib}`;
     case 'album':
       return `l/${p.lib}/albums/${p.albumId}`;
+    case 'map':
+      if (p.albumShare) return '';
+      return p.albumId === null ? `l/${p.lib}` : `l/${p.lib}/albums/${p.albumId}`;
     default:
       return '';
   }
+}
+
+/** The router path of a grid page's map ("l/peter/map", "l/peter/albums/3/map", "map"); null for pages without one. */
+export function mapPath(p: SharePage): string | null {
+  switch (p.kind) {
+    case 'grid':
+    case 'album':
+    case 'albumshare':
+    case 'map': {
+      const g = gridPath(p);
+      return g ? `${g}/map` : 'map';
+    }
+    default:
+      return null;
+  }
+}
+
+/** A map position from the route query (`at=<lat>,<lon>&z=<zoom>`), or null when absent or malformed. */
+export interface MapView {
+  lat: number;
+  lon: number;
+  zoom: number;
+}
+
+export function mapViewFromQuery(q: URLSearchParams): MapView | null {
+  const at = q.get('at');
+  const z = q.get('z');
+  if (!at || z === null || !/^\d{1,2}$/.test(z)) return null;
+  const m = /^(-?\d{1,3}(?:\.\d{1,8})?),(-?\d{1,3}(?:\.\d{1,8})?)$/.exec(at);
+  if (!m) return null;
+  const lat = Number(m[1]);
+  const lon = Number(m[2]);
+  const zoom = Number(z);
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180 || zoom > 19) return null;
+  return { lat, lon, zoom };
+}
+
+/** The route query of a map: the filters' plus the position (5 decimals, about a metre). */
+export function mapQuery(filters: URLSearchParams, view: MapView | null): URLSearchParams {
+  const q = new URLSearchParams(filters);
+  q.delete('at');
+  q.delete('z');
+  if (view) {
+    q.set('at', `${view.lat.toFixed(5)},${view.lon.toFixed(5)}`);
+    q.set('z', String(Math.round(view.zoom)));
+  }
+  return q;
 }
 
 /** The pairing token of a "#/pair/<token>" hash, else null. */

@@ -347,6 +347,7 @@ type GeoPoint struct {
 	Hash     uint64
 	Lat, Lon float64
 	TakenAt  time.Time // wall-clock as in Media.TakenAt (UTC placeholder zone); zero = unknown
+	ThumbAt  time.Time // as Media.ThumbAt; zero = never attempted
 }
 
 // geoBox is a validated bounding box query: the box condition with its
@@ -430,7 +431,7 @@ func (d *DB) GeoPoints(ctx context.Context, f Filter, west, south, east, north f
 	if err != nil {
 		return nil, fmt.Errorf("catalog: geo points: %w", err)
 	}
-	q := "SELECT id, hash, lat, lon, taken_at FROM " + from + whereClause(g.conds)
+	q := "SELECT id, hash, lat, lon, taken_at, thumb_at FROM " + from + whereClause(g.conds)
 	if limit > 0 {
 		out, err := d.geoPoints(ctx, q+" ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT ?", append(g.args, limit)...)
 		if err != nil {
@@ -485,14 +486,16 @@ func (d *DB) geoPoints(ctx context.Context, q string, args ...any) ([]GeoPoint, 
 	var out []GeoPoint
 	for rows.Next() {
 		var (
-			p    GeoPoint
-			hash int64
-			wall sql.NullInt64
+			p     GeoPoint
+			hash  int64
+			wall  sql.NullInt64
+			thumb sql.NullInt64
 		)
-		if err := rows.Scan(&p.ID, &hash, &p.Lat, &p.Lon, &wall); err != nil {
+		if err := rows.Scan(&p.ID, &hash, &p.Lat, &p.Lon, &wall, &thumb); err != nil {
 			return nil, err
 		}
 		p.Hash = uint64(hash)
+		p.ThumbAt = fromUnix(thumb)
 		p.TakenAt, _ = decodeTakenAt(wall, sql.NullInt64{})
 		out = append(out, p)
 	}

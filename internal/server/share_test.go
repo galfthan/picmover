@@ -37,6 +37,8 @@ var shareRouteGolden = []string{
 	"library GET /api/l/{lib}/large/{hash}",
 	"library GET /api/l/{lib}/file/{id}",
 	"library GET /api/l/{lib}/albums",
+	"library GET /api/l/{lib}/geo",
+	"library GET /api/l/{lib}/geo/items",
 	"library POST /api/l/{lib}/ratings",
 	"static GET /{$}",
 	"static GET /share.html",
@@ -135,6 +137,8 @@ func (f *shareFixture) phoneAPIRoutes(lib string) [][2]string {
 		{"GET", "/api/l/" + lib + "/preview/" + h}, {"GET", "/api/l/" + lib + "/large/" + h},
 		{"GET", "/api/l/" + lib + "/file/" + id}, {"GET", "/api/l/" + lib + "/albums"},
 		{"GET", "/api/l/" + lib + "/facets"},
+		{"GET", "/api/l/" + lib + "/geo?bbox=-180,-90,180,90&zoom=0"},
+		{"GET", "/api/l/" + lib + "/geo/items?bbox=-180,-90,180,90"},
 		{"POST", "/api/l/" + lib + "/ratings"},
 	}
 }
@@ -621,6 +625,8 @@ func TestShareCapabilities(t *testing.T) {
 		}
 		check("gps filter", f.phone("GET", "/api/l/peter/timeline?gps=1", "", c), gpsFilter)
 		check("gps filter (media)", f.phone("GET", "/api/l/peter/media?year=2024&month=7&gps=1", "", c), gpsFilter)
+		check("map", f.phone("GET", "/api/l/peter/geo?bbox=-180,-90,180,90&zoom=2", "", c), allow(caps.Location))
+		check("map items", f.phone("GET", "/api/l/peter/geo/items?bbox=-180,-90,180,90", "", c), allow(caps.Location))
 		if _, m := f.facets(c, "peter"); (m["gps"] != nil) != caps.Location {
 			t.Fatalf("%s facets %v", name, m)
 		}

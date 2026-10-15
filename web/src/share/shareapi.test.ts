@@ -12,6 +12,7 @@ import {
   shareFilterParams,
   THUMB_RETRIES,
   toAlbums,
+  toClusters,
   toCapabilities,
   toDetail,
   toFacets,
@@ -224,5 +225,25 @@ describe('share client errors and failed media', () => {
     expect(n).toBe(1);
     expect(backoffMs(0, 0)).toBe(1000);
     expect(backoffMs(10, 1)).toBe(30_500);
+  });
+
+  it('reads the map clusters leniently', () => {
+    const raw = {
+      clusters: [
+        { lat: 60.17, lon: 24.94, count: 3, hash: '0000000000000003', thumbAt: 1700000000, bounds: [24.9, 60.1, 25, 60.2], id: 9 },
+        { lat: 48.85, lon: 2.35, count: 1, hash: '0000000000000007', id: 7 },
+        { lat: 91, lon: 0, count: 1, hash: '0000000000000001', id: 1 },
+        { lat: 0, lon: 0, count: 0, hash: '0000000000000001' },
+        { lat: 0, lon: 0, count: 2, hash: 'nope' },
+        { lat: 1, lon: 1, count: 2, hash: '0000000000000002', bounds: [0, 2, 1, 1] },
+        'x',
+      ],
+    };
+    expect(toClusters(raw)).toEqual([
+      { lat: 60.17, lon: 24.94, count: 3, hash: '0000000000000003', thumbAt: 1700000000, id: null, bounds: { west: 24.9, south: 60.1, east: 25, north: 60.2 } },
+      { lat: 48.85, lon: 2.35, count: 1, hash: '0000000000000007', id: 7, bounds: null },
+      { lat: 1, lon: 1, count: 2, hash: '0000000000000002', id: null, bounds: null },
+    ]);
+    expect(toClusters({})).toEqual([]);
   });
 });

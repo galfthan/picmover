@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseHash } from '../lib/router';
-import { codeProblem, gridPath, normaliseCode, pairToken, phoneName, resolveRoute } from './routes';
+import { codeProblem, gridPath, mapPath, mapQuery, mapViewFromQuery, normaliseCode, pairToken, phoneName, resolveRoute } from './routes';
 import { toShareInfo, type ShareInfo } from './shareapi';
 
 const libShare = (ids: string[]): ShareInfo => toShareInfo({ name: 'My phone', kind: 'libraries', libraries: ids.map((id) => ({ id, name: id })) });
@@ -44,6 +44,47 @@ describe('share routes', () => {
     expect(pairToken('#/pair/short')).toBeNull();
     expect(pairToken('#/pair')).toBeNull();
     expect(pairToken('#/pair/a b c d e f')).toBeNull();
+  });
+
+  it('map routes exist only with location, for a library, an album page and an album share', () => {
+    const withLoc = (s: ShareInfo): ShareInfo => ({ ...s, capabilities: { ...s.capabilities, location: true } });
+    const lib = withLoc(libShare(['peter']));
+    expect(at('#/l/peter/map', lib)).toEqual({ page: { kind: 'map', lib: 'peter', albumId: null, albumShare: false, viewId: null } });
+    expect(at('#/l/peter/map/view/4', lib)).toEqual({ page: { kind: 'map', lib: 'peter', albumId: null, albumShare: false, viewId: 4 } });
+    expect(at('#/l/peter/albums/3/map', lib)).toEqual({ page: { kind: 'map', lib: 'peter', albumId: 3, albumShare: false, viewId: null } });
+    expect(at('#/l/peter/albums/3/map/view/9', lib)).toEqual({ page: { kind: 'map', lib: 'peter', albumId: 3, albumShare: false, viewId: 9 } });
+    expect(at('#/l/peter/map/view/x', lib)).toEqual({ redirect: '#/l/peter/' });
+    expect(at('#/map', lib)).toEqual({ redirect: '#/' });
+    const album = withLoc(albumShare);
+    expect(at('#/map', album)).toEqual({ page: { kind: 'map', lib: 'album', albumId: null, albumShare: true, viewId: null } });
+    expect(at('#/map/view/7', album)).toEqual({ page: { kind: 'map', lib: 'album', albumId: null, albumShare: true, viewId: 7 } });
+    expect(at('#/map/x', album)).toEqual({ redirect: '#/' });
+    // Without location: to the grid.
+    expect(at('#/l/peter/map', libShare(['peter']))).toEqual({ redirect: '#/l/peter/' });
+    expect(at('#/l/peter/albums/3/map/view/9', libShare(['peter']))).toEqual({ redirect: '#/l/peter/albums/3' });
+    expect(at('#/map', albumShare)).toEqual({ redirect: '#/' });
+    expect(at('#/map/view/7', albumShare)).toEqual({ redirect: '#/' });
+  });
+
+  it('map paths and the position in the query', () => {
+    const map = { kind: 'map', lib: 'peter', albumId: null, albumShare: false, viewId: 2 } as const;
+    expect(gridPath(map)).toBe('l/peter');
+    expect(mapPath(map)).toBe('l/peter/map');
+    expect(mapPath({ kind: 'album', lib: 'peter', albumId: 3, viewId: null })).toBe('l/peter/albums/3/map');
+    expect(gridPath({ ...map, albumId: 3 })).toBe('l/peter/albums/3');
+    expect(mapPath({ kind: 'albumshare', viewId: null })).toBe('map');
+    expect(gridPath({ kind: 'map', lib: 'album', albumId: null, albumShare: true, viewId: null })).toBe('');
+    // A library called "album" in a library share is still a library.
+    expect(gridPath({ kind: 'map', lib: 'album', albumId: null, albumShare: false, viewId: null })).toBe('l/album');
+    expect(mapPath({ kind: 'albums', lib: 'peter' })).toBeNull();
+    const q = (s: string) => new URLSearchParams(s);
+    expect(mapViewFromQuery(q('at=60.17,24.94&z=12'))).toEqual({ lat: 60.17, lon: 24.94, zoom: 12 });
+    expect(mapViewFromQuery(q('at=-33.87,151.21&z=0'))).toEqual({ lat: -33.87, lon: 151.21, zoom: 0 });
+    for (const bad of ['at=60.17,24.94', 'z=3', 'at=91,0&z=3', 'at=0,181&z=3', 'at=0,0&z=20', 'at=0,0&z=-1', 'at=x,y&z=3', 'at=1,2,3&z=3', 'at=1e3,2&z=3']) {
+      expect(mapViewFromQuery(q(bad))).toBeNull();
+    }
+    expect(mapQuery(q('type=video&at=1,2&z=3'), { lat: 60.123456789, lon: -0.5, zoom: 7.4 }).toString()).toBe('type=video&at=60.12346%2C-0.50000&z=7');
+    expect(mapQuery(q('type=video&at=1,2&z=3'), null).toString()).toBe('type=video');
   });
 
   it('grid paths for the lightbox routes', () => {

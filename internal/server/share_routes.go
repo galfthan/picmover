@@ -68,6 +68,8 @@ func (s *Server) shareRouteTable() []shareRoute {
 		media("GET /api/l/{lib}/large/{hash}", s.shareRendition(s.handleLarge)),
 		media("GET /api/l/{lib}/file/{id}", s.handleShareFile),
 		lib("GET /api/l/{lib}/albums", s.handleShareAlbums),
+		lib("GET /api/l/{lib}/geo", s.handleShareGeo),
+		lib("GET /api/l/{lib}/geo/items", s.handleShareGeoItems),
 		lib("POST /api/l/{lib}/ratings", s.handleShareRating),
 		static("GET /{$}", shareAppFile),
 		static("GET /share.html", shareAppFile),
@@ -97,9 +99,14 @@ func shareNotFound(w http.ResponseWriter) { writeError(w, http.StatusNotFound, "
 // shareBodyBytes caps a phone's request body.
 const shareBodyBytes = 4 << 10
 
-// shareCSP is the Content-Security-Policy of the phone app's HTML (no
-// map tiles, no forms).
-const shareCSP = "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; " +
+// shareTileOrigin is the one outside host the phone app may load from:
+// the OpenStreetMap tiles of the map (docs/design/lan-share.md "Map on
+// the phone"); web/src/share/ShareMap.svelte's tile URL must match it.
+const shareTileOrigin = "https://tile.openstreetmap.org"
+
+// shareCSP is the Content-Security-Policy of the phone app's HTML: its
+// own files, plus the map tiles as images; no forms.
+const shareCSP = "default-src 'self'; img-src 'self' data: blob: " + shareTileOrigin + "; media-src 'self' blob:; connect-src 'self'; " +
 	"style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 
 // hostOK reports whether a Host header names the share listener: the

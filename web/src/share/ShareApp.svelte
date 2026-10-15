@@ -14,9 +14,13 @@
   import ShareFilterChips from './ShareFilterChips.svelte';
   import ShareFilterSheet from './ShareFilterSheet.svelte';
   import { filterChips, filtersFromQuery, filtersQuery, hasFilters, type Chip, type FilterScope } from './filters';
-  import { gridPath, pairToken, resolveRoute, takePairToken, type SharePage } from './routes';
+  import { gridPath, mapPath, mapQuery, mapViewFromQuery, pairToken, resolveRoute, takePairToken, type SharePage } from './routes';
   import { shareSession } from './session.svelte';
   import { errorText, shareClient, type ShareAlbum, type ShareClient, type ShareFacets, type ShareFilters } from './shareapi';
+
+  // The map (with `location` only) loads Leaflet: only when it is opened.
+  let mapModule: Promise<typeof import('./ShareMap.svelte')> | null = null;
+  const loadMap = () => (mapModule ??= import('./ShareMap.svelte'));
 
   // The QR code's token leaves the address bar before anything else happens.
   let token = $state<string | null>(takePairToken());
@@ -81,10 +85,12 @@
   const libName = $derived(page && 'lib' in page ? (share?.libraries.find((l) => l.id === page.lib)?.name ?? page.lib) : '');
 
   const scope = $derived<FilterScope>({ rate: caps.rate, location: caps.location, library: share?.kind === 'libraries' });
+  /** The album of an album page (and of its map) in a library share. */
+  const pageAlbum = $derived(page?.kind === 'album' || page?.kind === 'map' ? page.albumId : null);
   const filters = $derived.by<ShareFilters>(() => {
     const f = filtersFromQuery(route.current.query, scope);
     // The album page is its album: an album in the query would fight it.
-    if (page?.kind === 'album') delete f.album;
+    if (pageAlbum !== null) delete f.album;
     return f;
   });
   const filtered = $derived(hasFilters(filters));
@@ -124,7 +130,7 @@
   // The album of an album page in a library share (its name and count for the header).
   let albums = $state.raw<{ lib: string; list: ShareAlbum[] } | null>(null);
   $effect(() => {
-    if (page?.kind !== 'album' || !client) return;
+    if (pageAlbum === null || !client) return;
     const c = client;
     if (albums?.lib === c.id) return;
     const ac = new AbortController();
@@ -133,7 +139,7 @@
       .catch(() => {});
     return () => ac.abort();
   });
-  const album = $derived(page?.kind === 'album' && albums?.lib === page.lib ? (albums.list.find((a) => a.id === page.albumId) ?? null) : null);
+  const album = $derived(pageAlbum !== null && page && 'lib' in page && albums?.lib === page.lib ? (albums.list.find((a) => a.id === pageAlbum) ?? null) : null);
 
   // ---- Menu and filters ----
 
@@ -160,7 +166,11 @@
     if (client) loadFacets(client, true);
     filterOpen = true;
   }
-  const gridHref = (f: ShareFilters) => href(page ? `${gridPath(page)}/` : '/', filtersQuery(f));
+  // On the map, the filters change the map and keep its position.
+  const gridHref = (f: ShareFilters) =>
+    page?.kind === 'map'
+      ? href(mapPath(page) ?? '', mapQuery(filtersQuery(f), mapViewFromQuery(route.current.query)))
+      : href(page ? `${gridPath(page)}/` : '/', filtersQuery(f));
   function applyFilters(f: ShareFilters) {
     filterOpen = false;
     navigate(gridHref(f));
@@ -173,7 +183,14 @@
     navigate(gridHref(c.without));
   }
 
-  const showsGrid = $derived(page?.kind === 'grid' || page?.kind === 'album' || page?.kind === 'albumshare');
+  const showsGrid = $derived(page?.kind === 'grid' || page?.kind === 'album' || page?.kind === 'albumshare' || page?.kind === 'map');
+  // The Map / Grid switch: only with `location` (the routes refuse the map without it).
+  const modeHref = $derived.by(() => {
+    if (!page || !caps.location || !showsGrid) return null;
+    if (page.kind === 'map') return href(`${gridPath(page)}/`, query);
+    const m = mapPath(page);
+    return m ? href(m, query) : null;
+  });
   const viewId = $derived(page && 'viewId' in page ? page.viewId : null);
 
   const STATES: Record<string, { title: string; text: string }> = {
@@ -241,17 +258,26 @@
           <span>Filter</span>{#if chips.length}<span class="badge">{chips.length}</span>{/if}
         </button>
       {/if}
+      {#if modeHref}
+        <a class="modebtn" href={modeHref} aria-label={page.kind === 'map' ? 'Grid' : 'Map'} title={page.kind === 'map' ? 'Grid' : 'Map'}>
+          {#if page.kind === 'map'}
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          {:else}
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          {/if}
+        </a>
+      {/if}
       <button class="ghost icon" aria-label="Menu" aria-expanded={menuOpen} aria-controls="share-menu" onclick={() => (menuOpen = !menuOpen)}>
         <span aria-hidden="true">⋮</span>
       </button>
     </header>
 
     {#if share.kind === 'libraries' && page.kind !== 'libraries' && 'lib' in page}
-      <nav class="tabs" aria-label="Library">
+      {#if page.kind !== 'map'}<nav class="tabs" aria-label="Library">
         <a href={href(`l/${page.lib}/`)} class:on={page.kind === 'grid'} aria-current={page.kind === 'grid' ? 'page' : undefined}>Photos</a>
         <a href={href(`l/${page.lib}/albums`)} class:on={page.kind !== 'grid'} aria-current={page.kind === 'albums' ? 'page' : undefined}>Albums</a>
-      </nav>
-      {#if page.kind === 'album'}
+      </nav>{/if}
+      {#if pageAlbum !== null}
         <div class="albumhead">
           <a href={href(`l/${page.lib}/albums`)} aria-label="All albums">‹</a>
           <strong>{album?.name ?? 'Album'}</strong>
@@ -297,6 +323,31 @@
             onclearfilters={clearFilters}
             onforbidden={recheck}
           />
+        {/key}
+      {:else if client && page.kind === 'map'}
+        {#key `${page.lib}/${page.albumId}`}
+          {#await loadMap()}
+            <div class="empty">Loading the map…</div>
+          {:then m}
+            <m.default
+              {client}
+              filters={page.albumId !== null ? { ...filters, album: page.albumId } : filters}
+              view={mapViewFromQuery(route.current.query)}
+              {viewId}
+              basePath={mapPath(page) ?? 'map'}
+              {query}
+              kind={share.kind === 'album' ? 'album' : 'libraries'}
+              {filtered}
+              albumHref={share.kind === 'album' ? null : (aid) => href(`l/${page.lib}/albums/${aid}`)}
+              onclearfilters={clearFilters}
+              onforbidden={recheck}
+            />
+          {:catch e}
+            <div class="empty" role="alert">
+              <h2>Could not load the map</h2>
+              <p>{errorText(e)}</p>
+            </div>
+          {/await}
         {/key}
       {:else if client && page.kind === 'album'}
         {#key `${page.lib}/${page.albumId}`}
@@ -512,6 +563,18 @@
   .filterbtn.on {
     border-color: var(--accent-strong);
     color: var(--accent);
+  }
+  .modebtn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    min-width: 44px;
+    min-height: 44px;
+    color: var(--text);
+  }
+  .modebtn:hover {
+    text-decoration: none;
   }
   .badge {
     display: inline-flex;
