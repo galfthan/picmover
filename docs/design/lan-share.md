@@ -140,7 +140,9 @@ Findings from reading the code at `origin/master` (befcdb6):
   - It already has a viewport meta tag, a web manifest and icons.
   - The Lightbox has one-finger swipe (`touchstart`/`touchend`) and
     `<video controls preload="metadata">`, but no `playsinline`.
-  - The Scrubber uses pointer events with `touch-action: none`.
+  - The Scrubber uses pointer events with `touch-action: none` (later:
+    touch events with non-passive listeners on the phone, see "Timeline
+    scrolling").
   - The tile date, rating and selection check appear on `:hover` only.
   - Two `max-width` media queries exist (App, Lightbox).
   - The grid picks thumb/large/preview by tile size × DPR
@@ -1201,9 +1203,18 @@ Error screens:
     name and photo count sit under the title, there is the same Filter
     button (filtering within the album), and the menu has "Paired as …",
     the expiry ("Available until 13 Nov") and Help.
-- **Grid:** the timeline with month headers and the scrubber.
+- **Grid:** the timeline with month headers and the scrubber (see
+  "Timeline scrolling" below).
   - Column count by width: 3 in portrait under 500 CSS px, 4–5 in
     landscape or on tablets. Pinch-to-change-columns is later.
+  - The scrubber: a 48 px thumb in a 40 px gutter at the right, drawn
+    8 px off the screen's edge, the years marked along the track, and a
+    large month bubble ("March 2019") while dragging. A press anywhere on
+    the track (on a year label too) jumps there and drags; grabbing the
+    thumb keeps the view where it is.
+  - A tap on a month's header ("March 2019 ▾") opens **Jump to a date**:
+    a bottom sheet with the years (and their counts), then the months of
+    the year picked (months without photos disabled).
   - Tiles show the video badge and duration, and the rating stars (only
     with `rate`), always visible: there is no hover on touch.
   - No selection and no checkboxes. A tap opens the lightbox.
@@ -1266,7 +1277,7 @@ its share's scope:
 | Dates, range: year chips (tap one year, a second for a range, the same again to clear) and From/To month and year pickers | `from`, `to` | ✓ | ✓ |
 | Dates, every year: a month grid, the admin's presets (Today, Christmas, New Year, Midsummer, Summer, This month) and a day range | `months`, `recur` | ✓ | ✓ |
 | Rating at least 1–5 | `rating` | with `rate` | with `rate` |
-| Camera (model) | `camera` | ✓ | ✓ (the album's cameras only) |
+| Camera: maker and model, or "Unknown camera" (photos without a model) | `camera` (a model), `nocamera` (`1`) | ✓ | ✓ (the album's cameras only) |
 | Has location | `gps` | with `location` | with `location` |
 | Album | `album` | ✓ (not on an album page, which is its album) | no |
 | Tags (every picked tag must match) | `tag` (repeated) | ✓ | no |
@@ -1281,10 +1292,21 @@ its share's scope:
 - **The sheet** is a bottom sheet (88 % of the height at most, its own
   scrolling, the header and the Clear all / Apply bar sticky) with one
   section per filter. It edits a draft; Apply puts it in the route.
-  Long lists (camera, album, the date pickers) are native `<select>`s,
+  Long lists (album, the date pickers) are native `<select>`s,
   which every phone browser shows with its own picker (the Sailfish
   Browser included; `<input type="date">` is not relied on). Every
   target is at least 44 px; nothing needs hover; it fits 360 px.
+- **Camera** comes right after Show, so it is on the sheet's first
+  screen: "Any camera", the five most used cameras with their counts,
+  "Unknown camera" when some photos have no model (videos often, scans,
+  edited copies), and with more than five cameras a search box (every
+  word must match the maker or the model) and "All n cameras" (a list
+  scrolling on its own). A camera reads as maker and model ("Apple
+  iPhone 12", "Samsung SM-G991B"), the model alone when it starts with
+  the maker ("Canon EOS R6"), without company suffixes ("NIKON D750",
+  not "NIKON CORPORATION NIKON D750"). The filter stays the exact model
+  (`camera`); `nocamera=1` is the unknown camera, and the two never go
+  together (the route keeps the camera).
 - **The route:** filters live in the hash query (`#/l/peter/?type=video&tag=3`,
   `#/?months=6,7` in an album share), like the admin's, so Back, reload
   and a link keep them. The lightbox route keeps the query, and the
@@ -1293,8 +1315,9 @@ its share's scope:
   whatever the share may not use (`rating` without `rate`, `gps`
   without `location`, `album` and `tag` in an album share), so a stale
   link never makes a request the server refuses.
-- **Facets:** the choices (types, years, cameras and the location count
-  with their numbers; a library share's tags and albums) come from
+- **Facets:** the choices (types, years, cameras, the photos without a
+  camera and the location count with their numbers; a library share's
+  tags and albums) come from
   `GET /api/l/{lib}/facets`, read each time the sheet opens, and when
   chips need tag or album names.
 
@@ -1318,6 +1341,61 @@ album itself is the owner's selection, and type, dates, camera and size
 are enough to find things in it. So an album share has no tag section,
 `facets` sends no `tags`, and `tag` is 400. A `tags` capability (like
 `rate` for ratings) is a possible later addition if wanted.
+
+### Timeline scrolling
+
+A family library can be 200,000 photos over 15 years. The phone grid
+scrolls it like this:
+
+- **The layout is exact before anything loads.** The timeline gives
+  every month's count; a month is its 40 px header, `ceil(count /
+  columns)` rows of the tile pitch and 8 px of padding
+  (`layoutTimeline`). Loading a month never changes its height, so the
+  view never moves when photos arrive, and any place can be jumped to
+  at once.
+- **The scrubber is proportional.** Its track maps linearly onto the
+  whole scroll range (`scrubScale`): a point of the track is a fixed
+  share of the photos, whatever the months' sizes, and dragging moves
+  month by month (180 months on a 600 px track is about 3 px a month).
+  Year labels are marks along the track, not targets.
+- **Touch:** the thumb is 48 px tall (a 44 px target and more), 26 px
+  wide and drawn 8 px off the screen's edge, in a 40 px gutter the grid
+  leaves free; a press anywhere on the gutter jumps there and drags,
+  and a press on the thumb keeps the finger's offset (no jump). Touch is
+  handled with touch events and non-passive listeners that call
+  `preventDefault` (the Sailfish Browser has no `touch-action`, and
+  would pan the page and cancel a pointer); the mouse and pen use
+  pointer events. Android's back gesture is a horizontal swipe, so a
+  vertical drag that starts at the edge still reaches the page; Sailfish
+  takes swipes that start at the edge itself, which is why the thumb
+  sits inside.
+- **Keyboard and screen readers:** the scrubber is a vertical
+  `role="slider"` whose `aria-valuetext` is the month at the top
+  ("March 2019"); Up/Down move a month, Page Up/Down a year, Home/End to
+  the ends. The month headers are buttons that open Jump to a date.
+- **Only what is near is drawn and loaded.** The grid renders the
+  months intersecting the view plus one screen above and below, and of
+  those only the visible rows (about 300 DOM nodes, whatever the
+  library's size). Months are fetched after the view rests for 60 ms
+  (150 ms while the scrubber is dragged), so months that only flash by
+  are not requested; a request for a month the view has left is
+  cancelled (`AbortController`). Past 12,000 loaded items the months
+  farthest from the view are dropped again (not while the lightbox is
+  open, which pages through them).
+- **Flying past:** while the view moves faster than 6 px/ms (a hard
+  fling, a scrubber drag) new tiles are drawn as grey placeholders, so
+  no image is fetched or decoded for photos nobody can see; tiles
+  already shown stay, and the rest become photos once the view slows
+  down.
+- **The place is kept** when the layout does change: a month's list is
+  shorter or longer than its count (photos came or went), the timeline
+  read again on return differs, or the phone turns (other columns). The
+  first photo of the row at the top, and how far into that row, stays
+  at the top (`anchorAt`/`anchorOffset`).
+
+The admin grid uses the same `Scrubber` (compact: no thumb, the small
+hover label) with the same mapping, the year labels as marks and the
+same keys.
 
 ### Responsive and touch work in shared components
 
@@ -2054,7 +2132,7 @@ internal/server/share_pair.go     POST /api/pair, Server.shareState
 internal/server/share_static.go   the phone app's files and the "not built" page
 internal/server/share_admin.go    /api/share/* (admin listener)
 internal/server/share_public.go   Running.StartSharing/StopSharing/SharingStatus/SharesHere/Pair/KeepSharingOn, ShareWorkspace
-internal/catalog/manage.go        LiveByHash; facets.go: Facets (types, location, years, cameras of a filter)
+internal/catalog/manage.go        LiveByHash; facets.go: Facets (types, location, years, cameras, no camera of a filter)
 internal/userdata/albums.go       AlbumHas; peek.go: PeekAlbums (PeekLibraryID now reads through the same open);
                                   tags.go: TagMembers, AlbumMembers (every membership in one query)
 cmd/serve.go                      --share, --share-port, --pair
@@ -2073,8 +2151,8 @@ web/src/components/ShareCapabilities.svelte, SharePill.svelte
 web/src/lib/sharing.svelte.ts           the store: GET /api/share (Share page, 2 s), GET /api/share/status (pill), every change
 web/src/lib/sharetext.ts                texts and expiry helpers; lib/api.ts: the admin types and lenient parsers
 web/share.html, web/src/share/          the phone app: main.ts (polyfills.ts first, --app-h), ShareApp, Pair, ShareLibraries,
-                                        ShareAlbums, ShareGrid, ShareLightbox, ShareFilterSheet, ShareFilterChips, routes.ts,
-                                        filters.ts (the filters in the route, chips, date helpers), gestures.ts,
+                                        ShareAlbums, ShareGrid, ShareJumpSheet, ShareLightbox, ShareFilterSheet, ShareFilterChips, routes.ts,
+                                        filters.ts (the filters in the route, chips, date and camera helpers), gestures.ts,
                                         session.svelte.ts, shareapi.ts (the only module that knows share URLs), share.css
 web/scripts/check-share-apis.mjs        run by npm run build: Gecko 91 API/CSS rules (share-compat.mjs) and no admin URLs in share chunks
 ```
@@ -2262,7 +2340,9 @@ the admin shapes (`{"buckets": [{year, month, count}]}`, `{"items":
 (`image`, `image_raw`, `video`), `from`, `to` (YYYY-MM-DD, `to`
 exclusive), `recur` (`MM-DD` or `MM-DD..MM-DD`), `months` (`1,7,12`),
 `rating` (1–5), `album`, `tag` (repeatable, up to 32, all must match),
-`camera` (an exact model, at most 200 bytes), `gps` (`1`), `minpx`,
+`camera` (an exact model, at most 200 bytes), `nocamera` (`1`: the
+photos without a camera model; **400** for another value, a repeat, or
+together with `camera`), `gps` (`1`), `minpx`,
 `maxpx` (the longer edge, 1–1000000) (and `year`, `month` on `media`
 only); anything else is **400** `{"error": "invalid filter \"<key>\""}`,
 and a malformed value **400** naming the key. `rating` without `rate`
@@ -2292,14 +2372,15 @@ as the timeline. A library share:
  "undated": 12,
  "cameras": [{"make": "Apple", "model": "iPhone 12", "count": 3011},
              {"make": "Canon", "model": "EOS R5", "count": 1800}],
+ "nocamera": 312,
  "gps": 2950,
  "tags": [{"id": 3, "name": "beach", "count": 41}],
  "albums": [{"id": 2, "name": "Summer", "count": 48}]}
 ```
 
 `types`, `years` (newest first, dated photos), `undated` and `cameras`
-(most frequent first, at most 100, photos with a model) count the
-scope's live photos; `gps` (photos with a position) is sent only with
+(most frequent first, at most 100, photos with a model) and `nocamera`
+(photos without a model) count the scope's live photos; `gps` (photos with a position) is sent only with
 `location`. `tags` and `albums` are sent only in a library share: the
 library's tags and albums with live photos, with their live counts,
 sorted by name (case-insensitively), at most 300 each (the most used
@@ -2308,7 +2389,8 @@ kept). An album share's answer, over the album's live members:
 ```json
 {"total": 48, "types": {"image": 45, "image_raw": 0, "video": 3},
  "years": [{"year": 2026, "count": 48}], "undated": 0,
- "cameras": [{"make": "Apple", "model": "iPhone 12", "count": 40}]}
+ "cameras": [{"make": "Apple", "model": "iPhone 12", "count": 40}],
+ "nocamera": 3}
 ```
 
 Client: read when the filter sheet opens (and when the route has tags or
@@ -2869,6 +2951,91 @@ read "Sharing · 1 phone" at 1366, 1024 and 900 px (a crowded top bar)
 and "Sharing · 1" at 700 px, never cut; the Share page showed the
 same-network sentence (that run's server did not send `wireless` yet; the merged
 backend does).
+
+### Timeline scrolling and the camera filter (after use)
+
+Two complaints after using the phone app on a real library:
+
+**"Scrolling over time was awkward and mostly snapped to each new
+year."** Reproduced in headless Chromium (390×844, touch) against a
+fake share listener with 213,000 photos over 2011–2025 (uneven months:
+more every year, big summers and Christmases, a few empty months and
+big trips). The scrubber's year labels were `<button>`s filling its
+30 px gutter (15 of them, 14 px tall each), and a press on one stopped
+the drag and jumped to that year's start on release. A finger is wider
+than a label: with touches of a finger's size (radius 18 px), Chrome's
+touch adjustment sent **13 of 16** presses on the track to the nearest
+year button, so the drag never started and the tap landed on a year's
+first month (December, newest first). The mapping itself was
+proportional; what the finger met were the year buttons. Fixed as
+"Timeline scrolling" describes: the labels are marks, the whole gutter
+drags, the thumb is large and off the edge. Afterwards **0 of 16**
+finger presses went anywhere but the track, and a drag along it passed
+58 months (4 of them Januaries), each in turn.
+
+Measured in the same harness (Chromium headless, CPU throttled 4×, the
+grid scrolled programmatically for 240 frames; before → after):
+
+| | before | after |
+|---|---|---|
+| 40 px a frame (reading): mean frame, frames over 33 ms | 16.7 ms, 0 | 16.7 ms, 0 |
+| 150 px a frame (a fling): mean, frames over 33 ms, long tasks | 20.6 ms, 12, 3 (238 ms) | 16.7 ms, 0, 0 |
+| 600 px a frame (a hard fling): mean, frames over 33 ms, long tasks | 44.1 ms, 125 of 239, 5 (562 ms) | 16.9 ms, 1 of 239, 0 |
+| the whole library in 4 s: p95 frame | 33.4 ms | 16.8 ms |
+| DOM nodes while scrolling | ≤ 300 | ≤ 314 |
+| month requests for a drag down the whole track and five taps on it | 62 | 10 |
+
+The grid was already windowed (about 300 nodes); the frames were lost
+creating tiles and decoding thumbnails that flew past, which the grey
+placeholders above remove, and the requests were months the drag only
+passed, which the longer rest while dragging and the cancelled loads
+remove.
+
+**"The phone filter lacks camera."** The camera filter and the
+facets' `cameras` were added on 2026-10-14 (`bd205eb`, `d74f37c`), after
+the build the user ran (the app's log shows version `c6e8fc0`, which
+has neither), so that phone had no camera section at all. In the
+current build the section was there but easy to miss: below the dates
+and the rating, past the sheet's first screen on a phone, as a select
+of bare model names, and photos without a model (most videos) could
+not be chosen. Now it comes right after Show, with maker and model,
+counts, a search, all cameras on request and "Unknown camera" (above).
+Scope is unchanged: the cameras and the `nocamera` count come from the
+share's live in-scope photos through the same restrict as the
+timeline, and `nocamera=1` is restricted like every other filter.
+
+Tests: `lib/timeline.test.ts` (200k photos over 15 years laid out from
+the counts alone in under 50 ms, every month's height from its count;
+the scrubber's mapping monotonic, linear and proportional to the
+photos, month by month; the anchor across a column change, a month
+above changing, a header and a month gone), `ShareScrub.test.ts` (the
+grid over that library requests one month and draws at most two;
+a finger drag follows proportionally with `preventDefault` on
+`touchstart`/`touchmove`, over more than 60 months, few of them
+Januaries, with the bubble, loading at most five months; grabbing the
+thumb does not jump; the slider's keys and value; Jump to a date by
+year and month, empty months disabled, Escape; loads cancelled when the
+view leaves; the place kept when the phone turns), `layout.test.ts`
+(thumb size and edge offset, labels not targets), `Grid.test.ts` (the
+admin scrubber has no buttons), `share/filters.test.ts` (`nocamera` in
+the route and chips, `cameraLabel`, `searchCameras`), `ShareApp.test.ts`
+(Camera second, the five most used, search, all, Unknown camera into
+the route and back to a camera), `shareapi.test.ts`; Go:
+`TestFacets` (`NoCamera` counts and filter), `TestShareFilterWhitelist`
+(`nocamera` values), `TestShareFacets` (`nocamera` per scope, the album
+share's only from its members).
+
+End to end (2026-10-15, Chromium headless over the DevTools protocol,
+390×844 with touch, the built bundle against the fake listener of
+213,000 photos): a drag on the scrubber showed the bubble "November
+2020" beside the thumb; a tap on "December 2025 ▾" opened the years
+(with counts), 2019 showed its months with October disabled, March
+scrolled to "March 2019" with its photos; scrolling on and turning the
+phone to 844×390 kept March 2019 and the same row at the top (5
+columns), and back; the filter sheet showed Camera at the top with the
+five most used, Unknown camera and "All 8 cameras", "apple" found the
+two iPhones, Unknown camera applied as `?nocamera=1` with its chip; no
+horizontal scroll, no console errors.
 
 ### Not done
 
