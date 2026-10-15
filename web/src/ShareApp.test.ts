@@ -447,6 +447,9 @@ describe('phone app', () => {
     const inSheet = (label: string) =>
       [...(sheet()?.querySelectorAll<HTMLButtonElement>('button') ?? [])].find((b) => b.getAttribute('aria-label') === label || b.firstChild?.textContent?.trim() === label || b.textContent?.trim() === label);
     const select = (label: string) => sheet()!.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`)!;
+    /** The camera choices (name and count), and one of them by name. */
+    const cameras = () => [...(sheet()?.querySelectorAll('.cams [role="radio"]') ?? [])].map((b) => b.textContent?.trim());
+    const camera = (name: string) => [...sheet()!.querySelectorAll<HTMLButtonElement>('.cams [role="radio"]')].find((b) => b.querySelector('.name')?.textContent === name)!;
     const chips = () => [...document.querySelectorAll('.chips .chip .label')].map((c) => c.textContent?.trim());
     const filterButton = () => document.querySelector<HTMLButtonElement>('.topbar .filterbtn')!;
     function choose(sel: HTMLSelectElement, value: string) {
@@ -466,8 +469,10 @@ describe('phone app', () => {
       expect(filterButton().textContent?.trim()).toBe('Filter');
       await openSheet();
       expect(paths()).toContain('/api/l/peter/facets');
-      expect(sections()).toEqual(['Show', 'Dates', 'Rating at least', 'Camera', 'Location', 'Album', 'Tags', 'Size']);
-      expect([...select('Camera').options].map((o) => o.textContent)).toEqual(['Any camera', 'Canon EOS R6 (5)', 'Pixel 7 (2)']);
+      // Camera right under Show: seen without scrolling the sheet.
+      expect(sections()).toEqual(['Show', 'Camera', 'Dates', 'Rating at least', 'Location', 'Album', 'Tags', 'Size']);
+      expect(cameras()).toEqual(['Any camera', 'Canon EOS R65', 'Pixel 72', 'Unknown camera1']);
+      expect(camera('Any camera').getAttribute('aria-checked')).toBe('true');
       expect([...select('Album').options].map((o) => o.textContent)).toEqual(['Any album', 'Secret (1)', 'Summer (3)']);
       expect(inSheet('beach')?.textContent).toBe('beach2');
       // Years from the facets, with their counts.
@@ -483,7 +488,7 @@ describe('phone app', () => {
       await openSheet();
       click(inSheet('Photos')!);
       click(inSheet('2024')!);
-      choose(select('Camera'), 'Canon EOS R6');
+      click(camera('Canon EOS R6'));
       click(inSheet('beach')!);
       flushSync();
       click(inSheet('Apply')!);
@@ -507,7 +512,8 @@ describe('phone app', () => {
       expect(chips()).toEqual(['Photos', '2024', 'Canon EOS R6']);
       await openSheet();
       expect(inSheet('Photos')?.getAttribute('aria-pressed')).toBe('true');
-      expect(select('Camera').value).toBe('Canon EOS R6');
+      expect(camera('Canon EOS R6').getAttribute('aria-checked')).toBe('true');
+      expect(camera('Any camera').getAttribute('aria-checked')).toBe('false');
       expect(select('From year').value).toBe('2024');
       expect(select('To month').value).toBe('12');
       click(inSheet('Clear all')!);
@@ -529,6 +535,48 @@ describe('phone app', () => {
       click(document.querySelector<HTMLButtonElement>('.chips .clear')!);
       await settle();
       expect(location.hash).toBe('#/l/peter/');
+    });
+
+    it('cameras: the most used first, a search over maker and model, all on request, and the unknown camera', async () => {
+      setup('libraries');
+      // Six more cameras in peter, one photo each (in July 2024).
+      const more = ['NIKON D750', 'iPhone 8', 'SM-G991B', 'ILCE-7M3', 'E-M10', 'X-T3'];
+      more.forEach((cam, i) => {
+        const id = 40 + i;
+        server.items.push({ id, hash: id.toString(16).padStart(16, '0'), type: 'image', takenAt: '2024-07-01T09:00:00', w: 400, h: 300, thumb: 'ok', lib: 'peter', camera: cam });
+      });
+      await start('#/l/peter/');
+      await openSheet();
+      const search = sheet()!.querySelector<HTMLInputElement>('input[type="search"]')!;
+      expect(search.getAttribute('aria-label')).toBe('Search cameras');
+      // Any camera, the five most used, the unknown camera; the rest on request.
+      expect(cameras()).toHaveLength(7);
+      expect(cameras()[1]).toBe('Canon EOS R65');
+      expect(cameras().at(-1)).toBe('Unknown camera1');
+      click(inSheet('All 8 cameras')!);
+      flushSync();
+      expect(cameras()).toHaveLength(10);
+      type(search, 'nikon');
+      expect(cameras()).toEqual(['NIKON D7501']);
+      type(search, 'zeiss');
+      expect(cameras()).toEqual([]);
+      expect(sheet()!.textContent).toContain('No camera matches “zeiss”.');
+      type(search, 'unknown');
+      click(camera('Unknown camera'));
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/?nocamera=1');
+      expect(server.requests('/api/l/peter/timeline').at(-1)?.path).toBe('/api/l/peter/timeline?nocamera=1');
+      expect(chips()).toEqual(['Unknown camera']);
+      // The one photo without a camera: the video.
+      expect(tiles().map((t) => t.getAttribute('href'))).toEqual(['#/l/peter/view/3?nocamera=1']);
+      // Picking a camera replaces the unknown camera.
+      await openSheet();
+      expect(camera('Unknown camera').getAttribute('aria-checked')).toBe('true');
+      click(camera('Pixel 7'));
+      click(inSheet('Apply')!);
+      await settle();
+      expect(location.hash).toBe('#/l/peter/?camera=Pixel+7');
     });
 
     it('every year: months and days like the admin', async () => {
@@ -593,12 +641,12 @@ describe('phone app', () => {
       expect(tiles()).toHaveLength(2);
       await openSheet();
       expect(paths()).toContain('/api/l/album/facets');
-      expect(sections()).toEqual(['Show', 'Dates', 'Camera', 'Size']);
-      // The Pixel took photos outside the album only: not offered.
-      expect([...select('Camera').options].map((o) => o.textContent)).toEqual(['Any camera', 'Canon EOS R6 (2)']);
+      expect(sections()).toEqual(['Show', 'Camera', 'Dates', 'Size']);
+      // The Pixel took photos outside the album only: not offered. The album's video has no camera.
+      expect(cameras()).toEqual(['Any camera', 'Canon EOS R62', 'Unknown camera1']);
       expect(text()).not.toContain('private');
       click(inSheet('Videos')!);
-      choose(select('Camera'), '');
+      click(camera('Any camera'));
       click(inSheet('Apply')!);
       await settle();
       expect(location.hash).toBe('#/?type=video');

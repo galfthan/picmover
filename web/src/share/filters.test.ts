@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cleanFilters, countFilters, filterChips, filtersFromQuery, filtersQuery, fromMonth, monthEnd, monthStart, tapYear, toMonth, wholeYears, type FilterScope } from './filters';
+import { cameraLabel, cleanFilters, countFilters, filterChips, filtersFromQuery, filtersQuery, fromMonth, monthEnd, monthStart, searchCameras, tapYear, toMonth, wholeYears, type FilterScope } from './filters';
 
 const all: FilterScope = { rate: true, location: true, library: true };
 const guest: FilterScope = { rate: false, location: false, library: false };
@@ -78,5 +78,43 @@ describe('share filters', () => {
     expect(tapYear('2020-03-01', undefined, 2022)).toEqual({ from: '2022-01-01', to: '2023-01-01' });
     expect(wholeYears('2020-01-01', '2024-01-01')).toEqual({ a: 2020, b: 2023 });
     expect(wholeYears('2020-02-01', '2024-01-01')).toBeNull();
+  });
+
+  it('unknown camera: from the route, as a chip, and never with a camera', () => {
+    expect(filtersFromQuery(q('nocamera=1'), guest)).toEqual({ nocamera: true });
+    expect(filtersFromQuery(q('nocamera=0'), guest)).toEqual({});
+    // A camera wins over a stale nocamera.
+    expect(filtersFromQuery(q('nocamera=1&camera=EOS+R5'), guest)).toEqual({ camera: 'EOS R5' });
+    expect(filtersQuery({ nocamera: true }).toString()).toBe('nocamera=1');
+    expect(filtersQuery({ camera: 'X', nocamera: true }).toString()).toBe('camera=X');
+    const chips = filterChips({ type: 'video', nocamera: true });
+    expect(chips.map((c) => c.label)).toEqual(['Videos', 'Unknown camera']);
+    expect(chips[1]!.without).toEqual({ type: 'video' });
+    expect(countFilters({ nocamera: true })).toBe(1);
+  });
+
+  it('names cameras by maker and model, without repeating the maker or its company suffix', () => {
+    expect(cameraLabel('Apple', 'iPhone 12')).toBe('Apple iPhone 12');
+    expect(cameraLabel('Canon', 'Canon EOS R6')).toBe('Canon EOS R6');
+    expect(cameraLabel('NIKON CORPORATION', 'NIKON D750')).toBe('NIKON D750');
+    expect(cameraLabel('OLYMPUS IMAGING CORP.', 'E-M10')).toBe('OLYMPUS E-M10');
+    expect(cameraLabel('samsung', 'SM-G991B')).toBe('Samsung SM-G991B');
+    expect(cameraLabel('SONY', 'ILCE-7M3')).toBe('SONY ILCE-7M3');
+    expect(cameraLabel('', 'Pixel 7')).toBe('Pixel 7');
+  });
+
+  it('searches cameras by any words of maker and model, keeping their order', () => {
+    const cams = [
+      { make: 'Apple', model: 'iPhone 12', count: 9 },
+      { make: 'NIKON CORPORATION', model: 'NIKON D750', count: 5 },
+      { make: 'Apple', model: 'iPhone 8', count: 3 },
+      { make: 'samsung', model: 'SM-G991B', count: 1 },
+    ];
+    expect(searchCameras(cams, '').map((c) => c.model)).toEqual(['iPhone 12', 'NIKON D750', 'iPhone 8', 'SM-G991B']);
+    expect(searchCameras(cams, 'apple').map((c) => c.model)).toEqual(['iPhone 12', 'iPhone 8']);
+    expect(searchCameras(cams, 'iphone 8').map((c) => c.model)).toEqual(['iPhone 8']);
+    expect(searchCameras(cams, 'Samsung').map((c) => c.model)).toEqual(['SM-G991B']);
+    expect(searchCameras(cams, 'nikon d7').map((c) => c.model)).toEqual(['NIKON D750']);
+    expect(searchCameras(cams, 'leica')).toEqual([]);
   });
 });

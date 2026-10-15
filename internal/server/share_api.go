@@ -244,7 +244,7 @@ func (s *Server) handleShareLibrary(w http.ResponseWriter, r *http.Request, req 
 // media list adds year and month. Anything else is 400 (trashed, import
 // and session among them).
 var shareFilterKeys = map[string]bool{"type": true, "from": true, "to": true, "recur": true, "months": true,
-	"rating": true, "album": true, "tag": true, "camera": true, "gps": true, "minpx": true, "maxpx": true}
+	"rating": true, "album": true, "tag": true, "camera": true, "nocamera": true, "gps": true, "minpx": true, "maxpx": true}
 
 // maxShareCamera bounds the camera filter's value (a model name).
 const maxShareCamera = 200
@@ -282,11 +282,25 @@ func (s *Server) shareFilter(w http.ResponseWriter, r *http.Request, req *shareR
 		writeError(w, http.StatusBadRequest, `invalid filter "camera": too long`)
 		return catalog.Filter{}, false
 	}
+	// nocamera=1: the photos without a camera model ("Unknown camera").
+	noCamera := false
+	if q.Has("nocamera") {
+		if q.Get("nocamera") != "1" || len(q["nocamera"]) != 1 {
+			writeError(w, http.StatusBadRequest, `invalid filter "nocamera": want 1`)
+			return catalog.Filter{}, false
+		}
+		if q.Has("camera") {
+			writeError(w, http.StatusBadRequest, `invalid filter "nocamera": not with "camera"`)
+			return catalog.Filter{}, false
+		}
+		noCamera = true
+	}
 	f, uf, err := parseFilter(q)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return f, false
 	}
+	f.NoCamera = noCamera
 	return f, s.shareScope(w, r, req, l, &f, uf)
 }
 

@@ -403,7 +403,7 @@ func TestShareFilterWhitelist(t *testing.T) {
 	f := newShareFixture(t)
 	c := f.pair(f.libraryShare().ID, "Anna")
 	for _, q := range []string{"type=video", "type=image_raw", "from=2024-01-01&to=2025-01-01", "recur=07-01..07-31",
-		"months=7", "months=1,7,12", "rating=3", "album=1", "tag=1", "tag=1&tag=2", "camera=EOS+R5", "gps=1",
+		"months=7", "months=1,7,12", "rating=3", "album=1", "tag=1", "tag=1&tag=2", "camera=EOS+R5", "nocamera=1", "gps=1",
 		"minpx=10", "maxpx=4000", "minpx=10&maxpx=20"} {
 		wantStatus(t, f.phone("GET", "/api/l/peter/timeline?"+q, "", c), http.StatusOK)
 		wantStatus(t, f.phone("GET", "/api/l/peter/media?year=2024&month=7&"+q, "", c), http.StatusOK)
@@ -411,7 +411,8 @@ func TestShareFilterWhitelist(t *testing.T) {
 	for _, q := range []string{"trashed=1", "trashed=0", "import=1", "session=1", "foo=1", "year=2024",
 		// Malformed values of allowed keys.
 		"type=raw", "gps=2", "minpx=0", "minpx=20&maxpx=10", "tag=x", "months=13", "recur=13-01", "rating=6",
-		"camera=" + strings.Repeat("x", maxShareCamera+1)} {
+		"camera=" + strings.Repeat("x", maxShareCamera+1), "nocamera=0", "nocamera=", "nocamera=1&nocamera=1",
+		"nocamera=1&camera=EOS+R5"} {
 		wantStatus(t, f.phone("GET", "/api/l/peter/timeline?"+q, "", c), http.StatusBadRequest)
 		if q != "year=2024" {
 			wantStatus(t, f.phone("GET", "/api/l/peter/media?year=2024&month=7&"+q, "", c), http.StatusBadRequest)
@@ -496,14 +497,18 @@ func TestShareFacets(t *testing.T) {
 		got, m := f.facets(c, "peter")
 		want := shareFacetsJSON{Total: 5, Types: shareTypesJSON{Image: 4, Video: 1},
 			Years: []shareYearJSON{{2024, 5}}, Cameras: []cameraJSON{{"Canon", "EOS R5", 2}, {"Canon", "Other Cam", 1},
-				{"Canon", "Secret Cam", 1}}, GPS: ptr(int64(1)),
+				{"Canon", "Secret Cam", 1}}, NoCamera: 1, GPS: ptr(int64(1)),
 			Tags:   &[]shareFacetJSON{{beach, "beach", 2}},
 			Albums: &[]shareFacetJSON{{f.albums["peter/Other"], "Other", 1}, {f.albums["peter/Summer"], "Summer", 3}}}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("peter facets\n got  %s\n want %s", asJSON(got), asJSON(want))
 		}
-		if len(m) != 8 {
+		if len(m) != 9 {
 			t.Fatalf("keys %v", m)
+		}
+		// The photos without a camera (the video): counted, and found by nocamera=1.
+		if got := f.listHashes(c, "peter", "?nocamera=1"); !slices.Equal(got, f.hexes("peter/v.mp4")) {
+			t.Fatalf("nocamera filter %v", got)
 		}
 		// Penny's own user.db: no tags, no albums.
 		got, _ = f.facets(c, "penny")
@@ -524,7 +529,7 @@ func TestShareFacets(t *testing.T) {
 		c := f.pair(sh.ID, "Mia")
 		got, m := f.facets(c, "album")
 		want := shareFacetsJSON{Total: 3, Types: shareTypesJSON{Image: 2, Video: 1}, Years: []shareYearJSON{{2024, 3}},
-			Cameras: []cameraJSON{{"Canon", "EOS R5", 2}}}
+			Cameras: []cameraJSON{{"Canon", "EOS R5", 2}}, NoCamera: 1}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("album facets\n got  %s\n want %s", asJSON(got), asJSON(want))
 		}
@@ -538,6 +543,10 @@ func TestShareFacets(t *testing.T) {
 		}
 		if got := f.listHashes(c, "album", "?camera=Secret+Cam"); len(got) != 0 {
 			t.Fatalf("camera outside the album: %v", got)
+		}
+		// Unknown camera within the album only: its video, not the library's other photos.
+		if got := f.listHashes(c, "album", "?nocamera=1"); !slices.Equal(got, f.hexes("peter/v.mp4")) {
+			t.Fatalf("album nocamera filter %v", got)
 		}
 		// With location: the album's gps count only.
 		f.update(sh.ID, `{"capabilities": {"video": true, "download": false, "rate": false, "location": true}}`)

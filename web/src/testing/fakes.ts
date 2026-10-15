@@ -1595,7 +1595,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
   };
   const notFound = () => json({ error: 'not found' }, 404);
   /** The filter whitelist of timeline and media; media adds year and month. */
-  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'tag', 'camera', 'gps', 'minpx', 'maxpx']);
+  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'tag', 'camera', 'nocamera', 'gps', 'minpx', 'maxpx']);
   /** The scope's photos of a {lib} key: the album's live members, or the library's. */
   const inLib = (lib: string) => visible().filter((x) => kind === 'album' || x.lib === lib);
 
@@ -1607,6 +1607,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     if (q.has('album') && kind === 'album') return json({ error: 'invalid filter "album": this share is one album' }, 400);
     if (q.has('tag') && kind === 'album') return json({ error: 'invalid filter "tag": this share is one album' }, 400);
     if ((q.get('camera') ?? '').length > 200) return json({ error: 'invalid filter "camera": too long' }, 400);
+    if (q.has('nocamera') && (q.get('nocamera') !== '1' || q.has('camera'))) return json({ error: 'invalid filter "nocamera"' }, 400);
     let list = inLib(lib);
     const aid = Number(q.get('album'));
     if (aid) {
@@ -1640,6 +1641,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
     }
     const cam = q.get('camera');
     if (cam) list = list.filter((x) => x.camera === cam);
+    if (q.get('nocamera') === '1') list = list.filter((x) => !x.camera);
     if (q.get('gps') === '1') list = list.filter((x) => x.gps === true);
     const minPx = Number(q.get('minpx'));
     if (minPx) list = list.filter((x) => Math.max(x.w, x.h) >= minPx);
@@ -1664,6 +1666,7 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       years: [...years].sort((a, b) => b[0] - a[0]).map(([year, count]) => ({ year, count })),
       undated: list.filter((x) => !x.takenAt).length,
       cameras: [...cams].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([model, count]) => ({ make: model.split(' ')[0], model, count })),
+      nocamera: list.filter((x) => !x.camera).length,
     };
     if (caps.location) out.gps = list.filter((x) => x.gps).length;
     if (kind !== 'album') {

@@ -33,6 +33,8 @@ type shareFacetsJSON struct {
 	Years   []shareYearJSON `json:"years"`
 	Undated int64           `json:"undated"`
 	Cameras []cameraJSON    `json:"cameras"`
+	// NoCamera counts the photos without a camera model (the `nocamera` filter).
+	NoCamera int64 `json:"nocamera"`
 	// GPS needs location.
 	GPS *int64 `json:"gps,omitempty"`
 	// Tags and Albums are sent where the scope covers whole libraries.
@@ -76,7 +78,7 @@ func (s *Server) handleShareFacets(w http.ResponseWriter, r *http.Request, req *
 		return
 	}
 	out := shareFacetsJSON{Total: fc.Total, Types: shareTypesJSON{Image: fc.Images, Raw: fc.Raw, Video: fc.Videos},
-		Years: make([]shareYearJSON, 0, len(fc.Years)), Undated: fc.Undated, Cameras: cameraList(fc.Cameras)}
+		Years: make([]shareYearJSON, 0, len(fc.Years)), Undated: fc.Undated, Cameras: cameraList(fc.Cameras), NoCamera: fc.NoCamera}
 	for _, y := range fc.Years {
 		out.Years = append(out.Years, shareYearJSON{Year: y.Year, Count: y.Count})
 	}
