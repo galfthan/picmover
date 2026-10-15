@@ -365,6 +365,13 @@ func (s *Server) handleShareMediaList(w http.ResponseWriter, r *http.Request, re
 		s.internalError(w, r, err)
 		return
 	}
+	shareRedactItems(items, req)
+	writeJSON(w, http.StatusOK, itemsJSON{Items: items})
+}
+
+// shareRedactItems drops what a phone's list items may not carry:
+// deletedAt always, rating without rate, gps without location.
+func shareRedactItems(items []itemJSON, req *shareReq) {
 	caps := req.sh.Capabilities
 	for i := range items {
 		items[i].DeletedAt = nil
@@ -375,7 +382,6 @@ func (s *Server) handleShareMediaList(w http.ResponseWriter, r *http.Request, re
 			items[i].GPS = false
 		}
 	}
-	writeJSON(w, http.StatusOK, itemsJSON{Items: items})
 }
 
 // shareVisibleRow checks a live row of l against the scope: false (and a
