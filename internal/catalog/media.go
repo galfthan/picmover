@@ -139,6 +139,15 @@ func timeColumns(ctx context.Context, w writer, m *Media) (wall, off, src, home 
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	if src == OffsetSourceHome && loc != nil {
+		// An instant whose local offset is unknown is shown in the home
+		// zone, whatever zone it came in (an import's or another
+		// library's).
+		t := m.TakenAt.In(loc)
+		_, o := t.Zone()
+		w := wallSeconds(t)
+		return w, int64(o), src, w, nil
+	}
 	home = wallSeconds(HomeWall(m.TakenAt, m.OffsetKnown, loc))
 	return wall, off, src, home, nil
 }

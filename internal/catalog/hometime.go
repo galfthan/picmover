@@ -560,6 +560,9 @@ func (d *DB) migrateFromV3(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fail(err)
 	}
+	if _, err := tx.ExecContext(ctx, migrateV3Index); err != nil {
+		return fail(err)
+	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
 		return fail(err)
 	}

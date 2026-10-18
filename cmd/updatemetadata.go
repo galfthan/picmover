@@ -56,7 +56,7 @@ Exits with status 2 when any row could not be updated.`,
 				return err
 			}
 			ctx := cmd.Context()
-			lib, db, unlock, err := openExistingLocked(ctx, args[0], "update-metadata", cmd.ErrOrStderr())
+			lib, db, unlock, err := openExistingFor(ctx, args[0], "update-metadata", !dryRun, cmd.ErrOrStderr())
 			if err != nil {
 				return err
 			}

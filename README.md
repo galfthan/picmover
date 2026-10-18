@@ -314,7 +314,7 @@ Phone videos often record only a UTC time. Their local offset is taken from the 
 
 ## Upgrading
 
-A catalog of the previous format (schema version 3) is upgraded in place the first time this version opens it: home times are added (see [Dates and time zones](#dates-and-time-zones); the home zone becomes the system zone when its name is known), and the local offsets of videos that only recorded a UTC time are estimated. Files are not moved.
+A catalog of the previous format (schema version 3) is upgraded in place by the first command of this version that changes the library (`serve`, `import`, `thumbs`, `update-metadata` without `--dry-run`, ...): a copy of the old catalog is kept as `media.db.bak-<YYYYMMDD-HHMMSS>` (rename it back to `media.db` to return to the previous picmover), home times are added (see [Dates and time zones](#dates-and-time-zones); the home zone becomes the system zone when its name is known), and the local offsets of videos that only recorded a UTC time are estimated. Files are not moved. Commands that only read (`db`, `home-zone` without a zone, `update-metadata --dry-run`) do not upgrade it; they name a command that does.
 
 The catalog is derived entirely from the files, so older formats are not migrated: when a new version changes the catalog format beyond that, every command refuses the old catalog (without changing it) with a message to run
 

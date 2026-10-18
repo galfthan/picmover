@@ -75,13 +75,16 @@ CREATE TABLE IF NOT EXISTS import_sessions (
 `
 
 // migrateV3 adds the version 4 columns to a version 3 catalog; the values
-// are filled in by migrateV3Data in the same transaction.
+// are filled in by migrateFromV3 in the same transaction.
 const migrateV3 = `
 ALTER TABLE media ADD COLUMN taken_at_home INTEGER;
 ALTER TABLE media ADD COLUMN taken_at_offset_source TEXT
     CHECK (taken_at_offset_source IN ('exif','video','gps','nearby','home'));
-CREATE INDEX IF NOT EXISTS media_taken_at_home ON media(taken_at_home);
 `
+
+// migrateV3Index indexes taken_at_home after the migration filled it
+// (building it once is cheaper than updating it row by row).
+const migrateV3Index = `CREATE INDEX IF NOT EXISTS media_taken_at_home ON media(taken_at_home);`
 
 // schemaV3 is the DDL of schema version 3 (migrated in place to version
 // 4 on open; kept for tests that build a version 3 catalog).

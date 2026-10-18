@@ -86,6 +86,11 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 		if err := checkSchema(path, v, hasMedia, true); err != nil {
 			return nil, err
 		}
+		if v == migratableVersion {
+			if err := backupForMigration(ctx, path, logger); err != nil {
+				return nil, err
+			}
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("catalog: %w", err)
 	}
@@ -93,7 +98,7 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := d.ensureSchema(ctx); err != nil {
+	if err := retryBusy(ctx, migrationBusyFor, func() error { return d.ensureSchema(ctx) }); err != nil {
 		d.Close()
 		return nil, err
 	}
@@ -101,7 +106,36 @@ func Open(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
 		d.Close()
 		return nil, err
 	}
+	if err := d.healHome(ctx); err != nil {
+		d.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+// ErrNeedsUpgrade is returned (wrapped) by OpenExistingNoUpgrade for a
+// catalog of the previous schema version, which only a writer (Open,
+// OpenExisting) upgrades in place.
+var ErrNeedsUpgrade = errors.New("catalog has the previous format and is upgraded by the next command that changes the library")
+
+// migrationBusyFor bounds how long an opener waits for another process's
+// migration of the same catalog (each attempt already waits busy_timeout).
+const migrationBusyFor = 5 * time.Minute
+
+// retryBusy runs fn again while it fails with SQLITE_BUSY, until limit.
+func retryBusy(ctx context.Context, limit time.Duration, fn func() error) error {
+	deadline := time.Now().Add(limit)
+	for {
+		err := fn()
+		if err == nil || !isBusy(err) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // ensureDerived creates the derived tables (similar_pairs, meta) when
@@ -123,10 +157,23 @@ func (d *DB) ensureDerived(ctx context.Context) error {
 
 // OpenExisting opens the catalog at path like Open but never creates it. It
 // returns an error if the file does not exist or has no schema, and an error
-// wrapping ErrNeedsRebuild if its schema version is not SchemaVersion. The
-// schema is probed without enabling WAL, so a database of another format is
-// not written. logger may be nil.
+// wrapping ErrNeedsRebuild if its schema version is neither SchemaVersion
+// nor the migratable version 3, which is upgraded in place (callers hold
+// the library lock or are the server). The schema is probed without
+// enabling WAL, so a database of another format is not written. logger
+// may be nil.
 func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
+	return openExisting(ctx, path, logger, true)
+}
+
+// OpenExistingNoUpgrade is OpenExisting for readers that do not hold the
+// library lock: a version 3 catalog is refused, untouched, with an error
+// wrapping ErrNeedsUpgrade.
+func OpenExistingNoUpgrade(ctx context.Context, path string, logger *slog.Logger) (*DB, error) {
+	return openExisting(ctx, path, logger, false)
+}
+
+func openExisting(ctx context.Context, path string, logger *slog.Logger, upgrade bool) (*DB, error) {
 	if err := checkPath(path); err != nil {
 		return nil, err
 	}
@@ -144,6 +191,14 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	if err := checkSchema(path, v, hasMedia, false); err != nil {
 		return nil, err
 	}
+	if v == migratableVersion {
+		if !upgrade {
+			return nil, fmt.Errorf("catalog: %s: %w", path, ErrNeedsUpgrade)
+		}
+		if err := backupForMigration(ctx, path, logger); err != nil {
+			return nil, err
+		}
+	}
 	d, err := openDB(ctx, path, logger)
 	if err != nil {
 		return nil, err
@@ -153,11 +208,17 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	if err == nil {
 		err = checkSchema(path, v, hasMedia, false)
 	}
+	if err == nil && v == migratableVersion && !upgrade {
+		err = fmt.Errorf("catalog: %s: %w", path, ErrNeedsUpgrade)
+	}
 	if err == nil {
 		err = d.ensureDerived(ctx)
 	}
 	if err == nil && v == migratableVersion {
-		err = d.ensureSchema(ctx)
+		err = retryBusy(ctx, migrationBusyFor, func() error { return d.ensureSchema(ctx) })
+	}
+	if err == nil && upgrade {
+		err = d.healHome(ctx)
 	}
 	if err != nil {
 		d.Close()

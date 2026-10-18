@@ -87,11 +87,19 @@ keeps an estimated offset while the re-read date is unchanged.
 
 ## Migration (schema 3 -> 4)
 
-`Open` and `OpenExisting` migrate a version 3 catalog in place, in one
-IMMEDIATE transaction (other versions still need `picmover rebuild`):
+`Open` and `OpenExisting` (writers: commands holding the library lock,
+and the server) migrate a version 3 catalog in place, in one IMMEDIATE
+transaction (other versions still need `picmover rebuild`). Readers
+without the lock (`db`, `home-zone` showing, `update-metadata --dry-run`)
+use `OpenExistingNoUpgrade`, which refuses it untouched with
+`ErrNeedsUpgrade`; the CLI names a command that upgrades it. First a
+consistent copy is written (VACUUM INTO) to `media.db.bak-<stamp>`, the
+name rebuild backups have. A second opener waiting on the migration
+retries SQLITE_BUSY for up to five minutes. Then:
 
-1. add `taken_at_home`, `taken_at_offset_source` and the
-   `media_taken_at_home` index (and the `meta` table if missing);
+1. add `taken_at_home` and `taken_at_offset_source` (and the `meta` table
+   if missing); the `media_taken_at_home` index is built last, after the
+   backfill;
 2. offset sources from `taken_at_source` (`exif`, `video`, else `home`);
 3. the home zone: meta's if set, else the system zone when its IANA name
    is known (`$TZ`, the `/etc/localtime` link), which is the zone the old
@@ -99,6 +107,13 @@ IMMEDIATE transaction (other versions still need `picmover rebuild`):
 4. every home time, with `home` rows re-expressed in the home zone;
 5. the video offsets inferred as above (stored wall clock minus stored
    offset is the instant).
+
+Every write open also fills rows that have a capture time but no
+`taken_at_home` (an older picmover writing into an upgraded catalog): one
+lookup in the `taken_at_home` index when there are none. A row written
+with offset source `home` is always stored in the home zone, whatever zone
+its time came in (an import's `--timezone`, another library's rows moved
+in).
 
 Files on disk are not moved: folders laid out by the old wall clock stay.
 `PeekFile` (the library list) reads a version 3 catalog without migrating
