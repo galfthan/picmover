@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"picmover/internal/library"
 )
@@ -181,6 +182,9 @@ func TestDevicePullFallsBack(t *testing.T) {
 	var all []string
 	for i, n := range names {
 		srcs[n] = writeFile(t, filepath.Join(e.src, n), jpegAt(date(2020, 3, 1+i), byte(i+1)))
+		// The walk goes newest first: a.jpg is the newest, so the files
+		// are dispatched in the order of names.
+		touch(t, srcs[n], date(2020, 3, 1).Add(-time.Duration(i)*time.Hour))
 		all = append(all, srcs[n])
 	}
 	boom := errors.New("gio copy mtp://Pixel/a.jpg: exit status 1: Operation not supported")
