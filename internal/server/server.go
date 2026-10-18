@@ -51,7 +51,13 @@ type Options struct {
 	// Workspace is the folder of libraries in workspace mode.
 	Workspace string
 	Version   string // reported by /api/l/{lib}/library
-	FFmpeg    string // ffmpeg path for video thumbnails; "" = not found
+	FFmpeg    string // ffmpeg path for video thumbnails and conversions; "" = not found
+	// FFProbe is the ffprobe path for reading a video's codec when the
+	// catalog has none; "" = not found.
+	FFProbe string
+	// VideoCacheBytes caps each library's cache of converted videos
+	// (least recently used files go first); 0 = DefaultVideoCacheBytes.
+	VideoCacheBytes int64
 	// Addr is the host:port the server listens on. Host and Origin
 	// headers must name it, or localhost / 127.0.0.1 / [::1] with its port.
 	Addr string
@@ -88,6 +94,9 @@ type Options struct {
 	// jobOptions, when set, adjusts the importer options of every job
 	// (tests use it to slow down or observe a job).
 	jobOptions func(*importer.Options)
+
+	// opener, when set, replaces the system's file opener (tests).
+	opener opener
 }
 
 // Server serves the API, the jobs and the frontend of one library or of a
@@ -107,6 +116,9 @@ type Server struct {
 	guard   *guard
 	jobs    *jobManager
 	large   *largeDeriver // on-demand large thumbnails
+	video   *videoManager // on-demand video conversions
+	ffprobe string
+	opener  opener // "Open original"; nil: not available
 	handler http.Handler
 
 	app      *AppHooks  // nil: no /api/app endpoints
@@ -165,6 +177,9 @@ func New(opts Options) (*Server, error) {
 		static:  opts.Static,
 		guard:   g,
 		large:   newLargeDeriver(log),
+		video:   newVideoManager(opts.FFmpeg, opts.VideoCacheBytes, log),
+		ffprobe: opts.FFProbe,
+		opener:  opts.opener,
 		app:     opts.App,
 
 		bodyTimeout: bodyReadTimeout,
@@ -179,6 +194,9 @@ func New(opts Options) (*Server, error) {
 		if _, err := fs.Stat(s.static, "index.html"); err != nil {
 			s.static = nil // an override without index.html: not built
 		}
+	}
+	if s.opener == nil {
+		s.opener = newSysOpener()
 	}
 	s.jobs = newJobManager(ws, s.ffmpeg, log, opts.jobOptions)
 	ws.ownedImports = s.jobs.ownedImports
@@ -272,6 +290,7 @@ func (s *Server) StopJobs(ctx context.Context) error {
 	s.share.shutdown() // phones first: nothing new reaches the libraries
 	ctx, cancel := context.WithTimeout(ctx, jobShutdownTimeout)
 	defer cancel()
+	s.video.shutdown(ctx)
 	return s.jobs.shutdown(ctx)
 }
 
@@ -337,6 +356,9 @@ func (s *Server) routes() *http.ServeMux {
 	scoped("GET /api/l/{lib}/preview/{hash}", s.handlePreview)
 	scoped("GET /api/l/{lib}/large/{hash}", s.handleLarge)
 	scoped("GET /api/l/{lib}/file/{id}", s.handleFile)
+	scoped("GET /api/l/{lib}/stream/{id}", s.handleStream)
+	scoped("GET /api/l/{lib}/stream/{id}/status", s.handleStreamStatus)
+	scoped("POST /api/l/{lib}/media/{id}/open", s.handleOpen)
 	scoped("GET /api/l/{lib}/geo", s.handleGeo)
 	scoped("GET /api/l/{lib}/geo/items", s.handleGeoItems)
 	scoped("GET /api/l/{lib}/jobs", s.handleLibJobList)

@@ -257,6 +257,8 @@ func (a *app) main(ctx context.Context) error {
 			// <config>/picmover/share: share.DefaultDir for the real
 			// config dir, and the test's own one in tests.
 			ShareDir: filepath.Join(a.configDir, "share"),
+			// Read once per start: a changed app.json applies after a restart.
+			VideoCacheBytes: int64(a.config().VideoCacheMB) << 20,
 		})
 	}
 	run, err := start(workspace)

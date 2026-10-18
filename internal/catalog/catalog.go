@@ -91,13 +91,12 @@ func (d *DB) ensureDerived(ctx context.Context) error {
 		WHERE type = 'table' AND name IN ('similar_pairs', 'meta')`).Scan(&n); err != nil {
 		return fmt.Errorf("catalog: inspect schema: %w", err)
 	}
-	if n == 2 {
-		return nil
+	if n != 2 {
+		if _, err := d.ExecContext(ctx, derivedTables); err != nil {
+			return fmt.Errorf("catalog: create derived tables: %w", err)
+		}
 	}
-	if _, err := d.ExecContext(ctx, derivedTables); err != nil {
-		return fmt.Errorf("catalog: create derived tables: %w", err)
-	}
-	return nil
+	return d.ensureVideoInfo(ctx)
 }
 
 // OpenExisting opens the catalog at path like Open but never creates it. It

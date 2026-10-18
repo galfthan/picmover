@@ -53,6 +53,9 @@ type StartOptions struct {
 	// Wi-Fi); sharing starts only through StartSharing or the Share page.
 	ShareDir string
 	ShareCmd string
+	// VideoCacheBytes caps each library's cache of converted videos; 0 =
+	// DefaultVideoCacheBytes.
+	VideoCacheBytes int64
 
 	static fs.FS // tests: Options.Static
 }
@@ -412,7 +415,9 @@ func Start(ctx context.Context, opts StartOptions) (*Running, error) {
 	}
 
 	ffmpeg, _ := metadata.FindTool("ffmpeg")
-	srvOpts.Version, srvOpts.FFmpeg, srvOpts.Addr = opts.Version, ffmpeg, actual
+	ffprobe, _ := metadata.FindTool("ffprobe")
+	srvOpts.Version, srvOpts.FFmpeg, srvOpts.FFProbe, srvOpts.Addr = opts.Version, ffmpeg, ffprobe, actual
+	srvOpts.VideoCacheBytes = opts.VideoCacheBytes
 	srvOpts.CORSOrigins, srvOpts.Logger = opts.CORSOrigins, logger
 	srv, err := New(srvOpts)
 	if err != nil {
@@ -420,6 +425,7 @@ func Start(ctx context.Context, opts StartOptions) (*Running, error) {
 		return nil, err
 	}
 	r.srv = srv
+	srv.video.warm()
 	r.addr = actual
 	r.url = "http://" + BrowserHost(actual) + "/"
 	r.httpSrv = &http.Server{

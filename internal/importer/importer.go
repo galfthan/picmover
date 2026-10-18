@@ -239,6 +239,9 @@ type pending struct {
 	bytes     int64  // bytes written by the copy
 	deleteSrc bool   // remove src after commit
 	trash     bool   // a trash file recorded in place
+	// video is the video's encoding (codec, HDR), recorded in video_info
+	// with the row; nil for images or without ffprobe.
+	video *metadata.VideoInfo
 }
 
 // New returns an importer for lib and db with opts, filling in defaults.
@@ -716,6 +719,7 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 			hash:   hash,
 			claim:  claim,
 			trash:  trash,
+			video:  info.Video,
 		}, nil
 	}
 
@@ -830,6 +834,7 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		copied:    copied,
 		bytes:     nbytes,
 		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
+		video:     info.Video,
 	}, nil
 }
 
@@ -1245,6 +1250,13 @@ func (im *Importer) commit(batch []*pending) error {
 			return err
 		}
 		inserted[i] = ok
+		if ok && p.video != nil {
+			if err := im.db.PutVideoInfo(ctx, tx, p.hash, catalog.VideoInfo(*p.video)); err != nil {
+				_ = tx.Rollback()
+				im.failBatch(batch, err)
+				return err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		_ = tx.Rollback()
