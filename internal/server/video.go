@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,8 +34,14 @@ import (
 
 const (
 	// videoFormatVersion is part of every cache file name: bump it when
-	// the encoding changes, and old files age out of the cache.
-	videoFormatVersion = 1
+	// the encoding changes. The files of an older version are removed
+	// before the first conversion in a library (cleanLocked); until then
+	// they count against the cap and are the first to go (LRU).
+	//
+	// 2: the source frame timing is kept (-fps_mode vfr); version 1 forced
+	// a constant rate (-fpsmax 60), which turned the jittery timestamps of
+	// phone videos into hundreds of duplicated and dropped frames (#20).
+	videoFormatVersion = 2
 	// DefaultVideoCacheBytes caps a library's video cache (LRU).
 	DefaultVideoCacheBytes int64 = 5 << 30
 	// MinVideoCacheBytes is the smallest accepted cap.
@@ -135,6 +142,7 @@ func videoCachePath(root string, hash uint64, variant string) string {
 // client that plays it.
 type videoManager struct {
 	ffmpeg     string // "" = no conversions
+	ffprobe    string // "" = none: slow motion is not thinned (frameCap)
 	log        *slog.Logger
 	cacheBytes int64
 	sem        chan struct{} // slots of full (cacheable) conversions
@@ -239,7 +247,7 @@ func (v *videoManager) capabilities() ffmpegCaps {
 		start := time.Now()
 		v.caps = probeFFmpeg(context.Background(), v.ffmpeg, v.hw, v.sw)
 		v.log.Info("video conversion", "encoders", strings.Join(v.caps.encoderNames(), ","),
-			"tonemap", v.caps.tonemap, "note", v.caps.note, "probe", time.Since(start).Round(time.Millisecond))
+			"tonemap", v.caps.tonemap, "fps_mode", v.caps.fpsMode, "note", v.caps.note, "probe", time.Since(start).Round(time.Millisecond))
 	})
 	return v.caps
 }
@@ -366,25 +374,55 @@ func (v *videoManager) cancelWhere(ctx context.Context, why string, match func(*
 	}
 }
 
-// cleanLocked removes the partial files a previous run left in a cache
-// directory, once per directory and process (before its first
-// conversion; v.mu held).
+// cleanLocked removes, from a cache directory, the partial files a
+// previous run left and the complete conversions of an older format
+// version (never served again), once per directory and process (before
+// its first conversion; v.mu held). Only names the cache writes are
+// touched.
 func (v *videoManager) cleanLocked(dir string) {
 	if v.cleaned[dir] {
 		return
 	}
 	v.cleaned[dir] = true
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
+		if err != nil || !d.Type().IsRegular() {
 			return nil
 		}
-		if d.Type().IsRegular() && (strings.HasSuffix(d.Name(), ".part") || strings.HasSuffix(d.Name(), ".tmp")) {
+		name := d.Name()
+		switch {
+		case strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".tmp"):
 			if err := os.Remove(p); err == nil {
 				v.log.Debug("removed partial video conversion", "path", p)
+			}
+		case staleVersion(name):
+			if err := os.Remove(p); err == nil {
+				v.log.Debug("removed video conversion of an older format", "path", p)
 			}
 		}
 		return nil
 	})
+}
+
+// staleVersion reports whether name is a complete conversion of an older
+// format version: <16 hex digits>-v<n>-<variant>.mp4 (videoCachePath)
+// with n below videoFormatVersion. A newer version (written by a newer
+// picmover sharing the library) is left alone.
+func staleVersion(name string) bool {
+	rest, ok := strings.CutSuffix(name, ".mp4")
+	if !ok || len(rest) < 20 || rest[16:18] != "-v" {
+		return false
+	}
+	for _, c := range rest[:16] {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	num, variant, ok := strings.Cut(rest[18:], "-")
+	if !ok || variant == "" {
+		return false
+	}
+	n, err := strconv.Atoi(num)
+	return err == nil && n >= 1 && n < videoFormatVersion && strconv.Itoa(n) == num
 }
 
 // source is what a conversion reads.
@@ -393,7 +431,10 @@ type source struct {
 	hash uint64
 	path string // the original, already checked by openOriginal
 	info *catalog.VideoInfo
-	row  catalog.Media
+	// nominalFPS is the stream's r_frame_rate, probed when a transcode of
+	// slow motion starts (frameCap); 0 otherwise.
+	nominalFPS float64
+	row        catalog.Media
 	// busy reports whether the library is in a state where no conversion
 	// may start (a move between libraries runs); nil: never.
 	busy func() bool
@@ -895,10 +936,15 @@ func (j *encodeJob) encode() error {
 	if len(caps.encoders) == 0 {
 		return errors.New(caps.note)
 	}
+	src := j.src
+	if src.info != nil && src.info.FrameRate > capAbove && v.ffprobe != "" {
+		// Slow motion by its average: its nominal rate decides (frameCap).
+		src.nominalFPS = nominalRate(j.ctx, v.ffprobe, src.path)
+	}
 	var lastErr error
 	for _, e := range caps.encoders {
 		j.setEncoder(e.Name)
-		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e))
+		lastErr = j.ffmpeg(transcodeArgs(src, j.req, e, caps.fpsMode))
 		j.mu.Lock()
 		wrote := j.written > 0
 		j.mu.Unlock()
@@ -1118,22 +1164,96 @@ func remuxArgs(src source, q streamReq) []string {
 
 // transcodeArgs convert to H.264 (8-bit 4:2:0) and AAC with encoder e:
 // scaled so the short side is q.tier (never up), HDR tone-mapped to SDR
-// BT.709 when the filters exist, at most 60 frames per second. ffmpeg
-// applies the rotation (autorotate), so the output is upright.
-func transcodeArgs(src source, q streamReq, e encoder) []string {
+// BT.709 when the filters exist, with the source's frame timing (only
+// slow motion is thinned, by frameCap). ffmpeg applies the rotation
+// (autorotate), so the output is upright. fpsMode: this ffmpeg has
+// -fps_mode (5.1 and later; ffmpegCaps.fpsMode), else -vsync is used.
+//
+// vfr keeps each frame's timestamp and drops only a frame that would
+// repeat the previous one's. A constant-rate mode (cfr, or -fpsmax, which
+// implies it) must not be used: phone videos have jittery timestamps and
+// frame durations that do not match them, and cfr then duplicates and
+// drops about every other frame (#20). passthrough is not used either: a
+// repeated timestamp makes the MP4 muxer fail.
+func transcodeArgs(src source, q streamReq, e encoder, fpsMode bool) []string {
 	args := inputArgs(src, q, e.input)
-	args = append(args, "-vf", videoFilter(q.tier, q.tonemap, src.info, e.format))
+	vf := videoFilter(q.tier, q.tonemap, src.info, e.format)
+	if src.info != nil {
+		if fc := frameCap(src.info.FrameRate, src.nominalFPS); fc != "" {
+			vf = fc + "," + vf // first: the rest handles fewer frames
+		}
+	}
+	args = append(args, "-vf", vf)
 	args = append(args, e.args(q.tier)...)
 	if q.tonemap {
 		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
 	}
-	args = append(args, "-fpsmax", "60", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
-		"-max_muxing_queue_size", "1024")
+	args = append(args, vfrArgs(fpsMode)...)
+	args = append(args, "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-max_muxing_queue_size", "1024")
 	args = append(args, fragmentFlags...)
 	return append(args, "-f", "mp4", "pipe:1")
 }
 
+// vfrArgs select the variable frame rate output: -fps_mode vfr, or
+// -vsync vfr for an ffmpeg before 5.1, which has no -fps_mode (it exits
+// with "Unrecognized option"). 5.1 and later only deprecate -vsync.
+func vfrArgs(fpsMode bool) []string {
+	if fpsMode {
+		return []string{"-fps_mode", "vfr"}
+	}
+	return []string{"-vsync", "vfr"}
+}
+
 func isHDR(transfer string) bool { return transfer == "smpte2084" || transfer == "arib-std-b67" }
+
+// Slow motion (capAbove) is thinned to at most maxKeptFPS.
+const (
+	capAbove   = 75
+	maxKeptFPS = 72
+)
+
+// frameCap is the filter that thins slow motion, recorded at 90, 120 or
+// 240 fps and played at normal speed: it keeps every k-th frame, k the
+// smallest whole number that brings the rate to maxKeptFPS or below (120
+// and 240 -> 60, 90 -> 45, 180 -> 60), so the motion stays even and no
+// frame is ever repeated. Only when both rates are above capAbove: the
+// catalog's average (avg) and the stream's nominal rate (nominal,
+// r_frame_rate, probed when the conversion starts). An average alone can
+// be nonsense (a wrong container duration), and a frame-time rule drops
+// frames of a jittery 60 fps phone video. "" for anything else, an unknown
+// rate included: no cap is better than judder.
+func frameCap(avg, nominal float64) string {
+	if !(avg > capAbove) || !(nominal > capAbove) || nominal > 100_000 {
+		return ""
+	}
+	k := int(math.Ceil(nominal / maxKeptFPS))
+	if k < 2 {
+		return ""
+	}
+	return fmt.Sprintf(`select=not(mod(n\,%d))`, k)
+}
+
+// nominalRate is the first video stream's r_frame_rate (the rate its
+// timestamps tick at), from ffprobe; 0 when unknown.
+func nominalRate(ctx context.Context, ffprobe, path string) float64 {
+	ctx, cancel := context.WithTimeout(ctx, videoProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", "file:"+path)
+	hideWindow(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	num, den, ok := strings.Cut(strings.TrimRight(strings.TrimSpace(first), ","), "/")
+	n, err1 := strconv.ParseFloat(num, 64)
+	d, err2 := strconv.ParseFloat(den, 64)
+	if !ok || err1 != nil || err2 != nil || n <= 0 || d <= 0 {
+		return 0
+	}
+	return n / d
+}
 
 // videoFilter is the -vf chain: scale (short side tier, even sizes),
 // optional tone mapping, then the encoder's format (and upload).

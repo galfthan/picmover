@@ -260,7 +260,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 		s.serveLive(w, r, j, rd)
 		return
 	}
+	// A player's live load (load=n, docs/design/video-playback.md) is only
+	// ever the live stream: once the conversion is cached it is refused,
+	// at any offset, and the player loads the cached file under its own
+	// URL. A browser that fetched the live URL again (a replay, data it
+	// dropped) would otherwise get the cached file, a different layout of
+	// the same video, mix the two and fail to decode; and a first load that
+	// found the file cached could not later be continued consistently.
+	liveLoad := r.URL.Query().Has("load")
 	for range 2 {
+		if liveLoad {
+			if fi, err := os.Stat(final); err == nil && fi.Mode().IsRegular() {
+				writeError(w, http.StatusConflict, "the conversion is complete: load it without load=")
+				return
+			}
+		}
 		if s.serveCached(w, r, final, src.hash, q) {
 			return
 		}

@@ -58,7 +58,7 @@ changes. The media detail carries it as `video`, plus
 ## Conversion endpoints
 
 ```
-GET /api/l/{lib}/stream/{id}?mode=remux|transcode[&h=480|720|1080|1440|2160|0][&t=seconds]
+GET /api/l/{lib}/stream/{id}?mode=remux|transcode[&h=480|720|1080|1440|2160|0][&t=seconds][&load=n]
 GET /api/l/{lib}/stream/{id}/status?mode=...&h=...[&t=...]
     -> {cached, encoding, bytes, encoder, encoders, tier, start}
 ```
@@ -69,13 +69,39 @@ must be a tier; `t` must be finite and non-negative.
 
 - **Remux**: `-c:v copy` (`-tag:v hvc1` for HEVC), audio copied when AAC or
   MP3, else AAC 160k stereo.
-- **Transcode**: H.264 High, 8-bit 4:2:0, AAC 160k stereo, at most 60 fps,
-  scaled so the short side is the tier. ffmpeg's autorotate applies the
+- **Transcode**: H.264 High, 8-bit 4:2:0, AAC 160k stereo, scaled so the
+  short side is the tier. ffmpeg's autorotate applies the
   rotation, so the output is upright. HDR (PQ `smpte2084` or HLG
   `arib-std-b67`) is tone-mapped to SDR BT.709 with
   `zscale` (linear, npl 100) → `tonemap=hable` → `zscale` BT.709 when the
   build has both filters; else it is only converted to 8-bit (washed out but
   playable).
+- **Frame timing**: the transcode keeps the source's frame timestamps
+  (`-fps_mode vfr`; `-vsync vfr` for an ffmpeg before 5.1, which has no
+  `-fps_mode` and would refuse every transcode: Ubuntu 22.04 ships 4.4.
+  The capability probe tries `-fps_mode` once). A constant-rate output
+  (`-fpsmax 60`, which implies cfr; format version 1) must not come back:
+  phone videos have jittery timestamps (a OnePlus 59.94 fps clip: 16.58 to
+  16.79 ms apart) and frame durations, taken from irregular decode
+  timestamps, that do not match them (9 ticks of 90 kHz for most frames,
+  2 to 4 frames for others). cfr then duplicated and dropped about every
+  other frame (dup=1073 drop=1073 of 2024), so the output juddered at an
+  uneven ~30 fps (#20). `vfr` has no duplicates or drops on that clip;
+  `passthrough` would also keep them but makes the MP4 muxer fail on a
+  repeated timestamp.
+- **Slow motion** (recorded at 90 to 240 fps, played at normal speed) is
+  thinned, first in the filter chain, by `select=not(mod(n,k))`: every k-th
+  frame, k the smallest whole number that brings the rate to 72 fps or
+  below (90 → 45, 120 → 60, 180 → 60, 240 → 60), so the motion stays even
+  and no frame is repeated (the `fps` filter would repeat frames of a
+  source slower than its target). Only when both rates are above 75 fps:
+  the catalog's average (`avg_frame_rate`, which a wrong container
+  duration makes nonsense) and the stream's nominal rate (`r_frame_rate`,
+  probed with ffprobe when such a conversion starts). Anything else, an
+  unknown rate included, gets no cap: an unneeded 60 fps is better than
+  judder. A rule on the frame times instead (keep a frame 1/75 s after the
+  last) dropped frames of a jittery 60 fps clip and made 75 fps uneven.
+  Checked with ffmpeg 8.1 and 4.4 (`TestFrameCapClips`).
 
 Both write a **fragmented MP4** (`frag_keyframe+empty_moov+default_base_moof`,
 fragments of at most 1 s) to ffmpeg's stdout. The server appends it to a
@@ -83,11 +109,37 @@ partial file and streams that file to every client of the conversion as it
 grows, so the first picture arrives as soon as the first fragment exists
 and a late client still starts at byte 0. When ffmpeg finishes, the
 fragmented file is rewritten with `-c copy -movflags +faststart` into
-`<library>/.picmover/video/<hh>/<hash>-v1-<variant>.mp4` (`variant` is
+`<library>/.picmover/video/<hh>/<hash>-v2-<variant>.mp4` (`variant` is
 `remux`, `src` or `h<tier>`, plus `-tm` when an HDR source was
 tone-mapped, so a build without zscale never serves another build's
-output; `v1` is the format version), which is then
+output; `v2` is the format version, `videoFormatVersion`), which is then
 served with `http.ServeContent`: Range requests, seeking, ETag.
+
+The same URL thus returns the live fragmented stream while the conversion
+runs and the faststart file afterwards: different bytes. A browser that
+fetches a live stream's URL again after the conversion was cached (a
+replay of an ended stream, a seek back to data it dropped) mixes the two
+and fails to decode (headless Chromium 153: `MEDIA_ERR_DECODE`,
+`PIPELINE_ERROR_DECODE`, on replaying a 34 s 1080p stream; the same
+replay of unchanged bytes plays). So:
+
+- The player gives every live load a URL of its own (`&load=<n>`) and asks
+  for the cached file without it.
+- A `load` request is only ever the live stream: once the conversion is
+  cached the server answers it with 409, at any offset, rather than with
+  the cached file's bytes. That covers a browser refetching the live URL,
+  and a first load that raced with the end of the conversion; the player
+  then loads the cached file (below), also before any picture.
+- A seek inside what the browser has buffered is immediate. Beyond it the
+  player asks `/status` for the cached file or a seek stream; and once a
+  live stream has ended and the server has said the file is cached, the
+  cached file is used for any seek.
+- When a live stream ends the player asks `/status` (every second, up to
+  20 s, while the faststart rewrite runs, and never after the player is
+  gone or shows another item) until it is cached; a replay then sets the
+  cached file and calls `play()` inside the tap (iOS plays only from a
+  user gesture). Before that, a replay asks first and relies on autoplay.
+  The viewer's Space key uses the same toggle.
 
 ### Seeking while it encodes
 
@@ -109,10 +161,33 @@ the catalog, a seek bar, mute, full screen.
   `X-Picmover-Start`).
 - A seek stream keeps the full conversion of the same output running (it
   counts as one of its readers), so a later seek finds it cached.
-- A failed seek stream is asked for once more, then the full conversion is
-  loaded (seeking in it once cached); only then does the player fall back
-  to the next plan, at the same position (a failed remux seek becomes a
-  transcode from there, not from 0).
+- A live stream that fails with an error (not for want of a decoder),
+  even before any picture, is replaced by the cached file when the
+  conversion is complete (the 409 above), else loaded once more.
+- A failed seek stream, or a conversion that failed after it showed a
+  picture, is loaded again: first a seek stream from where the viewer was
+  (a remux from the keyframe before it), then the full conversion; the
+  cached file at the viewer's time whenever the conversion is complete by
+  then (`/status`). Only then does the player fall back to the next plan,
+  at the same position (a failed remux seek becomes a transcode from
+  there, not from 0). A conversion that never showed a picture for want of
+  a decoder (a remux of a codec the browser cannot decode) goes to the
+  next plan at once. After 5 s of good playback the attempts start again,
+  so separate network drops in a long viewing each get theirs; but no
+  more than 4 in all per plan (a viewer's seek starts afresh), so a source
+  that always fails a while after it resumes does not restart ffmpeg
+  forever.
+- Every failure is logged to the browser console (`video playback
+  failed`, with the MediaError code and message, or why without one, the
+  mode, tier, offset and URL).
+- Events of a source that is no longer current are ignored. While the
+  player asks `/status` before a new source (a plan change, a seek, a
+  reload), the element still has the old one: a late `error` (or
+  metadata without a picture) of, say, the original HEVC file was
+  charged to the new transcode plan, which then gave up with "Converting
+  this video for playback failed" without trying it. The old source is
+  also paused meanwhile (an original without a video decoder plays its
+  sound).
 
 ### Concurrency, cancellation, cache
 
@@ -131,8 +206,13 @@ the catalog, a seek bar, mute, full screen.
   rewrite the oldest files go until the copy fits next to the partial file;
   after it, again until all fits. Serving a cached file renews its time
   (at most once a minute). Partial files
-  (`*.part`, `*.tmp`) left by a crash are removed before the first conversion
-  in a library's cache after start.
+  (`*.part`, `*.tmp`) left by a crash, and the conversions of an older
+  format version (`<hash>-v<n>-*.mp4`, n below the current one; a newer
+  version, from a newer picmover sharing the library, stays), are removed
+  before the first conversion in a library's cache after start; until then
+  they count against the cap and go first, being the least recently used.
+  The cache is derived data only: nothing outside `.picmover/video` is
+  touched.
 - A partial file never grows past half the cap. A conversion that reaches
   that (seek streams too) stops writing it: the rest passes through a
   memory window of 16 MB, ffmpeg waits for the slowest reader (one that
