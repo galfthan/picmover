@@ -1,0 +1,22 @@
+{
+  "name": "picmover",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "remoteUser": "dev",
+  "containerUser": "dev",
+  "updateRemoteUserUID": true,
+  "workspaceFolder": "/workspaces/picmover",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/picmover,type=bind",
+  "mounts": [
+    "source=picmover-gomod,target=/home/dev/go/pkg/mod,type=volume",
+    "source=picmover-gocache,target=/home/dev/.cache/go-build,type=volume",
+    "source=picmover-npm,target=/home/dev/.npm,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go", "svelte.svelte-vscode"]
+    }
+  }
+}

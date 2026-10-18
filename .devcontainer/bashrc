@@ -1,0 +1,3 @@
+# Sourced at the end of the dev user's ~/.bashrc: yellow cwd in the prompt and yellow directories in ls.
+export PS1="\u@\h:\[\e[01;33m\]\w\[\e[0m\]\$ "
+export LS_COLORS="$(echo $LS_COLORS | sed -E 's/di=[^:]*://g')di=01;33:"
