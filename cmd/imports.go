@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -27,7 +28,8 @@ func newImportsCmd() *cobra.Command {
 		Use:   "imports <library> [--rename <id> <name> | --delete <id>]",
 		Short: "List, rename and delete the library's import records",
 		Long: `List the library's import history, newest first: id, start time, mode,
-outcome, source folder name, files imported, already in place,
+outcome, source folder name, files imported (split into photos, RAW and
+videos; "-" for records made before the split was kept), already in place,
 duplicates and errors, bytes copied, and the record's name.
 
 Every import and rebuild is recorded in user.db; the first time a
@@ -159,10 +161,15 @@ func listImports(ctx context.Context, out io.Writer, dir string) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSTARTED\tMODE\tOUTCOME\tSOURCE\tIMPORTED\tEXISTING\tDUPLICATES\tERRORS\tBYTES\tNAME")
+	fmt.Fprintln(tw, "ID\tSTARTED\tMODE\tOUTCOME\tSOURCE\tIMPORTED\tPHOTOS\tRAW\tVIDEOS\tEXISTING\tDUPLICATES\tERRORS\tBYTES\tNAME")
 	for _, r := range recs {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n", r.ID, formatWhen(r.StartedAt), r.Mode,
-			r.Outcome, r.SourceName, r.Imported, r.Existing, r.Duplicates, r.Errors, humanSize(r.Bytes), r.Name)
+		// Records written before the split was kept show "-".
+		photos, raw, videos := "-", "-", "-"
+		if k := r.Kinds; k != nil {
+			photos, raw, videos = strconv.FormatInt(k.Photos, 10), strconv.FormatInt(k.Raw, 10), strconv.FormatInt(k.Videos, 10)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", r.ID, formatWhen(r.StartedAt), r.Mode,
+			r.Outcome, r.SourceName, r.Imported, photos, raw, videos, r.Existing, r.Duplicates, r.Errors, humanSize(r.Bytes), r.Name)
 	}
 	return tw.Flush()
 }

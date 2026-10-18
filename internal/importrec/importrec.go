@@ -139,8 +139,9 @@ func (r *Recorder) OnResult(res importer.Result) {
 }
 
 // Outcome maps the error of importer.Run to the record's outcome: done
-// (a failed thumbnail stage included: every file is recorded), cancelled
-// or failed.
+// (a failed thumbnail stage included: every file is recorded), cancelled,
+// disconnected (the source went away; importer.ErrSourceDisconnected) or
+// failed.
 func Outcome(runErr error) string {
 	var stageErr *importer.ThumbStageError
 	switch {
@@ -148,6 +149,8 @@ func Outcome(runErr error) string {
 		return userdata.ImportDone
 	case errors.Is(runErr, context.Canceled):
 		return userdata.ImportCancelled
+	case errors.Is(runErr, importer.ErrSourceDisconnected):
+		return userdata.ImportDisconnected
 	}
 	return userdata.ImportFailed
 }
@@ -184,7 +187,7 @@ type Newest interface {
 }
 
 // Finish records the end of the run: outcome (userdata.Import*), the
-// counts from stats, the catalog session, the items collected and their
+// counts from stats (the imported split by kind included), the catalog session, the items collected and their
 // cover, the newest of them in cat (nil, or a failure to read it: the
 // last item). It uses a context that is not cancelled with ctx, so a
 // cancelled run is still recorded. It returns Err.
@@ -212,7 +215,8 @@ func (r *Recorder) Finish(ctx context.Context, outcome string, stats importer.St
 	}
 	rec := userdata.ImportRecord{Outcome: outcome, Imported: stats.Imported, Existing: stats.Existing,
 		Duplicates: stats.Duplicates, Skipped: stats.SkippedSmall + stats.NonMedia, Errors: stats.Errors,
-		Bytes: stats.BytesCopied, CatalogSession: sessionID, Cover: cover}
+		Bytes: stats.BytesCopied, CatalogSession: sessionID, Cover: cover,
+		Kinds: &userdata.ImportKinds{Photos: stats.ImportedPhotos, Raw: stats.ImportedRaw, Videos: stats.ImportedVideos}}
 	if err := r.user.FinishImport(wctx, id, rec, items); err != nil {
 		r.fail("finish", err)
 		return r.Err()

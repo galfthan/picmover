@@ -63,10 +63,10 @@ func TestRebuildUnreadableUserDBKeepsCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw.Exec("PRAGMA user_version = 4")
+	raw.Exec("PRAGMA user_version = 5")
 	raw.Close()
 	out, err := run(t, "rebuild", "--quiet", "--no-thumbs", dir)
-	if err == nil || !strings.Contains(err.Error(), "schema version 4") {
+	if err == nil || !strings.Contains(err.Error(), "schema version 5") {
 		t.Fatalf("rebuild with a newer user.db: %v\n%s", err, out)
 	}
 	if n := catalogRows(t, lib); n != 2 {

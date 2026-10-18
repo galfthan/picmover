@@ -39,6 +39,9 @@ export function emptyStats(): JobStats {
   return {
     scanned: 0,
     imported: 0,
+    importedPhotos: 0,
+    importedRaw: 0,
+    importedVideos: 0,
     existing: 0,
     duplicates: 0,
     skippedSmall: 0,
@@ -50,6 +53,7 @@ export function emptyStats(): JobStats {
     thumbsUnsupported: 0,
     thumbsFailed: 0,
     largeDone: 0,
+    sourceDisconnected: false,
   };
 }
 

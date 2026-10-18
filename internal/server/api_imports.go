@@ -23,15 +23,20 @@ type importJSON struct {
 	SourceName string  `json:"sourceName"`
 	Mode       string  `json:"mode"`    // copy, move, rebuild, record
 	Host       string  `json:"host"`    // "" for records backfilled from the catalog
-	Outcome    string  `json:"outcome"` // running, done, cancelled, failed
+	Outcome    string  `json:"outcome"` // running, done, cancelled, failed, disconnected
 	Imported   int64   `json:"imported"`
-	Existing   int64   `json:"existing"`
-	Duplicates int64   `json:"duplicates"`
-	Skipped    int64   `json:"skipped"`
-	Errors     int64   `json:"errors"`
-	Bytes      int64   `json:"bytes"`
-	Items      *int64  `json:"items"`
-	Cover      *string `json:"cover"`
+	// The imported count split by kind; null for records written before
+	// the split was kept (only the total is known).
+	ImportedPhotos *int64  `json:"importedPhotos"`
+	ImportedRaw    *int64  `json:"importedRaw"`
+	ImportedVideos *int64  `json:"importedVideos"`
+	Existing       int64   `json:"existing"`
+	Duplicates     int64   `json:"duplicates"`
+	Skipped        int64   `json:"skipped"`
+	Errors         int64   `json:"errors"`
+	Bytes          int64   `json:"bytes"`
+	Items          *int64  `json:"items"`
+	Cover          *string `json:"cover"`
 }
 
 // importRefJSON names an import in a media detail.
@@ -57,6 +62,10 @@ func importObject(rec userdata.ImportRecord) importJSON {
 	if !rec.FinishedAt.IsZero() {
 		f := rfc3339(rec.FinishedAt)
 		out.FinishedAt = &f
+	}
+	if k := rec.Kinds; k != nil {
+		photos, raw, videos := k.Photos, k.Raw, k.Videos
+		out.ImportedPhotos, out.ImportedRaw, out.ImportedVideos = &photos, &raw, &videos
 	}
 	if rec.KeepsItems() {
 		n := rec.Items

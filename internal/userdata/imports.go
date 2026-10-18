@@ -30,6 +30,9 @@ const (
 	ImportDone      = "done"
 	ImportCancelled = "cancelled"
 	ImportFailed    = "failed"
+	// ImportDisconnected: the source went away during the run (a phone or
+	// card unplugged); the files recorded before are complete and kept.
+	ImportDisconnected = "disconnected"
 )
 
 // Import item statuses (ImportItem.Status).
@@ -59,6 +62,9 @@ type ImportRecord struct {
 	Outcome    string // Import* outcome
 	// Counts. Skipped is skipped_small + non_media; Bytes the bytes copied.
 	Imported, Existing, Duplicates, Skipped, Errors, Bytes int64
+	// Kinds splits Imported by media kind; nil when unknown (records
+	// written before schema version 4, crashed or backfilled ones).
+	Kinds *ImportKinds
 	// CatalogSession is the catalog's import_sessions id at the time
 	// (informational; a rebuild renumbers them); 0 when unknown.
 	CatalogSession int64
@@ -81,6 +87,11 @@ func ModeKeepsItems(mode string) bool {
 	return mode != ImportModeRebuild && mode != ImportModeRecord
 }
 
+// ImportKinds is the imported count of a record split by media kind.
+type ImportKinds struct {
+	Photos, Raw, Videos int64
+}
+
 // ImportItem is one file of an import: its content hash and Item* status.
 type ImportItem struct {
 	Hash   uint64
@@ -97,7 +108,7 @@ func validMode(m string) bool {
 
 func validOutcome(o string) bool {
 	switch o {
-	case ImportRunning, ImportDone, ImportCancelled, ImportFailed:
+	case ImportRunning, ImportDone, ImportCancelled, ImportFailed, ImportDisconnected:
 		return true
 	}
 	return false
@@ -202,10 +213,15 @@ func (d *DB) FinishImport(ctx context.Context, id int64, rec ImportRecord, items
 		if !rec.FinishedAt.IsZero() {
 			finished = rec.FinishedAt.Unix()
 		}
+		var photos, raw, videos any
+		if k := rec.Kinds; k != nil {
+			photos, raw, videos = k.Photos, k.Raw, k.Videos
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE imports SET finished_at = ?, outcome = ?, imported = ?, existing = ?,
-			duplicates = ?, skipped = ?, errors = ?, bytes = ?, catalog_session = COALESCE(?, catalog_session)
+			duplicates = ?, skipped = ?, errors = ?, bytes = ?, catalog_session = COALESCE(?, catalog_session),
+			imported_photos = ?, imported_raw = ?, imported_videos = ?
 			WHERE id = ?`, finished, rec.Outcome, rec.Imported, rec.Existing, rec.Duplicates, rec.Skipped,
-			rec.Errors, rec.Bytes, nonZeroOrNull(rec.CatalogSession), id); err != nil {
+			rec.Errors, rec.Bytes, nonZeroOrNull(rec.CatalogSession), photos, raw, videos, id); err != nil {
 			return err
 		}
 		if !ModeKeepsItems(mode) {
@@ -274,7 +290,7 @@ func (d *DB) SetImportSession(ctx context.Context, id, session int64) error {
 // RunningImports returns the records whose outcome is still running,
 // oldest first: imports in progress, or whose process died.
 func (d *DB) RunningImports(ctx context.Context) ([]ImportRecord, error) {
-	return d.listImports(ctx, "running imports", `SELECT `+importColumns+` FROM imports i WHERE i.outcome = ?
+	return d.listImports(ctx, "running imports", `SELECT `+importColumnsOf(ctx, d.db)+` FROM imports i WHERE i.outcome = ?
 		ORDER BY i.id`, ImportRunning)
 }
 
@@ -315,18 +331,30 @@ func (d *DB) CloseCrashedImport(ctx context.Context, id int64, hashes []uint64, 
 	return closed, err
 }
 
-const importColumns = `i.id, i.name, i.started_at, i.finished_at, i.source, i.source_name, i.mode, i.host, i.outcome,
+const importColumnsV3 = `i.id, i.name, i.started_at, i.finished_at, i.source, i.source_name, i.mode, i.host, i.outcome,
 	i.imported, i.existing, i.duplicates, i.skipped, i.errors, i.bytes, i.catalog_session, i.items, i.cover`
+
+// importColumnsOf returns the columns scanImport reads: a version-3
+// database (opened read-only, not migrated) has no split by kind, read
+// as NULL.
+func importColumnsOf(ctx context.Context, q queryRower) string {
+	var v int
+	if err := q.QueryRowContext(ctx, `SELECT user_version FROM pragma_user_version`).Scan(&v); err == nil && v == 3 {
+		return importColumnsV3 + `, NULL, NULL, NULL`
+	}
+	return importColumnsV3 + `, i.imported_photos, i.imported_raw, i.imported_videos`
+}
 
 func scanImport(r interface{ Scan(...any) error }) (ImportRecord, error) {
 	var (
 		rec                             ImportRecord
 		started                         int64
 		finished, session, items, cover sql.NullInt64
+		photos, raw, videos             sql.NullInt64
 	)
 	if err := r.Scan(&rec.ID, &rec.Name, &started, &finished, &rec.Source, &rec.SourceName, &rec.Mode,
 		&rec.Host, &rec.Outcome, &rec.Imported, &rec.Existing, &rec.Duplicates, &rec.Skipped, &rec.Errors,
-		&rec.Bytes, &session, &items, &cover); err != nil {
+		&rec.Bytes, &session, &items, &cover, &photos, &raw, &videos); err != nil {
 		return ImportRecord{}, err
 	}
 	rec.StartedAt = time.Unix(started, 0)
@@ -335,13 +363,16 @@ func scanImport(r interface{ Scan(...any) error }) (ImportRecord, error) {
 	}
 	rec.CatalogSession = session.Int64
 	rec.Items, rec.Cover = items.Int64, uint64(cover.Int64)
+	if photos.Valid && raw.Valid && videos.Valid {
+		rec.Kinds = &ImportKinds{Photos: photos.Int64, Raw: raw.Int64, Videos: videos.Int64}
+	}
 	return rec, nil
 }
 
 // ListImports returns every import record, newest first (by start, then
 // id), with its stored summary (Items, Cover); it never reads the items.
 func (d *DB) ListImports(ctx context.Context) ([]ImportRecord, error) {
-	return d.listImports(ctx, "imports", `SELECT `+importColumns+` FROM imports i ORDER BY i.started_at DESC, i.id DESC`)
+	return d.listImports(ctx, "imports", `SELECT `+importColumnsOf(ctx, d.db)+` FROM imports i ORDER BY i.started_at DESC, i.id DESC`)
 }
 
 func (d *DB) listImports(ctx context.Context, what, q string, args ...any) ([]ImportRecord, error) {
@@ -370,7 +401,7 @@ func (d *DB) GetImport(ctx context.Context, id int64) (ImportRecord, error) {
 }
 
 func getImport(ctx context.Context, q queryRower, id int64) (ImportRecord, error) {
-	rec, err := scanImport(q.QueryRowContext(ctx, `SELECT `+importColumns+` FROM imports i WHERE i.id = ?`, id))
+	rec, err := scanImport(q.QueryRowContext(ctx, `SELECT `+importColumnsOf(ctx, q)+` FROM imports i WHERE i.id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ImportRecord{}, fmt.Errorf("%w: import %d", ErrNotFound, id)
 	}
@@ -429,7 +460,7 @@ func (d *DB) DeleteImport(ctx context.Context, id int64) error {
 
 // ImportsOf returns the imports that have hash as an item, newest first.
 func (d *DB) ImportsOf(ctx context.Context, hash uint64) ([]ImportRecord, error) {
-	return d.listImports(ctx, "imports of", `SELECT `+importColumns+` FROM import_items t JOIN imports i ON i.id = t.import_id
+	return d.listImports(ctx, "imports of", `SELECT `+importColumnsOf(ctx, d.db)+` FROM import_items t JOIN imports i ON i.id = t.import_id
 		WHERE t.hash = ? ORDER BY i.started_at DESC, i.id DESC`, int64(hash))
 }
 

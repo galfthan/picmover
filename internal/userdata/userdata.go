@@ -35,9 +35,10 @@ import (
 )
 
 // SchemaVersion is the user.db schema version this package reads and
-// writes (PRAGMA user_version). Versions 1 (step 4) and 2 (step 5) are
-// migrated on open, in order.
-const SchemaVersion = 3
+// writes (PRAGMA user_version). Versions 1 (step 4), 2 (step 5) and 3
+// (import history without the imported split by kind) are migrated on
+// open, in order.
+const SchemaVersion = 4
 
 // FileName is the name of the user data database at the library root.
 const FileName = "user.db"
@@ -144,6 +145,16 @@ CREATE TABLE import_items (
 CREATE INDEX import_items_hash ON import_items(hash);
 `
 
+// schemaV4 is what version 4 adds to version 3: the imported count of
+// an import split by media kind (photos, RAW, videos). NULL for records
+// written before (and for crashed or backfilled ones): only the total is
+// known.
+const schemaV4 = `
+ALTER TABLE imports ADD COLUMN imported_photos INTEGER;
+ALTER TABLE imports ADD COLUMN imported_raw INTEGER;
+ALTER TABLE imports ADD COLUMN imported_videos INTEGER;
+`
+
 // migrations[v] upgrades a version-v database to version v+1 inside the
 // migration transaction.
 var migrations = map[int]func(ctx context.Context, d *DB, tx *sql.Tx) error{
@@ -155,6 +166,10 @@ var migrations = map[int]func(ctx context.Context, d *DB, tx *sql.Tx) error{
 	},
 	2: func(ctx context.Context, _ *DB, tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, schemaV3)
+		return err
+	},
+	3: func(ctx context.Context, _ *DB, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, schemaV4)
 		return err
 	},
 }
@@ -369,7 +384,7 @@ func (d *DB) create(ctx context.Context) error {
 		tx.Rollback()
 		return d.ensureSchema(ctx)
 	}
-	if _, err := tx.ExecContext(ctx, schemaV1+schemaV2+schemaV3); err != nil {
+	if _, err := tx.ExecContext(ctx, schemaV1+schemaV2+schemaV3+schemaV4); err != nil {
 		return fmt.Errorf("userdata: create schema: %w", err)
 	}
 	if err := d.writeIdentity(ctx, tx); err != nil {
@@ -388,7 +403,8 @@ func (d *DB) create(ctx context.Context) error {
 // it is written to user.db.bak-<YYYYMMDD-HHMMSS> next to it (never
 // replacing a file), then one transaction re-reads the version, runs the
 // steps from it to SchemaVersion in order (1 to 2: backup_targets and
-// meta with a new library_id and created_at; 2 to 3: the import history)
+// meta with a new library_id and created_at; 2 to 3: the import history;
+// 3 to 4: the imported split by kind)
 // and sets user_version last. One copy covers every step. A failure
 // leaves the old version in place.
 func (d *DB) migrate(ctx context.Context) error {

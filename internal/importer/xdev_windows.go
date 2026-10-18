@@ -55,3 +55,7 @@ func volumeSerial(p string) (uint32, error) {
 	}
 	return fi.VolumeSerialNumber, nil
 }
+
+// fileDev is not available on Windows: a removed drive is found by the
+// failing stat of the source root instead.
+func fileDev(os.FileInfo) (uint64, bool) { return 0, false }

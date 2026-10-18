@@ -85,7 +85,7 @@ func TestMigrateV2ToV3(t *testing.T) {
 	}
 	var v int
 	d.db.QueryRow("PRAGMA user_version").Scan(&v)
-	if v != 3 {
+	if v != SchemaVersion {
 		t.Fatalf("user_version %d", v)
 	}
 	// Data and identity survive; the import history is there and empty.
@@ -148,11 +148,11 @@ func TestMigrateV1ToV3(t *testing.T) {
 	}
 }
 
-func TestFreshIsV3(t *testing.T) {
+func TestFreshIsV4(t *testing.T) {
 	d := openTest(t)
 	var v int
 	d.db.QueryRow("PRAGMA user_version").Scan(&v)
-	if v != 3 || SchemaVersion != 3 {
+	if v != 4 || SchemaVersion != 4 {
 		t.Fatalf("user_version %d", v)
 	}
 	if from, _ := d.Migrated(); from != 0 {

@@ -320,11 +320,11 @@ func TestPeekErrorsNotCached(t *testing.T) {
 // the backup; the catalog stays.
 func TestRebuildJobUnreadableUserDB(t *testing.T) {
 	f, root := newWorkspace(t)
-	setUserDBVersion(t, filepath.Join(root, "peter"), 4)
+	setUserDBVersion(t, filepath.Join(root, "peter"), 5)
 	w := f.post("/api/libraries/peter/jobs", `{"kind":"rebuild","noThumbs":true}`)
 	if w.Code == http.StatusCreated {
 		j := f.pollJob(decode[jobJSON](t, w).ID)
-		if j.State != stateFailed || j.Error == nil || !strings.Contains(*j.Error, "schema version 4") {
+		if j.State != stateFailed || j.Error == nil || !strings.Contains(*j.Error, "schema version 5") {
 			t.Fatalf("rebuild %+v", j)
 		}
 	}
@@ -340,9 +340,9 @@ func TestRebuildJobUnreadableUserDB(t *testing.T) {
 // as error, with the open's message.
 func TestListingUserDBVersion(t *testing.T) {
 	f, root := newWorkspace(t)
-	setUserDBVersion(t, filepath.Join(root, "penny"), 4)
+	setUserDBVersion(t, filepath.Join(root, "penny"), 5)
 	l, _ := libByID(f.libraries(), "penny")
-	want := "user.db has schema version 4; this picmover supports 3: upgrade picmover"
+	want := "user.db has schema version 5; this picmover supports 4: upgrade picmover"
 	if l.State != libError || l.Error != want {
 		t.Fatalf("penny %+v", l)
 	}

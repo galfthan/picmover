@@ -277,7 +277,8 @@ export interface Album {
 // ---- Import history (docs/design/imports.md) ----
 
 export type ImportMode = 'copy' | 'move' | 'rebuild' | 'record' | 'transfer';
-export type ImportOutcome = 'running' | 'done' | 'cancelled' | 'failed';
+/** disconnected: the source went away during the run (a phone unplugged); what was imported before is kept. */
+export type ImportOutcome = 'running' | 'done' | 'cancelled' | 'failed' | 'disconnected';
 
 /** One import record of user.db, as GET imports and GET imports/<iid> answer. */
 export interface ImportRecord {
@@ -295,6 +296,13 @@ export interface ImportRecord {
   host: string;
   outcome: ImportOutcome | string;
   imported: number;
+  /**
+   * `imported` split by kind (photos, RAW, videos); null (or absent) for
+   * records made before the split was kept: only the total is known.
+   */
+  importedPhotos?: number | null;
+  importedRaw?: number | null;
+  importedVideos?: number | null;
   existing: number;
   duplicates: number;
   skipped: number;
@@ -477,11 +485,16 @@ export interface BackupProgressEvent {
 export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild' | 'transfer' | BackupRunKind;
 export const BACKUP_KINDS: readonly string[] = ['backup', 'scrub', 'prune', 'restore'];
 export const isBackupKind = (k: string): k is BackupRunKind => BACKUP_KINDS.includes(k);
-export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+/** disconnected: an import whose source went away; it stopped with one status (exit code 2), the files imported before are kept. */
+export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'disconnected';
 
 export interface JobStats {
   scanned: number;
   imported: number;
+  /** `imported` split by kind: image, image_raw, video. */
+  importedPhotos: number;
+  importedRaw: number;
+  importedVideos: number;
   existing: number;
   duplicates: number;
   skippedSmall: number;
@@ -495,6 +508,8 @@ export interface JobStats {
   thumbsFailed: number;
   /** Large (640 px) renditions derived from stored previews by a thumbs job. */
   largeDone: number;
+  /** The import's source went away (a phone unplugged): the run stops with one status. */
+  sourceDisconnected: boolean;
 }
 
 /**
@@ -616,6 +631,8 @@ export interface JobResult {
   source: string;
   dest?: string;
   message?: string;
+  /** Media kind of the file; absent when it is not a media file. */
+  kind?: FileType | string;
   seq: number;
 }
 

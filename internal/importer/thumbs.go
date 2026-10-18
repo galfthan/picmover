@@ -66,20 +66,59 @@ func (im *Importer) thumbWorkers() int {
 // cannot be opened or written). A file that cannot be decoded is not an
 // error of the stage; its row gets thumb_state "error" or "unsupported".
 func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) (Stats, error) {
+	stopProgress := im.startProgress()
+	err := im.runThumbs(ctx, sessionID, force, nil, 0)
+	stopProgress()
+	stats := im.Stats()
+	if err != nil {
+		return stats, err
+	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+	return stats, nil
+}
+
+// thumbPollInterval is how often the thumbnail stage looks for newly
+// committed rows while it follows the copy stage.
+var thumbPollInterval = 250 * time.Millisecond
+
+// thumbWorkersDuringCopy is how many thumbnail workers run while the copy
+// stage is still running (the rest join when it is done). A source on a
+// FUSE mount (a phone over MTP) is read at USB speed by one reader and
+// leaves the processors idle, so every worker runs; otherwise half of
+// them, so the copy workers (hashing, metadata) keep their share.
+func (im *Importer) thumbWorkersDuringCopy(fuse bool) int {
+	n := im.thumbWorkers()
+	if fuse {
+		return n
+	}
+	return max(1, n/2)
+}
+
+// runThumbs is the thumbnail stage (see RunThumbs) without the progress
+// calls. With follow not nil it runs alongside the copy stage: it keeps
+// polling the catalog for rows of sessionID committed meanwhile until
+// follow is closed (every row of the session is committed by then), with
+// only during workers busy until then. It returns a fatal error (the
+// cache or the catalog cannot be opened or written); a cancellation of
+// ctx is not returned.
+func (im *Importer) runThumbs(ctx context.Context, sessionID int64, force bool, follow <-chan struct{}, during int) error {
 	store, err := thumbs.OpenStore(im.lib)
 	if err != nil {
-		return im.Stats(), fmt.Errorf("importer: %w", err)
+		return fmt.Errorf("importer: %w", err)
 	}
 	defer store.Close()
 	gen := &thumbs.Generator{Store: store, FFmpeg: im.opts.FFmpeg}
 	workers := im.thumbWorkers()
+	if follow == nil || during <= 0 || during > workers {
+		during = workers
+	}
 	im.log.Info("thumbnails started", "library", im.lib.Root(), "session", sessionID, "force", force,
-		"workers", workers)
+		"workers", workers, "during_copy", follow != nil, "workers_during_copy", during)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
-	stopProgress := im.startProgress()
 
 	jobs := make(chan thumbJob, workers*2)
 	done := make(chan thumbDone, batchSize)
@@ -88,8 +127,15 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 	go func() { writerErr <- im.thumbWriter(ctx, done, cancel) }()
 
 	var wg sync.WaitGroup
-	for range workers {
+	for i := range workers {
 		wg.Go(func() {
+			if i >= during {
+				// Joins once the copy stage is done.
+				select {
+				case <-follow:
+				case <-runCtx.Done():
+				}
+			}
 			for j := range jobs {
 				if runCtx.Err() != nil {
 					continue // drain; the row stays pending
@@ -108,7 +154,7 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 		})
 	}
 
-	listErr := im.feedThumbs(runCtx, store, sessionID, force, jobs)
+	listErr := im.feedThumbs(runCtx, store, sessionID, force, follow, jobs)
 	close(jobs)
 	wg.Wait()
 	close(done)
@@ -116,19 +162,12 @@ func (im *Importer) RunThumbs(ctx context.Context, sessionID int64, force bool) 
 	if fatal == nil && listErr != nil && runCtx.Err() == nil {
 		fatal = fmt.Errorf("importer: %w", listErr)
 	}
-	stopProgress()
 
 	stats := im.Stats()
 	im.log.Info("thumbnails finished", "library", im.lib.Root(), "session", sessionID,
 		"ok", stats.ThumbsDone, "unsupported", stats.ThumbsUnsupported, "failed", stats.ThumbsFailed,
 		"large_filled", stats.LargeDone)
-	if fatal != nil {
-		return stats, fatal
-	}
-	if err := ctx.Err(); err != nil {
-		return stats, err
-	}
-	return stats, nil
+	return fatal
 }
 
 // fillLarge derives the missing large thumbnail of a large job's row from
@@ -177,7 +216,14 @@ func (im *Importer) countLarge(store *thumbs.Store, j thumbJob, filled bool, err
 // regenerates every row anyway) the ok rows whose preview exists and
 // whose large thumbnail is missing, found with one directory listing per
 // fan-out directory (store.NewPresence) while walking the rows.
-func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, sessionID int64, all bool, jobs chan<- thumbJob) error {
+//
+// With follow not nil the first pass keeps polling, every
+// thumbPollInterval, for rows committed after the last one read until
+// follow is closed; then (the copy stage has committed every row of the
+// session) it sweeps the session's rows that still need renditions once
+// more, skipping those already sent, and goes on. No row is missed or
+// sent twice.
+func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, sessionID int64, all bool, follow <-chan struct{}, jobs chan<- thumbJob) error {
 	sent := 0
 	limit := im.opts.ThumbLimit
 	send := func(j thumbJob) error {
@@ -197,6 +243,13 @@ func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, session
 		return thumbPageSize
 	}
 	var afterID int64
+	// While following, the rows sent: the final sweep (from the first
+	// row again, in case a row got an id below one already seen) skips
+	// them, as their results may not be recorded yet.
+	var sentIDs map[int64]bool
+	if follow != nil {
+		sentIDs = map[int64]bool{}
+	}
 	for {
 		n := page()
 		if n == 0 {
@@ -207,6 +260,13 @@ func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, session
 			return err
 		}
 		for _, m := range rows {
+			afterID = m.ID
+			if sentIDs != nil {
+				if sentIDs[m.ID] {
+					continue
+				}
+				sentIDs[m.ID] = true
+			}
 			// Size and MTime let Generate refuse a file changed since it
 			// was recorded (its content no longer matches the hash).
 			j := thumbJob{id: m.ID, rel: m.RelPath, force: all || m.ThumbState == catalog.ThumbStateStale,
@@ -214,10 +274,24 @@ func (im *Importer) feedThumbs(ctx context.Context, store *thumbs.Store, session
 			if err := send(j); err != nil {
 				return err
 			}
-			afterID = m.ID
 		}
 		if len(rows) < n {
-			break
+			if follow == nil {
+				break
+			}
+			// Caught up with the copy stage: wait for more rows.
+			t := time.NewTimer(thumbPollInterval)
+			select {
+			case <-follow:
+				// Every row of the session is committed: one more sweep
+				// takes the rest.
+				follow, afterID = nil, 0
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			}
+			t.Stop()
 		}
 	}
 	if all {

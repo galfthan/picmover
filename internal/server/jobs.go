@@ -38,6 +38,10 @@ const (
 	stateDone      = "done"
 	stateFailed    = "failed"
 	stateCancelled = "cancelled"
+	// stateDisconnected: an import whose source went away (a phone
+	// unplugged) and that stopped with one status; the files imported
+	// before are kept. Exit code 2, error importer.DisconnectedMessage.
+	stateDisconnected = "disconnected"
 )
 
 const (
@@ -98,6 +102,9 @@ func isBackupKind(kind string) bool {
 type statsJSON struct {
 	Scanned           int64 `json:"scanned"`
 	Imported          int64 `json:"imported"`
+	ImportedPhotos    int64 `json:"importedPhotos"` // imported split by kind: image
+	ImportedRaw       int64 `json:"importedRaw"`    // image_raw
+	ImportedVideos    int64 `json:"importedVideos"` // video
 	Existing          int64 `json:"existing"`
 	Duplicates        int64 `json:"duplicates"`
 	SkippedSmall      int64 `json:"skippedSmall"`
@@ -109,12 +116,17 @@ type statsJSON struct {
 	ThumbsUnsupported int64 `json:"thumbsUnsupported"`
 	ThumbsFailed      int64 `json:"thumbsFailed"`
 	LargeDone         int64 `json:"largeDone"` // large thumbnails filled from previews
+	// SourceDisconnected: the import's source went away; the job stops
+	// with one status (importer.DisconnectedMessage).
+	SourceDisconnected bool `json:"sourceDisconnected"`
 }
 
 func newStats(s importer.Stats) statsJSON {
 	return statsJSON{
 		Scanned: s.Scanned, Imported: s.Imported, Existing: s.Existing, Duplicates: s.Duplicates,
-		SkippedSmall: s.SkippedSmall, NonMedia: s.NonMedia, Errors: s.Errors, BytesCopied: s.BytesCopied,
+		ImportedPhotos: s.ImportedPhotos, ImportedRaw: s.ImportedRaw, ImportedVideos: s.ImportedVideos,
+		SourceDisconnected: s.SourceDisconnected,
+		SkippedSmall:       s.SkippedSmall, NonMedia: s.NonMedia, Errors: s.Errors, BytesCopied: s.BytesCopied,
 		Rate:       s.Rate,
 		ThumbsDone: s.ThumbsDone, ThumbsUnsupported: s.ThumbsUnsupported, ThumbsFailed: s.ThumbsFailed,
 		LargeDone: s.LargeDone,
@@ -243,7 +255,10 @@ type resultJSON struct {
 	Source  string `json:"source"`
 	Dest    string `json:"dest"`
 	Message string `json:"message"`
-	Seq     int64  `json:"seq"`
+	// Kind is the media kind (image, image_raw, video); omitted when the
+	// file is not a media file.
+	Kind string `json:"kind,omitempty"`
+	Seq  int64  `json:"seq"`
 }
 
 // sseEvent is one server-sent event, its data already encoded.
@@ -297,7 +312,7 @@ type job struct {
 }
 
 func (j *job) finalLocked() bool {
-	return j.state == stateDone || j.state == stateFailed || j.state == stateCancelled
+	return j.state == stateDone || j.state == stateFailed || j.state == stateCancelled || j.state == stateDisconnected
 }
 
 // jsonLocked returns the job object.
@@ -453,7 +468,7 @@ func (j *job) onResult(r importer.Result) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.seq++
-	res := resultJSON{Status: string(r.Status), Source: r.Source, Dest: r.Dest, Message: msg, Seq: j.seq}
+	res := resultJSON{Status: string(r.Status), Source: r.Source, Dest: r.Dest, Message: msg, Kind: string(r.Kind), Seq: j.seq}
 	j.ring.add(res, ringSize)
 	if r.Status == importer.StatusError {
 		j.errRing.add(res, errorRingSize)
@@ -965,6 +980,9 @@ func outcome(kind string, s importer.Stats, err error, logPath, root string) (st
 	switch {
 	case errors.Is(err, context.Canceled):
 		return stateCancelled, 130, ""
+	case errors.Is(err, importer.ErrSourceDisconnected):
+		// One status for the whole run, not an error per file left.
+		return stateDisconnected, 2, importer.DisconnectedMessage
 	case errors.As(err, &stageErr):
 		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (see the job log); fix the cache and run 'picmover thumbs %s'",
 			library.QuoteArg(root))
