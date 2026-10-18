@@ -207,7 +207,7 @@
     {#if live}
       <div class="controls">
         <button class="ghost small" onclick={toggle} aria-label={paused ? 'Play' : 'Pause'} title={paused ? 'Play (Space)' : 'Pause (Space)'}>{paused ? '▶' : '❚❚'}</button>
-        <span class="time">{formatDuration(shown * 1000)}{#if duration} / {formatDuration(duration * 1000)}{/if}</span>
+        <span class="time">{formatDuration(shown * 1000)}{duration ? ` / ${formatDuration(duration * 1000)}` : ''}</span>
         {#if duration}
           <input
             type="range"

@@ -25,7 +25,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
 ### Prerequisites
 
 - Go 1.27 or newer. The `toolchain` line in `go.mod` fetches the required toolchain automatically.
-- For videos only: `ffprobe` (metadata) and `ffmpeg` (video thumbnails), both part of FFmpeg, on the PATH or placed next to the `picmover` binary. Without `ffprobe` videos are imported with their file time; without `ffmpeg` their thumbnails are marked unsupported. Everything else is pure Go: no cgo and no system libraries.
+- For videos only: `ffprobe` (metadata, codec) and `ffmpeg` (video thumbnails, and converting videos the browser cannot play), both part of FFmpeg, on the PATH or placed next to the `picmover` binary. Without `ffprobe` videos are imported with their file time; without `ffmpeg` their thumbnails are marked unsupported and only videos the browser plays itself can be watched in the viewer. Everything else is pure Go: no cgo and no system libraries.
 
 ### Steps
 
@@ -127,6 +127,7 @@ Flags:
 - `--cors-origin URL`: allow a development page at URL (for example `http://localhost:5173`) to call the API cross-origin; repeatable.
 - `--verbose`: log every request to stderr.
 - `--workspace`: serve the folder as a workspace (below) even when it holds no library yet; it is created when absent.
+- `--video-cache-mb N`: size cap of each library's cache of videos converted for playback (default 5120, minimum 256; below).
 
 **Workspaces.** `picmover serve /media`, where `/media` holds libraries as subfolders (`/media/peter`, `/media/penny`), serves all of them: the browser starts with a page listing the libraries (cover, counts, date span, state), opens any of them, creates new ones, and records a plain subfolder in place (the same as `picmover rebuild`) so it becomes a library. The folder is served as a workspace when it has no `media.db` itself and at least one subfolder has one, or with `--workspace`; it prints `Serving workspace /media (N libraries) at ...`. Each library is locked only once it is opened in the browser, so the others stay free for the CLI; a library in use by another picmover process is shown with that process. `picmover serve /media/peter` still serves one library.
 
@@ -141,6 +142,10 @@ Flags:
 ```
 
 **Moving between libraries.** In a workspace, select photos and choose **Move to…** (selection bar, or `m` in the lightbox), or use `picmover move <from> <to>` with a selection (`--album`, `--tag`, `--rating`, `--from`/`--to`, `--recur`, `--months`, `--type`, `--import`, `--hashes FILE`, or `--all`; `--dry-run` shows the plan). The file, its catalog metadata, thumbnails, rating, tags and album memberships (by album name) move to the other library. On one drive the file is checked against its hash and renamed; across drives it is copied, read back and checked, and the original then goes to the source library's **trash** (nothing is deleted until you empty it). A photo the target already holds is not copied again; the source's copy goes to the trash. The target's Imports page lists each move. Every step is journalled in the target, so a move interrupted by a crash is finished the next time (or with **Finish moving** in the UI, `picmover move --resume <library>`). See `docs/design/library-move.md`.
+
+**Videos.** The viewer plays a video as it is when the browser can (it asks the browser about the video's codec, which is read with `ffprobe` at import). Otherwise, with `ffmpeg` installed, the server converts it while you watch: a camcorder `.MTS`, `.AVI` or `.MKV` with H.264 inside is repackaged into MP4 (the picture is copied, only unusual audio such as AC-3 is converted), and a codec the browser lacks (HEVC from recent phones in Chrome, 10-bit or HDR video, ProRes, Motion JPEG) is converted to H.264 at the size the player shows it (480p to 2160p, never above the original), with HDR tone-mapped so colours are not washed out. A graphics card's encoder (NVIDIA NVENC, Intel Quick Sync, VA-API, AMD AMF, Apple VideoToolbox) is used when one works, else the CPU (`libx264`). Playback starts within a second; while the conversion runs the player shows its own seek bar, and a jump past what has been converted starts a new conversion from there. The finished conversion is kept under `.picmover/video/` and plays with normal seeking afterwards; the least recently played conversions are removed when the cache passes its cap (`--video-cache-mb`, or `"videoCacheMB"` in the desktop app's `app.json`; default 5 GB per library). Without `ffmpeg` the viewer says which codec the browser cannot play and what to install (on Windows the HEVC Video Extensions from the Microsoft Store also let the browser play HEVC itself). See `docs/design/video-playback.md`.
+
+**Open original.** On the computer running picmover, the viewer's **Open** button opens the original photo or video in its default program (`xdg-open` on Linux, `open` on macOS, the file's associated program on Windows). The button is not offered to other devices, and the server refuses the request from them. **Download** stays available everywhere.
 
 **Near-duplicates.** The Duplicates page runs a job that compares the perceptual hashes computed with the thumbnails (Hamming distance 1–7, default 6; 136k photos take well under 10 s) and shows groups of similar photos: keep one and trash the rest, or ignore the group.
 
@@ -291,11 +296,12 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
   .picmover/thumbs.db   thumbnail cache (256 px, WebP or older JPEG, keyed by content hash)
   .picmover/large/      large thumbnail cache (640 px WebP, <hh>/<hash>.webp)
   .picmover/previews/   preview cache (1600 px, <hh>/<hash>.webp, or .jpg from earlier versions)
+  .picmover/video/      videos converted for playback (<hh>/<hash>-v1-<variant>.mp4; size-capped, least recently played go first)
   .picmover/logs/       import, thumbs and rebuild logs
   .picmover/tmp/        in-progress copies
 ```
 
-The thumbnail, large thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them.
+The thumbnail, large thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them. The video cache is too: a deleted conversion is made again when the video is next played.
 
 Times are stored as the camera's wall-clock time, plus the UTC offset when it is known. `--timezone` only affects videos and files without an embedded timestamp.
 
@@ -315,7 +321,7 @@ Width and height in the catalog are the display (upright) dimensions: a portrait
 
 - Images: JPEG, PNG, TIFF, HEIC/HEIF, AVIF, WebP, GIF, BMP. Dimensions, dates, GPS and camera come from the file header and EXIF (also inside HEIC/AVIF).
 - RAW: CR2, CR3, CRW, NEF, ARW, DNG, ORF, RW2, RAF, PEF, SRW, X3F, RAW. Thumbnails come from the JPEG preview embedded in the RAW file; a RAW file without one is marked unsupported.
-- Video: MP4, MOV, M4V, AVI, MKV, WebM, MTS/M2TS/TS, MPG, 3GP, WMV, FLV, ASF. Metadata needs `ffprobe`, thumbnails need `ffmpeg`.
+- Video: MP4, MOV, M4V, AVI, MKV, WebM, MTS/M2TS/TS, MPG, 3GP, WMV, FLV, ASF. Metadata needs `ffprobe`, thumbnails need `ffmpeg`; playing what the browser cannot play needs `ffmpeg` too (Videos, above).
 
 All image decoding is pure Go (HEIC and AVIF through WebAssembly builds of libheif and libavif); images above 100 megapixels are not decoded and get no thumbnail.
 
