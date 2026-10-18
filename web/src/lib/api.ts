@@ -485,7 +485,8 @@ export interface BackupProgressEvent {
 export type JobKind = 'import' | 'thumbs' | 'similar' | 'rebuild' | 'transfer' | BackupRunKind;
 export const BACKUP_KINDS: readonly string[] = ['backup', 'scrub', 'prune', 'restore'];
 export const isBackupKind = (k: string): k is BackupRunKind => BACKUP_KINDS.includes(k);
-export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+/** disconnected: an import whose source went away; it stopped with one status (exit code 2), the files imported before are kept. */
+export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'disconnected';
 
 export interface JobStats {
   scanned: number;

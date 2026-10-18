@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { JobResult } from './api';
 import { filterResults, kindCounts, mergeResults, statusCounts } from './results';
-import { DISCONNECTED_MESSAGE, kindSplit, outcome } from './jobtext';
+import { DISCONNECTED_MESSAGE, exitCodeOf, kindSplit, outcome } from './jobtext';
 import { importCounts, outcomeLabel } from './imports';
 import { ZERO_STATS } from '../testing/fakes';
 
@@ -50,5 +50,9 @@ describe('import counts by kind', () => {
       exitCode: 2,
     };
     expect(outcome(job)).toEqual({ tone: 'warn', text: DISCONNECTED_MESSAGE });
+    // The job state says it too (the stats need not).
+    const byState = { ...job, state: 'disconnected', exitCode: undefined, stats: { ...ZERO_STATS } };
+    expect(outcome(byState)).toEqual({ tone: 'warn', text: DISCONNECTED_MESSAGE });
+    expect(exitCodeOf(byState)).toBe(2);
   });
 });

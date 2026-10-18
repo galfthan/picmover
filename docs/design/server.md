@@ -273,7 +273,7 @@ Job object:
  "error":null,"exitCode":0}
 ```
 
-`state` ∈ `queued|running|done|failed|cancelled`. `exitCode` mirrors the
+`state` ∈ `queued|running|done|failed|cancelled|disconnected` (disconnected: an import whose source went away, exit code 2, `error` the one status message; `stats.sourceDisconnected` is set). `exitCode` mirrors the
 CLI (0, 2 for per-file or thumbnail failures, 130 cancelled, 1 otherwise)
 so the UI can word the summary the same way. `sessionId` is the catalog
 import session once known (needed for "show what this import added").

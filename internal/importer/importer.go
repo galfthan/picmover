@@ -222,6 +222,7 @@ type Importer struct {
 	// root is the source root of a copy or move run (nil for record in
 	// place); disconnected is set once it is found gone (sourceGone).
 	root         *srcRoot
+	watch        *sourceWatch
 	disconnected atomic.Bool
 
 	readers chan struct{} // semaphore of the staging reads, cap SourceReaders
@@ -242,6 +243,7 @@ type Importer struct {
 	isDevice   func(string) bool                                                        // gvfs.IsDevice
 	gioOK      func() bool                                                              // gvfs.Available
 	statRoot   func(string) (fs.FileInfo, error)                                        // os.Stat, for sourceGone
+	readDir    func(string) ([]fs.DirEntry, error)                                      // os.ReadDir, for sourceGone
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	importedPhotos, importedRaw, importedVideos                                        atomic.Int64
@@ -294,6 +296,7 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		isDevice:   gvfs.IsDevice,
 		gioOK:      gvfs.Available,
 		statRoot:   os.Stat,
+		readDir:    os.ReadDir,
 	}
 }
 
@@ -362,7 +365,7 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	im.readers = make(chan struct{}, im.opts.SourceReaders)
 	im.usePull.Store(!im.opts.RecordInPlace && im.gioOK())
 	im.pullFails.Store(0)
-	im.initSourceWatch(src, srcInfo)
+	im.initSourceWatch(ctx, src, srcInfo)
 	// gio=true: the files below src are pulled through the gvfs daemon
 	// (src is on a phone mount, or is the gvfs directory itself, whose
 	// mounts it then walks).
@@ -1050,7 +1053,7 @@ func (im *Importer) verifySource(ctx context.Context, src string, want uint64) e
 		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
 			return err
 		}
-		return fmt.Errorf("%w: %s: the source could not be read again to verify the copy before the move: %v",
+		return fmt.Errorf("%w: %s: the source could not be read again to verify the copy before the move: %w",
 			library.ErrHashMismatch, src, err)
 	}
 	if got != want {

@@ -38,6 +38,10 @@ const (
 	stateDone      = "done"
 	stateFailed    = "failed"
 	stateCancelled = "cancelled"
+	// stateDisconnected: an import whose source went away (a phone
+	// unplugged) and that stopped with one status; the files imported
+	// before are kept. Exit code 2, error importer.DisconnectedMessage.
+	stateDisconnected = "disconnected"
 )
 
 const (
@@ -308,7 +312,7 @@ type job struct {
 }
 
 func (j *job) finalLocked() bool {
-	return j.state == stateDone || j.state == stateFailed || j.state == stateCancelled
+	return j.state == stateDone || j.state == stateFailed || j.state == stateCancelled || j.state == stateDisconnected
 }
 
 // jsonLocked returns the job object.
@@ -978,7 +982,7 @@ func outcome(kind string, s importer.Stats, err error, logPath, root string) (st
 		return stateCancelled, 130, ""
 	case errors.Is(err, importer.ErrSourceDisconnected):
 		// One status for the whole run, not an error per file left.
-		return stateDone, 2, importer.DisconnectedMessage
+		return stateDisconnected, 2, importer.DisconnectedMessage
 	case errors.As(err, &stageErr):
 		msg = fmt.Sprintf("import finished, but the thumbnail stage failed (see the job log); fix the cache and run 'picmover thumbs %s'",
 			library.QuoteArg(root))

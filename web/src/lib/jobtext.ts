@@ -38,6 +38,7 @@ export function thumbsProcessed(s: { thumbsDone: number; thumbsUnsupported: numb
 export function exitCodeOf(j: Job): number {
   if (typeof j.exitCode === 'number') return j.exitCode;
   if (j.state === 'cancelled') return 130;
+  if (j.state === 'disconnected') return 2;
   if (j.state === 'failed') return 1;
   return 0;
 }
@@ -74,7 +75,7 @@ export function outcome(j: Job): { tone: Tone; text: string } {
   if (j.kind === 'transfer') return transferOutcome(j, what, log);
   const s = j.stats;
   // One status for the run, not an error per file left behind.
-  if (j.kind === 'import' && s.sourceDisconnected) return { tone: 'warn', text: DISCONNECTED_MESSAGE };
+  if (j.kind === 'import' && (j.state === 'disconnected' || s.sourceDisconnected)) return { tone: 'warn', text: DISCONNECTED_MESSAGE };
   switch (exitCodeOf(j)) {
     case 0:
       return { tone: 'ok', text: `${what} finished.` };

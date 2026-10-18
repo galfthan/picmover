@@ -49,9 +49,9 @@ func TestItemStatusAndOutcome(t *testing.T) {
 	}
 	for err, want := range map[error]string{
 		nil: userdata.ImportDone,
-		&importer.ThumbStageError{Err: errors.New("x")}: userdata.ImportDone,
-		fmt.Errorf("run: %w", context.Canceled):         userdata.ImportCancelled,
-		errors.New("disk full"):                         userdata.ImportFailed,
+		&importer.ThumbStageError{Err: errors.New("x")}:       userdata.ImportDone,
+		fmt.Errorf("run: %w", context.Canceled):               userdata.ImportCancelled,
+		errors.New("disk full"):                               userdata.ImportFailed,
 		fmt.Errorf("run: %w", importer.ErrSourceDisconnected): userdata.ImportDisconnected,
 	} {
 		if got := Outcome(err); got != want {
