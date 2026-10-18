@@ -18,6 +18,7 @@ import {
   toFacets,
   toItem,
   toSession,
+  toVideoInfo,
   toShareInfo,
   UNREACHABLE,
   type UrlCheck,
@@ -248,5 +249,26 @@ describe('share client errors and failed media', () => {
       { lat: 1, lon: 1, count: 2, hash: '0000000000000002', id: null, bounds: null },
     ]);
     expect(toClusters({})).toEqual([]);
+  });
+});
+
+describe('video playback on the phone', () => {
+  const caps = { video: true, download: false, rate: false, location: false };
+  it('parses the video fields of a detail leniently', () => {
+    const d = toDetail({ id: 3, hash: '0000000000000003', type: 'video', video: { codec: 'hevc', bitDepth: 10, hdr: true, level: 'x', audio: '' }, canConvert: true, browserFormat: false }, caps);
+    expect(d.video).toEqual({ codec: 'hevc', bitDepth: 10, hdr: true });
+    expect(d.canConvert).toBe(true);
+    expect(d.browserFormat).toBe(false);
+    // Without video, canConvert means nothing; an older computer says nothing about the container.
+    const old = toDetail({ id: 3, hash: '0000000000000003', type: 'video', canConvert: true }, { ...caps, video: false });
+    expect(old.canConvert).toBe(false);
+    expect(old.browserFormat).toBe(true);
+    expect(old.video).toBeNull();
+    expect(toVideoInfo({ codec: 7 })).toBeNull();
+  });
+  it('builds the stream URLs like the admin client', () => {
+    const c = shareClient('peter', caps);
+    expect(c.streamUrl(3, 'transcode', 720, 12.3456)).toBe('/api/l/peter/stream/3?mode=transcode&h=720&t=12.346');
+    expect(c.streamUrl(3, 'remux', 720)).toBe('/api/l/peter/stream/3?mode=remux');
   });
 });

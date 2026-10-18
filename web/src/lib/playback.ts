@@ -35,6 +35,25 @@ export interface PlayableDetail {
   canConvert?: boolean;
 }
 
+/** What the player needs of the server: the admin LibApi and the phone's ShareClient both fit. */
+export interface PlayerApi {
+  fileUrl(id: number, download?: boolean): string;
+  previewUrl(ref: { hash: string; thumbAt?: number }): string;
+  streamUrl(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): string;
+  streamStatus(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): Promise<{ cached: boolean; start?: number }>;
+}
+
+/** The item the player shows. */
+export interface PlayerDetail extends PlayableDetail {
+  id: number;
+  hash: string;
+  thumbAt?: number;
+  w: number;
+  h: number;
+  /** Milliseconds. */
+  dur?: number;
+}
+
 /** HTMLMediaElement.canPlayType: '', 'maybe' or 'probably'. */
 export type CanPlay = (type: string) => string;
 

@@ -1496,6 +1496,8 @@ export interface FakeShareOptions {
    * first), their items made up when a month is asked for (unfiltered).
    */
   bulk?: { year: number; month: number; count: number }[];
+  /** Extra detail fields of videos (video, canConvert, browserFormat), and /stream/{id}/status answers. */
+  video?: Record<string, unknown>;
 }
 
 /**
@@ -1861,7 +1863,16 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
       if (caps.location && x.lat !== undefined) Object.assign(d, { lat: x.lat, lon: x.lon });
       if (caps.rate) d.rating = x.rating ?? 0;
       if (kind !== 'album') d.albums = albums.filter((a) => a.hashes.includes(x.hash)).map((a) => ({ id: a.id, name: a.name }));
+      if (x.type === 'video' && opts.video) Object.assign(d, opts.video);
       return json(d);
+    }
+    const sm = /^stream\/(\d+)\/status$/.exec(rest);
+    if (method === 'GET' && sm) {
+      const x = items.find((i) => i.id === Number(sm[1]));
+      if (!x || !inScope(x) || x.type !== 'video') return notFound();
+      if (!caps.video) return json({ error: 'not allowed in this share' }, 403);
+      const t = Number(q.get('t') ?? 0);
+      return json({ cached: false, encoding: false, bytes: 0, encoders: ['libx264'], tier: Number(q.get('h') ?? 0), start: t });
     }
     const rm = /^(thumb|preview|large)\/([0-9a-f]+)$/.exec(rest);
     if (method === 'GET' && rm) {

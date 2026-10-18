@@ -36,6 +36,8 @@ var shareRouteGolden = []string{
 	"library GET /api/l/{lib}/preview/{hash}",
 	"library GET /api/l/{lib}/large/{hash}",
 	"library GET /api/l/{lib}/file/{id}",
+	"library GET /api/l/{lib}/stream/{id}",
+	"library GET /api/l/{lib}/stream/{id}/status",
 	"library GET /api/l/{lib}/albums",
 	"library GET /api/l/{lib}/geo",
 	"library GET /api/l/{lib}/geo/items",

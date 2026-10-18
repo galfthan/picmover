@@ -202,7 +202,9 @@ func New(opts Options) (*Server, error) {
 	ws.ownedImports = s.jobs.ownedImports
 	s.share = newSharing(s, opts.ShareDir, opts.ShareCmd)
 	s.handler = s.middleware(s.routes())
-	s.share.handler = s.share.middleware(s.shareMux())
+	// RemoteOnly: no phone request counts as local (Open original), even
+	// one that reaches the listener from this machine.
+	s.share.handler = RemoteOnly(s.share.middleware(s.shareMux()))
 	return s, nil
 }
 

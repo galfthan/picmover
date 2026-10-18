@@ -143,6 +143,24 @@ the catalog, a seek bar, mute, full screen.
   cancels the library's conversions and `/stream` answers 409 while a move
   runs. On Windows a file ffmpeg holds open cannot be renamed or removed.
 
+## Phones (LAN share)
+
+The share listener exposes the same two routes,
+`GET /api/l/{lib}/stream/{id}` and `.../stream/{id}/status`, behind its
+own checks: a paired device of an active share (the pairing cookie), a
+live row visible in the share's scope and a video (else the share's 404),
+and the `video` capability (else 403). They then run the admin handlers,
+so caching, slots and seek streams are shared with the computer's viewer.
+The redacted detail adds `video`, `canConvert` (ffmpeg and `video`) and
+`browserFormat` (the container plays in browsers). The phone lightbox uses
+the same `VideoPlayer` (with Download only under `download`); when it gives
+up after a load error, the lightbox still asks the URL why (capability
+turned off, computer unreachable or busy). The share mux has no route to
+POST .../open, and the share handler is wrapped in `RemoteOnly`, so no
+phone request counts as local even when it reaches the listener from this
+machine. The phone bundle stays within its Gecko 91 check
+(`scripts/check-share-apis.mjs`).
+
 ## Encoder choice
 
 Probed once per process (in the background at start): `ffmpeg -encoders`
@@ -186,7 +204,5 @@ button (false for other devices and when there is no opener).
   the GPU.
 - Adaptive streaming (HLS/DASH) and switching tiers during playback: the tier
   is chosen once when the video is opened.
-- The phone viewer of the LAN share (branch `feat/lan-share`) has its own
-  lightbox; it can use the same endpoints.
 - `video_info` rows of deleted media are not removed (a hash names the same
   content forever; they are tiny).

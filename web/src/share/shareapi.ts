@@ -8,6 +8,7 @@
 // does not grant is off, never defaulted on.
 
 import type { MediaItem, ShareCapabilities, ShareCapability, TimelineBucket } from '../lib/api';
+import type { VideoInfo } from '../lib/playback';
 
 export const CAPABILITIES: readonly ShareCapability[] = ['video', 'download', 'rate', 'location'];
 
@@ -142,6 +143,30 @@ export interface ShareDetail extends MediaItem {
   lon: number | null;
   /** In a library share only. */
   albums: { id: number; name: string }[];
+  /** A video: how it is encoded (null when unknown), whether the server converts it, and whether its container plays in browsers. */
+  video: VideoInfo | null;
+  canConvert: boolean;
+  browserFormat: boolean;
+}
+
+/** The video info of a detail; null unless it names a codec field. */
+export function toVideoInfo(v: unknown): VideoInfo | null {
+  if (!isRecord(v) || typeof v.codec !== 'string') return null;
+  const out: VideoInfo = { codec: v.codec, hdr: v.hdr === true };
+  for (const k of ['codecTag', 'profile', 'pixFmt', 'transfer', 'primaries', 'audio', 'container'] as const) {
+    if (typeof v[k] === 'string' && v[k] !== '') out[k] = v[k];
+  }
+  for (const k of ['level', 'bitDepth', 'fps'] as const) {
+    const n = num(v[k]);
+    if (n > 0) out[k] = n;
+  }
+  return out;
+}
+
+/** GET /stream/{id}/status: is the conversion cached, and where a stream from t starts. */
+export interface ShareStreamStatus {
+  cached: boolean;
+  start?: number;
 }
 
 /**
@@ -309,6 +334,10 @@ export function toDetail(v: unknown, caps: ShareCapabilities): ShareDetail {
     displayable: caps.download && r.displayable === true,
     lat: caps.location ? lat : null,
     lon: caps.location ? lon : null,
+    video: toVideoInfo(r.video),
+    canConvert: caps.video && r.canConvert === true,
+    // Absent (an older computer): try the original; the player falls back.
+    browserFormat: r.browserFormat === undefined || r.browserFormat === true,
     albums: Array.isArray(r.albums)
       ? r.albums.filter(isRecord).flatMap((a) => {
           const id = positiveId(a.id);
@@ -617,6 +646,14 @@ function withQuery(path: string, q: URLSearchParams): string {
 }
 
 /** "w,s,e,n", each number exactly (a cluster's bounds sent back must keep the photos on their edges). */
+/** The query of /stream, as the admin client builds it. */
+function streamQuery(mode: 'remux' | 'transcode', h: number, t: number): string {
+  const q = new URLSearchParams({ mode });
+  if (mode === 'transcode' && h > 0) q.set('h', String(Math.trunc(h)));
+  if (t > 0 && Number.isFinite(t)) q.set('t', (Math.round(t * 1000) / 1000).toString());
+  return q.toString();
+}
+
 function bboxParam(b: GeoBox): string {
   return [b.west, b.south, b.east, b.north].map(String).join(',');
 }
@@ -634,6 +671,9 @@ export interface ShareClient {
   largeUrl(ref: ThumbRef): string;
   previewUrl(ref: ThumbRef): string;
   fileUrl(id: number, download?: boolean): string;
+  /** A video converted by the computer (`video` only): remuxed, or transcoded to short side h, from t seconds. */
+  streamUrl(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): string;
+  streamStatus(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): Promise<ShareStreamStatus>;
   getLibrary(signal?: AbortSignal): Promise<ShareLibrarySummary>;
   getTimeline(f: ShareFilters, signal?: AbortSignal): Promise<TimelineBucket[]>;
   getBucket(f: ShareFilters, year: number, month: number, signal?: AbortSignal): Promise<MediaItem[]>;
@@ -667,6 +707,12 @@ export function shareClient(id: string, caps: ShareCapabilities): ShareClient {
     largeUrl: (ref) => versioned('large', ref),
     previewUrl: (ref) => versioned('preview', ref),
     fileUrl: (mid, download = false) => `${base}/file/${enc(String(mid))}${download ? '?download=1' : ''}`,
+    streamUrl: (mid, mode, h = 0, t = 0) => `${base}/stream/${enc(String(mid))}?${streamQuery(mode, h, t)}`,
+    async streamStatus(mid, mode, h = 0, t = 0) {
+      const r = await getJSON(`${base}/stream/${enc(String(mid))}/status?${streamQuery(mode, h, t)}`);
+      const v = isRecord(r) ? r : {};
+      return { cached: v.cached === true, start: typeof v.start === 'number' && Number.isFinite(v.start) ? v.start : undefined };
+    },
     async getLibrary(signal) {
       return toSummary(await getJSON(`${base}/library`, signal), id);
     },

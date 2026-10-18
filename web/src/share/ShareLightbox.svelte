@@ -30,6 +30,7 @@
   import { untrack } from 'svelte';
   import { formatBytes, formatCoord, formatDuration, formatTakenAt } from '../lib/format';
   import RatingStars from '../components/RatingStars.svelte';
+  import VideoPlayer from '../components/VideoPlayer.svelte';
   import { classify, dragAxis, startsAwayFromEdges, DOUBLE_TAP_MS, type Point } from './gestures';
   import { errorText, isAbort, ShareError, UNREACHABLE, type ShareClient, type ShareDetail, type UrlCheck } from './shareapi';
 
@@ -185,11 +186,12 @@
     if (r.status === 404) ongone?.(cur);
   }
 
-  function onVideoError() {
+  /** The player gave up (the original and any conversion failed): ask the URL why. */
+  function onUnplayable(url: string) {
     if (!d) return;
     videoFailed = true;
     mediaNote = '';
-    void failed(client.fileUrl(d.id), 'video');
+    void failed(url || client.fileUrl(d.id), 'video');
   }
   function retryVideo() {
     videoFailed = false;
@@ -411,11 +413,11 @@
       </div>
     {:else if item}
       {#key item.id}
-        <div class="media" class:video={playable && !!d && !videoFailed} style:transform={dragStyle} style:opacity={dragY ? Math.max(0.3, 1 - dragY / 400) : null}>
-          {#if playable && d && !videoFailed}
+        <div class="media" class:video={playable && !!d && !(videoFailed && mediaNote)} style:transform={dragStyle} style:opacity={dragY ? Math.max(0.3, 1 - dragY / 400) : null}>
+          {#if playable && d && !(videoFailed && mediaNote)}
             {#key videoTry}
-              <!-- svelte-ignore a11y_media_has_caption -->
-              <video controls playsinline preload="metadata" src={client.fileUrl(d.id)} poster={client.previewUrl(d)} onerror={onVideoError}></video>
+              <!-- The admin viewer's player: the original when this browser plays it, else a conversion. -->
+              <VideoPlayer api={client} detail={{ ...d, displayable: d.browserFormat }} download={caps.download} onunplayable={onUnplayable} />
             {/key}
           {:else if full && d}
             <div class="full">
@@ -441,15 +443,11 @@
         </div>
         {#if isVideo && !caps.video}
           <div class="banner">Video not available in this share</div>
-        {:else if videoFailed && d}
+        {:else if videoFailed && d && mediaNote}
+          <!-- The player says when the browser cannot play it; this says why it did not load. -->
           <div class="banner" role="alert">
-            {#if mediaNote}
-              <span>{mediaNote}</span>
-              {#if mediaNote !== goneText}<button class="ghost" onclick={retryVideo}>Try again</button>{/if}
-            {:else}
-              <span>This video cannot be played in this browser.</span>
-              {#if caps.download}<a class="btn" href={client.fileUrl(d.id, true)} download>Download</a>{/if}
-            {/if}
+            <span>{mediaNote}</span>
+            {#if mediaNote !== goneText}<button class="ghost" onclick={retryVideo}>Try again</button>{/if}
           </div>
         {/if}
       {/key}
@@ -590,14 +588,6 @@
   .media.video {
     top: calc(var(--bar-h) + env(safe-area-inset-top, 0px));
     bottom: calc(var(--bar-h) + env(safe-area-inset-bottom, 0px));
-  }
-  video {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: #000;
   }
   .full {
     position: absolute;

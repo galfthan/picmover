@@ -10,17 +10,21 @@
   // finished meanwhile, else a new stream starting at that time (the
   // player adds the offset to the times it shows).
   import { untrack } from 'svelte';
-  import type { LibApi, MediaDetail } from '../lib/api';
   import { formatDuration } from '../lib/format';
-  import { inBuffered, nextPlan, pickTier, planPlayback, type Plan } from '../lib/playback';
+  import { inBuffered, nextPlan, pickTier, planPlayback, type Plan, type PlayerApi, type PlayerDetail } from '../lib/playback';
 
   interface Props {
-    api: LibApi;
-    detail: MediaDetail;
+    /** The admin LibApi or the phone's ShareClient. */
+    api: PlayerApi;
+    detail: PlayerDetail;
     /** The <video> element, for the viewer's Space key. */
     videoEl?: HTMLVideoElement;
+    /** Offer "Download original" with a message (the phone: only with `download`). */
+    download?: boolean;
+    /** The player gave up after a source failed to load (not a planned "cannot play"): its URL, for a diagnosis. */
+    onunplayable?: (url: string) => void;
   }
-  let { api, detail, videoEl = $bindable() }: Props = $props();
+  let { api, detail, videoEl = $bindable(), download = true, onunplayable }: Props = $props();
 
   let box: HTMLDivElement | undefined = $state();
   let plan = $state<Plan>({ mode: 'direct' });
@@ -134,7 +138,9 @@
       }
       return;
     }
-    void apply(nextPlan(plan.mode, detail), at, play);
+    const next = nextPlan(plan.mode, detail);
+    if (next.mode === 'none') onunplayable?.(src);
+    void apply(next, at, play);
   }
 
   function onMetadata() {
@@ -221,7 +227,7 @@
     <img class="fit" src={api.previewUrl(detail)} alt="" />
     <div class="msgbar" role="status">
       <span>{plan.reason}</span>
-      <a class="btn small" href={api.fileUrl(detail.id, true)} download>Download original</a>
+      {#if download}<a class="btn small" href={api.fileUrl(detail.id, true)} download>Download original</a>{/if}
     </div>
   {:else if src}
     <!-- svelte-ignore a11y_media_has_caption -->
