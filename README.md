@@ -102,7 +102,7 @@ Flags:
 - `--min-dimension N`: skip images whose width and height are both below N pixels (0 = no limit).
 - `--workers N`: number of parallel workers (0 = auto).
 - `--source-readers N`: how many workers read from the source at once (0 = auto: 1 when the source is a FUSE mount such as a phone, otherwise `--workers`).
-- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time). Defaults to the system zone.
+- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time), and the library's home zone when it has none yet (see [Dates and time zones](#dates-and-time-zones)). Defaults to the system zone.
 - `--quiet`: do not show the live status line.
 - `--no-thumbs`: skip the thumbnail stage; the files are marked pending for `picmover thumbs`.
 
@@ -185,7 +185,7 @@ It exits with status 2 when thumbnails failed for some files (they are listed in
 
 ### One writer at a time
 
-Commands that change a library (`serve` for as long as it runs, `import`, `rebuild`, `thumbs`, `update-metadata`, `verify --rehash`/`--fill-size`, and `backup`, `prune`, `restore` and `scrub --library`) hold a lock on `<library>/.picmover/lock`. A second such command on the same library stops at once with `library is in use by another picmover process (pid N, <command>, since <time>)`; stop that process first (for example the browser server) and try again. `db` and plain `verify` only read and work at any time. The lock belongs to the running process, so it disappears when that process ends, even after a crash: there is never a stale lock to delete. On a file system that cannot lock files (some network mounts) a warning is printed and the command runs without the lock.
+Commands that change a library (`serve` for as long as it runs, `import`, `rebuild`, `thumbs`, `update-metadata`, `home-zone` when it sets the zone, `verify --rehash`/`--fill-size`, and `backup`, `prune`, `restore` and `scrub --library`) hold a lock on `<library>/.picmover/lock`. A second such command on the same library stops at once with `library is in use by another picmover process (pid N, <command>, since <time>)`; stop that process first (for example the browser server) and try again. `db` and plain `verify` only read and work at any time. The lock belongs to the running process, so it disappears when that process ends, even after a crash: there is never a stale lock to delete. On a file system that cannot lock files (some network mounts) a warning is printed and the command runs without the lock.
 
 ### Rebuild
 
@@ -195,7 +195,7 @@ To recreate the catalog from the files in the library:
 ./picmover rebuild /path/to/library
 ```
 
-The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. Flags: `--workers`, `--timezone`, `--quiet`, `--no-thumbs` as for `import`.
+The current `media.db` (with its `-wal`, `-shm` and `-journal` files) is renamed to `media.db.bak-<YYYYMMDD-HHMMSS>`. Then every media file under the library root is recorded where it is, whatever folder it is in: rebuild never copies, moves, renames or deletes a file. A file whose content is already recorded (an identical copy elsewhere in the library) is counted as a duplicate and left in place; zip archives are not extracted. Finally the thumbnail stage runs. Thumbnails are cached by content hash, so they are reused and not generated again. The backup name, the import summary and the thumbnail summary are printed; the exit status is as for `import`. The new catalog keeps the old one's home time zone. Flags: `--workers`, `--timezone`, `--quiet`, `--no-thumbs` as for `import`.
 
 Files in the trash (`.picmover/trash/`) are recorded as trashed, with the time they were trashed from `user.db` (else their modification time); the ratings, tags and albums in `user.db` are never changed, and the rebuild is recorded in its import history (mode `rebuild`, counts only). A folder without `media.db` (for example a tree already in the `<type>/YYYY/MM` layout) must exist and is handled the same way, without a backup: rebuild records the existing files into a new catalog without copying or moving any of them.
 
@@ -229,7 +229,7 @@ Flags:
 
 - `--type TYPE`, `-t TYPE`: type of media to update: `all`, `image`, `image_raw` or `video` (default `all`).
 - `--dry-run`, `-d`: show changes without writing them.
-- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time), applied to every row. Without it, such rows keep the UTC offset already stored in the catalog, so running on a machine in another time zone does not change them; other rows use the system zone.
+- `--timezone ZONE`: IANA zone for times stored as instants (video UTC, file modification time), applied to every row. Without it, such rows keep the UTC offset already stored in the catalog, so running on a machine in another time zone does not change them; other rows use the system zone. After the update the local offsets of videos that only record a UTC instant are estimated again from the photos taken near them, as an import does.
 - `--verbose`, `-v`: print extractor warnings to stderr, and the rows skipped because extraction degraded.
 
 `update-metadata` never makes the catalog worse: if a file's date can now only be taken from its modification time, but the catalog has a date read from the file's metadata, the row is left alone and counted as `Skipped (extraction degraded)`; and an empty new value (no GPS, no camera, unknown size) never replaces a known one. If the catalog has videos, `ffprobe` must be available (or use `--type` to skip videos). When a file's orientation changes, its thumbnail state becomes `stale` and the next `picmover thumbs` regenerates its thumbnail and preview. It exits with status 2 when any row could not be updated.
@@ -303,11 +303,26 @@ Usage errors (a missing argument, an unknown flag) end with a hint such as `see 
 
 The thumbnail, large thumbnail and preview caches are derived data: they are safe to delete (stop picmover first), and `picmover thumbs --rebuild <library>` regenerates them. The video cache is too: a deleted conversion is made again when the video is next played.
 
-Times are stored as the camera's wall-clock time, plus the UTC offset when it is known. `--timezone` only affects videos and files without an embedded timestamp.
+## Dates and time zones
+
+Each item keeps the wall-clock time where it was taken (its local time), plus the UTC offset when it is known. A library also has a home time zone: the timeline (order, months, date filters, the map lists) and the `YYYY/MM` folders of new imports use each item's time on the home zone's clock, with the summer or winter time of its date. So on a trip to Paris from Helsinki a photo taken at 14:30 local time sits at 15:30 on the timeline, next to the videos taken around it, and the viewer shows `15:30:00 UTC+03:00 · 14:30 local (UTC+02:00)`. Items without a known offset keep their recorded time.
+
+The first import sets the home zone to its zone (the browser's zone in the web import, `--timezone` or the system zone on the command line). Change it on the Library page or with:
+
+```
+./picmover home-zone /path/to/library               # show it
+./picmover home-zone /path/to/library Europe/Helsinki
+```
+
+Changing it recomputes the timeline; files are not moved.
+
+Phone videos often record only a UTC time. Their local offset is taken from the nearest photo with a recorded offset from the same camera within 6 hours (same import preferred), after each import; the viewer marks such a local time with `≈`. Without such a photo the video is shown in the home zone. `--timezone` only affects videos and files without an embedded timestamp. Details: [docs/design/home-time.md](docs/design/home-time.md).
 
 ## Upgrading
 
-The catalog is derived entirely from the files, so there is no migration: when a new version changes the catalog format, every command refuses the old catalog (without changing it) with a message to run
+A catalog of the previous format (schema version 3) is upgraded in place by the first command of this version that changes the library (`serve`, `import`, `thumbs`, `update-metadata` without `--dry-run`, ...): a copy of the old catalog is kept as `media.db.bak-<YYYYMMDD-HHMMSS>` (rename it back to `media.db` to return to the previous picmover), home times are added (see [Dates and time zones](#dates-and-time-zones); the home zone becomes the system zone when its name is known), and the local offsets of videos that only recorded a UTC time are estimated. Files are not moved. Commands that only read (`db`, `home-zone` without a zone, `update-metadata --dry-run`) do not upgrade it; they name a command that does.
+
+The catalog is derived entirely from the files, so older formats are not migrated: when a new version changes the catalog format beyond that, every command refuses the old catalog (without changing it) with a message to run
 
 ```
 picmover rebuild /path/to/library

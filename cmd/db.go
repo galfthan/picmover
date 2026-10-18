@@ -64,7 +64,7 @@ or with --list a table of catalog rows (newest first).`,
 			}
 			fmt.Fprintf(out, "\nMost recent files:\n")
 			for _, m := range rows {
-				fmt.Fprintf(out, "%s - %s (%s)\n", formatTakenAt(m.TakenAt, m.OffsetKnown), m.RelPath, m.FileType)
+				fmt.Fprintf(out, "%s - %s (%s)\n", formatCaptureRow(m), m.RelPath, m.FileType)
 			}
 			return nil
 		},
@@ -137,7 +137,7 @@ func printMediaTable(w io.Writer, rows []catalog.Media) {
 	fmt.Fprintln(tw, "ID\tHASH\tPATH\tTAKEN AT\tTYPE\tWxH\tLAT,LON\tCAMERA\tTHUMB")
 	for _, m := range rows {
 		fmt.Fprintf(tw, "%d\t%016x\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			m.ID, m.Hash, m.RelPath, formatTakenAt(m.TakenAt, m.OffsetKnown), m.FileType,
+			m.ID, m.Hash, m.RelPath, formatCaptureRow(m), m.FileType,
 			orDash(formatResolution(m.Width, m.Height)), orDash(formatLatLon(m.Lat, m.Lon, m.HasGPS)),
 			orDash(strings.TrimSpace(m.CameraMake+" "+m.CameraModel)), orDash(m.ThumbState))
 	}

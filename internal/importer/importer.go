@@ -171,6 +171,12 @@ type Options struct {
 	// (the server stops counting it as missing).
 	OnLargeFailed func(hash uint64)
 
+	// HomeZone is an IANA zone name stored as the library's home zone
+	// when the catalog has none yet (the import's zone; see
+	// docs/design/home-time.md). "" stores nothing. The layout folder
+	// of a copied file follows its home time.
+	HomeZone string
+
 	NoThumbs     bool   // Run skips the thumbnail stage; rows stay pending
 	ThumbWorkers int    // thumbnail workers; <=0: min(runtime.NumCPU(), 16); at most 64
 	ThumbLimit   int    // RunThumbs processes at most this many rows; <=0: no limit
@@ -193,6 +199,7 @@ type Importer struct {
 	sessionID int64
 	session   atomic.Int64 // sessionID for SessionID, readable from other goroutines
 	cancel    context.CancelFunc
+	home      *time.Location // the library's home zone; nil = none (set in Run)
 
 	inflight sync.Map // uint64 hash -> origin, files between hashing and commit
 
@@ -318,6 +325,9 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	case im.opts.Move:
 		mode = "move"
 	}
+	if im.home, err = im.db.EnsureHomeZone(ctx, im.opts.HomeZone); err != nil {
+		return im.Stats(), fmt.Errorf("importer: %w", err)
+	}
 	im.sessionID, err = im.db.BeginSession(ctx, src, mode)
 	if err != nil {
 		return im.Stats(), fmt.Errorf("importer: %w", err)
@@ -352,6 +362,14 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	}
 	stopProgress()
 
+	// Videos that only know their UTC instant borrow the offset of a
+	// photo taken near them: a pass over the session's rows, as photos
+	// and videos arrive in any order.
+	if n, err := im.db.InferVideoOffsets(context.Background(), im.sessionID); err != nil {
+		im.log.Error("estimate video offsets", "session", im.sessionID, "err", err)
+	} else if n > 0 {
+		im.log.Info("video offsets estimated", "session", im.sessionID, "rows", n)
+	}
 	stats := im.Stats()
 	if err := im.db.FinishSession(context.Background(), im.sessionID, catalog.SessionStats{
 		Imported: stats.Imported, Existing: stats.Existing, Duplicates: stats.Duplicates,
@@ -691,7 +709,8 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 	if takenAt.IsZero() {
 		takenAt, offsetKnown, source = fi.ModTime(), true, "mtime"
 	}
-	rel := library.LayoutPath(string(kind), takenAt, filepath.Base(srcPath))
+	// The month folder follows the timeline: the home time.
+	rel := library.LayoutPath(string(kind), catalog.HomeWall(takenAt, offsetKnown, im.home), filepath.Base(srcPath))
 
 	if im.opts.RecordInPlace {
 		rel = ownRel

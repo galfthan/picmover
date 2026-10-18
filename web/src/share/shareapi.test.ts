@@ -81,6 +81,14 @@ describe('share client parsing', () => {
     expect(toDetail(raw, every)).toMatchObject({ displayable: true, lat: 60, lon: 24, rating: 2 });
   });
 
+  it('reads the home and local capture times', () => {
+    const raw = { id: 1, hash: '0000000000000001', type: 'image', takenAt: '2024-07-14T15:30:00', localTakenAt: '2024-07-14T14:30:00', offset: 7200, offsetSource: 'exif', homeOffset: 10800 };
+    expect(toDetail(raw, none)).toMatchObject({ takenAt: '2024-07-14T15:30:00', localTakenAt: '2024-07-14T14:30:00', offset: 7200, offsetSource: 'exif', homeOffset: 10800 });
+    // An older server: the local time is the only time.
+    const old = toDetail({ id: 1, hash: '0000000000000001', type: 'image', takenAt: '2024-07-14T14:30:00', offset: 7200 }, none);
+    expect(old).toMatchObject({ localTakenAt: '2024-07-14T14:30:00', offsetSource: null, homeOffset: null });
+  });
+
   it('reads albums', () => {
     expect(toAlbums({ albums: [{ id: 2, name: 'Summer', count: 3, cover: '0000000000000001' }, { id: -1 }] })).toEqual([{ id: 2, name: 'Summer', count: 3, cover: '0000000000000001' }]);
     expect(toAlbums(null)).toEqual([]);

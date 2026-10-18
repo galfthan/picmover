@@ -355,6 +355,7 @@ func (s *Server) routes() *http.ServeMux {
 		scoped(pattern, notMoving(h))
 	}
 	scoped("GET /api/l/{lib}/library", s.handleLibrary)
+	edit("POST /api/l/{lib}/settings", s.handleSettings)
 	scoped("GET /api/l/{lib}/timeline", s.handleTimeline)
 	scoped("GET /api/l/{lib}/media", s.handleMediaList)
 	scoped("GET /api/l/{lib}/media/{id}", s.handleMediaDetail)

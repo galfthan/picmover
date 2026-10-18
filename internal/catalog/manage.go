@@ -156,21 +156,22 @@ func (d *DB) ListTrashed(ctx context.Context) ([]Media, error) {
 }
 
 // Cover returns the hash of the newest live row with a thumbnail
-// (taken_at DESC, id DESC; undated rows last); ok is false when there is
+// (taken_at_home DESC, id DESC; undated rows last); ok is false when there is
 // none.
 func (d *DB) Cover(ctx context.Context) (hash uint64, ok bool, err error) {
-	hash, _, ok, err = cover(ctx, d.DB)
+	hash, _, ok, err = cover(ctx, d.DB, d.timeCol())
 	return hash, ok, err
 }
 
-// cover returns the cover hash and its thumb_at (zero when unknown).
-func cover(ctx context.Context, q queryRower) (uint64, time.Time, bool, error) {
+// cover returns the cover hash and its thumb_at (zero when unknown);
+// col is the time column (DB.timeCol).
+func cover(ctx context.Context, q queryRower, col string) (uint64, time.Time, bool, error) {
 	var (
 		h  int64
 		at sql.NullInt64
 	)
 	err := q.QueryRowContext(ctx, `SELECT hash, thumb_at FROM media WHERE deleted_at IS NULL AND thumb_state = 'ok'
-		ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1`).Scan(&h, &at)
+		ORDER BY `+col+` IS NULL, `+col+` DESC, id DESC LIMIT 1`).Scan(&h, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, time.Time{}, false, nil
 	}
@@ -205,7 +206,7 @@ func (d *DB) LiveHashes(ctx context.Context, hashes []uint64) (map[uint64]bool, 
 	return out, nil
 }
 
-// NewestOf returns the newest live row among hashes (taken_at DESC, id
+// NewestOf returns the newest live row among hashes (taken_at_home DESC, id
 // DESC, undated last); ok is false when none of them is a live row.
 func (d *DB) NewestOf(ctx context.Context, hashes []uint64) (hash uint64, ok bool, err error) {
 	if len(hashes) == 0 {
@@ -214,7 +215,7 @@ func (d *DB) NewestOf(ctx context.Context, hashes []uint64) (hash uint64, ok boo
 	var h int64
 	err = d.QueryRowContext(ctx, `SELECT hash FROM media WHERE deleted_at IS NULL
 		AND hash IN (SELECT value FROM json_each(?))
-		ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1`, hashArray(hashes)).Scan(&h)
+		ORDER BY taken_at_home IS NULL, taken_at_home DESC, id DESC LIMIT 1`, hashArray(hashes)).Scan(&h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -232,10 +233,10 @@ func (d *DB) LiveSummary(ctx context.Context, hashes []uint64) (n int64, newest 
 		return 0, 0, false, nil
 	}
 	var h sql.NullInt64
-	err = d.QueryRowContext(ctx, `WITH live AS MATERIALIZED (SELECT id, hash, taken_at FROM media
+	err = d.QueryRowContext(ctx, `WITH live AS MATERIALIZED (SELECT id, hash, taken_at_home FROM media
 		WHERE deleted_at IS NULL AND hash IN (SELECT value FROM json_each(?)))
 		SELECT (SELECT COUNT(*) FROM live),
-		(SELECT hash FROM live ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT 1)`, hashArray(hashes)).Scan(&n, &h)
+		(SELECT hash FROM live ORDER BY taken_at_home IS NULL, taken_at_home DESC, id DESC LIMIT 1)`, hashArray(hashes)).Scan(&n, &h)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("catalog: live summary: %w", err)
 	}
@@ -482,12 +483,14 @@ func peekFile(ctx context.Context, path string, immutable bool) (Peek, error) {
 	if err := checkSchema(path, v, hasMedia, false); err != nil {
 		return Peek{}, err
 	}
-	d := &DB{DB: sqldb, path: path}
+	// A version 3 catalog is migrated when it is opened; a peek reads it
+	// as it is.
+	d := &DB{DB: sqldb, path: path, v3: v == migratableVersion}
 	var p Peek
 	if p.Summary, err = d.Summary(ctx); err != nil {
 		return Peek{}, err
 	}
-	if p.Cover, p.CoverThumbAt, p.HasCover, err = cover(ctx, sqldb); err != nil {
+	if p.Cover, p.CoverThumbAt, p.HasCover, err = cover(ctx, sqldb, d.timeCol()); err != nil {
 		return Peek{}, err
 	}
 	return p, nil
@@ -556,7 +559,7 @@ func readFileOnce(ctx context.Context, path string, immutable bool, fn func(*DB)
 			return err
 		}
 	}
-	return fn(&DB{DB: sqldb, path: path})
+	return fn(&DB{DB: sqldb, path: path, v3: v == migratableVersion})
 }
 
 // readOnlyDSN returns a SQLite URI that opens path read-only.
@@ -570,14 +573,14 @@ func readOnlyDSN(path string) string {
 }
 
 // MatchingHashes returns the hashes of the rows matching f, oldest first
-// (taken_at, undated last, then id): the selection of a command-line move.
+// (taken_at_home, undated last, then id): the selection of a command-line move.
 func (d *DB) MatchingHashes(ctx context.Context, f Filter) ([]uint64, error) {
 	conds, args, err := f.where()
 	if err != nil {
 		return nil, err
 	}
 	rows, err := d.QueryContext(ctx, "SELECT hash FROM media"+whereClause(conds)+
-		" ORDER BY taken_at IS NULL, taken_at, id", args...)
+		" ORDER BY taken_at_home IS NULL, taken_at_home, id", args...)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: matching hashes: %w", err)
 	}

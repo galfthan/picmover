@@ -164,8 +164,8 @@ func TestBucketItemsUsesTakenAtIndex(t *testing.T) {
 			}
 			rows.Close()
 			p := strings.Join(plan, "; ")
-			if !strings.Contains(p, "USING INDEX media_taken_at (taken_at") {
-				t.Errorf("filter %+v bucket %v: plan %q does not use the taken_at range", f, ym, p)
+			if !strings.Contains(p, "USING INDEX media_taken_at_home (taken_at_home") {
+				t.Errorf("filter %+v bucket %v: plan %q does not use the taken_at_home range", f, ym, p)
 			}
 		}
 	}
@@ -391,7 +391,7 @@ func TestBucketsOutOfRangeYears(t *testing.T) {
 		if !insert(t, d, m) {
 			t.Fatal("not inserted")
 		}
-		if _, err := d.Exec("UPDATE media SET taken_at = ? WHERE id = ?", v, m.ID); err != nil {
+		if _, err := d.Exec("UPDATE media SET taken_at = ?, taken_at_home = ? WHERE id = ?", v, v, m.ID); err != nil {
 			t.Fatal(err)
 		}
 		ids[m.ID] = h

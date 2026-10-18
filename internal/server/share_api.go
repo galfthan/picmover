@@ -468,26 +468,31 @@ func (s *Server) shareRendition(h func(http.ResponseWriter, *http.Request, *libH
 // shareDetailJSON is the redacted media detail. lat/lon need location,
 // rating needs rate, albums are sent in library shares only.
 type shareDetailJSON struct {
-	ID          int64      `json:"id"`
-	Hash        string     `json:"hash"`
-	Type        string     `json:"type"`
-	TakenAt     *string    `json:"takenAt"`
-	Offset      *int       `json:"offset"`
-	W           int        `json:"w"`
-	H           int        `json:"h"`
-	Dur         int64      `json:"dur"`
-	Size        int64      `json:"size"`
-	Ext         string     `json:"ext"`
-	FileName    string     `json:"fileName"`
-	CameraMake  string     `json:"cameraMake"`
-	CameraModel string     `json:"cameraModel"`
-	Lens        string     `json:"lens"`
-	Displayable bool       `json:"displayable"`
-	ThumbAt     int64      `json:"thumbAt"`
-	Lat         *float64   `json:"lat,omitempty"`
-	Lon         *float64   `json:"lon,omitempty"`
-	Rating      *int       `json:"rating,omitempty"`
-	Albums      *[]refJSON `json:"albums,omitempty"`
+	ID   int64  `json:"id"`
+	Hash string `json:"hash"`
+	Type string `json:"type"`
+	// TakenAt is the home time; LocalTakenAt, Offset, OffsetSource and
+	// HomeOffset as in the library's detail (docs/design/home-time.md).
+	TakenAt      *string    `json:"takenAt"`
+	LocalTakenAt *string    `json:"localTakenAt"`
+	Offset       *int       `json:"offset"`
+	OffsetSource *string    `json:"offsetSource"`
+	HomeOffset   *int       `json:"homeOffset"`
+	W            int        `json:"w"`
+	H            int        `json:"h"`
+	Dur          int64      `json:"dur"`
+	Size         int64      `json:"size"`
+	Ext          string     `json:"ext"`
+	FileName     string     `json:"fileName"`
+	CameraMake   string     `json:"cameraMake"`
+	CameraModel  string     `json:"cameraModel"`
+	Lens         string     `json:"lens"`
+	Displayable  bool       `json:"displayable"`
+	ThumbAt      int64      `json:"thumbAt"`
+	Lat          *float64   `json:"lat,omitempty"`
+	Lon          *float64   `json:"lon,omitempty"`
+	Rating       *int       `json:"rating,omitempty"`
+	Albums       *[]refJSON `json:"albums,omitempty"`
 	// Videos only (docs/design/video-playback.md): the encoding, whether
 	// the computer converts it for this share (ffmpeg and `video`), and
 	// whether its container plays in browsers.
@@ -505,13 +510,27 @@ func (s *Server) handleShareMediaDetail(w http.ResponseWriter, r *http.Request, 
 	}
 	ctx := r.Context()
 	caps := req.sh.Capabilities
-	d := shareDetailJSON{ID: m.ID, Hash: hexHash(m.Hash), Type: m.FileType, TakenAt: wallClock(m.TakenAt),
-		W: m.Width, H: m.Height, Dur: m.DurationMS, Size: m.Size, Ext: m.Ext, FileName: path.Base(m.RelPath),
+	_, home, err := l.db.HomeZone(ctx)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	d := shareDetailJSON{ID: m.ID, Hash: hexHash(m.Hash), Type: m.FileType, TakenAt: wallClock(m.TakenAtHome),
+		LocalTakenAt: wallClock(m.TakenAt),
+		W:            m.Width, H: m.Height, Dur: m.DurationMS, Size: m.Size, Ext: m.Ext, FileName: path.Base(m.RelPath),
 		CameraMake: m.CameraMake, CameraModel: m.CameraModel, Lens: m.Lens,
 		Displayable: caps.Download && displayable(m.Ext), ThumbAt: unixOrZero(m.ThumbAt)}
 	if m.OffsetKnown && !m.TakenAt.IsZero() {
 		_, off := m.TakenAt.Zone()
 		d.Offset = &off
+		if m.OffsetSource != "" {
+			src := m.OffsetSource
+			d.OffsetSource = &src
+		}
+		if home != nil {
+			_, hoff := m.TakenAt.In(home).Zone()
+			d.HomeOffset = &hoff
+		}
 	}
 	if m.FileType == "video" {
 		d.Video = newVideoJSON(s.videoInfo(ctx, l, &m))

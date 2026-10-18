@@ -370,8 +370,10 @@ above is the scope's answer, not a missing route. The scope interface
 cover}` for an album share. `shareLib` is `{id, name, cover, total}`:
 no path, no state.
 
-Redacted detail: `{id, hash, type, takenAt, offset, w, h, dur, size,
-ext, fileName, cameraMake, cameraModel, lens, displayable, thumbAt}`.
+Redacted detail: `{id, hash, type, takenAt, localTakenAt, offset,
+offsetSource, homeOffset, w, h, dur, size, ext, fileName, cameraMake,
+cameraModel, lens, displayable, thumbAt}` (`takenAt` is the home time,
+docs/design/home-time.md).
 
 - With `location`, it adds `lat`/`lon`.
 - With `rate`, it adds `rating`.
@@ -2565,10 +2567,12 @@ malformed entries are dropped. A failed read leaves the sheet usable
 with "Could not read the choices".
 
 `GET /api/l/{lib}/media/{id}`: exactly these keys (`dur` and `thumbAt`
-are always present, 0 when none; `takenAt`, `offset` may be null):
+are always present, 0 when none; `takenAt`, `localTakenAt`, `offset`,
+`offsetSource`, `homeOffset` may be null):
 
 ```json
-{"id": 12, "hash": "9f3a0c11d2e4b6a8", "type": "image", "takenAt": "2024-07-14T13:05:22", "offset": 10800,
+{"id": 12, "hash": "9f3a0c11d2e4b6a8", "type": "image", "takenAt": "2024-07-14T13:05:22",
+ "localTakenAt": "2024-07-14T13:05:22", "offset": 10800, "offsetSource": "exif", "homeOffset": 10800,
  "w": 4032, "h": 3024, "dur": 0, "size": 2345678, "ext": ".jpg", "fileName": "IMG_1234.jpg",
  "cameraMake": "Apple", "cameraModel": "iPhone 12", "lens": "", "displayable": true, "thumbAt": 1781092800,
  "lat": 60.1699, "lon": 24.9384, "rating": 4, "albums": [{"id": 3, "name": "Summer"}]}

@@ -16,7 +16,10 @@ export interface MediaItem {
   /** 16 lower-case hex digits. */
   hash: string;
   type: FileType | string;
-  /** Wall-clock "2024-07-14T13:05:22", null when unknown. */
+  /**
+   * Home time: the wall clock of the library's home zone, "2024-07-14T13:05:22";
+   * null when unknown. The timeline orders and groups by it.
+   */
   takenAt: string | null;
   w: number;
   h: number;
@@ -52,8 +55,14 @@ export interface MediaDetail extends MediaItem {
   relPath: string;
   ext: string;
   size: number;
-  /** Seconds east of UTC, null when unknown. */
+  /** Wall clock where it was taken (null when undated). */
+  localTakenAt?: string | null;
+  /** Its offset, seconds east of UTC; null when unknown. */
   offset: number | null;
+  /** Where the offset came from: exif | video | gps | nearby | home; null when unknown. */
+  offsetSource?: string | null;
+  /** The home zone's offset at that instant; null when it or the local offset is unknown. */
+  homeOffset?: number | null;
   takenAtSource: string;
   orientation: number;
   lat?: number | null;
@@ -156,6 +165,13 @@ export interface LibraryInfo {
   ffmpeg: boolean;
   userdb?: UserdbCounts | null;
   similar?: SimilarInfo | null;
+  /** The timeline's time zone; name null when none is set. */
+  homeZone?: HomeZone | null;
+}
+
+export interface HomeZone {
+  /** IANA zone name, null when not set. */
+  name: string | null;
 }
 
 export interface TimelineBucket {
@@ -826,6 +842,8 @@ export function libBase(id: string): string {
 export interface LibApi {
   readonly id: string;
   getLibrary(signal?: AbortSignal): Promise<LibraryInfo>;
+  /** Sets the home zone (an IANA name); every home time is recomputed. */
+  setHomeZone(zone: string): Promise<HomeZone>;
   getTimeline(f: Filters, signal?: AbortSignal): Promise<TimelineBucket[]>;
   getBucket(f: Filters, year: number, month: number, signal?: AbortSignal): Promise<MediaItem[]>;
   getMedia(id: number, signal?: AbortSignal): Promise<MediaDetail>;
@@ -936,6 +954,7 @@ function makeLibApi(id: string): LibApi {
   return {
     id,
     getLibrary: (signal) => get<LibraryInfo>('/library', signal),
+    setHomeZone: (zone) => post<HomeZone>('/settings', { homeZone: zone }),
     async getTimeline(f, signal) {
       const r = await get<{ buckets: TimelineBucket[] | null }>(withQuery('/timeline', filterParams(f)), signal);
       return r.buckets ?? [];

@@ -312,9 +312,11 @@ func (s *Server) filterError(w http.ResponseWriter, r *http.Request, err error) 
 
 // itemJSON is the compact media item of lists.
 type itemJSON struct {
-	ID      int64   `json:"id"`
-	Hash    string  `json:"hash"`
-	Type    string  `json:"type"`
+	ID   int64  `json:"id"`
+	Hash string `json:"hash"`
+	Type string `json:"type"`
+	// TakenAt is the home time (wall clock in the library's home zone),
+	// which the timeline orders and groups by.
 	TakenAt *string `json:"takenAt"`
 	W       int     `json:"w"`
 	H       int     `json:"h"`
@@ -335,7 +337,7 @@ type itemJSON struct {
 
 func newItem(m *catalog.Media) itemJSON {
 	return itemJSON{
-		ID: m.ID, Hash: hexHash(m.Hash), Type: m.FileType, TakenAt: wallClock(m.TakenAt),
+		ID: m.ID, Hash: hexHash(m.Hash), Type: m.FileType, TakenAt: wallClock(m.TakenAtHome),
 		W: m.Width, H: m.Height, Dur: m.DurationMS, Thumb: m.ThumbState, GPS: m.HasGPS,
 		ThumbAt: unixOrZero(m.ThumbAt),
 	}
@@ -384,10 +386,19 @@ func itemList(ctx context.Context, l *libHandles, ms []catalog.Media) ([]itemJSO
 // UI shows.
 type detailJSON struct {
 	itemJSON
-	RelPath       string    `json:"relPath"`
-	Ext           string    `json:"ext"`
-	Size          int64     `json:"size"`
-	Offset        *int      `json:"offset"` // seconds east of UTC; null when unknown
+	RelPath string `json:"relPath"`
+	Ext     string `json:"ext"`
+	Size    int64  `json:"size"`
+	// LocalTakenAt is the wall clock where the item was taken, Offset its
+	// UTC offset in seconds (null when unknown) and OffsetSource where
+	// the offset came from (exif, video, gps, nearby, home; null when
+	// unknown). HomeOffset is the home zone's offset at that instant
+	// (null when the offset or the home zone is unknown): the local time
+	// differs from takenAt when Offset != HomeOffset.
+	LocalTakenAt  *string   `json:"localTakenAt"`
+	Offset        *int      `json:"offset"`
+	OffsetSource  *string   `json:"offsetSource"`
+	HomeOffset    *int      `json:"homeOffset"`
 	TakenAtSource string    `json:"takenAtSource"`
 	Orientation   int       `json:"orientation"`
 	Lat           *float64  `json:"lat,omitempty"`
@@ -420,9 +431,12 @@ type refJSON struct {
 	Name string `json:"name"`
 }
 
-func newDetail(m *catalog.Media) detailJSON {
+// newDetail builds the detail of m; home is the library's home zone (nil
+// when none).
+func newDetail(m *catalog.Media, home *time.Location) detailJSON {
 	d := detailJSON{
 		itemJSON:      newItem(m),
+		LocalTakenAt:  wallClock(m.TakenAt),
 		RelPath:       m.RelPath,
 		Ext:           m.Ext,
 		Size:          m.Size,
@@ -440,6 +454,14 @@ func newDetail(m *catalog.Media) detailJSON {
 	if m.OffsetKnown && !m.TakenAt.IsZero() {
 		_, off := m.TakenAt.Zone()
 		d.Offset = &off
+		if m.OffsetSource != "" {
+			src := m.OffsetSource
+			d.OffsetSource = &src
+		}
+		if home != nil {
+			_, hoff := m.TakenAt.In(home).Zone()
+			d.HomeOffset = &hoff
+		}
 	}
 	if m.HasGPS {
 		lat, lon := m.Lat, m.Lon
@@ -547,9 +569,13 @@ func (s *Server) handleMediaDetail(w http.ResponseWriter, r *http.Request, l *li
 		return
 	}
 	ctx := r.Context()
-	d := newDetail(&m)
+	_, home, err := l.db.HomeZone(ctx)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	d := newDetail(&m, home)
 	d.DeletedAt = localWallClock(m.DeletedAt)
-	var err error
 	if d.Rating, err = l.user.Rating(ctx, m.Hash); err != nil {
 		s.internalError(w, r, err)
 		return

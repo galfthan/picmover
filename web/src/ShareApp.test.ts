@@ -694,6 +694,18 @@ describe('phone app', () => {
       expect(lightbox()!.querySelector('[aria-label="Rating"]')).toBeNull();
     });
 
+    it('shows the home time, and the local time where it differs, in the details', async () => {
+      setup('album');
+      await start('#/view/1');
+      const info = buttons().find((b) => b.textContent?.trim() === 'Info')!;
+      click(info);
+      await settle();
+      const details = lightbox()!.querySelector('[aria-label="Details"]')!.textContent ?? '';
+      expect(details).toMatch(/UTC\+02:00/);
+      expect(details).toMatch(/\d\d:\d\d local \(UTC\+01:00\)/);
+      expect(lightbox()!.querySelector('.title')?.textContent).toMatch(/UTC\+02:00$/);
+    });
+
     it('shows what was turned on while the page is open', async () => {
       setup('album');
       await start('#/view/1');

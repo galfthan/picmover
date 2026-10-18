@@ -13,12 +13,12 @@ type PathRow struct {
 	Trashed bool // deleted_at is set: the file is in the trash
 }
 
-// PathRows returns every row (live and trashed) newest first: taken_at
+// PathRows returns every row (live and trashed) newest first: taken_at_home
 // DESC, id DESC, undated rows last (the order a backup copies in, so a
 // short run secures the recent imports first).
 func (d *DB) PathRows(ctx context.Context) ([]PathRow, error) {
 	rows, err := d.QueryContext(ctx, `SELECT hash, coalesce(size, 0), rel_path, deleted_at IS NOT NULL FROM media
-		ORDER BY taken_at IS NULL, taken_at DESC, id DESC`)
+		ORDER BY taken_at_home IS NULL, taken_at_home DESC, id DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("catalog: path rows: %w", err)
 	}

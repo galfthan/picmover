@@ -128,7 +128,14 @@ export interface ShareLibrarySummary {
 
 /** The redacted detail (docs/design/lan-share.md "Redacted detail"). */
 export interface ShareDetail extends MediaItem {
+  /** Wall clock where it was taken; `takenAt` is the home time (docs/design/home-time.md). */
+  localTakenAt: string | null;
+  /** The local UTC offset; null when unknown. */
   offset: number | null;
+  /** exif | video | gps | nearby | home; null when unknown. */
+  offsetSource: string | null;
+  /** The home zone's offset at that instant; null when unknown. */
+  homeOffset: number | null;
   size: number;
   ext: string;
   /** Base name only. */
@@ -324,7 +331,10 @@ export function toDetail(v: unknown, caps: ShareCapabilities): ShareDetail {
   const lon = typeof r.lon === 'number' && Number.isFinite(r.lon) ? r.lon : null;
   return {
     ...item,
+    localTakenAt: 'localTakenAt' in r ? instant(r.localTakenAt) : item.takenAt,
     offset: typeof r.offset === 'number' && Number.isFinite(r.offset) ? r.offset : null,
+    offsetSource: typeof r.offsetSource === 'string' && r.offsetSource !== '' ? r.offsetSource : null,
+    homeOffset: typeof r.homeOffset === 'number' && Number.isFinite(r.homeOffset) ? r.homeOffset : null,
     size: count(r.size),
     ext: str(r.ext),
     fileName: str(r.fileName).replace(/^.*[\\/]/, ''),

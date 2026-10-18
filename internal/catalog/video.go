@@ -11,8 +11,8 @@ import (
 // videoInfoTable holds how each video is encoded (ffprobe's codec, pixel
 // format, HDR transfer, audio codec), for deciding playback in the
 // browser. It is derived data keyed by content hash, like similar_pairs:
-// created on open when absent with no version bump (an older catalog is a
-// valid v3 catalog without it), filled at import and by update-metadata,
+// created on open when absent with no version bump (an older catalog is
+// valid without it), filled at import and by update-metadata,
 // and lazily by the server for rows that have none. Rows of deleted media
 // are harmless (a hash names the same content forever).
 const videoInfoTable = `

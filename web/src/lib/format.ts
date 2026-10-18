@@ -64,6 +64,57 @@ export function formatTakenAt(wallClock: string | null | undefined, offset: numb
   return offset === null || offset === undefined ? s : `${s} ${formatOffset(offset)}`;
 }
 
+/** The capture time fields of a media detail (docs/design/home-time.md). */
+export interface CaptureFields {
+  /** Home time: the wall clock of the library's home zone. */
+  takenAt: string | null;
+  /** The home zone's UTC offset at that instant; null/absent when unknown. */
+  homeOffset?: number | null;
+  /** Wall clock where it was taken; absent from older servers. */
+  localTakenAt?: string | null;
+  /** The local UTC offset; null when unknown. */
+  offset: number | null;
+  /** exif | video | gps | nearby | home; null/absent when unknown. */
+  offsetSource?: string | null;
+}
+
+export interface CaptureText {
+  /** The home time, "14/07/2024 15:30:00 UTC+03:00". */
+  home: string;
+  /**
+   * The local time when it differs from the home clock, "14:30 local
+   * (UTC+02:00)" (with the date when that differs too; "≈" first when
+   * estimated); null otherwise.
+   */
+  local: string | null;
+  /** How the local time was estimated (a tooltip), null when it was recorded. */
+  note: string | null;
+}
+
+/**
+ * The capture time of a detail as shown in the viewer: the home time, and
+ * the local time where the item was taken when its clock differed. A
+ * local offset known only as the home zone's ('home') is not a local
+ * time of its own and is not repeated.
+ */
+export function formatCapture(d: CaptureFields): CaptureText {
+  const homeOffset = d.homeOffset ?? null;
+  // No home zone (or an older server): the home time is the local one.
+  const shownOffset = homeOffset ?? (d.localTakenAt === undefined || d.localTakenAt === d.takenAt ? d.offset : null);
+  const home = formatTakenAt(d.takenAt, shownOffset);
+  const out: CaptureText = { home, local: null, note: null };
+  const loc = parseWallClock(d.localTakenAt);
+  const h = parseWallClock(d.takenAt);
+  if (!loc || !h || d.offset === null || homeOffset === null || d.offset === homeOffset || d.offsetSource === 'home') return out;
+  const time = `${p2(loc.getUTCHours())}:${p2(loc.getUTCMinutes())}`;
+  const sameDay = utcDay(loc) === utcDay(h);
+  const estimated = d.offsetSource === 'nearby' || d.offsetSource === 'gps';
+  out.local = `${estimated ? '≈ ' : ''}${sameDay ? time : `${utcDay(loc)} ${time}`} local (${formatOffset(d.offset)})`;
+  if (d.offsetSource === 'nearby') out.note = 'Local time estimated from photos taken nearby';
+  else if (d.offsetSource === 'gps') out.note = 'Local time zone looked up from the location';
+  return out;
+}
+
 /** Date only ("14/07/2024"), wall-clock; "Undated" for null. */
 export function formatWallDate(wallClock: string | null | undefined): string {
   const d = parseWallClock(wallClock);

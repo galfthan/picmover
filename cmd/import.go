@@ -56,7 +56,7 @@ A detailed log is written to <library>/.picmover/logs/.`,
 			if err != nil {
 				return err
 			}
-			p.zone = zone
+			p.zone, p.homeZone = zone, catalog.ZoneName(zone)
 			// Check the source before anything is created in the library.
 			if _, err := os.Stat(args[0]); err != nil {
 				return fmt.Errorf("source: %w", err)
@@ -82,7 +82,7 @@ A detailed log is written to <library>/.picmover/logs/.`,
 	f.IntVar(&p.minDimension, "min-dimension", 0, "skip images whose width and height are both below N pixels (0 = no limit)")
 	f.IntVar(&p.workers, "workers", 0, "number of parallel workers (0 = auto)")
 	f.IntVar(&p.sourceReaders, "source-readers", 0, "workers reading the source at once (0 = auto: 1 on FUSE mounts such as phones, else --workers)")
-	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime); default the system zone")
+	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime), and the library's home zone when it has none yet; default the system zone")
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.noThumbs, "no-thumbs", false, "do not generate thumbnails and previews (run 'picmover thumbs' later)")
 	return c
@@ -96,6 +96,7 @@ type importParams struct {
 	workers         int
 	sourceReaders   int
 	zone            *time.Location
+	homeZone        string // importer.Options.HomeZone
 	quiet           bool
 	noThumbs        bool
 	isNew           bool
@@ -192,6 +193,7 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 			NoThumbs:      p.noThumbs,
 			RecordInPlace: p.recordInPlace,
 			TrashTimes:    p.trashTimes,
+			HomeZone:      p.homeZone,
 		}
 		var status *statusLine // nil: no live status line
 		if !p.quiet {

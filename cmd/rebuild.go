@@ -113,6 +113,16 @@ Exit status as for import.`,
 			// that died are closed with its rows; the rebuild's own record
 			// is begun only after this.
 			prepareHistory(ctx, root, dbPath, hasCatalog, cmd.ErrOrStderr())
+			// The new catalog keeps the old one's home zone; without one,
+			// the rebuild's zone becomes it.
+			p.homeZone = catalog.ZoneName(zone)
+			if hasCatalog {
+				if hz, err := catalog.HomeZoneFile(ctx, dbPath); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: the old catalog's home zone could not be read: %v\n", err)
+				} else if hz != "" {
+					p.homeZone = hz
+				}
+			}
 			if hasCatalog {
 				backup, err := backupCatalog(dbPath, time.Now())
 				if err != nil {
@@ -133,7 +143,7 @@ Exit status as for import.`,
 	}
 	f := c.Flags()
 	f.IntVar(&p.workers, "workers", 0, "number of parallel workers (0 = auto)")
-	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime); default the system zone")
+	f.StringVar(&zoneName, "timezone", "", "IANA zone for times stored as instants (video UTC, file mtime), and the home zone when the old catalog has none; default the system zone")
 	f.BoolVar(&p.quiet, "quiet", false, "do not show the live status line")
 	f.BoolVar(&p.noThumbs, "no-thumbs", false, "do not generate thumbnails and previews (run 'picmover thumbs' later)")
 	return c

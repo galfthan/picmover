@@ -22,7 +22,7 @@ type Filter struct {
 	CameraModel    string    // exact match on camera_model
 	NoCamera       bool      // only rows without a camera model (camera_model ''); none with CameraModel
 	SessionID      int64     // import_session_id
-	From, To       time.Time // wall-clock bounds on taken_at (To exclusive); zero = open
+	From, To       time.Time // wall-clock bounds on taken_at_home (To exclusive); zero = open
 	IncludeDeleted bool
 	// Trashed selects the trashed rows (deleted_at set) instead of the
 	// live ones; it takes precedence over IncludeDeleted.
@@ -112,7 +112,7 @@ func (f Filter) where() ([]string, []any, error) {
 		}
 		// Inside the dated-range guard: strftime cannot format years
 		// beyond 9999, and undated rows never match.
-		md := "strftime('%m-%d', taken_at, 'unixepoch')"
+		md := "strftime('%m-%d', taken_at_home, 'unixepoch')"
 		if r.From <= r.To {
 			conds = append(conds, datedRange+" AND "+md+" BETWEEN ? AND ?")
 		} else {
@@ -134,7 +134,7 @@ func (f Filter) where() ([]string, []any, error) {
 		}
 		ph := strings.TrimSuffix(strings.Repeat("?, ", len(ms)), ", ")
 		// Inside the dated-range guard, like Recur.
-		conds = append(conds, datedRange+" AND CAST(strftime('%m', taken_at, 'unixepoch') AS INTEGER) IN ("+ph+")")
+		conds = append(conds, datedRange+" AND CAST(strftime('%m', taken_at_home, 'unixepoch') AS INTEGER) IN ("+ph+")")
 		args = append(args, ms...)
 	}
 	if f.FileType != "" {
@@ -173,11 +173,11 @@ func (f Filter) where() ([]string, []any, error) {
 		args = append(args, f.SessionID)
 	}
 	if !f.From.IsZero() {
-		conds = append(conds, "taken_at >= ?")
+		conds = append(conds, "taken_at_home >= ?")
 		args = append(args, wallSeconds(f.From))
 	}
 	if !f.To.IsZero() {
-		conds = append(conds, "taken_at < ?")
+		conds = append(conds, "taken_at_home < ?")
 		args = append(args, wallSeconds(f.To))
 	}
 	return conds, args, nil
@@ -190,7 +190,7 @@ func whereClause(conds []string) string {
 	return " WHERE " + strings.Join(conds, " AND ")
 }
 
-// The range of taken_at values that the timeline dates: 0001-01-01
+// The range of taken_at_home values that the timeline dates: 0001-01-01
 // 00:00:00 to 9999-12-31 23:59:59 (wall clock as UTC). strftime cannot
 // format years beyond 9999, and years before 1 have no bucket, so rows
 // outside the range count as undated in both Buckets and BucketItems.
@@ -200,8 +200,8 @@ const (
 )
 
 var (
-	datedRange   = fmt.Sprintf("taken_at BETWEEN %d AND %d", minDatedTakenAt, maxDatedTakenAt)
-	undatedConds = fmt.Sprintf("(taken_at IS NULL OR taken_at < %d OR taken_at > %d)", minDatedTakenAt, maxDatedTakenAt)
+	datedRange   = fmt.Sprintf("taken_at_home BETWEEN %d AND %d", minDatedTakenAt, maxDatedTakenAt)
+	undatedConds = fmt.Sprintf("(taken_at_home IS NULL OR taken_at_home < %d OR taken_at_home > %d)", minDatedTakenAt, maxDatedTakenAt)
 )
 
 // Bucket is one calendar month of dated rows, or the undated rows
@@ -216,9 +216,10 @@ type Bucket struct {
 const notIndexedHashes = 10000
 
 // Buckets returns the months matching f, newest first, undated last.
-// Implemented with one GROUP BY over strftime('%Y-%m', taken_at, 'unixepoch');
-// taken_at is wall-clock-as-UTC so no zone conversion is applied. Rows
-// without taken_at, or with one outside years 1-9999, are undated.
+// Implemented with one GROUP BY over strftime('%Y-%m', taken_at_home,
+// 'unixepoch'); taken_at_home is the home zone's wall clock as UTC so no
+// zone conversion is applied. Rows without a capture time, or with one
+// outside years 1-9999, are undated.
 func (d *DB) Buckets(ctx context.Context, f Filter) ([]Bucket, error) {
 	conds, args, err := f.where()
 	if err != nil {
@@ -230,7 +231,7 @@ func (d *DB) Buckets(ctx context.Context, f Filter) ([]Bucket, error) {
 		// (measured 159 -> 127 ms for 50k of 136k rows).
 		from = " FROM media NOT INDEXED"
 	}
-	q := `SELECT CASE WHEN ` + datedRange + ` THEN strftime('%Y-%m', taken_at, 'unixepoch') END AS ym, COUNT(*)` + from +
+	q := `SELECT CASE WHEN ` + datedRange + ` THEN strftime('%Y-%m', taken_at_home, 'unixepoch') END AS ym, COUNT(*)` + from +
 		whereClause(conds) + ` GROUP BY ym ORDER BY ym IS NULL, ym DESC`
 	rows, err := d.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -275,11 +276,11 @@ func parseYearMonth(s string) (year, month int, ok bool) {
 	return y, m, true
 }
 
-// BucketItems returns the rows of one bucket ordered taken_at DESC, id DESC
-// (undated, year == 0 && month == 0: id DESC; that includes taken_at
+// BucketItems returns the rows of one bucket ordered taken_at_home DESC,
+// id DESC (undated, year == 0 && month == 0: id DESC; that includes times
 // outside years 1-9999, as in Buckets). The month range is a
 // half-open [first, next-first) pair of Unix wall-clock seconds and the
-// query names the media_taken_at index (INDEXED BY), so another index
+// query names the media_taken_at_home index (INDEXED BY), so another index
 // matching a filter (file_type, session) is never chosen instead.
 func (d *DB) BucketItems(ctx context.Context, f Filter, year, month int) ([]Media, error) {
 	q, args, err := bucketItemsQuery(f, year, month)
@@ -298,19 +299,19 @@ func bucketItemsQuery(f Filter, year, month int) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	order := "taken_at DESC, id DESC"
+	order := "taken_at_home DESC, id DESC"
 	switch {
 	case year == 0 && month == 0:
 		conds = append(conds, undatedConds)
 		order = "id DESC"
 	case month >= 1 && month <= 12 && year >= 1 && year <= 9999:
 		first := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-		conds = append(conds, "taken_at >= ? AND taken_at < ?")
+		conds = append(conds, "taken_at_home >= ? AND taken_at_home < ?")
 		args = append(args, first.Unix(), first.AddDate(0, 1, 0).Unix())
 	default:
 		return "", nil, fmt.Errorf("catalog: invalid bucket %04d-%02d", year, month)
 	}
-	q := "SELECT " + mediaColumns + " FROM media INDEXED BY media_taken_at" + whereClause(conds) + " ORDER BY " + order
+	q := "SELECT " + mediaColumns + " FROM media INDEXED BY media_taken_at_home" + whereClause(conds) + " ORDER BY " + order
 	return q, args, nil
 }
 
@@ -350,7 +351,7 @@ type GeoPoint struct {
 	ID       int64
 	Hash     uint64
 	Lat, Lon float64
-	TakenAt  time.Time // wall-clock as in Media.TakenAt (UTC placeholder zone); zero = unknown
+	TakenAt  time.Time // home wall clock as in Media.TakenAtHome (UTC placeholder zone); zero = unknown
 	ThumbAt  time.Time // as Media.ThumbAt; zero = never attempted
 }
 
@@ -417,7 +418,7 @@ func (g geoBox) from(ctx context.Context, d *DB) (string, error) {
 
 // GeoPoints returns every row with coordinates matching f inside the box
 // (west, south, east, north; west > east crosses the antimeridian). With a
-// limit (> 0) the newest rows are returned, ordered taken_at DESC, id DESC
+// limit (> 0) the newest rows are returned, ordered taken_at_home DESC, id DESC
 // (undated last); limit 0 returns every row in no particular order (the
 // clustering pass does not need an order, and sorting 100k rows would
 // double its cost).
@@ -435,9 +436,9 @@ func (d *DB) GeoPoints(ctx context.Context, f Filter, west, south, east, north f
 	if err != nil {
 		return nil, fmt.Errorf("catalog: geo points: %w", err)
 	}
-	q := "SELECT id, hash, lat, lon, taken_at, thumb_at FROM " + from + whereClause(g.conds)
+	q := "SELECT id, hash, lat, lon, taken_at_home, thumb_at FROM " + from + whereClause(g.conds)
 	if limit > 0 {
-		out, err := d.geoPoints(ctx, q+" ORDER BY taken_at IS NULL, taken_at DESC, id DESC LIMIT ?", append(g.args, limit)...)
+		out, err := d.geoPoints(ctx, q+" ORDER BY taken_at_home IS NULL, taken_at_home DESC, id DESC LIMIT ?", append(g.args, limit)...)
 		if err != nil {
 			return nil, fmt.Errorf("catalog: geo points: %w", err)
 		}
@@ -507,7 +508,7 @@ func (d *DB) geoPoints(ctx context.Context, q string, args ...any) ([]GeoPoint, 
 }
 
 // GeoItems returns up to limit rows (all when limit <= 0) with coordinates
-// matching f inside the box, newest first (taken_at DESC, id DESC, undated
+// matching f inside the box, newest first (taken_at_home DESC, id DESC, undated
 // last), and the total number of matching rows. Both come from one
 // statement (a COUNT(*) OVER () window, computed before the LIMIT), so they
 // describe the same snapshot even while an import adds rows.
@@ -521,7 +522,7 @@ func (d *DB) GeoItems(ctx context.Context, f Filter, west, south, east, north fl
 		return nil, 0, fmt.Errorf("catalog: geo items: %w", err)
 	}
 	q := "SELECT " + mediaColumns + ", COUNT(*) OVER () FROM " + from + whereClause(g.conds) +
-		" ORDER BY taken_at IS NULL, taken_at DESC, id DESC"
+		" ORDER BY taken_at_home IS NULL, taken_at_home DESC, id DESC"
 	args := g.args
 	if limit > 0 {
 		q += " LIMIT ?"

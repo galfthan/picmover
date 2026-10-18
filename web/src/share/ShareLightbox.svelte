@@ -28,7 +28,7 @@
   // fine is "cannot be played in this browser". The lightbox follows the
   // client it is given, which changes with the capabilities.
   import { untrack } from 'svelte';
-  import { formatBytes, formatCoord, formatDuration, formatTakenAt } from '../lib/format';
+  import { formatBytes, formatCapture, formatCoord, formatDuration, formatTakenAt } from '../lib/format';
   import RatingStars from '../components/RatingStars.svelte';
   import VideoPlayer from '../components/VideoPlayer.svelte';
   import { classify, dragAxis, startsAwayFromEdges, DOUBLE_TAP_MS, type Point } from './gestures';
@@ -75,6 +75,8 @@
   let dialog: HTMLDivElement | undefined = $state();
 
   const d = $derived(detail && detail.id === id ? detail : null);
+  /** The home time, and the local time when it differs (docs/design/home-time.md). */
+  const capture = $derived(d ? formatCapture(d) : null);
   const item = $derived<MediaItem | null>(d ?? (hint && hint.id === id ? hint : null));
   const isVideo = $derived(item?.type === 'video');
   const playable = $derived(isVideo && caps.video);
@@ -463,7 +465,7 @@
 
   <div class="bar top">
     <button class="ghost icon" onclick={onclose} aria-label="Close">✕</button>
-    <span class="title">{item ? formatTakenAt(item.takenAt, d?.offset ?? null) : ''}</span>
+    <span class="title">{capture ? capture.home : item ? formatTakenAt(item.takenAt, null) : ''}</span>
   </div>
 
   {#if note}<div class="note" role="status">{note}</div>{/if}
@@ -488,7 +490,11 @@
       {#if d}
         <dl>
           <dt>Date</dt>
-          <dd>{formatTakenAt(d.takenAt, d.offset)}</dd>
+          <dd>
+            {capture?.home ?? ''}
+            {#if capture?.local}<span class="local-time" title={capture.note ?? undefined}>{capture.local}</span>{/if}
+            {#if capture?.note}<span class="local-time">{capture.note}</span>{/if}
+          </dd>
           {#if camera}
             <dt>Camera</dt>
             <dd>{camera}</dd>
@@ -672,6 +678,11 @@
   }
   .icon {
     font-size: 18px;
+  }
+  .local-time {
+    display: block;
+    opacity: 0.7;
+    font-size: 0.9em;
   }
   .title {
     margin-left: 4px;
