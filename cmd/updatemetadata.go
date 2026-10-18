@@ -67,6 +67,13 @@ Exits with status 2 when any row could not be updated.`,
 			if err != nil {
 				return err
 			}
+			// Instants whose local offset is unknown are stored in the
+			// home zone (catalog.OffsetSourceHome): compare and print them
+			// as stored, not in the zone they were extracted in.
+			_, home, err := db.HomeZone(ctx)
+			if err != nil {
+				return err
+			}
 			if hasVideo(rows) {
 				if _, err := findTool("ffprobe"); err != nil {
 					return fmt.Errorf("ffprobe not found; video metadata would be lost (install ffprobe or use --type to skip videos): %w", err)
@@ -104,6 +111,7 @@ Exits with status 2 when any row could not be updated.`,
 					errCount++
 					continue
 				}
+				info.TakenAt = asStored(old, info, home)
 				if info.Video != nil && !dryRun {
 					videos = append(videos, videoUpdate{old.Hash, catalog.VideoInfo(*info.Video)})
 				}
@@ -275,6 +283,29 @@ func rowZone(m catalog.Media, def *time.Location, explicit bool) *time.Location 
 		return time.FixedZone("", off)
 	}
 	return def
+}
+
+// asStored returns info's capture time as the catalog would store it for
+// the row old. An instant with no local offset of its own (an mtime or a
+// video's UTC time, offset source "home") is shown in the home zone,
+// whatever zone it was extracted in (--timezone); unchanged when there is
+// no home zone. When old holds the same instant from the same source with
+// an offset of another source (estimated from nearby photos), that offset
+// is kept: the row is unchanged and keeps its offset source.
+func asStored(old catalog.Media, info metadata.Info, home *time.Location) time.Time {
+	if info.TakenAt.IsZero() ||
+		catalog.DefaultOffsetSource(info.Source, info.OffsetKnown) != catalog.OffsetSourceHome {
+		return info.TakenAt
+	}
+	if old.OffsetKnown && old.TakenAtSource == info.Source && !old.TakenAt.IsZero() &&
+		old.TakenAt.Unix() == info.TakenAt.Unix() &&
+		old.OffsetSource != "" && old.OffsetSource != catalog.OffsetSourceHome {
+		return info.TakenAt.In(old.TakenAt.Location())
+	}
+	if home == nil {
+		return info.TakenAt
+	}
+	return info.TakenAt.In(home)
 }
 
 // trustedSources are date sources read from the file's own metadata.
