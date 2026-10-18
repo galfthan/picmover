@@ -173,6 +173,9 @@
   .tone-failed {
     color: var(--danger);
   }
+  .tone-disconnected {
+    color: var(--warn);
+  }
   .bad {
     color: var(--danger);
   }

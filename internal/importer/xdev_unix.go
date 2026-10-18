@@ -35,3 +35,12 @@ func sameDevice(src, dir string) bool {
 	}
 	return a.Dev == b.Dev
 }
+
+// fileDev returns the file system device (st_dev) of fi.
+func fileDev(fi os.FileInfo) (uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Dev), true //nolint:unconvert // int32 on darwin
+}

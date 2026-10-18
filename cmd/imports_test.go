@@ -80,9 +80,9 @@ func TestImportRecordsAndImportsCommand(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 4 || lines[0] != "Library: "+dir ||
-		!regexp.MustCompile(`^ID\s+STARTED\s+MODE\s+OUTCOME\s+SOURCE\s+IMPORTED\s+EXISTING\s+DUPLICATES\s+ERRORS\s+BYTES\s+NAME$`).MatchString(lines[1]) ||
-		!regexp.MustCompile(`^2\s+\d{4}-\d\d-\d\d \d\d:\d\d\s+rebuild\s+done\s+lib\s+0\s+2\s+0\s+0\s+0 B\s*$`).MatchString(lines[2]) ||
-		!regexp.MustCompile(`^1\s+\S+ \S+\s+copy\s+done\s+phone\s+2\s+0\s+1\s+0\s+\S+ \S+\s*$`).MatchString(lines[3]) {
+		!regexp.MustCompile(`^ID\s+STARTED\s+MODE\s+OUTCOME\s+SOURCE\s+IMPORTED\s+PHOTOS\s+RAW\s+VIDEOS\s+EXISTING\s+DUPLICATES\s+ERRORS\s+BYTES\s+NAME$`).MatchString(lines[1]) ||
+		!regexp.MustCompile(`^2\s+\d{4}-\d\d-\d\d \d\d:\d\d\s+rebuild\s+done\s+lib\s+0\s+0\s+0\s+0\s+2\s+0\s+0\s+0 B\s*$`).MatchString(lines[2]) ||
+		!regexp.MustCompile(`^1\s+\S+ \S+\s+copy\s+done\s+phone\s+2\s+2\s+0\s+0\s+0\s+1\s+0\s+\S+ \S+\s*$`).MatchString(lines[3]) {
 		t.Fatalf("imports output:\n%s", out)
 	}
 
@@ -172,13 +172,13 @@ func TestImportRecordFailureDoesNotFailImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw.Exec("PRAGMA user_version = 4")
+	raw.Exec("PRAGMA user_version = 5")
 	raw.Close()
 	writeJPEG(t, filepath.Join(src, "b.jpg"), 2)
 	out, err := run(t, "import", "--quiet", "--no-thumbs", src, dir)
 	if err != nil || !strings.Contains(out, "Imported:          1\n") ||
 		!strings.Contains(out, "Import record: could not be written (import record: open user.db:") ||
-		!strings.Contains(out, "schema version 4") {
+		!strings.Contains(out, "schema version 5") {
 		t.Fatalf("import with a newer user.db: %v\n%s", err, out)
 	}
 	logs, _ := filepath.Glob(filepath.Join(dir, library.MetaDir, "logs", "import_*.log"))
@@ -343,7 +343,7 @@ func TestRebuildMigrationNoticeAndBackfillWarning(t *testing.T) {
 	raw.Exec("PRAGMA user_version = 1") // a catalog of another format: no sessions to read
 	raw.Close()
 	out, err := run(t, "rebuild", "--quiet", "--no-thumbs", dir)
-	if err != nil || !strings.Contains(out, "user.db upgraded from schema version 2 to 3 (the old file is kept as user.db.bak-") ||
+	if err != nil || !strings.Contains(out, "user.db upgraded from schema version 2 to 4 (the old file is kept as user.db.bak-") ||
 		!strings.Contains(out, "Warning: the old catalog's import sessions could not be copied into the import history:") {
 		t.Fatalf("rebuild: %v\n%s", err, out)
 	}

@@ -646,6 +646,9 @@ func TestOutcome(t *testing.T) {
 		{kindImport, importer.Stats{}, fmt.Errorf("/abs/path: disk full"), stateFailed, 1, "import failed; see the job log"},
 		{kindThumbs, importer.Stats{ThumbsFailed: 1}, nil, stateDone, 2, "thumbnails failed for 1 files"},
 		{kindThumbs, importer.Stats{}, context.Canceled, stateCancelled, 130, ""},
+		// One status for a disconnected source, however many files were left.
+		{kindImport, importer.Stats{Imported: 3, SourceDisconnected: true}, importer.ErrSourceDisconnected, stateDone, 2,
+			"Source disconnected — reconnect and run the import again; already imported files are kept and will be skipped"},
 	} {
 		state, code, msg := outcome(c.kind, c.s, c.err, "L", "/lib")
 		if state != c.state || code != c.code || !strings.Contains(msg, c.msg) || (c.msg == "" && msg != "") ||

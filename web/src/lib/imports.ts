@@ -4,6 +4,7 @@
 
 import type { ImportRecord, ImportRef } from './api';
 import { formatAgo, formatCount, formatLocalDay } from './format';
+import { kindSplit } from './jobtext';
 
 /** "Summer trip", else the source's base name, else "Import #12". */
 export function importTitle(r: Pick<ImportRecord, 'id' | 'name'> & { sourceName?: string }): string {
@@ -26,7 +27,13 @@ export function modeLabel(mode: string): string {
   return MODES[mode] ?? (mode || 'Import');
 }
 
-const OUTCOMES: Record<string, string> = { running: 'Running', cancelled: 'Cancelled', failed: 'Failed', done: 'Done' };
+const OUTCOMES: Record<string, string> = {
+  running: 'Running',
+  cancelled: 'Cancelled',
+  failed: 'Failed',
+  done: 'Done',
+  disconnected: 'Source disconnected',
+};
 
 /** Label of an outcome worth showing; null for a plain finished import. */
 export function outcomeLabel(outcome: string): string | null {
@@ -37,16 +44,27 @@ export function outcomeLabel(outcome: string): string | null {
 const plural = (n: number, one: string, many: string) => `${formatCount(n)} ${n === 1 ? one : many}`;
 
 /**
- * "12 new, 3 already there, 1 error"; zero counts are left out. A rebuild
- * (isRebuild) found every file in place: "1,234 files recorded".
+ * "12 new (10 photos, 2 videos), 3 already there, 1 error"; zero counts
+ * are left out, and so is the split for a record made before it was kept
+ * (importedPhotos null or absent). A rebuild (isRebuild) found every file
+ * in place: "1,234 files recorded".
  */
-export function importCounts(r: Pick<ImportRecord, 'imported' | 'existing' | 'duplicates' | 'skipped' | 'errors'> & { mode?: string }): string {
+export function importCounts(
+  r: Pick<ImportRecord, 'imported' | 'existing' | 'duplicates' | 'skipped' | 'errors'> &
+    Partial<Pick<ImportRecord, 'importedPhotos' | 'importedRaw' | 'importedVideos'>> & { mode?: string },
+): string {
   const parts: string[] = [];
   if (r.mode !== undefined && isRebuild(r.mode)) {
     const n = r.imported + r.existing;
     if (n) parts.push(plural(n, 'file recorded', 'files recorded'));
   } else {
-    if (r.imported) parts.push(`${formatCount(r.imported)} new`);
+    if (r.imported) {
+      const split =
+        r.importedPhotos != null && r.importedRaw != null && r.importedVideos != null
+          ? kindSplit({ importedPhotos: r.importedPhotos, importedRaw: r.importedRaw, importedVideos: r.importedVideos })
+          : '';
+      parts.push(`${formatCount(r.imported)} new${split ? ` (${split})` : ''}`);
+    }
     if (r.existing) parts.push(`${formatCount(r.existing)} already there`);
   }
   if (r.duplicates) parts.push(plural(r.duplicates, 'duplicate', 'duplicates'));

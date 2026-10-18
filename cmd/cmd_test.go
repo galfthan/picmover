@@ -890,6 +890,30 @@ func TestBackupCatalog(t *testing.T) {
 	}
 }
 
+func TestStatusKindsAndThumbs(t *testing.T) {
+	s := importer.Stats{Scanned: 9, Imported: 6, ImportedPhotos: 3, ImportedRaw: 2, ImportedVideos: 1, Existing: 2,
+		ThumbsDone: 4, ThumbsFailed: 1}
+	got := formatStatus(s)
+	if !strings.Contains(got, "Imported 6 (3 photos, 2 RAW, 1 video)") || !strings.Contains(got, "Thumbs 5/8") ||
+		strings.Contains(got, "disconnected") {
+		t.Errorf("status = %q", got)
+	}
+	// Photos only: no split.
+	s = importer.Stats{Imported: 2, ImportedPhotos: 2, SourceDisconnected: true}
+	if got := formatStatus(s); !strings.Contains(got, "Imported 2 |") || !strings.Contains(got, "Source disconnected") {
+		t.Errorf("status = %q", got)
+	}
+	var b strings.Builder
+	importSummary{libRoot: "/lib", logPath: "L"}.print(&b, importer.Stats{Imported: 6, ImportedPhotos: 3, ImportedRaw: 2,
+		ImportedVideos: 1, SourceDisconnected: true})
+	for _, want := range []string{"Imported:          6\n", "  Photos:          3\n", "  RAW:             2\n",
+		"  Videos:          1\n", "Stopped:           Source disconnected"} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("summary lacks %q:\n%s", want, b.String())
+		}
+	}
+}
+
 func TestStatusTransferRate(t *testing.T) {
 	s := importer.Stats{Imported: 1, BytesCopied: 5 << 20, Rate: 1 << 20}
 	if got := formatStatus(s); !strings.Contains(got, "Copied 5.0 MiB (1.0 MiB/s)") {

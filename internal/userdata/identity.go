@@ -142,7 +142,8 @@ var ErrNeedsMigration = fmt.Errorf("user.db has schema version 1 and would be up
 // version a *VersionError. A version-2 file is opened as it is: it has
 // the identity and the backup targets (all a read-only caller, the
 // backup dry run, reads), but not the import history, whose methods fail
-// on it.
+// on it. A version-3 file is opened as it is too: its import records
+// have no split by kind (ImportRecord.Kinds nil).
 func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -164,7 +165,7 @@ func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
 	switch {
 	case err != nil:
 		err = fmt.Errorf("userdata: open %s: %w", path, err)
-	case v == SchemaVersion, v == 2:
+	case v >= 2 && v <= SchemaVersion:
 		return d, nil
 	case v == 1:
 		err = ErrNeedsMigration

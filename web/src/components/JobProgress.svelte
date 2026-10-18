@@ -2,7 +2,7 @@
   import { errorMessage, type Job } from '../lib/api';
   import { jobs, isActive, processed } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed } from '../lib/format';
-  import { jobTitle } from '../lib/jobtext';
+  import { DISCONNECTED_MESSAGE, jobTitle, thumbsProcessed } from '../lib/jobtext';
   import ConfirmButton from './ConfirmButton.svelte';
 
   interface Props {
@@ -25,7 +25,9 @@
   });
 
   const s = $derived(job.stats);
-  const thumbsStarted = $derived(s.thumbsDone + s.thumbsUnsupported + s.thumbsFailed > 0);
+  const thumbsStarted = $derived(thumbsProcessed(s) > 0);
+  // An import makes the thumbnails while it copies: of the files recorded so far.
+  const thumbsOf = $derived(s.imported + s.existing);
   const fraction = $derived((job.kind === 'import' || job.kind === 'rebuild') && s.scanned > 0 ? Math.min(1, processed(s) / s.scanned) : null);
 
   let cancelling = $state(false);
@@ -74,6 +76,7 @@
   {/if}
   {#if cancelError}<div class="error-box">{cancelError}</div>{/if}
   {#if jobs.reconnecting}<div class="notice">Connection lost; reconnecting…</div>{/if}
+  {#if job.kind === 'import' && s.sourceDisconnected}<div class="notice disconnected" role="status">{DISCONNECTED_MESSAGE}</div>{/if}
 
   {#if fraction !== null}
     <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(fraction * 100)}>
@@ -84,7 +87,9 @@
   {#if job.kind === 'import'}
     <div class="stats">
       <div class="stat"><span class="v">{formatCount(s.scanned)}</span><span class="k">Scanned</span></div>
-      <div class="stat"><span class="v">{formatCount(s.imported)}</span><span class="k">Imported</span></div>
+      <div class="stat" data-kind="image"><span class="v">{formatCount(s.importedPhotos)}</span><span class="k">Photos imported</span></div>
+      <div class="stat" data-kind="image_raw"><span class="v">{formatCount(s.importedRaw)}</span><span class="k">RAW imported</span></div>
+      <div class="stat" data-kind="video"><span class="v">{formatCount(s.importedVideos)}</span><span class="k">Videos imported</span></div>
       <div class="stat"><span class="v">{formatCount(s.existing)}</span><span class="k">Already in place</span></div>
       <div class="stat"><span class="v">{formatCount(s.duplicates)}</span><span class="k">Duplicates</span></div>
       <div class="stat"><span class="v">{formatCount(s.skippedSmall)}</span><span class="k">Skipped (small)</span></div>
@@ -108,7 +113,11 @@
     </p>
   {/if}
   {#if thumbsStarted || job.kind === 'thumbs'}
-    <h3 class="sub">Thumbnails</h3>
+    <h3 class="sub">
+      Thumbnails{#if job.kind === 'import' && thumbsOf > 0}<span class="of" data-testid="thumbs-of">
+          {formatCount(thumbsProcessed(s))} of {formatCount(thumbsOf)}</span
+        >{/if}
+    </h3>
     <div class="stats">
       <div class="stat"><span class="v">{formatCount(s.thumbsDone)}</span><span class="k">Done</span></div>
       <div class="stat"><span class="v">{formatCount(s.thumbsUnsupported)}</span><span class="k">Unsupported</span></div>
@@ -151,5 +160,13 @@
     margin: 16px 0 8px;
     color: var(--muted);
     font-weight: 500;
+  }
+  .of {
+    margin-left: 8px;
+    font-weight: 400;
+    color: var(--faint);
+  }
+  .disconnected {
+    border-color: var(--warn);
   }
 </style>

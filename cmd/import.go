@@ -38,9 +38,14 @@ copied through a temp file and recorded in the catalog with its hash.
 Files whose content is already in the catalog are skipped as duplicates.
 With --move the sources are deleted once they are safely recorded.
 
-After the copy stage a thumbnail (256 px) and a preview (1600 px) of every
-imported file are generated into <library>/.picmover (skip with
---no-thumbs; 'picmover thumbs' generates them later).
+While the files are copied, a thumbnail (256 px) and a preview (1600 px)
+of every imported file are generated into <library>/.picmover from the
+library copy (skip with --no-thumbs; 'picmover thumbs' generates them
+later).
+
+If the source goes away during the import (a phone or card unplugged),
+the import stops with one message; the files imported so far are kept,
+and running the import again skips them.
 
 Every import is recorded in the library's import history in user.db
 (created when missing); the summary prints the record's id, and
@@ -125,9 +130,9 @@ func interruptContext(parent context.Context) (context.Context, context.CancelFu
 }
 
 // runImport runs an import (with its thumbnail stage) and prints the
-// summary. Exit status: 0; 2 when files could not be imported, thumbnails
-// failed or the thumbnail stage could not run; 130 when cancelled; 1
-// otherwise (never after a successful copy stage). ctx is the interrupt
+// summary. Exit status: 0; 2 when files could not be imported, the source
+// disconnected, thumbnails failed or the thumbnail stage could not run;
+// 130 when cancelled; 1 otherwise (never after a successful copy stage). ctx is the interrupt
 // context; nil installs one.
 func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 	if p.logPrefix == "" {
@@ -283,6 +288,15 @@ func runImport(cmd *cobra.Command, ctx context.Context, p importParams) error {
 		fmt.Fprintf(out, "%s cancelled.\n", p.what)
 		sum.print(out, stats)
 		return &exitError{code: 130}
+	case errors.Is(runErr, importer.ErrSourceDisconnected):
+		// One status for the run: the files not reached are not errors.
+		logger.Warn("source disconnected", "source", p.source)
+		sum.print(out, stats)
+		msg := importer.DisconnectedMessage
+		if stats.Errors > 0 {
+			msg = fmt.Sprintf("%s (%d files could not be imported before; see %s)", msg, stats.Errors, logPath)
+		}
+		return &exitError{code: 2, msg: msg}
 	case errors.As(runErr, &stageErr):
 		// The copy stage succeeded: every file is recorded. Only the
 		// thumbnails are missing; their rows stay pending.
@@ -364,15 +378,51 @@ func redrawLine(line string, width int, vt bool) string {
 // formatStatus is the live status line of an import; the transfer rate
 // is shown only while bytes are moving.
 func formatStatus(s importer.Stats) string {
-	line := fmt.Sprintf("Scanned %d | Imported %d | Existing %d | Duplicates %d | Small %d | Non-media %d | Errors %d | Copied %s",
-		s.Scanned, s.Imported, s.Existing, s.Duplicates, s.SkippedSmall, s.NonMedia, s.Errors, humanSize(s.BytesCopied))
+	line := fmt.Sprintf("Scanned %d | Imported %d%s | Existing %d | Duplicates %d | Small %d | Non-media %d | Errors %d | Copied %s",
+		s.Scanned, s.Imported, kindSplit(s), s.Existing, s.Duplicates, s.SkippedSmall, s.NonMedia, s.Errors, humanSize(s.BytesCopied))
 	if s.Rate > 0 {
 		line += " (" + humanSize(s.Rate) + "/s)"
 	}
 	if n := thumbsProcessed(s); n > 0 {
-		line += fmt.Sprintf(" | Thumbs %d", n)
+		// Thumbnails are made while copying: done of the rows recorded.
+		line += fmt.Sprintf(" | Thumbs %d/%d", n, s.Imported+s.Existing)
+	}
+	if s.SourceDisconnected {
+		line += " | Source disconnected"
 	}
 	return line
+}
+
+// kindSplit is " (P photos, R RAW, V videos)" for the imported files of
+// more than one kind ("" when nothing or only photos were imported).
+func kindSplit(s importer.Stats) string {
+	if s.Imported == 0 || s.ImportedPhotos == s.Imported {
+		return ""
+	}
+	return " (" + kindParts(s.ImportedPhotos, s.ImportedRaw, s.ImportedVideos) + ")"
+}
+
+// kindParts is "P photos, R RAW, V videos", leaving out the zero counts.
+func kindParts(photos, raw, videos int64) string {
+	var parts []string
+	if photos > 0 {
+		parts = append(parts, countOf(photos, "photo", "photos"))
+	}
+	if raw > 0 {
+		parts = append(parts, fmt.Sprintf("%d RAW", raw))
+	}
+	if videos > 0 {
+		parts = append(parts, countOf(videos, "video", "videos"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// countOf is "1 photo" or "12 photos".
+func countOf(n int64, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 // thumbsProcessed is the number of rows the thumbnail stage has finished.
@@ -413,12 +463,20 @@ func (is importSummary) print(w io.Writer, s importer.Stats) {
 	fmt.Fprintf(w, "Import summary:\n")
 	fmt.Fprintf(w, "Scanned:           %d\n", s.Scanned)
 	fmt.Fprintf(w, "Imported:          %d\n", s.Imported)
+	if s.Imported > 0 {
+		fmt.Fprintf(w, "  Photos:          %d\n", s.ImportedPhotos)
+		fmt.Fprintf(w, "  RAW:             %d\n", s.ImportedRaw)
+		fmt.Fprintf(w, "  Videos:          %d\n", s.ImportedVideos)
+	}
 	fmt.Fprintf(w, "Already in place:  %d\n", s.Existing)
 	fmt.Fprintf(w, "Duplicates:        %d\n", s.Duplicates)
 	fmt.Fprintf(w, "Skipped (small):   %d\n", s.SkippedSmall)
 	fmt.Fprintf(w, "Non-media:         %d\n", s.NonMedia)
 	fmt.Fprintf(w, "Errors:            %d\n", s.Errors)
 	fmt.Fprintf(w, "Copied:            %s\n", humanSize(s.BytesCopied))
+	if s.SourceDisconnected {
+		fmt.Fprintf(w, "Stopped:           %s\n", importer.DisconnectedMessage)
+	}
 	if is.thumbs {
 		printThumbSummary(w, s)
 	}

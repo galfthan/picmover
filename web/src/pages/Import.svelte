@@ -2,7 +2,7 @@
   import { errorMessage, isBackupKind, type Job } from '../lib/api';
   import { jobs, isActive } from '../lib/jobs.svelte';
   import { formatBytes, formatCount, formatElapsed } from '../lib/format';
-  import { exitCodeOf, outcome } from '../lib/jobtext';
+  import { exitCodeOf, outcome, thumbsProcessed } from '../lib/jobtext';
   import { importedHref, libHref } from '../lib/routes';
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
@@ -106,6 +106,9 @@
     return [
       ['Scanned', formatCount(s.scanned)],
       ['Imported', formatCount(s.imported)],
+      ['· Photos', formatCount(s.importedPhotos)],
+      ['· RAW', formatCount(s.importedRaw)],
+      ['· Videos', formatCount(s.importedVideos)],
       ['Already in place', formatCount(s.existing)],
       ['Duplicates', formatCount(s.duplicates)],
       ['Skipped (small)', formatCount(s.skippedSmall)],
@@ -177,7 +180,7 @@
       </section>
       <section class="card">
         <h2>Recent files</h2>
-        <ResultsList results={jobs.results} errors={jobs.errors} />
+        <ResultsList results={jobs.results} errors={jobs.errors} errorCount={cur.stats.errors} />
       </section>
     {:else if mode === 'done' && cur && summary}
       <section class="card">
@@ -193,11 +196,11 @@
             <caption class="muted">Import summary{elapsed !== null ? ` · ${formatElapsed(elapsed)}` : ''}</caption>
             <tbody>
               {#each summaryRows as [k, v] (k)}
-                <tr class:bad={k === 'Errors' && cur.stats.errors > 0}><th>{k}</th><td class="num">{v}</td></tr>
+                <tr class:bad={k === 'Errors' && cur.stats.errors > 0} class:part={k.startsWith('·')}><th>{k}</th><td class="num">{v}</td></tr>
               {/each}
             </tbody>
           </table>
-          {#if cur.stats.thumbsDone + cur.stats.thumbsUnsupported + cur.stats.thumbsFailed > 0}
+          {#if thumbsProcessed(cur.stats) > 0}
             <table class="data summary">
               <caption class="muted">Thumbnails</caption>
               <tbody>
@@ -225,7 +228,7 @@
       {#if jobs.errors.length || jobs.results.length}
         <section class="card">
           <h2>Files</h2>
-          <ResultsList results={jobs.results} errors={jobs.errors} />
+          <ResultsList results={jobs.results} errors={jobs.errors} errorCount={cur.stats.errors} />
         </section>
       {/if}
     {:else}
@@ -416,6 +419,10 @@
   tr.bad td,
   tr.bad th {
     color: var(--danger);
+  }
+  tr.part th {
+    padding-left: 22px;
+    color: var(--muted);
   }
   .log {
     display: flex;

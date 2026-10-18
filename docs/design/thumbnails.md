@@ -407,6 +407,15 @@ the stored value is NULL or 0. `ThumbStats` counts non-deleted rows;
 
 ## internal/importer
 
+(Since the import improvements, the stage runs alongside the copy stage:
+`Run` starts `runThumbs` in follow mode, which polls the catalog every
+250 ms for rows of the session committed since the last one it sent, with
+half the workers while copying from a local disk and all of them from a
+FUSE (phone) source; when the copy stage is done it reads once more and
+the other workers join. It reads the library copies of committed rows
+only, so a source file is still read once and a file whose copy failed
+never gets renditions. The text below describes the original design.)
+
 A second stage after the copy stage: `Run` collects the ids of rows it
 imported or recorded (Imported + Existing), then runs the thumbnail stage
 over them with `min(runtime.NumCPU(), 16)` workers unless

@@ -7,6 +7,33 @@ import { formatCount } from './format';
 
 export type Tone = 'ok' | 'warn' | 'error' | 'muted';
 
+/** The one status of an import whose source went away (importer.DisconnectedMessage). */
+export const DISCONNECTED_MESSAGE =
+  'Source disconnected — reconnect and run the import again; already imported files are kept and will be skipped';
+
+/** Imported counts by kind. */
+export interface KindCounts {
+  importedPhotos: number;
+  importedRaw: number;
+  importedVideos: number;
+}
+
+const countOf = (n: number, one: string, many: string) => `${formatCount(n)} ${n === 1 ? one : many}`;
+
+/** "3 photos, 2 RAW, 1 video": the imported split by kind, zero counts left out ("" when all are zero). */
+export function kindSplit(s: KindCounts): string {
+  const parts: string[] = [];
+  if (s.importedPhotos) parts.push(countOf(s.importedPhotos, 'photo', 'photos'));
+  if (s.importedRaw) parts.push(`${formatCount(s.importedRaw)} RAW`);
+  if (s.importedVideos) parts.push(countOf(s.importedVideos, 'video', 'videos'));
+  return parts.join(', ');
+}
+
+/** Thumbnails processed by an import (or thumbs) job. */
+export function thumbsProcessed(s: { thumbsDone: number; thumbsUnsupported: number; thumbsFailed: number }): number {
+  return s.thumbsDone + s.thumbsUnsupported + s.thumbsFailed;
+}
+
 /** The CLI's exit code for a finished job, derived from state when absent. */
 export function exitCodeOf(j: Job): number {
   if (typeof j.exitCode === 'number') return j.exitCode;
@@ -46,6 +73,8 @@ export function outcome(j: Job): { tone: Tone; text: string } {
   if (isBackupKind(j.kind)) return backupOutcome(j, what, log);
   if (j.kind === 'transfer') return transferOutcome(j, what, log);
   const s = j.stats;
+  // One status for the run, not an error per file left behind.
+  if (j.kind === 'import' && s.sourceDisconnected) return { tone: 'warn', text: DISCONNECTED_MESSAGE };
   switch (exitCodeOf(j)) {
     case 0:
       return { tone: 'ok', text: `${what} finished.` };
@@ -132,4 +161,10 @@ export const resultLabels: Record<string, string> = {
   duplicate: 'Duplicate',
   skipped_small: 'Skipped (small)',
   error: 'Error',
+};
+
+export const kindLabels: Record<string, string> = {
+  image: 'Photo',
+  image_raw: 'RAW',
+  video: 'Video',
 };

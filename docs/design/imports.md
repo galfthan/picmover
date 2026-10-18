@@ -56,6 +56,29 @@ destination; `restored` is trashed content brought back by the import.
 Duplicates (content already in the catalog) are counted but have no item
 row: they belong to the earlier import that brought them.
 
+## user.db version 4
+
+Version 4 adds the imported count split by media kind:
+
+```sql
+ALTER TABLE imports ADD COLUMN imported_photos INTEGER;  -- image
+ALTER TABLE imports ADD COLUMN imported_raw    INTEGER;  -- image_raw
+ALTER TABLE imports ADD COLUMN imported_videos INTEGER;  -- video
+```
+
+They add up to `imported` and are written by `FinishImport` (from
+`importer.Stats.ImportedPhotos/Raw/Videos`). Records written before (and
+records closed as crashed or backfilled from the catalog) keep NULL:
+`ImportRecord.Kinds` is nil, the API sends `importedPhotos`,
+`importedRaw` and `importedVideos` as null and the UI and `picmover
+imports` show the total only ("-"). The migration v3 → v4 follows the
+others (backup copy, one transaction, `user_version` last);
+`OpenReadOnly` reads a version-3 file as it is, its split as NULL.
+
+Outcome `disconnected` (also new): the source went away during the run
+(`importer.ErrSourceDisconnected`); the files recorded before are
+complete and kept.
+
 ## Recording
 
 `userdata.DB` gets:

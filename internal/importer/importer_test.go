@@ -962,13 +962,21 @@ func TestThumbsCancellationLeavesPending(t *testing.T) {
 	o.ThumbWorkers = 1
 	o.ProgressInterval = time.Millisecond
 	o.OnProgress = func(s Stats) {
-		if s.ThumbsDone > 0 {
+		// Thumbnails are made while copying: cancel once every file is
+		// recorded and some thumbnails are done.
+		if s.Imported == 30 && s.ThumbsDone > 0 {
 			cancel()
 		}
 	}
-	st, err := New(e.lib, e.db, o).Run(ctx)
+	im := New(e.lib, e.db, o)
+	st, err := im.Run(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run err = %v (stats %+v)", err, st)
+	}
+	// Every file was recorded before the cancellation (a rebuild keeps
+	// its catalog).
+	if !im.RecordStageDone() {
+		t.Error("record stage not done")
 	}
 	if st.Imported != 30 || st.ThumbsFailed != 0 || st.ThumbsUnsupported != 0 {
 		t.Fatalf("stats = %+v", st)

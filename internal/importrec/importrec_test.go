@@ -52,6 +52,7 @@ func TestItemStatusAndOutcome(t *testing.T) {
 		&importer.ThumbStageError{Err: errors.New("x")}: userdata.ImportDone,
 		fmt.Errorf("run: %w", context.Canceled):         userdata.ImportCancelled,
 		errors.New("disk full"):                         userdata.ImportFailed,
+		fmt.Errorf("run: %w", importer.ErrSourceDisconnected): userdata.ImportDisconnected,
 	} {
 		if got := Outcome(err); got != want {
 			t.Errorf("Outcome(%v) = %s, want %s", err, got, want)
@@ -89,6 +90,19 @@ func TestRecorder(t *testing.T) {
 	if err != nil || rec.Source != "/media/phone/DCIM" || rec.SourceName != "DCIM" || rec.Mode != "move" ||
 		rec.Host != "testhost" || rec.Outcome != "cancelled" || rec.Imported != 26 || rec.Duplicates != 1 ||
 		rec.Skipped != 5 || rec.Errors != 4 || rec.Bytes != 999 || rec.CatalogSession != 7 {
+		t.Fatalf("record %+v %v", rec, err)
+	}
+	if k := rec.Kinds; k == nil || *k != (userdata.ImportKinds{}) {
+		t.Fatalf("kinds %+v", k)
+	}
+	// The imported split by kind is recorded, and the disconnect outcome.
+	r2 := Begin(ctx, u, nil, "/media/phone", userdata.ImportModeCopy, nil)
+	if err := r2.Finish(ctx, Outcome(importer.ErrSourceDisconnected), importer.Stats{Imported: 6, ImportedPhotos: 3,
+		ImportedRaw: 2, ImportedVideos: 1}, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := u.GetImport(ctx, r2.ID()); err != nil || rec.Outcome != userdata.ImportDisconnected || rec.Imported != 6 ||
+		rec.Kinds == nil || *rec.Kinds != (userdata.ImportKinds{Photos: 3, Raw: 2, Videos: 1}) {
 		t.Fatalf("record %+v %v", rec, err)
 	}
 	hs, _ := u.ImportHashes(ctx, r.ID())

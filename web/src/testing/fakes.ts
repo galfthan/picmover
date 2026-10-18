@@ -113,7 +113,7 @@ interface FakeTarget {
 }
 
 /** The importer counters every job object carries; zero for the backup kinds (their stats are in `result`). */
-export const ZERO_STATS = { scanned: 0, imported: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0, largeDone: 0 };
+export const ZERO_STATS = { scanned: 0, imported: 0, importedPhotos: 0, importedRaw: 0, importedVideos: 0, existing: 0, duplicates: 0, skippedSmall: 0, nonMedia: 0, errors: 0, bytesCopied: 0, rate: 0, thumbsDone: 0, thumbsUnsupported: 0, thumbsFailed: 0, largeDone: 0, sourceDisconnected: false };
 
 /** Run stats (`result`, and `stats` in runs) exactly as the step 5 server writes them, per kind. */
 export function runResult(kind: string, p: Record<string, unknown> = {}): Record<string, unknown> {

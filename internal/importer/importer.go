@@ -98,12 +98,18 @@ type Result struct {
 	// Restored marks an imported result whose content was in the trash
 	// and was restored instead of imported again.
 	Restored bool
+	// Kind is the media kind of the file (image, image_raw, video), from
+	// its catalog row or its name; "" when the name is not a media file.
+	Kind metadata.Kind
 }
 
 // Stats are the counters of an import run.
 type Stats struct {
 	Scanned, Imported, Existing, Duplicates, SkippedSmall, NonMedia, Errors int64
-	BytesCopied                                                             int64
+	// Imported split by media kind: photos (image), RAW (image_raw) and
+	// videos; they add up to Imported.
+	ImportedPhotos, ImportedRaw, ImportedVideos int64
+	BytesCopied                                 int64
 	// Rate is the transfer rate in bytes per second, BytesCopied's growth
 	// smoothed over about the last two seconds of progress ticks; 0 when
 	// nothing is moving, before the first tick, without OnProgress, and in
@@ -117,6 +123,10 @@ type Stats struct {
 	// there (renditions generated before the large size existed). Large
 	// thumbnails written together with fresh renditions are not counted.
 	LargeDone int64
+	// SourceDisconnected is set once the source root has gone away
+	// during the run (a phone or card unplugged): the run stops and Run
+	// returns ErrSourceDisconnected. See sourceGone.
+	SourceDisconnected bool
 }
 
 // Options configure an import.
@@ -209,6 +219,11 @@ type Importer struct {
 
 	recorded atomic.Bool // the copy (or record) stage finished; see RecordStageDone
 
+	// root is the source root of a copy or move run (nil for record in
+	// place); disconnected is set once it is found gone (sourceGone).
+	root         *srcRoot
+	disconnected atomic.Bool
+
 	readers chan struct{} // semaphore of the staging reads, cap SourceReaders
 
 	// usePull: files on a phone mount (gvfs mtp or gphoto2) are read by
@@ -226,8 +241,10 @@ type Importer struct {
 	pull       func(ctx context.Context, src, dst string, onProgress func(int64)) error // gvfs.Pull
 	isDevice   func(string) bool                                                        // gvfs.IsDevice
 	gioOK      func() bool                                                              // gvfs.Available
+	statRoot   func(string) (fs.FileInfo, error)                                        // os.Stat, for sourceGone
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
+	importedPhotos, importedRaw, importedVideos                                        atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed, largeDone                             atomic.Int64
 	rate                                                                               atomic.Int64 // last computed Stats.Rate
 }
@@ -276,6 +293,7 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		pull:       gvfs.Pull,
 		isDevice:   gvfs.IsDevice,
 		gioOK:      gvfs.Available,
+		statRoot:   os.Stat,
 	}
 }
 
@@ -291,12 +309,18 @@ func sourceReaders(n, workers int, src string) int {
 	}
 }
 
-// Run executes the import and then, unless Options.NoThumbs, the thumbnail
-// stage for the rows of this session (RunThumbs). The thumbnail stage only
-// runs when the copy stage finished without cancellation or a fatal error.
-// Run always returns the final stats, plus ctx.Err() when cancelled or a
-// fatal error (the source cannot be stat'ed, the catalog or the thumbnail
-// cache cannot be written). Per-file problems are results, not errors.
+// Run executes the import and, unless Options.NoThumbs, the thumbnail
+// stage for the rows of this session. The thumbnail stage runs alongside
+// the copy (runThumbs in follow mode): it generates renditions from the
+// library copies of the rows already committed, never from the source,
+// so every source file is still read once; when the copy stage is done
+// it finishes the rows left. After a cancellation or a fatal error of the
+// copy stage it stops too; after the source disconnected it finishes the
+// rows already recorded. Run always returns the final stats, plus
+// ctx.Err() when cancelled, ErrSourceDisconnected when the source went
+// away (see sourceGone), a *ThumbStageError when only the thumbnail
+// stage failed, or a fatal error (the source cannot be stat'ed, the
+// catalog cannot be written). Per-file problems are results, not errors.
 func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	if err := im.lib.CleanTemp(); err != nil {
 		return im.Stats(), fmt.Errorf("importer: clean temp dir: %w", err)
@@ -333,10 +357,12 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 		return im.Stats(), fmt.Errorf("importer: %w", err)
 	}
 	im.session.Store(im.sessionID)
+	fuse := isFUSE(src)
 	im.opts.SourceReaders = sourceReaders(im.opts.SourceReaders, im.opts.Workers, src)
 	im.readers = make(chan struct{}, im.opts.SourceReaders)
 	im.usePull.Store(!im.opts.RecordInPlace && im.gioOK())
 	im.pullFails.Store(0)
+	im.initSourceWatch(src, srcInfo)
 	// gio=true: the files below src are pulled through the gvfs daemon
 	// (src is on a phone mount, or is the gvfs directory itself, whose
 	// mounts it then walks).
@@ -349,6 +375,32 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	im.cancel = cancel
 
 	stopProgress := im.startProgress()
+	defer func() {
+		if stopProgress != nil {
+			stopProgress()
+		}
+	}()
+
+	// The thumbnail stage follows the copy: it reads the rows committed
+	// so far, while copyDone is open.
+	copyDone := make(chan struct{})
+	thumbCtx, cancelThumbs := context.WithCancel(ctx)
+	defer cancelThumbs()
+	var (
+		thumbErr  error
+		thumbWait = func() {}
+	)
+	if !im.opts.NoThumbs {
+		finished := make(chan struct{})
+		thumbWait = func() { <-finished }
+		during := im.thumbWorkersDuringCopy(fuse)
+		go func() {
+			defer close(finished)
+			thumbErr = im.runThumbs(thumbCtx, im.sessionID, false, copyDone, during)
+		}()
+	}
+
+	stopWatch := im.watchSource(runCtx)
 	fatal := im.pipeline(runCtx, func(jobs chan<- job) { im.scan(runCtx, src, srcInfo, jobs, false) })
 	if fatal == nil && runCtx.Err() == nil && im.opts.RecordInPlace {
 		// The trash after the library tree: a file in both keeps its live
@@ -360,7 +412,8 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 			im.report(Result{Status: StatusError, Source: trash, Message: "cannot read the trash", Err: err})
 		}
 	}
-	stopProgress()
+	stopWatch()
+	disconnected := im.disconnected.Load()
 
 	// Videos that only know their UTC instant borrow the offset of a
 	// photo taken near them: a pass over the session's rows, as photos
@@ -382,29 +435,45 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	}
 	im.log.Info("import finished", "source", src, "library", im.lib.Root(), "mode", mode,
 		"workers", im.opts.Workers, "scanned", stats.Scanned, "imported", stats.Imported,
+		"photos", stats.ImportedPhotos, "raw", stats.ImportedRaw, "videos", stats.ImportedVideos,
 		"existing", stats.Existing, "duplicates", stats.Duplicates, "skipped_small", stats.SkippedSmall,
-		"non_media", stats.NonMedia, "errors", stats.Errors, "bytes_copied", stats.BytesCopied)
+		"non_media", stats.NonMedia, "errors", stats.Errors, "bytes_copied", stats.BytesCopied,
+		"source_disconnected", disconnected)
+
+	// The record stage is done (RecordStageDone) before the thumbnails
+	// finish: a cancellation from now on leaves every file recorded (a
+	// rebuild keeps its catalog).
+	if fatal == nil && runCtx.Err() == nil {
+		im.recorded.Store(true)
+	}
+
+	// Every row of the session is committed: the thumbnail stage takes
+	// the rest. A fatal error stops it (a cancellation of ctx already
+	// has); a disconnected source does not, as it reads the library.
+	if fatal != nil {
+		cancelThumbs()
+	}
+	close(copyDone)
+	thumbWait()
+	stopProgress()
+	stopProgress = nil
+	stats = im.Stats()
 
 	if fatal != nil {
 		return stats, fatal
 	}
-	if runCtx.Err() == nil {
-		im.recorded.Store(true)
-	}
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
-	if im.opts.NoThumbs {
-		return stats, nil
+	if disconnected {
+		return stats, ErrSourceDisconnected
 	}
-	// The thumbnail stage reads the library copies, after every file of
-	// this session is recorded; a failure here leaves rows pending and
-	// never affects the imported files.
-	stats, err = im.RunThumbs(ctx, im.sessionID, false)
-	if err != nil && ctx.Err() == nil {
-		return stats, &ThumbStageError{Err: err}
+	// A failure of the thumbnail stage leaves rows pending and never
+	// affects the imported files.
+	if thumbErr != nil {
+		return stats, &ThumbStageError{Err: thumbErr}
 	}
-	return stats, err
+	return stats, nil
 }
 
 // pipeline runs workers and the writer over the jobs scan sends and
@@ -534,6 +603,12 @@ func (im *Importer) Stats() Stats {
 		Errors:       im.errs.Load(),
 		BytesCopied:  im.bytesCopied.Load(),
 		Rate:         im.rate.Load(),
+
+		ImportedPhotos: im.importedPhotos.Load(),
+		ImportedRaw:    im.importedRaw.Load(),
+		ImportedVideos: im.importedVideos.Load(),
+
+		SourceDisconnected: im.disconnected.Load(),
 
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),
@@ -1296,7 +1371,8 @@ func (im *Importer) commit(batch []*pending) error {
 			continue
 		}
 		im.release(p)
-		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath, Hash: p.hash}
+		r := Result{Status: p.status, Source: p.origin, Dest: p.media.RelPath, Hash: p.hash,
+			Kind: metadata.Kind(p.media.FileType)}
 		if p.trash {
 			r.Message = "in trash"
 		} else if p.moved {
@@ -1358,12 +1434,36 @@ func (im *Importer) undo(p *pending) {
 	}
 }
 
-// report counts, logs and forwards one result.
+// report counts, logs and forwards one result. An error result caused by
+// the source going away (sourceGone) is not counted nor forwarded: the
+// run stops with one "source disconnected" status instead.
 func (im *Importer) report(r Result) {
+	if r.Kind == "" {
+		name := r.Dest
+		if name == "" {
+			name = r.Source
+		}
+		if k, ok := metadata.Classify(name); ok {
+			r.Kind = k
+		}
+	}
+	if r.Status == StatusError && im.disconnectError(r) {
+		im.log.Debug("error after the source disconnected; not counted", "source", r.Source,
+			"message", r.Message, "err", r.Err)
+		return
+	}
 	attrs := []any{"source", r.Source, "dest", r.Dest, "message", r.Message}
 	switch r.Status {
 	case StatusImported:
 		im.imported.Add(1)
+		switch r.Kind {
+		case metadata.KindRaw:
+			im.importedRaw.Add(1)
+		case metadata.KindVideo:
+			im.importedVideos.Add(1)
+		default:
+			im.importedPhotos.Add(1)
+		}
 	case StatusExisting:
 		im.existing.Add(1)
 	case StatusDuplicate:

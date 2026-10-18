@@ -9,6 +9,7 @@ import (
 
 	"picmover/internal/catalog"
 	"picmover/internal/library"
+	"picmover/internal/metadata"
 )
 
 // ErrRecordRestore is returned (wrapped) by RestoreFromTrash when the file
@@ -111,7 +112,8 @@ func (im *Importer) restoreTrashed(ctx context.Context, hash uint64, srcPath, or
 			im.log.Error("record restore in user.db", "hash", fmt.Sprintf("%016x", hash), "err", err)
 		}
 	}
-	r := &Result{Status: StatusImported, Source: origin, Dest: rel, Message: "restored from trash", Hash: hash, Restored: true}
+	r := &Result{Status: StatusImported, Source: origin, Dest: rel, Message: "restored from trash", Hash: hash, Restored: true,
+		Kind: metadata.Kind(m.FileType)}
 	if !im.opts.Move || fromZip {
 		return r
 	}
