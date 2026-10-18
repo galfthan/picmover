@@ -901,6 +901,7 @@ func (m *jobManager) execute(j *job) (state string, code int, stats importer.Sta
 		opts.Move = j.params.Move
 		opts.MinDimension = j.params.MinDimension
 		opts.Extractor = metadata.Default{DefaultZone: j.zone}
+		opts.HomeZone = catalog.ZoneName(j.zone)
 		opts.NoThumbs = j.params.NoThumbs
 		opts.OnResult = func(r importer.Result) {
 			rec.OnResult(r)
@@ -1082,6 +1083,16 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 			m.log.Warn("import history backfill from the old catalog", "id", j.id, "library", j.entry.id, "err", err)
 		}
 	}
+	// The new catalog keeps the old one's home zone (read-only, best
+	// effort); without one, the system zone becomes it.
+	homeZone := catalog.ZoneName(time.Local)
+	if _, err := os.Stat(dbPath); err == nil {
+		if hz, err := catalog.HomeZoneFile(ctx, dbPath); err != nil {
+			logger.Warn("read the old catalog's home zone", "err", err)
+		} else if hz != "" {
+			homeZone = hz
+		}
+	}
 	backup := ""
 	switch fi, err := os.Stat(dbPath); {
 	case err == nil && !fi.Mode().IsRegular():
@@ -1136,6 +1147,7 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 		TrashTimes:    times,
 		NoThumbs:      j.params.NoThumbs,
 		Extractor:     metadata.Default{DefaultZone: time.Local},
+		HomeZone:      homeZone,
 		Logger:        logger,
 		FFmpeg:        m.ffmpeg,
 		OnResult: func(r importer.Result) {

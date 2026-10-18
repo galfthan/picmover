@@ -10,6 +10,7 @@
   import CopyButton from '../components/CopyButton.svelte';
   import { joinPath } from '../lib/paths';
   import { backups } from '../lib/backups.svelte';
+  import { browserZone, zoneList } from '../lib/zones';
   import { untrack } from 'svelte';
 
   interface Props {
@@ -27,6 +28,32 @@
 
   let actionError = $state('');
   let starting = $state(false);
+
+  // ---- Home time zone ----
+  const homeZone = $derived(info?.homeZone?.name ?? null);
+  let zoneChoice = $state('');
+  let zoneSaving = $state(false);
+  let zoneError = $state('');
+  const zones = $derived(zoneList(browserZone(), homeZone));
+  $effect(() => {
+    // Follow the stored zone (or suggest the browser's) until the user picks one.
+    zoneChoice = homeZone ?? browserZone();
+  });
+
+  async function saveZone() {
+    const api = library.api;
+    if (!api || !zoneChoice) return;
+    zoneError = '';
+    zoneSaving = true;
+    try {
+      await api.setHomeZone(zoneChoice);
+      await library.load();
+    } catch (e) {
+      zoneError = errorMessage(e);
+    } finally {
+      zoneSaving = false;
+    }
+  }
 
   async function thumbs(rebuild: boolean) {
     actionError = '';
@@ -151,6 +178,27 @@
             ><span class="v">{sim && sim.pairs !== null ? formatCount(sim.pairs) : '–'}</span><span class="k">Similar pairs</span></a
           >
         </div>
+      </section>
+
+      <section class="card">
+        <h2>Home time zone</h2>
+        <p class="muted small">
+          The timeline puts every photo and video on the clock of the home zone, with the summer or winter time of its date, so a trip's
+          photos and videos stay in the order they were taken. The viewer also shows the local time where an item was taken when it
+          differs. Changing the zone recomputes the timeline; files are not moved.
+        </p>
+        <div class="row zone">
+          <select bind:value={zoneChoice} aria-label="Home time zone" disabled={zoneSaving}>
+            {#each zones as z (z)}<option value={z}>{z}</option>{/each}
+          </select>
+          <button class="primary" disabled={zoneSaving || !zoneChoice || zoneChoice === homeZone} onclick={saveZone}>
+            {zoneSaving ? 'Saving…' : homeZone ? 'Change' : 'Set'}
+          </button>
+          {#if !homeZone}
+            <span class="muted small">Not set: times are shown as recorded where they were taken. The next import sets it.</span>
+          {/if}
+        </div>
+        {#if zoneError}<div class="error-box">{zoneError}</div>{/if}
       </section>
 
       <section class="card">
@@ -314,6 +362,10 @@
   }
   .actions {
     margin-top: 14px;
+  }
+  .zone {
+    flex-wrap: wrap;
+    gap: 8px 12px;
   }
   .large {
     margin: 12px 0 0;

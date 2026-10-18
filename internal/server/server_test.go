@@ -424,7 +424,7 @@ func TestMediaDetail(t *testing.T) {
 		t.Fatalf("importedAt %q: %v", *d.ImportedAt, err)
 	}
 	// A zero import time (not stored by the catalog) is null, not "".
-	if b, _ := json.Marshal(newDetail(&catalog.Media{})); !strings.Contains(string(b), `"importedAt":null`) {
+	if b, _ := json.Marshal(newDetail(&catalog.Media{}, nil)); !strings.Contains(string(b), `"importedAt":null`) {
 		t.Errorf("zero importedAt: %s", b)
 	}
 

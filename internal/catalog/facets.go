@@ -78,7 +78,7 @@ func (d *DB) Facets(ctx context.Context, f Filter, maxCameras int) (Facets, erro
 	}
 
 	rows, err = d.QueryContext(ctx, `SELECT CASE WHEN `+datedRange+
-		` THEN CAST(strftime('%Y', taken_at, 'unixepoch') AS INTEGER) END AS y, COUNT(*)`+from+where+
+		` THEN CAST(strftime('%Y', taken_at_home, 'unixepoch') AS INTEGER) END AS y, COUNT(*)`+from+where+
 		` GROUP BY y ORDER BY y IS NULL, y DESC`, args...)
 	if err != nil {
 		return out, fmt.Errorf("catalog: facets: %w", err)

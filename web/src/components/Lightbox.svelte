@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick, untrack } from 'svelte';
   import { errorMessage, isAbort, type LibApi, type MediaDetail, type MediaItem } from '../lib/api';
-  import { formatAgo, formatBytes, formatCoord, formatDuration, formatInstant, formatTakenAt, formatWallDate, parseLocalWallClock } from '../lib/format';
+  import { formatAgo, formatBytes, formatCapture, formatCoord, formatDuration, formatInstant, formatTakenAt, formatWallDate, parseLocalWallClock } from '../lib/format';
   import { closeViewer, sequenceProvider, showInViewer, viewerHref, type Neighbours } from '../lib/viewer';
   import { libHref } from '../lib/routes';
   import { importLine } from '../lib/imports';
@@ -46,6 +46,8 @@
 
   const item = $derived<MediaItem | null>(detail && detail.id === id ? detail : hint && hint.id === id ? hint : null);
   const d = $derived(detail && detail.id === id ? detail : null);
+  /** The home time, and the local time when it differs (docs/design/home-time.md). */
+  const capture = $derived(d ? formatCapture(d) : null);
   const isVideo = $derived(item?.type === 'video');
   const canFull = $derived(!!d && d.displayable && !isVideo);
   const playable = $derived(!!d && d.displayable && isVideo);
@@ -399,7 +401,13 @@
   <div class="main">
     <div class="bar">
       <button class="ghost" onclick={close} aria-label="Close (Esc)" title="Close (Esc)">✕</button>
-      <span class="title">{item ? formatTakenAt(item.takenAt, d?.offset ?? null) : ''}</span>
+      <span class="title">
+        {#if capture}
+          {capture.home}{#if capture.local}<span class="local" title={capture.note ?? undefined}> · {capture.local}</span>{/if}
+        {:else if item}
+          {formatTakenAt(item.takenAt, null)}
+        {/if}
+      </span>
       <span class="spacer"></span>
       {#if canFull}
         <button class="ghost" class:on={full} onclick={toggleFull} title="Original size (F, or double-click)">1:1</button>
@@ -547,8 +555,11 @@
 
           <dt>Date</dt>
           <dd>
-            {formatTakenAt(d.takenAt, d.offset)}
-            {#if d.takenAtSource}<span class="src">{d.takenAtSource}</span>{/if}
+            {#if capture}
+              {capture.home}
+              {#if capture.local}<span class="src local-time" title={capture.note ?? undefined}>{capture.local}</span>{/if}
+            {/if}
+            {#if d.takenAtSource}<span class="src">{d.takenAtSource}{#if capture?.note} · {capture.note.toLowerCase()}{/if}</span>{/if}
           </dd>
 
           {#if camera}
@@ -792,6 +803,12 @@
     display: block;
     color: var(--faint);
     font-size: 12px;
+  }
+  .src.local-time {
+    color: var(--muted);
+  }
+  .title .local {
+    color: var(--muted);
   }
   .imports {
     margin: 0;

@@ -10,15 +10,22 @@ import (
 
 // Media is one catalog row.
 type Media struct {
-	ID                                        int64
-	Hash                                      uint64
-	Size                                      int64 // bytes; required (> 0)
-	RelPath                                   string
-	FileType                                  string
-	Ext                                       string
-	TakenAt                                   time.Time // zero = unknown; wall-clock, see package doc
-	OffsetKnown                               bool
-	TakenAtSource                             string
+	ID            int64
+	Hash          uint64
+	Size          int64 // bytes; required (> 0)
+	RelPath       string
+	FileType      string
+	Ext           string
+	TakenAt       time.Time // zero = unknown; wall-clock, see package doc
+	OffsetKnown   bool
+	TakenAtSource string
+	// OffsetSource is where the offset came from (OffsetSource*; "" when
+	// unknown). Writes take "" as DefaultOffsetSource.
+	OffsetSource string
+	// TakenAtHome is TakenAt on the clock of the library's home zone
+	// (UTC placeholder zone; zero = unknown). Computed by every write
+	// from TakenAt, OffsetKnown and the home zone; ignored as input.
+	TakenAtHome                               time.Time
 	Width, Height                             int // 0 = unknown
 	Orientation                               int // 0 = unknown
 	DurationMS                                int64
@@ -65,7 +72,8 @@ type ListOptions struct {
 	Offset         int
 	IncludeDeleted bool
 	// OrderBy is "" (= "taken_at DESC, id DESC") or one of "taken_at",
-	// "taken_at DESC", "id", "id DESC", "rel_path".
+	// "taken_at DESC", "id", "id DESC", "rel_path". "taken_at" orders by
+	// the home time (taken_at_home), as the timeline does.
 	OrderBy string
 }
 
@@ -79,9 +87,9 @@ type SessionStats struct {
 func orderBy(s string) (string, error) {
 	switch s {
 	case "", "taken_at DESC":
-		return "taken_at DESC, id DESC", nil
+		return "taken_at_home DESC, id DESC", nil
 	case "taken_at":
-		return "taken_at ASC, id ASC", nil
+		return "taken_at_home ASC, id ASC", nil
 	case "id":
 		return "id ASC", nil
 	case "id DESC":
@@ -96,10 +104,52 @@ const mediaColumns = `id, hash, size, rel_path, file_type, ext, taken_at, taken_
 	taken_at_source, width, height, orientation, duration_ms, lat, lon, altitude,
 	camera_make, camera_model, camera_type, lens, original_path, original_mtime,
 	imported_at, import_session_id, rating, deleted_at,
-	phash, thumb_state, thumb_error, thumb_at`
+	phash, thumb_state, thumb_error, thumb_at, taken_at_home, taken_at_offset_source`
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// writer is a transaction or the database: what a row write needs to
+// read the home zone and write.
+type writer interface {
+	execer
+	queryRower
+}
+
+// timeColumns returns the time column values of m for a write: taken_at,
+// taken_at_offset, taken_at_offset_source and taken_at_home (with the
+// home zone read through w).
+func timeColumns(ctx context.Context, w writer, m *Media) (wall, off, src, home any, err error) {
+	wall, off = encodeTakenAt(m.TakenAt, m.OffsetKnown)
+	if wall == nil {
+		return nil, nil, nil, nil, nil
+	}
+	if off != nil {
+		s := m.OffsetSource
+		if s == "" {
+			s = DefaultOffsetSource(m.TakenAtSource, true)
+		}
+		if !validOffsetSource(s) {
+			return nil, nil, nil, nil, fmt.Errorf("catalog: unknown offset source %q", s)
+		}
+		src = s
+	}
+	_, loc, err := homeZone(ctx, w)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if src == OffsetSourceHome && loc != nil {
+		// An instant whose local offset is unknown is shown in the home
+		// zone, whatever zone it came in (an import's or another
+		// library's).
+		t := m.TakenAt.In(loc)
+		_, o := t.Zone()
+		w := wallSeconds(t)
+		return w, int64(o), src, w, nil
+	}
+	home = wallSeconds(HomeWall(m.TakenAt, m.OffsetKnown, loc))
+	return wall, off, src, home, nil
 }
 
 // encodeTakenAt converts a wall-clock time to the (taken_at, taken_at_offset)
@@ -173,11 +223,14 @@ func (d *DB) InsertMedia(ctx context.Context, tx *sql.Tx, m *Media) (inserted bo
 	if m.Size <= 0 {
 		return false, fmt.Errorf("catalog: insert %s: size %d, must be > 0", m.RelPath, m.Size)
 	}
-	var ex execer = d.DB
+	var ex writer = d.DB
 	if tx != nil {
 		ex = tx
 	}
-	wall, off := encodeTakenAt(m.TakenAt, m.OffsetKnown)
+	wall, off, offSrc, home, err := timeColumns(ctx, ex, m)
+	if err != nil {
+		return false, fmt.Errorf("catalog: insert %s: %w", m.RelPath, err)
+	}
 	var lat, lon, alt any
 	if m.HasGPS {
 		lat, lon = m.Lat, m.Lon
@@ -194,15 +247,15 @@ func (d *DB) InsertMedia(ctx context.Context, tx *sql.Tx, m *Media) (inserted bo
 		width, height, orientation, duration_ms, lat, lon, altitude,
 		camera_make, camera_model, camera_type, lens, original_path, original_mtime,
 		imported_at, import_session_id, rating, deleted_at,
-		phash, thumb_state, thumb_error, thumb_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		phash, thumb_state, thumb_error, thumb_at, taken_at_home, taken_at_offset_source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(hash) DO NOTHING`,
 		int64(m.Hash), m.Size, m.RelPath, m.FileType, m.Ext, wall, off, takenAtSource(m.TakenAtSource),
 		nonZeroInt(int64(m.Width)), nonZeroInt(int64(m.Height)), nonZeroInt(int64(m.Orientation)), nonZeroInt(m.DurationMS),
 		lat, lon, alt,
 		m.CameraMake, m.CameraModel, m.CameraType, m.Lens, m.OriginalPath, unixOrNil(m.OriginalMTime),
 		importedAt.Unix(), nonZeroInt(m.ImportSessionID), m.Rating, unixOrNil(m.DeletedAt),
-		nonZeroInt(int64(m.PHash)), thumbState(m.ThumbState), m.ThumbError, unixOrNil(m.ThumbAt))
+		nonZeroInt(int64(m.PHash)), thumbState(m.ThumbState), m.ThumbError, unixOrNil(m.ThumbAt), home, offSrc)
 	if err != nil {
 		return false, fmt.Errorf("catalog: insert %s: %w", m.RelPath, err)
 	}
@@ -255,21 +308,24 @@ func scanMedia(r rowScanner) (Media, error) {
 		m                                       Media
 		hash, size                              int64
 		wall, off, w, h, orient, dur            sql.NullInt64
-		phash, thumbAt                          sql.NullInt64
+		phash, thumbAt, home                    sql.NullInt64
 		lat, lon, alt                           sql.NullFloat64
 		mtime, importedAt, sessionID, deletedAt sql.NullInt64
+		offSrc                                  sql.NullString
 	)
 	err := r.Scan(&m.ID, &hash, &size, &m.RelPath, &m.FileType, &m.Ext, &wall, &off,
 		&m.TakenAtSource, &w, &h, &orient, &dur, &lat, &lon, &alt,
 		&m.CameraMake, &m.CameraModel, &m.CameraType, &m.Lens, &m.OriginalPath, &mtime,
 		&importedAt, &sessionID, &m.Rating, &deletedAt,
-		&phash, &m.ThumbState, &m.ThumbError, &thumbAt)
+		&phash, &m.ThumbState, &m.ThumbError, &thumbAt, &home, &offSrc)
 	if err != nil {
 		return Media{}, err
 	}
 	m.Hash = uint64(hash)
 	m.Size = size
 	m.TakenAt, m.OffsetKnown = decodeTakenAt(wall, off)
+	m.TakenAtHome, _ = decodeTakenAt(home, sql.NullInt64{})
+	m.OffsetSource = offSrc.String
 	m.Width, m.Height, m.Orientation = int(w.Int64), int(h.Int64), int(orient.Int64)
 	m.DurationMS = dur.Int64
 	if lat.Valid && lon.Valid {
@@ -517,16 +573,20 @@ func (d *DB) ThumbStats(ctx context.Context) (pending, ok, unsupported, failed i
 }
 
 // UpdateMetadata rewrites the metadata columns of row id from m: taken_at,
-// taken_at_offset, taken_at_source, width, height, orientation, duration_ms,
-// lat, lon, altitude, camera_make, camera_model, camera_type, lens.
+// taken_at_offset, taken_at_source, taken_at_offset_source, taken_at_home,
+// width, height, orientation, duration_ms, lat, lon, altitude,
+// camera_make, camera_model, camera_type, lens.
 // tx may be nil to run outside a transaction. Returns sql.ErrNoRows when no
 // row has this id.
 func (d *DB) UpdateMetadata(ctx context.Context, tx *sql.Tx, id int64, m *Media) error {
-	var ex execer = d.DB
+	var ex writer = d.DB
 	if tx != nil {
 		ex = tx
 	}
-	wall, off := encodeTakenAt(m.TakenAt, m.OffsetKnown)
+	wall, off, offSrc, home, err := timeColumns(ctx, ex, m)
+	if err != nil {
+		return fmt.Errorf("catalog: update metadata %d: %w", id, err)
+	}
 	var lat, lon, alt any
 	if m.HasGPS {
 		lat, lon = m.Lat, m.Lon
@@ -535,11 +595,12 @@ func (d *DB) UpdateMetadata(ctx context.Context, tx *sql.Tx, id int64, m *Media)
 		alt = m.Altitude
 	}
 	res, err := ex.ExecContext(ctx, `UPDATE media SET
-		taken_at = ?, taken_at_offset = ?, taken_at_source = ?, width = ?, height = ?,
+		taken_at = ?, taken_at_offset = ?, taken_at_source = ?, taken_at_offset_source = ?, taken_at_home = ?,
+		width = ?, height = ?,
 		orientation = ?, duration_ms = ?, lat = ?, lon = ?, altitude = ?,
 		camera_make = ?, camera_model = ?, camera_type = ?, lens = ?
 		WHERE id = ?`,
-		wall, off, takenAtSource(m.TakenAtSource), nonZeroInt(int64(m.Width)), nonZeroInt(int64(m.Height)),
+		wall, off, takenAtSource(m.TakenAtSource), offSrc, home, nonZeroInt(int64(m.Width)), nonZeroInt(int64(m.Height)),
 		nonZeroInt(int64(m.Orientation)), nonZeroInt(m.DurationMS), lat, lon, alt,
 		m.CameraMake, m.CameraModel, m.CameraType, m.Lens, id)
 	if err != nil {
@@ -592,8 +653,8 @@ func (d *DB) Summary(ctx context.Context) (Summary, error) {
 		COALESCE(SUM(deleted_at IS NULL AND lat IS NOT NULL), 0),
 		COALESCE(SUM(deleted_at IS NOT NULL), 0),
 		COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN size END), 0),
-		MIN(CASE WHEN deleted_at IS NULL THEN taken_at END),
-		MAX(CASE WHEN deleted_at IS NULL THEN taken_at END),
+		MIN(CASE WHEN deleted_at IS NULL THEN `+d.timeCol()+` END),
+		MAX(CASE WHEN deleted_at IS NULL THEN `+d.timeCol()+` END),
 		COUNT(DISTINCT CASE WHEN deleted_at IS NULL AND camera_model <> '' THEN camera_model END)
 		FROM media`).Scan(&s.Total, &s.Images, &s.Raw, &s.Videos, &s.WithGPS, &s.Deleted,
 		&s.TotalBytes, &earliest, &latest, &s.UniqueModels)
@@ -642,7 +703,7 @@ type Session struct {
 	// Hashes are the hashes of the rows recorded by the session (trashed
 	// rows included), in row id order.
 	Hashes []uint64
-	// Newest is the newest live row among them (taken_at DESC, id DESC,
+	// Newest is the newest live row among them (taken_at_home DESC, id DESC,
 	// undated last, as NewestOf); 0 when none is live.
 	Newest uint64
 }
@@ -703,7 +764,7 @@ func (r *sessionRows) add(h int64, taken sql.NullInt64, live bool) {
 // readSessionRows returns the rows of the sessions (all of them when
 // session is 0), by session id. The query uses only the columns every
 // catalog version with sessions has (hash, import_session_id) and
-// tolerates missing taken_at and deleted_at.
+// tolerates missing taken_at_home, taken_at and deleted_at.
 func readSessionRows(ctx context.Context, q *sql.DB, session int64) (map[int64]*sessionRows, error) {
 	cols, err := tableColumns(ctx, q, "media")
 	if err != nil {
@@ -717,7 +778,7 @@ func readSessionRows(ctx context.Context, q *sql.DB, session int64) (map[int64]*
 	if session != 0 {
 		where, args = "import_session_id = ?", []any{session}
 	}
-	rows, err := q.QueryContext(ctx, `SELECT import_session_id, hash, `+colOr(cols, "taken_at", "NULL")+`, `+
+	rows, err := q.QueryContext(ctx, `SELECT import_session_id, hash, `+colOr(cols, "taken_at_home", colOr(cols, "taken_at", "NULL"))+`, `+
 		colOr(cols, "deleted_at", "NULL")+` IS NULL FROM media WHERE `+where+` ORDER BY `+colOr(cols, "id", "rowid"), args...)
 	if err != nil {
 		return nil, err
