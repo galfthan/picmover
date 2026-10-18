@@ -1,0 +1,48 @@
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  padding: 0 0 48px;
+  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #f4f4f2;
+  color: #1b1b1b;
+}
+header, .panel, .items, .banner { margin: 12px 12px; }
+h1 { font-size: 20px; margin: 12px 0 0; }
+h2 { font-size: 17px; margin: 0 0 8px; }
+.muted { color: #666; font-size: 14px; }
+.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.panel { background: #fff; border-radius: 10px; padding: 12px; }
+.banner { border-radius: 10px; padding: 14px; font-size: 18px; font-weight: 600; background: #fff3c4; }
+.items { list-style: none; padding: 0; }
+.item { display: flex; align-items: flex-start; gap: 10px; background: #fff; border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+.badge {
+  flex: 0 0 76px; text-align: center; font-weight: 800; font-size: 20px;
+  padding: 10px 0; border-radius: 8px; color: #fff; background: #888;
+}
+.PASS { background: #1d8a3a; }
+.FAIL { background: #c62828; }
+.INFO { background: #2f6db5; }
+.WAIT { background: #9a9a9a; }
+.SKIP { background: #6d6d6d; }
+.item .t { font-weight: 600; }
+.item .d { font-size: 13px; color: #444; white-space: pre-wrap; word-break: break-word; }
+button, .button {
+  display: inline-block; font: inherit; font-weight: 600; padding: 10px 14px; margin: 4px 4px 4px 0;
+  border-radius: 8px; border: 0; background: #1b5fae; color: #fff; text-decoration: none; min-height: 44px;
+}
+button.secondary { background: #e2e2e2; color: #1b1b1b; }
+button.chosen { outline: 3px solid #f5a623; }
+input { font: inherit; padding: 8px; width: 12em; text-transform: uppercase; }
+.q { border-top: 1px solid #eee; padding-top: 6px; margin-top: 6px; }
+.clip { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+.clip video { width: 160px; height: 120px; background: #000; flex: 0 0 160px; }
+.clip .badge { flex-basis: 64px; font-size: 16px; }
+.clip .d { font-size: 12px; color: #444; word-break: break-word; }
+.swipe {
+  /* full screen width, so swipes can start at the very edge */
+  margin: 8px -24px; height: 160px; background: #cfcfcf; touch-action: none;
+  display: flex; align-items: center; justify-content: center; color: #555; user-select: none; -webkit-user-select: none;
+}
+.steps li { margin-bottom: 6px; }
+#svelte-root .ok { color: #1d8a3a; font-weight: 700; }

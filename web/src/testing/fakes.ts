@@ -54,6 +54,32 @@ const TINY_WEBP = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x04, 0x00, 0x00, 0x00
 
 export const hashOf = (id: number) => id.toString(16).padStart(16, '0');
 
+/**
+ * A large library's timeline, newest first: about 200,000 photos over 15
+ * years (2011–2025) with uneven months, as a family library has them (more
+ * every year, summers and Christmases big, a few empty months, a few big
+ * trips), and an undated bucket. Deterministic.
+ */
+export function bigTimeline(): { year: number; month: number; count: number }[] {
+  let seed = 42;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+  const out: { year: number; month: number; count: number }[] = [];
+  for (let y = 2025; y >= 2011; y--) {
+    const base = 600 + (y - 2011) * 70;
+    for (let m = 12; m >= 1; m--) {
+      let n = base * (0.3 + rnd());
+      if (m === 6 || m === 7) n *= 2.6;
+      if (m === 12) n *= 1.8;
+      if (rnd() < 0.08) n = 0;
+      if (rnd() < 0.04) n *= 4;
+      n = Math.round(n);
+      if (n > 0) out.push({ year: y, month: m, count: n });
+    }
+  }
+  out.push({ year: 0, month: 0, count: 312 });
+  return out;
+}
+
 export interface Item extends MediaItem {
   deletedAt?: string | null;
   tagIds: number[];
@@ -163,6 +189,34 @@ export interface FakeImport {
    */
   items?: number | null;
   cover?: string | null;
+}
+
+/** A share as the fake admin API keeps it (docs/design/lan-share.md "Shares"). */
+export interface FakeShare {
+  id: string;
+  name: string;
+  kind: 'libraries' | 'album';
+  /** The shared libraries; an album share's one library. */
+  libraries: string[];
+  album: number;
+  /** The album's name when the share was made (shown once the album is gone). */
+  albumName: string;
+  /** The album was deleted or its id reused (the share is broken). */
+  albumMissing: boolean;
+  /** Members in user.db, trashed ones included (the admin count); the album's hashes when left out. */
+  albumCount?: number;
+  /** A scope kind this picmover does not know (another version wrote it): state unavailable, scope {}. */
+  unknownKind?: string;
+  /** Another workspace's share: state unavailable. */
+  elsewhere?: boolean;
+  /** Why the share's pairings were cancelled. */
+  notice?: string;
+  capabilities: { video: boolean; download: boolean; rate: boolean; location: boolean };
+  expiresAt: string | null;
+  paused: boolean;
+  approve: boolean;
+  createdAt: string;
+  devices: { id: string; name: string; pairedAt: string; lastSeen: string; lastAddress: string; browser: string }[];
 }
 
 interface FakeClass {
@@ -1027,6 +1081,301 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     return json({ error: 'not found' }, 404);
   }
 
+  /**
+   * Sharing on the home Wi-Fi, admin side (docs/design/lan-share.md
+   * "Admin API"): the global switch and the shares with their devices, as
+   * the server would keep them. `supported: false` answers 404 (an older
+   * server). Tests pair phones with `pairPhone`, add approval requests to
+   * `requests`, and change shares in place.
+   */
+  const sharing = {
+    supported: true,
+    state: 'off' as 'off' | 'on' | 'paused' | 'error',
+    reason: '',
+    port: 7443,
+    address: '192.168.1.20',
+    addresses: [
+      { ip: '192.168.1.20', iface: 'wlp3s0', subnet: '192.168.1.0/24', wireless: true },
+      { ip: '10.0.0.5', iface: 'enp0s31f6', subnet: '10.0.0.0/24', wireless: false },
+    ] as { ip: string; iface: string; subnet: string; virtual?: boolean; wireless?: boolean }[],
+    fingerprint: { leaf: 'AB:CD:EF:01:23:45:67:89', ca: '12:34:56:78:9A:BC:DE:F0' },
+    keepOn: false,
+    mdns: false,
+    autoOff: { mode: 'quit', until: null as string | null },
+    managedElsewhere: null as { pid: number; cmd: string } | null,
+    /** One plain-text string, lines separated by \n (as the server sends it on Linux). */
+    firewallHint:
+      'If the phone cannot connect, allow the port in the firewall (and undo it when done):\n' +
+      'ufw:       sudo ufw allow from 192.168.1.0/24 to any port 7443 proto tcp\n' +
+      'firewalld: sudo firewall-cmd --zone=home --add-port=7443/tcp --permanent && sudo firewall-cmd --reload',
+    /** POST {enabled: true} fails with this reason (state error, still 200), e.g. a busy port. */
+    startError: '',
+    /** Libraries held by another process (busy: true on the share's library). */
+    busy: new Set<string>(),
+    shares: [] as FakeShare[],
+    /** Approval requests per share id. */
+    requests: new Map<string, { id: string; name: string; browser: string; address: string; at: string }[]>(),
+    /** Open pairings per share id (the token's tail), as issued. */
+    pairings: new Map<string, { token: string; expiresAt: string }>(),
+    nextId: 1,
+  };
+
+  const sharingNow = () => new Date().toISOString();
+  function shareStateOf(s: FakeShare): string {
+    if (s.unknownKind || s.elsewhere) return 'unavailable';
+    if (s.paused) return 'paused';
+    if (s.expiresAt && Date.parse(s.expiresAt) <= Date.now()) return 'expired';
+    if (s.kind === 'album' && (s.albumMissing || !albums.some((a) => a.id === s.album))) return 'gone';
+    if (s.kind === 'album' && !libs.some((l) => l.id === s.libraries[0])) return 'gone';
+    return 'active';
+  }
+  function shareJSON(s: FakeShare) {
+    // The server names libraries by their folder id; busy and missing are absent when false.
+    const libRef = (id: string) => {
+      const l = libs.find((x) => x.id === id);
+      return l ? { id, name: id, ...(sharing.busy.has(id) ? { busy: true } : {}) } : { id, name: id, missing: true };
+    };
+    const a = albums.find((x) => x.id === s.album);
+    const scope =
+      s.kind === 'album'
+        ? {
+            library: libRef(s.libraries[0] ?? ''),
+            album: a && !s.albumMissing ? { id: a.id, name: a.name, count: s.albumCount ?? a.hashes.length } : { id: s.album, name: '', count: 0, missing: true },
+          }
+        : { libraries: s.libraries.map(libRef) };
+    const open = sharing.pairings.get(s.id);
+    return {
+      id: s.id,
+      name: s.name,
+      kind: s.unknownKind ?? s.kind,
+      scope: s.unknownKind ? {} : scope,
+      capabilities: { ...s.capabilities },
+      expiresAt: s.expiresAt,
+      state: shareStateOf(s),
+      approve: s.approve,
+      createdAt: s.createdAt,
+      devices: s.devices.map((d) => ({ ...d })),
+      pairing: open ? { expiresAt: open.expiresAt } : null,
+      ...(s.notice ? { notice: s.notice } : {}),
+      requests: (sharing.requests.get(s.id) ?? []).length,
+    };
+  }
+  /** GET /api/share/status: the pill's counts over the shares phones can use now. */
+  function sharingSummaryJSON() {
+    const active = sharing.shares.filter((s) => {
+      const st = shareStateOf(s);
+      return st === 'active' || st === 'gone';
+    });
+    return {
+      state: sharing.state,
+      ...(sharing.reason ? { reason: sharing.reason } : {}),
+      ...(sharing.state === 'on' ? { url: `https://${sharing.address}:${sharing.port}/` } : {}),
+      shares: active.length,
+      phones: active.reduce((n, s) => n + s.devices.length, 0),
+      autoOff: sharing.autoOff.until ? sharing.autoOff : { mode: sharing.autoOff.mode },
+      ...(sharing.managedElsewhere ? { managedElsewhere: sharing.managedElsewhere } : {}),
+    };
+  }
+  function sharingJSON() {
+    const on = sharing.state === 'on';
+    return {
+      state: sharing.state,
+      ...(sharing.reason ? { reason: sharing.reason } : {}),
+      ...(on ? { url: `https://${sharing.address}:${sharing.port}/` } : {}),
+      ...(on && sharing.mdns ? { mdnsUrl: `https://laptop.local:${sharing.port}/` } : {}),
+      port: sharing.port,
+      address: sharing.address,
+      addresses: sharing.addresses,
+      fingerprint: sharing.fingerprint,
+      keepOn: sharing.keepOn,
+      mdns: sharing.mdns,
+      autoOff: sharing.autoOff.until ? sharing.autoOff : { mode: sharing.autoOff.mode },
+      ...(sharing.managedElsewhere ? { managedElsewhere: sharing.managedElsewhere } : {}),
+      firewallHint: sharing.firewallHint,
+      shares: sharing.shares.map(shareJSON),
+    };
+  }
+  const CAPS = ['video', 'download', 'rate', 'location'] as const;
+  /** The kind's defaults without `v`; with it, `v` taken whole (a missing capability is off), as the server does. */
+  function capsFrom(v: unknown, kind: string): FakeShare['capabilities'] {
+    const all = kind !== 'album';
+    if (!v || typeof v !== 'object') return { video: true, download: all, rate: all, location: all };
+    const c = { video: false, download: false, rate: false, location: false };
+    for (const k of CAPS) c[k] = (v as Record<string, unknown>)[k] === true;
+    return c;
+  }
+  /** Simulates a phone redeeming a pairing of share `sid` (the server side of POST /api/pair on the share listener). */
+  function pairPhone(sid: string, name = "Anna's iPhone", browser = 'Safari on iPhone') {
+    const s = sharing.shares.find((x) => x.id === sid);
+    if (!s) throw new Error(`no fake share ${sid}`);
+    const d = { id: `d_${(sharing.nextId++).toString(16).padStart(16, '0')}`, name, pairedAt: sharingNow(), lastSeen: sharingNow(), lastAddress: '192.168.1.34', browser };
+    s.devices.push(d);
+    sharing.pairings.delete(sid);
+    return d;
+  }
+  /** Adds a share directly (as `picmover share create` would have). */
+  function addShare(p: Partial<FakeShare> & { name: string; kind: 'libraries' | 'album' }): FakeShare {
+    const s: FakeShare = {
+      id: `s_${(sharing.nextId++).toString(16).padStart(16, '0')}`,
+      libraries: p.kind === 'album' ? ['peter'] : ['peter'],
+      album: 0,
+      albumName: '',
+      albumMissing: false,
+      capabilities: capsFrom(undefined, p.kind),
+      expiresAt: null,
+      paused: false,
+      approve: false,
+      createdAt: sharingNow(),
+      devices: [],
+      ...p,
+    };
+    sharing.shares.push(s);
+    return s;
+  }
+
+  function shareRoute(p: string, method: string, body: Record<string, unknown>): Response {
+    if (!sharing.supported) return json({ error: 'not found' }, 404);
+    const write = method === 'POST';
+    if (write && sharing.managedElsewhere) {
+      const me = sharing.managedElsewhere;
+      return json({ error: `sharing is managed by picmover pid ${me.pid} (${me.cmd}); use its Share page`, managedElsewhere: me }, 409);
+    }
+    if (p === '/api/share' && method === 'GET') return json(sharingJSON());
+    if (p === '/api/share/status' && method === 'GET') return json(sharingSummaryJSON());
+    if (p === '/api/share' && write) {
+      if (typeof body.address === 'string') {
+        if (!sharing.addresses.some((a) => a.ip === body.address)) return json({ error: 'address: not a LAN address of this computer' }, 400);
+        sharing.address = body.address;
+      }
+      if (body.port !== undefined) {
+        if (typeof body.port !== 'number' || body.port < 1 || body.port > 65535) return json({ error: 'port: want 1-65535' }, 400);
+        sharing.port = body.port;
+      }
+      if (body.enabled === false) {
+        sharing.state = 'off';
+        sharing.reason = '';
+        sharing.pairings.clear();
+      } else if (body.enabled === true) {
+        // A failed start is still 200: the body's state and reason say why.
+        sharing.state = sharing.startError ? 'error' : 'on';
+        sharing.reason = sharing.startError;
+      }
+      if (typeof body.keepOn === 'boolean') sharing.keepOn = body.keepOn;
+      if (typeof body.mdns === 'boolean') sharing.mdns = body.mdns;
+      if (typeof body.autoOff === 'string') {
+        if (!['never', '1h', '4h', 'quit'].includes(body.autoOff)) return json({ error: 'autoOff: want never, 1h, 4h or quit' }, 400);
+        const h = body.autoOff === '1h' ? 1 : body.autoOff === '4h' ? 4 : 0;
+        sharing.autoOff = { mode: body.autoOff, until: h ? new Date(Date.now() + h * 3600_000).toISOString() : null };
+      }
+      return json(sharingJSON());
+    }
+    if (p === '/api/share/cert/renew' && write) {
+      sharing.fingerprint = { ...sharing.fingerprint, leaf: '99:88:77:66:55:44:33:22' };
+      return json(sharingJSON());
+    }
+    if (p === '/api/share/shares' && write) {
+      const sc = (body.scope ?? {}) as Record<string, unknown>;
+      const name = typeof body.name === 'string' ? body.name.trim() : '';
+      if (!name) return json({ error: 'invalid name' }, 400);
+      if (sharing.shares.some((x) => x.name.toLowerCase() === name.toLowerCase())) return json({ error: 'a share with this name exists' }, 409);
+      let s: FakeShare;
+      if (sc.kind === 'libraries') {
+        const ids = Array.isArray(sc.libraries) ? (sc.libraries as string[]) : [];
+        if (!ids.length) return json({ error: 'scope: no libraries' }, 400);
+        if (ids.some((id) => !libs.some((l) => l.id === id))) return json({ error: 'scope: unknown library' }, 400);
+        s = addShare({ name, kind: 'libraries', libraries: ids });
+      } else if (sc.kind === 'album') {
+        const a = albums.find((x) => x.id === sc.album);
+        if (sc.library !== 'peter' || !a) return json({ error: `unknown album ${String(sc.album)} in library "${String(sc.library)}"` }, 400);
+        s = addShare({ name, kind: 'album', libraries: ['peter'], album: a.id, albumName: a.name, expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString() });
+      } else return json({ error: 'scope: kind must be "libraries" or "album"' }, 400);
+      s.capabilities = capsFrom(body.capabilities, s.kind);
+      if (typeof body.expiresIn === 'number') s.expiresAt = new Date(Date.now() + body.expiresIn * 1000).toISOString();
+      else if (body.expiresAt === null) s.expiresAt = null;
+      else if (typeof body.expiresAt === 'string') s.expiresAt = body.expiresAt;
+      s.approve = body.approve === true;
+      return json(shareJSON(s), 201);
+    }
+    const dm = /^\/api\/share\/devices\/([^/]+)(\/revoke)?$/.exec(p);
+    if (dm && write) {
+      for (const s of sharing.shares) {
+        const d = s.devices.find((x) => x.id === dm[1]);
+        if (!d) continue;
+        if (dm[2]) {
+          s.devices.splice(s.devices.indexOf(d), 1);
+          return new Response(null, { status: 204 });
+        }
+        if (typeof body.name !== 'string' || !body.name.trim()) return json({ error: 'invalid name' }, 400);
+        d.name = body.name.trim();
+        return json({ ...d });
+      }
+      return json({ error: 'no such phone' }, 404);
+    }
+    const m = /^\/api\/share\/shares\/([^/]+)(\/delete|\/revoke-all|\/pairings|\/pairings\/cancel|\/requests(?:\/([^/]+))?)?$/.exec(p);
+    if (!m) return json({ error: 'not found' }, 404);
+    const s = sharing.shares.find((x) => x.id === m[1]);
+    if (!s) return json({ error: 'no such share' }, 404);
+    const sub = m[2] ?? '';
+    if (method === 'GET' && sub === '/requests') return json(sharing.requests.get(s.id) ?? []);
+    if (!write) return json({ error: 'not found' }, 404);
+    switch (sub) {
+      case '':
+        if (body.kind !== undefined || body.album !== undefined || body.scope !== undefined)
+          return json({ error: "the kind and an album share's album cannot change; create a new share" }, 400);
+        if (Array.isArray(body.libraries)) {
+          if (s.kind !== 'libraries') return json({ error: 'libraries: only a library share has libraries' }, 400);
+          if (body.libraries.length === 0) return json({ error: 'libraries: at least one' }, 400);
+        }
+        if (typeof body.name === 'string') {
+          const n = body.name.trim();
+          if (sharing.shares.some((x) => x !== s && x.name.toLowerCase() === n.toLowerCase())) return json({ error: 'a share with this name exists' }, 409);
+          s.name = n;
+        }
+        if (Array.isArray(body.libraries)) s.libraries = body.libraries as string[];
+        if (body.capabilities !== undefined) s.capabilities = capsFrom(body.capabilities, s.kind);
+        if ('expiresAt' in body) s.expiresAt = (body.expiresAt as string | null) ?? null;
+        if (typeof body.paused === 'boolean') s.paused = body.paused;
+        if (s.paused) sharing.pairings.delete(s.id);
+        if (typeof body.approve === 'boolean') s.approve = body.approve;
+        return json(shareJSON(s));
+      case '/delete':
+        sharing.shares.splice(sharing.shares.indexOf(s), 1);
+        return new Response(null, { status: 204 });
+      case '/revoke-all':
+        s.devices = [];
+        return json(shareJSON(s));
+      case '/pairings': {
+        if (sharing.state !== 'on') return json({ error: 'sharing on Wi-Fi is off; turn it on first' }, 409);
+        if (shareStateOf(s) !== 'active') return json({ error: `the share is ${shareStateOf(s)}; phones cannot pair with it now` }, 409);
+        const token = `tok${sharing.nextId++}`;
+        const expiresAt = new Date(Date.now() + 120_000).toISOString();
+        sharing.pairings.set(s.id, { token, expiresAt });
+        return json({
+          url: `https://${sharing.address}:${sharing.port}/#/pair/${token}`,
+          ...(sharing.mdns ? { mdnsUrl: `https://laptop.local:${sharing.port}/#/pair/${token}` } : {}),
+          code: 'K7QM-3XRD',
+          qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><path d="M0 0h7v7H0z"/></svg>',
+          expiresAt,
+        });
+      }
+      case '/pairings/cancel':
+        sharing.pairings.delete(s.id);
+        return new Response(null, { status: 204 });
+      default: {
+        const rid = m[3];
+        const list = sharing.requests.get(s.id) ?? [];
+        const r = list.find((x) => x.id === rid);
+        if (!r) return json({ error: 'no such request' }, 404);
+        sharing.requests.set(
+          s.id,
+          list.filter((x) => x !== r),
+        );
+        if (body.approve === true) pairPhone(s.id, r.name, r.browser);
+        return new Response(null, { status: 204 });
+      }
+    }
+  }
+
   function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const url = new URL(String(input), 'http://127.0.0.1:7439');
     const method = init?.method ?? 'GET';
@@ -1037,6 +1386,8 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
     const unset = json({ error: 'no workspace', state: 'unset' }, 409);
     if (p === '/api/app' || p.startsWith('/api/app/')) {
       res = appRoute(p, method, body);
+    } else if (p === '/api/share' || p.startsWith('/api/share/')) {
+      res = shareRoute(p, method, body);
     } else if (p === '/api/libraries' && method === 'GET') {
       res = json(listing());
     } else if (ws.mode === 'unset' && (p.startsWith('/api/libraries') || p.startsWith('/api/l/'))) {
@@ -1115,7 +1466,493 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   /** POST calls to a path (relative to /api/), in order. */
   const posts = (path: string) => calls.filter((c) => c.method === 'POST' && c.path === `/api/${path}`);
 
-  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, transfer, ws, libraryFolders, app, install, posts, finish, finishTransfer };
+  return { calls, items, tags, albums, imports, libs, folders, similar, openErrors, userdb, thumbCounts, largeFallback, backup, transfer, ws, libraryFolders, app, sharing, install, posts, finish, finishTransfer, pairPhone, addShare };
 }
 
 export type FakeServer = ReturnType<typeof fakeServer>;
+
+// ---- The share listener (docs/design/lan-share.md "Share listener: routes") ----
+
+/** An item of the fake share server (library "peter"). */
+export interface ShareItem extends MediaItem {
+  lat?: number;
+  lon?: number;
+  /** Camera model ("" for none). */
+  camera?: string;
+}
+
+export interface FakeShareOptions {
+  /** The share's capabilities; the kind's defaults when left out. */
+  capabilities?: Partial<Record<'video' | 'download' | 'rate' | 'location', boolean>>;
+  /** Library shares: the shared libraries (default: peter and penny). */
+  libraries?: string[];
+  /** Whether this browser holds a valid device cookie at the start (default: true). */
+  paired?: boolean;
+  /**
+   * peter's timeline instead of its few items: these months (newest
+   * first), their items made up when a month is asked for (unfiltered).
+   */
+  bulk?: { year: number; month: number; count: number }[];
+}
+
+/**
+ * A stateful fake of the share listener's API for the phone app's tests:
+ * one share of `kind` (a library share "My phone" over peter and penny, or
+ * an album share "Summer guests" of peter's album "Summer"), a cookie that
+ * pairing sets and revocation clears, the share's state (paused, expired,
+ * gone, unavailable), scope and capability checks and redaction as the
+ * design specifies them, and the filter whitelist (anything else is 400).
+ * Pairing: `pairing.tokens` and `pairing.codes` are open (single use);
+ * `pairing.approve` holds a redeem until `approve()`/`deny()`; a paired
+ * browser gets 409 `{current: {share}}` without `replace`.
+ */
+export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts: FakeShareOptions = {}) {
+  const calls: Call[] = [];
+  const all = kind !== 'album';
+  const caps = { video: true, download: all, rate: all, location: all, ...opts.capabilities };
+  const libNames: Record<string, string> = { peter: 'Peter', penny: 'Penny' };
+  const shared = kind === 'album' ? [] : (opts.libraries ?? ['peter', 'penny']);
+  // peter: July 2024 ids 1..6 (3 is a video), June ids 7..8; penny: one item (20).
+  const items: (ShareItem & { lib: string })[] = [];
+  for (let i = 1; i <= 6; i++) {
+    items.push({ id: i, hash: hashOf(i), type: i === 3 ? 'video' : 'image', takenAt: `2024-07-${String(20 - i).padStart(2, '0')}T10:00:00`, w: 4000, h: 3000, thumb: 'ok', thumbAt: 1700000000, lib: 'peter' });
+  }
+  for (let i = 7; i <= 8; i++) items.push({ id: i, hash: hashOf(i), type: 'image', takenAt: `2024-06-${String(20 - i).padStart(2, '0')}T10:00:00`, w: 4000, h: 3000, thumb: 'ok', lib: 'peter' });
+  items.push({ id: 20, hash: hashOf(20), type: 'image', takenAt: '2023-01-05T10:00:00', w: 100, h: 100, thumb: 'ok', lib: 'penny' });
+  const first = items[0]!;
+  first.rating = 4;
+  first.lat = 60.17;
+  first.lon = 24.94;
+  first.gps = true;
+  items[2]!.dur = 7000;
+  // More positions for the map: 2 and the video 3 next to 1 in Helsinki
+  // (all in "Summer"), 7 in Paris (in "Secret"), penny's 20 in New York.
+  const place = (id: number, lat: number, lon: number) => Object.assign(items.find((x) => x.id === id)!, { lat, lon, gps: true });
+  place(2, 60.171, 24.941);
+  place(3, 60.1705, 24.9405);
+  place(7, 48.85, 2.35);
+  place(20, 40.7, -74.0);
+  // Cameras: peter's July on the Canon (the video has none), June on a
+  // Pixel (outside the album "Summer"), penny on an iPhone.
+  for (const x of items) x.camera = x.lib === 'penny' ? 'iPhone 12' : x.takenAt?.startsWith('2024-06') ? 'Pixel 7' : x.type === 'video' ? '' : 'Canon EOS R6';
+  /** peter's tags: "beach" on 1 and 2, "private" only on 7 (outside the album). */
+  const tags = [
+    { id: 1, name: 'beach', hashes: [hashOf(1), hashOf(2)] },
+    { id: 4, name: 'private', hashes: [hashOf(7)] },
+  ];
+  /** peter's albums; an album share covers "Summer" (2). */
+  const albums = [
+    { id: 2, name: 'Summer', hashes: [hashOf(1), hashOf(2), hashOf(3)] },
+    { id: 5, name: 'Secret', hashes: [hashOf(7)] },
+  ];
+  const share = {
+    name: kind === 'album' ? 'Summer guests' : 'My phone',
+    expiresAt: kind === 'album' ? '2026-11-13T19:00:00+02:00' : null,
+    /** '' active, else the 403 state. */
+    state: '' as '' | 'paused' | 'expired' | 'gone' | 'unavailable',
+  };
+  const device = { id: 'd_3f9a1c2e7b5d4a10', name: "Anna's phone" };
+  const cookie = { paired: opts.paired ?? true, otherShare: '' };
+  /** Libraries answering 503 (rebuilding, held by another process). */
+  const busy = new Set<string>();
+  /** A move runs: ratings answer 409. */
+  const moving = { on: false };
+  /** The next `times` requests for an image or file answer `status` (429: rate limited), with Retry-After when set. */
+  const mediaFail = { times: 0, status: 429, retryAfter: '' };
+  function failMedia(): Response | null {
+    if (mediaFail.times <= 0) return null;
+    mediaFail.times--;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (mediaFail.retryAfter) headers['Retry-After'] = mediaFail.retryAfter;
+    return new Response(JSON.stringify({ error: 'too many requests' }), { status: mediaFail.status, headers });
+  }
+  const pairing = {
+    /** The share has its 20 phones: a redeem is 409 without `current`. */
+    full: false,
+    tokens: new Set<string>(['tok_' + 'a'.repeat(40)]),
+    codes: new Set<string>(['K7QM3XRD']),
+    /** Redeems wait for the computer while set. */
+    approve: false,
+    /** Answers 429 to the next redeem. */
+    limited: false,
+    /** The waiting redeem: approved (true), denied (false), or sharing turned off meanwhile ('off'). */
+    pending: null as null | ((r: boolean | 'off') => void),
+  };
+
+  const visible = () =>
+    items.filter((x) => (kind === 'album' ? x.lib === 'peter' && share.state !== 'gone' && albums[0]!.hashes.includes(x.hash) : shared.includes(x.lib)));
+  const libsJSON = () =>
+    shared.map((id) => ({ id, name: libNames[id] ?? id, cover: items.find((x) => x.lib === id)?.hash ?? null, total: items.filter((x) => x.lib === id).length }));
+  const shareJSON = () => ({
+    name: share.name,
+    kind,
+    capabilities: { ...caps },
+    expiresAt: share.expiresAt,
+    ...(kind === 'album'
+      ? { album: { name: albums[0]!.name, count: visible().length, cover: albums[0]!.hashes[0] } }
+      : { libraries: libsJSON() }),
+  });
+  const itemJSON = (x: ShareItem & { lib: string }): Record<string, unknown> => {
+    const { lib: _l, lat: _a, lon: _o, camera: _c, rating, gps, ...rest } = x;
+    return { ...rest, ...(caps.rate && rating ? { rating } : {}), ...(caps.location && gps ? { gps } : {}) };
+  };
+  const ym = (x: ShareItem) => {
+    const m = /^(\d{4})-(\d{2})/.exec(x.takenAt ?? '');
+    return m ? [Number(m[1]), Number(m[2])] : [0, 0];
+  };
+  const notFound = () => json({ error: 'not found' }, 404);
+  /** The filter whitelist of timeline and media; media adds year and month. */
+  const ALLOWED = new Set(['type', 'from', 'to', 'recur', 'months', 'rating', 'album', 'tag', 'camera', 'nocamera', 'gps', 'minpx', 'maxpx']);
+  /** The scope's photos of a {lib} key: the album's live members, or the library's. */
+  const inLib = (lib: string) => visible().filter((x) => kind === 'album' || x.lib === lib);
+
+  function select(lib: string, q: URLSearchParams, extra: string[] = []): (ShareItem & { lib: string })[] | Response {
+    for (const k of q.keys()) if (!ALLOWED.has(k) && !extra.includes(k)) return json({ error: `invalid filter "${k}"` }, 400);
+    // The server's capability and scope checks, in its order.
+    if (q.has('rating') && !caps.rate) return json({ error: 'invalid filter "rating": not allowed in this share' }, 400);
+    if (q.has('gps') && !caps.location) return json({ error: 'invalid filter "gps": not allowed in this share' }, 400);
+    if (q.has('album') && kind === 'album') return json({ error: 'invalid filter "album": this share is one album' }, 400);
+    if (q.has('tag') && kind === 'album') return json({ error: 'invalid filter "tag": this share is one album' }, 400);
+    if ((q.get('camera') ?? '').length > 200) return json({ error: 'invalid filter "camera": too long' }, 400);
+    if (q.has('nocamera') && (q.get('nocamera') !== '1' || q.has('camera'))) return json({ error: 'invalid filter "nocamera"' }, 400);
+    let list = inLib(lib);
+    const aid = Number(q.get('album'));
+    if (aid) {
+      const a = lib === 'peter' ? albums.find((x) => x.id === aid) : undefined;
+      if (!a) return notFound();
+      list = list.filter((x) => a.hashes.includes(x.hash));
+    }
+    for (const v of q.getAll('tag')) {
+      if (!/^[1-9]\d*$/.test(v)) return json({ error: `invalid tag "${v}": want a tag id` }, 400);
+      const tg = lib === 'peter' ? tags.find((x) => x.id === Number(v)) : undefined;
+      list = list.filter((x) => !!tg && tg.hashes.includes(x.hash));
+    }
+    const t = q.get('type');
+    if (t) list = list.filter((x) => x.type === t);
+    const rating = Number(q.get('rating'));
+    if (rating) list = list.filter((x) => (x.rating ?? 0) >= rating);
+    const from = q.get('from');
+    if (from) list = list.filter((x) => (x.takenAt ?? '') >= from);
+    const to = q.get('to');
+    if (to) list = list.filter((x) => (x.takenAt ?? '9999') < to);
+    const months = q.get('months');
+    if (months) list = list.filter((x) => x.takenAt !== null && months.split(',').map(Number).includes(Number(x.takenAt.slice(5, 7))));
+    const recur = q.get('recur');
+    if (recur) {
+      const [a, b = a] = recur.split('..') as [string, string?];
+      list = list.filter((x) => {
+        const md = x.takenAt?.slice(5, 10);
+        if (!md) return false;
+        return a <= b! ? md >= a && md <= b! : md >= a || md <= b!;
+      });
+    }
+    const cam = q.get('camera');
+    if (cam) list = list.filter((x) => x.camera === cam);
+    if (q.get('nocamera') === '1') list = list.filter((x) => !x.camera);
+    if (q.get('gps') === '1') list = list.filter((x) => x.gps === true);
+    const minPx = Number(q.get('minpx'));
+    if (minPx) list = list.filter((x) => Math.max(x.w, x.h) >= minPx);
+    const maxPx = Number(q.get('maxpx'));
+    if (maxPx) list = list.filter((x) => Math.max(x.w, x.h) <= maxPx);
+    return list;
+  }
+
+  /** GET /api/l/{lib}/facets as the server computes it: inside the scope, gps with location, tags and albums in a library share. */
+  function facetsOf(lib: string, real: string): Record<string, unknown> {
+    const list = inLib(lib);
+    const years = new Map<number, number>();
+    const cams = new Map<string, number>();
+    for (const x of list) {
+      const y = ym(x)[0]!;
+      if (y) years.set(y, (years.get(y) ?? 0) + 1);
+      if (x.camera) cams.set(x.camera, (cams.get(x.camera) ?? 0) + 1);
+    }
+    const out: Record<string, unknown> = {
+      total: list.length,
+      types: { image: list.filter((x) => x.type === 'image').length, image_raw: list.filter((x) => x.type === 'image_raw').length, video: list.filter((x) => x.type === 'video').length },
+      years: [...years].sort((a, b) => b[0] - a[0]).map(([year, count]) => ({ year, count })),
+      undated: list.filter((x) => !x.takenAt).length,
+      cameras: [...cams].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([model, count]) => ({ make: model.split(' ')[0], model, count })),
+      nocamera: list.filter((x) => !x.camera).length,
+    };
+    if (caps.location) out.gps = list.filter((x) => x.gps).length;
+    if (kind !== 'album') {
+      const live = items.filter((x) => x.lib === real);
+      const counted = (g: { id: number; name: string; hashes: string[] }[]) =>
+        g
+          .map((x) => ({ id: x.id, name: x.name, count: live.filter((i) => x.hashes.includes(i.hash)).length }))
+          .filter((x) => x.count > 0)
+          .sort((a, b) => a.name.localeCompare(b.name));
+      out.tags = real === 'peter' ? counted(tags) : [];
+      out.albums = real === 'peter' ? counted(albums) : [];
+    }
+    return out;
+  }
+
+  const STATE_MSG: Record<string, string> = {
+    paused: 'This share is paused.',
+    expired: 'This share has ended.',
+    gone: 'This album is no longer shared.',
+    unavailable: 'This share is not available on the computer right now.',
+  };
+  /** Device → share → scope, as shareScoped: the library key, or a refusal. */
+  function auth(): Response | null {
+    if (!cookie.paired) return json({ error: 'This phone is not paired with picmover. Show a pairing code on the computer.', paired: false }, 401);
+    if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 403);
+    return null;
+  }
+
+  async function redeem(body: Record<string, unknown>): Promise<Response> {
+    if (pairing.limited) {
+      pairing.limited = false;
+      return json({ error: 'Too many pairing attempts; wait a minute and try again.' }, 429);
+    }
+    const token = typeof body.token === 'string' ? body.token : null;
+    const code = typeof body.code === 'string' ? body.code.toUpperCase().replace(/-/g, '') : null;
+    if ((token === null) === (code === null)) return json({ error: 'want a token or a code' }, 400);
+    const set = token !== null ? pairing.tokens : pairing.codes;
+    const key = token ?? code ?? '';
+    if (!set.has(key)) return json({ error: 'This pairing code has expired or was already used. Show a new one on the computer.' }, 410);
+    // The pairing exists but its share refuses phones: 410 with the state.
+    if (share.state) return json({ error: STATE_MSG[share.state], state: share.state }, 410);
+    if (cookie.paired && body.replace !== true) {
+      const cur = cookie.otherShare || share.name;
+      // `sameShare`: the cookie's device is of the pairing's own share (asked of the backend in the review).
+      return json({ error: `This phone is already paired with "${cur}".`, current: { share: cur, ...(cookie.otherShare ? {} : { sameShare: true }) } }, 409);
+    }
+    set.delete(key);
+    if (pairing.approve) {
+      const ok = await new Promise<boolean | 'off'>((resolve) => (pairing.pending = resolve));
+      pairing.pending = null;
+      if (ok === 'off') return json({ error: 'Sharing was turned off on the computer.', state: 'off' }, 410);
+      if (!ok) return json({ error: 'The computer did not allow this phone.' }, 403);
+    }
+    if (pairing.full) return json({ error: 'this share has 20 phones; revoke one first' }, 409);
+    cookie.paired = true;
+    cookie.otherShare = '';
+    device.name = (typeof body.name === 'string' ? body.name.trim() : '') || 'Phone';
+    return json({ device: { ...device }, share: shareJSON() });
+  }
+
+  function libRoute(lib: string, rest: string, q: URLSearchParams, method: string, body: Record<string, unknown>): Response {
+    const refused = auth();
+    if (refused) return refused;
+    if (kind === 'album' ? lib !== 'album' : !shared.includes(lib)) return notFound();
+    const real = kind === 'album' ? 'peter' : lib;
+    if (busy.has(real)) return json({ error: 'This library is not available right now.' }, 503);
+    const inScope = (x: ShareItem & { lib: string }) => visible().includes(x) && x.lib === real;
+    if (method === 'GET' && rest === 'library') {
+      if (kind === 'album') return notFound();
+      const l = items.filter((x) => x.lib === real);
+      return json({ id: lib, name: libNames[lib] ?? lib, summary: { total: l.length, images: l.filter((x) => x.type !== 'video').length, raw: 0, videos: l.filter((x) => x.type === 'video').length, earliest: null, latest: null } });
+    }
+    if (method === 'GET' && rest === 'albums') {
+      if (kind === 'album') return notFound();
+      return json({ albums: real === 'peter' ? albums.map((a) => ({ id: a.id, name: a.name, count: a.hashes.length, cover: a.hashes[0] ?? null })) : [] });
+    }
+    if (method === 'GET' && rest === 'facets') {
+      for (const k of q.keys()) return json({ error: `invalid filter "${k}"` }, 400);
+      return json(facetsOf(lib, real));
+    }
+    if (method === 'GET' && (rest === 'geo' || rest === 'geo/items')) {
+      // The map: `location` only; the filter whitelist plus bbox and zoom or limit.
+      if (!caps.location) return json({ error: 'not allowed in this share' }, 403);
+      const list = select(lib, q, rest === 'geo' ? ['bbox', 'zoom'] : ['bbox', 'limit']);
+      if (list instanceof Response) return list;
+      const b = (q.get('bbox') ?? '').split(',').map(Number);
+      if (b.length !== 4 || b.some((x) => !Number.isFinite(x))) return json({ error: 'bbox is required' }, 400);
+      const [w, s, e, n] = b as [number, number, number, number];
+      const inBox = list
+        .filter((x) => x.lat !== undefined && x.lon !== undefined && x.lat >= s && x.lat <= n && (w <= e ? x.lon >= w && x.lon <= e : x.lon >= w || x.lon <= e))
+        .sort((a, b2) => (b2.takenAt ?? '').localeCompare(a.takenAt ?? '') || b2.id - a.id);
+      if (rest === 'geo/items') {
+        const limit = Number(q.get('limit') ?? 200);
+        return json({ items: inBox.slice(0, limit).map(itemJSON), total: inBox.length });
+      }
+      const zoom = Number(q.get('zoom'));
+      if (!Number.isInteger(zoom) || zoom < 0 || zoom > 22) return json({ error: 'zoom is required: an integer 0-22' }, 400);
+      // Cells of 90/2^zoom degrees; the newest photo represents its cell.
+      const d = 90 / 2 ** zoom;
+      const cells = new Map<string, (ShareItem & { lib: string })[]>();
+      for (const x of inBox) {
+        const k = `${Math.floor(x.lat! / d)},${Math.floor(x.lon! / d)}`;
+        cells.set(k, [...(cells.get(k) ?? []), x]);
+      }
+      const clusters = [...cells.values()].map((xs) => {
+        const lat = xs.reduce((t, x) => t + x.lat!, 0) / xs.length;
+        const lon = xs.reduce((t, x) => t + x.lon!, 0) / xs.length;
+        const rep = xs[0]!;
+        const c: Record<string, unknown> = { lat, lon, count: xs.length, hash: rep.hash, ...(rep.thumbAt ? { thumbAt: rep.thumbAt } : {}) };
+        if (xs.length === 1) c.id = rep.id;
+        else c.bounds = [Math.min(...xs.map((x) => x.lon!)), Math.min(...xs.map((x) => x.lat!)), Math.max(...xs.map((x) => x.lon!)), Math.max(...xs.map((x) => x.lat!))];
+        return c;
+      });
+      return json({ clusters: clusters.sort((a, b2) => (b2.count as number) - (a.count as number)) });
+    }
+    if (opts.bulk && real === 'peter' && method === 'GET' && (rest === 'timeline' || rest === 'media')) {
+      // A large library made up on the fly: the months' counts, items generated per month.
+      if (rest === 'timeline') return json({ buckets: opts.bulk });
+      const y = Number(q.get('year'));
+      const mo = Number(q.get('month'));
+      const b = opts.bulk.find((x) => x.year === y && x.month === mo);
+      let id = 1_000_000;
+      for (const x of opts.bulk) {
+        if (x === b) break;
+        id += x.count;
+      }
+      const day = (i: number, n: number) => String(Math.max(1, 28 - Math.floor((i / n) * 27))).padStart(2, '0');
+      return json({
+        items: Array.from({ length: b?.count ?? 0 }, (_, i) => ({
+          id: id + i,
+          hash: hashOf(id + i),
+          type: 'image',
+          takenAt: `${y}-${String(mo).padStart(2, '0')}-${day(i, b?.count ?? 1)}T10:00:00`,
+          w: 4000,
+          h: 3000,
+          thumb: 'ok',
+        })),
+      });
+    }
+    if (method === 'GET' && rest === 'timeline') {
+      const list = select(lib, q);
+      if (list instanceof Response) return list;
+      const m = new Map<string, { year: number; month: number; count: number }>();
+      for (const x of list) {
+        const [y, mo] = ym(x) as [number, number];
+        const b = m.get(`${y}-${mo}`) ?? { year: y, month: mo, count: 0 };
+        b.count++;
+        m.set(`${y}-${mo}`, b);
+      }
+      return json({ buckets: [...m.values()].sort((a, b) => b.year - a.year || b.month - a.month) });
+    }
+    if (method === 'GET' && rest === 'media') {
+      const list = select(lib, q, ['year', 'month']);
+      if (list instanceof Response) return list;
+      const y = Number(q.get('year'));
+      const mo = Number(q.get('month'));
+      return json({ items: list.filter((x) => ym(x)[0] === y && ym(x)[1] === mo).map(itemJSON) });
+    }
+    const mm = /^media\/(\d+)$/.exec(rest);
+    if (method === 'GET' && mm) {
+      const x = items.find((i) => i.id === Number(mm[1]));
+      if (!x || !inScope(x)) return notFound();
+      const d: Record<string, unknown> = {
+        id: x.id,
+        hash: x.hash,
+        type: x.type,
+        takenAt: x.takenAt,
+        offset: 7200,
+        w: x.w,
+        h: x.h,
+        dur: x.dur ?? 0,
+        size: 2048,
+        ext: x.type === 'video' ? '.mp4' : '.jpg',
+        fileName: `IMG_${x.id}.${x.type === 'video' ? 'mp4' : 'jpg'}`,
+        cameraMake: 'Canon',
+        cameraModel: 'Canon EOS R6',
+        lens: '',
+        displayable: caps.download,
+        // dur and thumbAt are always present (0 when none).
+        thumbAt: x.thumbAt ?? 0,
+      };
+      if (caps.location && x.lat !== undefined) Object.assign(d, { lat: x.lat, lon: x.lon });
+      if (caps.rate) d.rating = x.rating ?? 0;
+      if (kind !== 'album') d.albums = albums.filter((a) => a.hashes.includes(x.hash)).map((a) => ({ id: a.id, name: a.name }));
+      return json(d);
+    }
+    const rm = /^(thumb|preview|large)\/([0-9a-f]+)$/.exec(rest);
+    if (method === 'GET' && rm) {
+      const failed = failMedia();
+      if (failed) return failed;
+      const x = items.find((i) => i.hash === rm[2]);
+      if (!x || !inScope(x)) return notFound();
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { headers: { 'Content-Type': 'image/jpeg' } });
+    }
+    const fm = /^file\/(\d+)$/.exec(rest);
+    if (method === 'GET' && fm) {
+      const failed = failMedia();
+      if (failed) return failed;
+      const x = items.find((i) => i.id === Number(fm[1]));
+      if (!x || !inScope(x)) return notFound();
+      const need = q.get('download') === '1' || x.type !== 'video' ? caps.download : caps.video;
+      if (!need) return json({ error: 'not allowed in this share' }, 403);
+      return new Response(new Uint8Array([0]), { headers: { 'Content-Type': 'application/octet-stream' } });
+    }
+    if (method === 'POST' && rest === 'ratings') {
+      // The server's order: the body, the row (404), the capability (403), a move (409).
+      const hashes = Array.isArray(body.hashes) ? body.hashes : [];
+      if (hashes.length !== 1) return json({ error: 'hashes: want exactly one hash' }, 400);
+      if (typeof hashes[0] !== 'string' || !/^[0-9a-f]{16}$/.test(hashes[0])) return json({ error: 'hashes: invalid hash: want 16 lower-case hex digits' }, 400);
+      const r = Number(body.rating);
+      if (typeof body.rating !== 'number' || !Number.isInteger(r) || r < 0 || r > 5) return json({ error: 'rating: want 0-5 (0 clears)' }, 400);
+      const x = items.find((i) => i.hash === hashes[0]);
+      if (!x || !inScope(x)) return notFound();
+      if (!caps.rate) return json({ error: 'not allowed in this share' }, 403);
+      if (moving.on) return json({ error: 'a move is running on this library; try again when it has finished' }, 409);
+      if (r > 0) x.rating = r;
+      else delete x.rating;
+      return json({ updated: 1 });
+    }
+    return notFound();
+  }
+
+  async function fetchImpl(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = new URL(String(input), 'https://192.168.1.20:7443');
+    const method = init?.method ?? 'GET';
+    const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    calls.push({ method, path: url.pathname + url.search, body: method === 'POST' ? body : null });
+    const p = url.pathname;
+    if (method === 'POST') {
+      const h = new Headers(init?.headers);
+      if (h.get('X-Picmover') !== '1' || h.get('Content-Type') !== 'application/json') return json({ error: 'forbidden' }, 403);
+    }
+    if (p === '/api/session' && method === 'GET') {
+      // An album share's session opens its library: 503 while that is busy.
+      const refused = auth() ?? (kind === 'album' && busy.has('peter') ? json({ error: 'This library is not available right now.' }, 503) : null);
+      return refused ?? json({ device: { ...device }, computer: 'laptop', share: shareJSON() });
+    }
+    if (p === '/api/pair' && method === 'POST') return redeem(body);
+    if (p === '/api/libraries' && method === 'GET') {
+      const refused = auth();
+      if (refused) return refused;
+      if (kind === 'album') return notFound();
+      return json({ libraries: libsJSON() });
+    }
+    const m = /^\/api\/l\/([^/]+)\/(.+)$/.exec(p);
+    if (m) return libRoute(decodeURIComponent(m[1] ?? ''), m[2] ?? '', url.searchParams, method, body);
+    return notFound();
+  }
+
+  function install() {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'Date'] });
+    vi.setSystemTime(new Date('2026-10-10T12:00:00'));
+    vi.stubGlobal('fetch', vi.fn(fetchImpl));
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+  }
+
+  /** Requests to a path (with its query), in order. */
+  const requests = (prefix: string) => calls.filter((c) => c.path.startsWith(prefix));
+
+  return {
+    calls,
+    items,
+    albums,
+    tags,
+    caps,
+    share,
+    device,
+    cookie,
+    busy,
+    moving,
+    mediaFail,
+    pairing,
+    install,
+    requests,
+    approve: () => pairing.pending?.(true),
+    deny: () => pairing.pending?.(false),
+    /** Sharing turned off while a redeem waits for approval. */
+    turnOff: () => pairing.pending?.('off'),
+  };
+}
+
+export type FakeShareServer = ReturnType<typeof fakeShareServer>;

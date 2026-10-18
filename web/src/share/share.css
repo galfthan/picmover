@@ -1,0 +1,76 @@
+/* The phone app's own global styles, on top of app.css. Nothing here may
+   use what Gecko 91 lacks (dvh, :has(), container queries, nesting,
+   color-mix()); scripts/check-share-apis.mjs fails the build if it does. */
+
+#app {
+  /* 100% of a body that is 100% tall; main.ts sets --app-h from innerHeight
+     for browsers whose toolbars resize the viewport (no dvh in Gecko 91). */
+  height: var(--app-h, 100%);
+}
+/* No overscroll in either axis: a sideways drag on a bar or a sheet must
+   not become the browser's back/forward gesture (Chrome on Android), nor
+   a pull-to-refresh. Gecko 91 has overscroll-behavior. */
+html,
+body {
+  overscroll-behavior: none;
+}
+body {
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+}
+button,
+.btn {
+  min-height: 40px;
+}
+
+.list-page {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 12px 12px calc(32px + env(safe-area-inset-bottom, 0px));
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cardlink {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+.cardlink:hover {
+  text-decoration: none;
+}
+.cardlink .cover {
+  display: block;
+  position: relative;
+  padding-top: 75%;
+  background: var(--placeholder);
+}
+.cardlink .cover img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.cardlink .label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 44px;
+  padding: 8px 10px;
+}
+.cardlink strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

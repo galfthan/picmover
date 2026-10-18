@@ -1,0 +1,172 @@
+// Texts and small pure helpers of the admin Share page and ShareDialog
+// (docs/design/lan-share.md "Entry points"); see sharetext.test.ts.
+
+import type { Share, ShareAddress, ShareKind, SharingSummary } from './api';
+import { formatAgo } from './format';
+
+/** "Album: Summer 2026 in peter, 48 photos" / "Libraries: peter, penny". */
+export function scopeText(s: Share): string {
+  if (s.kind === 'album') {
+    const a = s.album;
+    const lib = s.library?.name ?? '?';
+    if (!a) return `Album in ${lib}`;
+    return `Album: ${a.name || `#${a.id}`} in ${lib}, ${a.count} ${a.count === 1 ? 'photo' : 'photos'}`;
+  }
+  if (s.kind !== 'libraries') return `Unknown kind “${s.kind}”; update picmover`;
+  return `${s.libraries.length === 1 ? 'Library' : 'Libraries'}: ${s.libraries.map((l) => l.name).join(', ') || 'none'}`;
+}
+
+/** Why a share does not work now, for its card; "" when it is active. */
+export function stateText(s: Share): string {
+  switch (s.state) {
+    case 'active':
+      return '';
+    case 'paused':
+      return 'Paused';
+    case 'expired':
+      return 'Expired';
+    case 'gone':
+      if (s.kind === 'album') return s.library?.missing ? 'Library missing' : 'Album deleted';
+      return 'Library missing';
+    case 'unavailable':
+      return s.kind === 'album' || s.kind === 'libraries' ? 'Not in this workspace' : 'Needs a newer picmover';
+    default:
+      return s.state;
+  }
+}
+
+/** "Never expires", "Expires in 12 days", "Ended 3 days ago". */
+export function expiryText(expiresAt: string | null, now = Date.now()): string {
+  if (!expiresAt) return 'Never expires';
+  const t = Date.parse(expiresAt);
+  if (!Number.isFinite(t)) return 'Never expires';
+  return t <= now ? `Ended ${formatAgo(new Date(t), now)}` : `Expires ${formatAgo(new Date(t), now)}`;
+}
+
+export type ExpiryChoice = 'keep' | 'never' | '1d' | '7d' | '30d' | '90d' | 'date';
+
+export const EXPIRY_CHOICES: readonly { value: Exclude<ExpiryChoice, 'keep'>; label: string }[] = [
+  { value: '1d', label: '1 day' },
+  { value: '7d', label: '7 days' },
+  { value: '30d', label: '30 days' },
+  { value: '90d', label: '90 days' },
+  { value: 'date', label: 'Until a date' },
+  { value: 'never', label: 'Never' },
+];
+
+const DAY = 86_400;
+
+/** The dialog's default: 30 days for an album share, never for a library share (Q17). */
+export function defaultExpiry(kind: ShareKind | string): ExpiryChoice {
+  return kind === 'album' ? '30d' : 'never';
+}
+
+/**
+ * The expiry as an absolute time (RFC 3339), null for never, undefined to
+ * leave it as it is (`keep`, or a date that is not valid). `day` is
+ * "YYYY-MM-DD"; the share then ends at the end of that local day.
+ */
+export function expiryAt(choice: ExpiryChoice, day: string, now = Date.now()): string | null | undefined {
+  switch (choice) {
+    case 'keep':
+      return undefined;
+    case 'never':
+      return null;
+    case 'date': {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+      if (!m) return undefined;
+      const end = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1);
+      return Number.isNaN(end.getTime()) || end.getTime() <= now ? undefined : end.toISOString();
+    }
+    default:
+      return new Date(now + Number(choice.slice(0, -1)) * DAY * 1000).toISOString();
+  }
+}
+
+/** Seconds from now for the relative choices (the create body's `expiresIn`); null for the others. */
+export function expirySeconds(choice: ExpiryChoice): number | null {
+  return /^\d+d$/.test(choice) ? Number(choice.slice(0, -1)) * DAY : null;
+}
+
+/** The first `groups` byte groups of a fingerprint ("AB:CD:EF"), for "starts with". */
+export function fingerprintStart(fp: string, groups = 3): string {
+  return fp.split(':').slice(0, groups).join(':');
+}
+
+/** "Anna's iPhone" checks: 1–60 characters, no control characters; null when fine. */
+export function deviceNameProblem(raw: string): string | null {
+  const name = raw.trim();
+  if (!name) return 'Enter a name.';
+  if ([...name].length > 60) return 'At most 60 characters.';
+  if (/[\u0000-\u001f\u007f]/.test(name)) return 'A name cannot contain control characters.';
+  return null;
+}
+
+/** Share names: 1–60 characters, no control characters; null when fine. */
+export const shareNameProblem = deviceNameProblem;
+
+/** "Wi-Fi", "wired", or "" when the server did not say. */
+export function linkKind(a: Pick<ShareAddress, 'wireless'>): string {
+  return a.wireless === true ? 'Wi-Fi' : a.wireless === false ? 'wired' : '';
+}
+
+/** "Wi-Fi, wlp3s0, 192.168.1.0/24": what is known of an address besides its ip. */
+export function addressDetail(a: ShareAddress): string {
+  return [linkKind(a), a.iface, a.subnet, a.virtual ? 'virtual' : ''].filter((x) => x !== '').join(', ');
+}
+
+/** "192.168.1.20 (Wi-Fi, wlp3s0, 192.168.1.0/24)": an address as the Network choice lists it. */
+export function addressLabel(a: ShareAddress): string {
+  const d = addressDetail(a);
+  return d ? `${a.ip} (${d})` : a.ip;
+}
+
+/**
+ * A Wi-Fi address to suggest when the chosen one is wired (phones are on
+ * the Wi-Fi, and a wired network is often another one); null when the
+ * choice is Wi-Fi, unknown, or there is no Wi-Fi address. Only a
+ * suggestion: a saved choice is never switched by itself.
+ */
+export function wifiSuggestion(addresses: ShareAddress[], chosen: string): ShareAddress | null {
+  const cur = addresses.find((a) => a.ip === chosen);
+  if (!cur || cur.wireless !== false) return null;
+  return addresses.find((a) => a.wireless === true && !a.virtual) ?? null;
+}
+
+/** One way to write the top-bar pill: its text, and the auto-off timer ("52 min left"; "" leaves it out). */
+export interface PillVariant {
+  text: string;
+  left: string;
+}
+
+/**
+ * The pill's texts from the longest to the shortest, and its tooltip (all
+ * of it). The pill shows the longest that fits, so it shortens by whole
+ * parts, never in the middle of a word: the timer goes first, then the
+ * share count, then the word "phones"; "Sharing" always stays. `left` is
+ * the auto-off timer's text ("" without one).
+ */
+export function pillVariants(st: Pick<SharingSummary, 'state' | 'reason' | 'url' | 'shares' | 'phones'>, left: string): { variants: PillVariant[]; title: string } {
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  if (st.state === 'on') {
+    const shares = plural(st.shares, 'share', 'shares');
+    const phones = plural(st.phones, 'phone', 'phones');
+    const full = `Sharing · ${shares} · ${phones}`;
+    const variants: PillVariant[] = left ? [{ text: full, left }] : [];
+    for (const text of [full, `Sharing · ${phones}`, `Sharing · ${st.phones}`, 'Sharing']) variants.push({ text, left: '' });
+    const where = st.url ? `Sharing on Wi-Fi at ${st.url}` : 'Sharing on Wi-Fi';
+    return { variants, title: `${where} · ${shares} · ${phones}${left ? ` · ${left}` : ''}` };
+  }
+  if (st.state === 'paused') {
+    const variants = [{ text: `Sharing paused${st.reason ? `: ${st.reason}` : ''}`, left: '' }];
+    if (st.reason) variants.push({ text: 'Sharing paused', left: '' });
+    return { variants, title: st.reason ? `Sharing paused: ${st.reason}` : 'Sharing is paused' };
+  }
+  return { variants: [{ text: 'Sharing failed', left: '' }], title: st.reason || 'Sharing failed' };
+}
+
+/** The first variant (longest first) whose measured width fits; the last when none does. */
+export function fittingVariant(widths: number[], available: number): number {
+  for (let i = 0; i < widths.length; i++) if ((widths[i] ?? 0) <= available + 0.5) return i;
+  return Math.max(0, widths.length - 1);
+}

@@ -156,11 +156,13 @@ button.danger {
 button.danger:hover:not(:disabled) {
   background: var(--danger-bg);
 }
-button.ghost {
+button.ghost,
+.btn.ghost {
   background: transparent;
   border-color: transparent;
 }
-button.ghost:hover:not(:disabled) {
+button.ghost:hover:not(:disabled),
+.btn.ghost:hover {
   background: var(--surface-3);
 }
 button.small,

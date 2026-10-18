@@ -1,0 +1,592 @@
+<script lang="ts">
+  // The phone app's shell (docs/design/lan-share.md "Phone UI"): reads the
+  // session, then shows what the share covers. A library share gets its
+  // libraries, each with Photos and Albums; an album share opens straight
+  // into its album, titled with the share's name, and has no library or
+  // album navigation at all. Not paired (401) and a refusing share (403
+  // `{state}`) replace every page, whichever request met them.
+  import { monthName } from '../lib/format';
+  import { href, navigate, route } from '../lib/router';
+  import Pair from './Pair.svelte';
+  import ShareGrid from './ShareGrid.svelte';
+  import ShareAlbums from './ShareAlbums.svelte';
+  import ShareLibraries from './ShareLibraries.svelte';
+  import ShareFilterChips from './ShareFilterChips.svelte';
+  import ShareFilterSheet from './ShareFilterSheet.svelte';
+  import { filterChips, filtersFromQuery, filtersQuery, hasFilters, type Chip, type FilterScope } from './filters';
+  import { gridPath, mapPath, mapQuery, mapViewFromQuery, pairToken, resolveRoute, takePairToken, type SharePage } from './routes';
+  import { shareSession } from './session.svelte';
+  import { errorText, shareClient, type ShareAlbum, type ShareClient, type ShareFacets, type ShareFilters } from './shareapi';
+
+  // The map (with `location` only) loads Leaflet: only when it is opened.
+  let mapModule: Promise<typeof import('./ShareMap.svelte')> | null = null;
+  const loadMap = () => (mapModule ??= import('./ShareMap.svelte'));
+
+  // The QR code's token leaves the address bar before anything else happens.
+  let token = $state<string | null>(takePairToken());
+  $effect(() => {
+    void route.current.raw;
+    if (pairToken(location.hash) !== null) token = takePairToken();
+  });
+
+  $effect(() => {
+    void shareSession.load();
+  });
+
+  // Capabilities changed on the computer (turned on as well as off) take
+  // effect without a reload: the session is read again when the page comes
+  // back into view, and every few minutes while it is in view.
+  const SESSION_EVERY = 3 * 60_000;
+  $effect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    };
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') void shareSession.refresh();
+    }, SESSION_EVERY);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  });
+  /** Something was refused (403 without a state, a failed image or video): the capabilities may have changed. */
+  const recheck = () => shareSession.refresh(5_000);
+
+  const share = $derived(shareSession.share);
+  const caps = $derived(shareSession.caps);
+  const resolved = $derived(resolveRoute(route.current, shareSession.status === 'ready' ? share : null));
+  const page = $derived<SharePage | null>('page' in resolved ? resolved.page : null);
+
+  $effect(() => {
+    if (shareSession.status !== 'ready' && route.current.segments[0] !== 'pair') return;
+    if ('redirect' in resolved) navigate(resolved.redirect, { replace: true });
+  });
+
+  $effect(() => {
+    document.title = share?.name ? `${share.name} · picmover` : 'picmover';
+  });
+
+  // ---- Clients ----
+
+  const clients = new Map<string, ShareClient>();
+  function clientFor(lib: string): ShareClient {
+    const c = caps;
+    const key = `${lib}|${c.video}|${c.download}|${c.rate}|${c.location}`;
+    let x = clients.get(key);
+    if (!x) {
+      x = shareClient(lib, c);
+      clients.set(key, x);
+    }
+    return x;
+  }
+  const lib = $derived(page && 'lib' in page ? page.lib : page?.kind === 'albumshare' ? 'album' : null);
+  const client = $derived(lib !== null ? clientFor(lib) : null);
+  const libName = $derived(page && 'lib' in page ? (share?.libraries.find((l) => l.id === page.lib)?.name ?? page.lib) : '');
+
+  const scope = $derived<FilterScope>({ rate: caps.rate, location: caps.location, library: share?.kind === 'libraries' });
+  /** The album of an album page (and of its map) in a library share. */
+  const pageAlbum = $derived(page?.kind === 'album' || page?.kind === 'map' ? page.albumId : null);
+  const filters = $derived.by<ShareFilters>(() => {
+    const f = filtersFromQuery(route.current.query, scope);
+    // The album page is its album: an album in the query would fight it.
+    if (pageAlbum !== null) delete f.album;
+    return f;
+  });
+  const filtered = $derived(hasFilters(filters));
+  const query = $derived(filtersQuery(filters));
+
+  // ---- Facets: the sheet's choices, and the names of tags and albums in the chips ----
+
+  let facets = $state.raw<{ lib: string; data: ShareFacets } | null>(null);
+  let facetsError = $state('');
+  let facetsFor = '';
+  function loadFacets(c: ShareClient, force: boolean) {
+    if (!force && (facets?.lib === c.id || facetsFor === c.id)) return;
+    facetsFor = c.id;
+    facetsError = '';
+    c.getFacets()
+      .then((data) => {
+        if (client?.id === c.id) facets = { lib: c.id, data };
+      })
+      .catch((e: unknown) => {
+        if (client?.id === c.id) facetsError = errorText(e);
+      })
+      .finally(() => {
+        if (facetsFor === c.id) facetsFor = '';
+      });
+  }
+  const libFacets = $derived(client && facets?.lib === client.id ? facets.data : null);
+  // Chips name tags and albums: read the facets once when the route has some.
+  $effect(() => {
+    if (client && (filters.tags?.length || filters.album)) loadFacets(client, false);
+  });
+  const names = $derived({
+    tags: new Map((libFacets?.tags ?? []).map((t) => [t.id, t.name])),
+    albums: new Map((libFacets?.albums ?? []).map((a) => [a.id, a.name])),
+  });
+  const chips = $derived(filterChips(filters, names));
+
+  // The album of an album page in a library share (its name and count for the header).
+  let albums = $state.raw<{ lib: string; list: ShareAlbum[] } | null>(null);
+  $effect(() => {
+    if (pageAlbum === null || !client) return;
+    const c = client;
+    if (albums?.lib === c.id) return;
+    const ac = new AbortController();
+    c.getAlbums(ac.signal)
+      .then((list) => (albums = { lib: c.id, list }))
+      .catch(() => {});
+    return () => ac.abort();
+  });
+  const album = $derived(pageAlbum !== null && page && 'lib' in page && albums?.lib === page.lib ? (albums.list.find((a) => a.id === pageAlbum) ?? null) : null);
+
+  // ---- Menu and filters ----
+
+  let menuOpen = $state(false);
+  let help = $state(false);
+  let filterOpen = $state(false);
+  $effect(() => {
+    void route.current.raw;
+    menuOpen = false;
+    filterOpen = false;
+  });
+
+  function expiryText(s: string | null): string {
+    const d = s ? new Date(s) : null;
+    if (!d || Number.isNaN(d.getTime())) return '';
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    return `Available until ${d.getDate()} ${monthName(d.getMonth() + 1, 'short')}${sameYear ? '' : ` ${d.getFullYear()}`}`;
+  }
+
+  // The filter sheet edits a draft; Apply puts it in the route (so Back,
+  // reload and the lightbox keep it). The facets are read again each time
+  // the sheet opens: photos may have come or gone.
+  function openFilters() {
+    if (client) loadFacets(client, true);
+    filterOpen = true;
+  }
+  // On the map, the filters change the map and keep its position.
+  const gridHref = (f: ShareFilters) =>
+    page?.kind === 'map'
+      ? href(mapPath(page) ?? '', mapQuery(filtersQuery(f), mapViewFromQuery(route.current.query)))
+      : href(page ? `${gridPath(page)}/` : '/', filtersQuery(f));
+  function applyFilters(f: ShareFilters) {
+    filterOpen = false;
+    navigate(gridHref(f));
+  }
+  function clearFilters() {
+    filterOpen = false;
+    navigate(gridHref({}));
+  }
+  function removeChip(c: Chip) {
+    navigate(gridHref(c.without));
+  }
+
+  const showsGrid = $derived(page?.kind === 'grid' || page?.kind === 'album' || page?.kind === 'albumshare' || page?.kind === 'map');
+  // The Map / Grid switch: only with `location` (the routes refuse the map without it).
+  const modeHref = $derived.by(() => {
+    if (!page || !caps.location || !showsGrid) return null;
+    if (page.kind === 'map') return href(`${gridPath(page)}/`, query);
+    const m = mapPath(page);
+    return m ? href(m, query) : null;
+  });
+  const viewId = $derived(page && 'viewId' in page ? page.viewId : null);
+
+  const STATES: Record<string, { title: string; text: string }> = {
+    paused: { title: 'This share is paused', text: 'The owner paused it on the computer. It works again once they resume it.' },
+    expired: { title: 'This share has ended', text: 'Ask the owner to extend it on the computer.' },
+    gone: { title: 'This album is no longer shared', text: 'The album was deleted on the computer.' },
+    unavailable: { title: 'This share is not available right now', text: 'The computer is showing other photos at the moment. Try again later.' },
+  };
+  const blocked = $derived(STATES[shareSession.blocked] ?? { title: 'This share is not available', text: '' });
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key === 'Escape' && menuOpen && !e.defaultPrevented) {
+      e.preventDefault();
+      menuOpen = false;
+    }
+  }
+</script>
+
+<svelte:window onkeydown={onKey} />
+
+<div class="shell">
+  {#if route.current.segments[0] === 'pair'}
+    <div class="page"><Pair {token} /></div>
+  {:else if shareSession.status === 'loading'}
+    <div class="empty">Loading…</div>
+  {:else if shareSession.status === 'unpaired'}
+    <div class="page">
+      <Pair
+        token={null}
+        title={shareSession.removed ? 'This phone was removed' : 'Not paired'}
+        message={shareSession.removed
+          ? 'This phone was removed from picmover on the computer. To see the photos again, show a new code on the computer and type it here.'
+          : 'This phone is not paired with picmover. On the computer, open the Share page and choose Pair a phone; then scan the QR code, or type the code here.'}
+      />
+    </div>
+  {:else if shareSession.status === 'blocked'}
+    <div class="empty" role="alert">
+      <h2>{blocked.title}</h2>
+      {#if blocked.text}<p>{blocked.text}</p>{/if}
+      <button onclick={() => shareSession.load()}>Try again</button>
+    </div>
+  {:else if shareSession.status === 'busy'}
+    <div class="empty" role="alert">
+      <h2>Not available right now</h2>
+      <p>The computer is busy with this library. Try again later.</p>
+      <button onclick={() => shareSession.load()}>Try again</button>
+    </div>
+  {:else if shareSession.status === 'offline'}
+    <div class="empty" role="alert">
+      <h2>Cannot reach the computer</h2>
+      <p>{shareSession.error}</p>
+      <button onclick={() => shareSession.load()}>Try again</button>
+    </div>
+  {:else if share && page}
+    <header class="topbar">
+      <div class="titles">
+        <span class="title">{share.name}{#if libName && share.libraries.length > 1}<span class="sub-inline">{' · '}{libName}</span>{/if}</span>
+        {#if share.kind === 'album' && share.album}
+          <span class="sub">{share.album.name} · {share.album.count} {share.album.count === 1 ? 'item' : 'items'}</span>
+        {/if}
+      </div>
+      {#if showsGrid}
+        <button class="filterbtn" class:on={filtered} aria-label={chips.length ? `Filter, ${chips.length} on` : 'Filter'} aria-haspopup="dialog" onclick={openFilters}>
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4 2v-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          <span>Filter</span>{#if chips.length}<span class="badge">{chips.length}</span>{/if}
+        </button>
+      {/if}
+      {#if modeHref}
+        <a class="modebtn" href={modeHref} aria-label={page.kind === 'map' ? 'Grid' : 'Map'} title={page.kind === 'map' ? 'Grid' : 'Map'}>
+          {#if page.kind === 'map'}
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          {:else}
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" /></svg>
+          {/if}
+        </a>
+      {/if}
+      <button class="ghost icon" aria-label="Menu" aria-expanded={menuOpen} aria-controls="share-menu" onclick={() => (menuOpen = !menuOpen)}>
+        <span aria-hidden="true">⋮</span>
+      </button>
+    </header>
+
+    {#if share.kind === 'libraries' && page.kind !== 'libraries' && 'lib' in page}
+      {#if page.kind !== 'map'}<nav class="tabs" aria-label="Library">
+        <a href={href(`l/${page.lib}/`)} class:on={page.kind === 'grid'} aria-current={page.kind === 'grid' ? 'page' : undefined}>Photos</a>
+        <a href={href(`l/${page.lib}/albums`)} class:on={page.kind !== 'grid'} aria-current={page.kind === 'albums' ? 'page' : undefined}>Albums</a>
+      </nav>{/if}
+      {#if pageAlbum !== null}
+        <div class="albumhead">
+          <a href={href(`l/${page.lib}/albums`)} aria-label="All albums">‹</a>
+          <strong>{album?.name ?? 'Album'}</strong>
+          {#if album}<span class="muted small">{album.count} {album.count === 1 ? 'item' : 'items'}</span>{/if}
+        </div>
+      {/if}
+    {/if}
+
+    {#if showsGrid && chips.length}
+      <ShareFilterChips {chips} onremove={removeChip} onopen={openFilters} onclear={clearFilters} />
+    {/if}
+
+    <main>
+      {#if page.kind === 'libraries'}
+        <ShareLibraries />
+      {:else if page.kind === 'albums' && client}
+        <ShareAlbums {client} />
+      {:else if client && page.kind === 'albumshare'}
+        <ShareGrid
+          {client}
+          {filters}
+          {viewId}
+          basePath=""
+          {query}
+          kind="album"
+          {filtered}
+          emptyText="Nothing here yet"
+          onclearfilters={clearFilters}
+          onforbidden={recheck}
+        />
+      {:else if client && page.kind === 'grid'}
+        {#key page.lib}
+          <ShareGrid
+            {client}
+            {filters}
+            {viewId}
+            basePath={gridPath(page)}
+            {query}
+            kind="libraries"
+            {filtered}
+            albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
+            emptyText="No photos yet"
+            onclearfilters={clearFilters}
+            onforbidden={recheck}
+          />
+        {/key}
+      {:else if client && page.kind === 'map'}
+        {#key `${page.lib}/${page.albumId}`}
+          {#await loadMap()}
+            <div class="empty">Loading the map…</div>
+          {:then m}
+            <m.default
+              {client}
+              filters={page.albumId !== null ? { ...filters, album: page.albumId } : filters}
+              view={mapViewFromQuery(route.current.query)}
+              {viewId}
+              basePath={mapPath(page) ?? 'map'}
+              {query}
+              kind={share.kind === 'album' ? 'album' : 'libraries'}
+              {filtered}
+              albumHref={share.kind === 'album' ? null : (aid) => href(`l/${page.lib}/albums/${aid}`)}
+              onclearfilters={clearFilters}
+              onforbidden={recheck}
+            />
+          {:catch e}
+            <div class="empty" role="alert">
+              <h2>Could not load the map</h2>
+              <p>{errorText(e)}</p>
+            </div>
+          {/await}
+        {/key}
+      {:else if client && page.kind === 'album'}
+        {#key `${page.lib}/${page.albumId}`}
+          <ShareGrid
+            {client}
+            filters={{ ...filters, album: page.albumId }}
+            {viewId}
+            basePath={gridPath(page)}
+            {query}
+            kind="libraries"
+            {filtered}
+            albumHref={(aid) => href(`l/${page.lib}/albums/${aid}`)}
+            emptyText="This album is empty"
+            onclearfilters={clearFilters}
+            onforbidden={recheck}
+          />
+        {/key}
+      {/if}
+    </main>
+
+    {#if menuOpen}
+      <button class="scrim" aria-label="Close the menu" onclick={() => (menuOpen = false)}></button>
+      <!-- A disclosure, not an ARIA menu: it holds text as well as a link and a button. -->
+      <div class="menu" id="share-menu" role="group" aria-label="Menu">
+        {#if share.kind === 'libraries' && share.libraries.length > 1}
+          <a href="#/">Libraries</a>
+        {/if}
+        <p class="item">Paired as <strong>{shareSession.session?.device.name || 'this phone'}</strong>{#if shareSession.session?.computer}<span class="muted"> with {shareSession.session.computer}</span>{/if}</p>
+        {#if share.expiresAt}<p class="item muted">{expiryText(share.expiresAt)}</p>{/if}
+        <button class="ghost" aria-expanded={help} onclick={() => (help = !help)}>Help</button>
+        {#if help}
+          <div class="help small">
+            <p>These photos are shared from picmover on a computer on this Wi-Fi. You can look at them{caps.rate ? ' and give them stars' : ''}{caps.download ? ', and download originals' : ''}; nothing else can be changed from here.</p>
+            <p>Tap a photo to open it. Swipe left or right for the next one, swipe down to close, double-tap to zoom. Start swipes away from the screen edges.</p>
+            <p>If this stops working, ask the owner for a new code.</p>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if filterOpen}
+      <ShareFilterSheet
+        {filters}
+        facets={libFacets}
+        {facetsError}
+        {scope}
+        albumImplied={page.kind === 'album'}
+        onapply={applyFilters}
+        onclose={() => (filterOpen = false)}
+      />
+    {/if}
+  {:else}
+    <div class="empty">Loading…</div>
+  {/if}
+</div>
+
+<style>
+  .shell {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+  .shell > .page {
+    flex: 1;
+  }
+  .topbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-height: 48px;
+    padding: env(safe-area-inset-top, 0px) calc(4px + env(safe-area-inset-right, 0px)) 0 calc(12px + env(safe-area-inset-left, 0px));
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .titles {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    line-height: 1.2;
+  }
+  .title {
+    font-weight: 600;
+    font-size: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sub-inline {
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .sub {
+    color: var(--muted);
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .icon {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    font-size: 20px;
+  }
+  .tabs {
+    flex: none;
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .tabs a {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    color: var(--muted);
+    border-bottom: 2px solid transparent;
+  }
+  .tabs a.on {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  .tabs a:hover {
+    text-decoration: none;
+  }
+  .albumhead {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 0 12px 0 0;
+  }
+  .albumhead a {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 24px;
+  }
+  main {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+  }
+  .scrim {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 900;
+    border: 0;
+    border-radius: 0;
+    background: rgba(0, 0, 0, 0.4);
+  }
+  .scrim:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.4);
+  }
+  .menu {
+    position: fixed;
+    top: calc(48px + env(safe-area-inset-top, 0px));
+    right: 8px;
+    z-index: 901;
+    display: flex;
+    flex-direction: column;
+    width: min(320px, calc(100vw - 16px));
+    max-height: 80vh;
+    overflow-y: auto;
+    padding: 6px 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+  .menu a,
+  .menu button,
+  .menu .item {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    min-height: 44px;
+    margin: 0;
+    padding: 0 16px;
+    border-radius: 0;
+    white-space: normal;
+  }
+  .menu .item {
+    display: block;
+    padding-top: 12px;
+    padding-bottom: 12px;
+    min-height: 0;
+  }
+  .help {
+    padding: 0 16px 8px;
+  }
+  .help p {
+    margin: 6px 0;
+  }
+  .filterbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 40px;
+    padding: 0 12px;
+    border-radius: 20px;
+    flex: none;
+  }
+  .filterbtn.on {
+    border-color: var(--accent-strong);
+    color: var(--accent);
+  }
+  .modebtn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    min-width: 44px;
+    min-height: 44px;
+    color: var(--text);
+  }
+  .modebtn:hover {
+    text-decoration: none;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 10px;
+    background: var(--accent-strong);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+  }
+</style>

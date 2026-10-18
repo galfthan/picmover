@@ -173,6 +173,68 @@ export function layoutTimeline(buckets: readonly Bucket[], p: LayoutParams): Tim
   };
 }
 
+/**
+ * The scrubber's mapping between a track position (the thumb's centre, in
+ * px from the track's top) and a timeline offset. Linear over the whole
+ * scroll range, so a point of the track is a fixed share of the photos
+ * (the layout's heights follow the months' counts): monotonic, and
+ * proportional whatever the months' sizes.
+ */
+export interface ScrubScale {
+  /** The scrollable range of the timeline (at least 1). */
+  maxScroll: number;
+  /** The track position of a timeline offset (clamped). */
+  toTrack(y: number): number;
+  /** The timeline offset of a track position (clamped). */
+  toTimeline(trackY: number): number;
+}
+
+export function scrubScale(totalHeight: number, viewportHeight: number, pad: number, thumb: number): ScrubScale {
+  const travel = Math.max(0, viewportHeight - 2 * pad - thumb);
+  const maxScroll = Math.max(1, totalHeight - viewportHeight);
+  const lo = pad + thumb / 2;
+  return {
+    maxScroll,
+    toTrack: (y) => lo + Math.min(1, Math.max(0, y / maxScroll)) * travel,
+    toTimeline: (t) => (Math.min(travel, Math.max(0, t - lo)) / Math.max(1, travel)) * maxScroll,
+  };
+}
+
+/**
+ * A place in the timeline that survives a new layout: the first item of
+ * the row at the top of the view and how far into that row, or (in a
+ * month's header) the offset into the header.
+ */
+export interface TimelineAnchor {
+  year: number;
+  month: number;
+  /** Index of the row's first item; -1 in the header. */
+  index: number;
+  /** Fraction of a row (in the rows) or px (in the header). */
+  within: number;
+}
+
+/** The anchor at timeline offset y; null when there are no buckets. */
+export function anchorAt(tl: Timeline, y: number): TimelineAnchor | null {
+  const b = tl.buckets[tl.indexAtOffset(y)];
+  if (!b) return null;
+  const inRows = y - b.rowsTop;
+  if (inRows >= 0 && b.rows > 0) {
+    const row = Math.min(b.rows - 1, Math.floor(inRows / tl.rowPitch));
+    return { year: b.year, month: b.month, index: row * tl.columns, within: Math.min(1, Math.max(0, (inRows - row * tl.rowPitch) / tl.rowPitch)) };
+  }
+  return { year: b.year, month: b.month, index: -1, within: Math.max(0, y - b.top) };
+}
+
+/** The offset of an anchor in another layout; null when its month is gone. */
+export function anchorOffset(tl: Timeline, a: TimelineAnchor): number | null {
+  const b = tl.buckets.find((x) => x.year === a.year && x.month === a.month);
+  if (!b) return null;
+  if (a.index < 0 || b.rows === 0) return b.top + Math.min(a.within, b.height);
+  const row = Math.floor(Math.min(a.index, Math.max(0, b.count - 1)) / tl.columns);
+  return b.rowsTop + row * tl.rowPitch + a.within * tl.rowPitch;
+}
+
 /** The first bucket of every year (and the undated bucket as year 0), in order. */
 export function yearMarks(buckets: readonly BucketLayout[]): YearMark[] {
   const marks: YearMark[] = [];

@@ -221,15 +221,13 @@ func IntegrityCheck(ctx context.Context, path string) error {
 
 // PeekLibraryID reads the library id of the user.db at path read-only;
 // "" when the file is missing or empty or has no identity (version 1).
+// It sees changes still in the -wal file of a process that has the
+// library open (peekOpen).
 func PeekLibraryID(ctx context.Context, path string) (string, error) {
-	fi, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) || (err == nil && fi.Size() == 0) {
+	sqldb, _, err := peekOpen(ctx, path)
+	if errors.Is(err, ErrNoUserDB) {
 		return "", nil
 	}
-	if err != nil {
-		return "", fmt.Errorf("userdata: %w", err)
-	}
-	sqldb, err := openReadOnly(path)
 	if err != nil {
 		return "", err
 	}

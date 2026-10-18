@@ -426,7 +426,7 @@
         {#key item.id}
           {#if playable && d}
             <!-- svelte-ignore a11y_media_has_caption -->
-            <video bind:this={videoEl} controls preload="metadata" src={api.fileUrl(d.id)} poster={api.previewUrl(d)}></video>
+            <video bind:this={videoEl} controls playsinline preload="metadata" src={api.fileUrl(d.id)} poster={api.previewUrl(d)}></video>
           {:else if full && d}
             <div class="full">
               <img src={api.fileUrl(d.id)} alt="" />

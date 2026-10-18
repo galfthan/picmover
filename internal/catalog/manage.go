@@ -38,6 +38,22 @@ func (d *DB) GetByHash(ctx context.Context, hash uint64) (Media, error) {
 	return m, nil
 }
 
+// LiveByHash returns the live (not trashed) row with this content hash;
+// ok is false when there is none. hash is UNIQUE, so this is one index
+// probe.
+func (d *DB) LiveByHash(ctx context.Context, hash uint64) (m Media, ok bool, err error) {
+	m, err = d.GetByHash(ctx, hash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Media{}, false, nil
+	case err != nil:
+		return Media{}, false, err
+	case !m.DeletedAt.IsZero():
+		return Media{}, false, nil
+	}
+	return m, true, nil
+}
+
 // ByHashes returns the rows (trashed or not) with these content hashes,
 // keyed by hash; hashes without a row are absent.
 func (d *DB) ByHashes(ctx context.Context, hashes []uint64) (map[uint64]Media, error) {

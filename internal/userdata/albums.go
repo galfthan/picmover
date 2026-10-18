@@ -265,6 +265,20 @@ func (d *DB) AlbumHashes(ctx context.Context, id int64) ([]uint64, error) {
 	return d.queryHashes(ctx, "album hashes", "SELECT hash FROM album_items WHERE album_id = ? ORDER BY position", id)
 }
 
+// AlbumHas reports whether hash is a member of album id (one probe of
+// the album_items primary key).
+func (d *DB) AlbumHas(ctx context.Context, id int64, hash uint64) (bool, error) {
+	var one int
+	err := d.db.QueryRowContext(ctx, "SELECT 1 FROM album_items WHERE album_id = ? AND hash = ?", id, int64(hash)).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("userdata: album has: %w", err)
+	}
+	return true, nil
+}
+
 // AlbumsOf returns the albums hash belongs to, sorted by name.
 func (d *DB) AlbumsOf(ctx context.Context, hash uint64) ([]AlbumRef, error) {
 	rows, err := d.db.QueryContext(ctx, `SELECT a.id, a.name FROM album_items i JOIN albums a ON a.id = i.album_id

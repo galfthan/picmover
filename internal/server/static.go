@@ -96,7 +96,13 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, cache string) {
-	f, err := s.static.Open(name)
+	serveStaticFile(s, w, r, s.static, name, cache, htmlCSP)
+}
+
+// serveStaticFile serves file name of fsys with the given Cache-Control;
+// HTML gets the Content-Security-Policy csp.
+func serveStaticFile(s *Server, w http.ResponseWriter, r *http.Request, fsys fs.FS, name, cache, csp string) {
+	f, err := fsys.Open(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			http.NotFound(w, r)
@@ -129,7 +135,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name, cache s
 	h.Set("Content-Type", ct)
 	h.Set("Cache-Control", cache)
 	if strings.HasPrefix(ct, "text/html") {
-		h.Set("Content-Security-Policy", htmlCSP)
+		h.Set("Content-Security-Policy", csp)
 	}
 	http.ServeContent(w, r, "", modTime, rs)
 }

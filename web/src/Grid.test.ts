@@ -283,6 +283,19 @@ describe('grid', () => {
     expect(Number(slider.value)).toBeLessThan(160);
   });
 
+  it('leaves a failed thumbnail alone until a job versions it (no timed retries in the admin grid)', async () => {
+    await start();
+    const tile = () => document.querySelector<HTMLAnchorElement>('a.tile[href="#/l/Photos/view/3"]')!;
+    tile().querySelector('img')!.dispatchEvent(new Event('error'));
+    await settle();
+    expect(tile().querySelector('img')).toBeNull();
+    const before = requests.length;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(tile().querySelector('img')).toBeNull();
+    expect(requests.filter((r) => r.includes('/thumb/'))).toHaveLength(0);
+    expect(requests.slice(before).filter((r) => !r.includes('/api/jobs'))).toEqual([]);
+  });
+
   it('swaps tiles between thumb, large and preview across the thresholds, keeping the loaded image underneath', async () => {
     await start();
     const tile = (id: number) => document.querySelector<HTMLAnchorElement>(`a.tile[href="#/l/Photos/view/${id}"]`)!;
@@ -383,6 +396,9 @@ describe('grid', () => {
     const scrub = document.querySelector<HTMLElement>('.scrubber')!;
     expect(scrub.getAttribute('role')).toBe('slider');
     expect(scrub.tabIndex).toBe(0);
+    // The year labels are marks: a press on one drags like anywhere on the track.
+    expect(scrub.querySelectorAll('button').length).toBe(0);
+    expect(scrub.querySelectorAll('.year').length).toBe(3);
     expect(scrub.getAttribute('aria-valuetext')).toBe('July 2024');
     scrub.focus();
     scrub.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));

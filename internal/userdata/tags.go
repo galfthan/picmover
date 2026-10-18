@@ -268,3 +268,43 @@ func (d *DB) HashesWithTags(ctx context.Context, tagIDs []int64) ([]uint64, erro
 		WHERE tag_id IN (SELECT value FROM json_each(?)) GROUP BY hash HAVING COUNT(*) = ?`,
 		"["+strings.Join(ids, ",")+"]", len(ids))
 }
+
+// Member is one (tag or album id, hash) membership.
+type Member struct {
+	ID   int64
+	Hash uint64
+}
+
+// TagMembers returns every (tag id, hash) pair, by tag id.
+func (d *DB) TagMembers(ctx context.Context) ([]Member, error) {
+	return d.members(ctx, "tag members", "SELECT tag_id, hash FROM media_tags ORDER BY tag_id")
+}
+
+// AlbumMembers returns every (album id, hash) pair, by album id.
+func (d *DB) AlbumMembers(ctx context.Context) ([]Member, error) {
+	return d.members(ctx, "album members", "SELECT album_id, hash FROM album_items ORDER BY album_id")
+}
+
+func (d *DB) members(ctx context.Context, what, q string) ([]Member, error) {
+	rows, err := d.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("userdata: %s: %w", what, err)
+	}
+	defer rows.Close()
+	out := []Member{}
+	for rows.Next() {
+		var (
+			m Member
+			h int64
+		)
+		if err := rows.Scan(&m.ID, &h); err != nil {
+			return nil, fmt.Errorf("userdata: %s: %w", what, err)
+		}
+		m.Hash = uint64(h)
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("userdata: %s: %w", what, err)
+	}
+	return out, nil
+}
