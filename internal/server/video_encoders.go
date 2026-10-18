@@ -119,6 +119,9 @@ type ffmpegCaps struct {
 	// tonemap is set when the zscale and tonemap filters exist (HDR to
 	// SDR conversion).
 	tonemap bool
+	// fpsMode is set when ffmpeg has -fps_mode (5.1 and later); else a
+	// transcode uses -vsync (vfrArgs).
+	fpsMode bool
 	// note explains an empty encoders list, for the log.
 	note string
 }
@@ -147,6 +150,7 @@ func probeFFmpeg(ctx context.Context, ffmpeg string, hw, sw []encoder) ffmpegCap
 	}
 	filters, _ := ffmpegList(ctx, ffmpeg, "-filters")
 	caps.tonemap = listHas(filters, "zscale") && listHas(filters, "tonemap")
+	caps.fpsMode = hasFPSMode(ctx, ffmpeg)
 	pick := func(cands []encoder) {
 		for _, e := range cands {
 			if !listHas(listed, e.Name) {
@@ -187,6 +191,17 @@ func listHas(listing, name string) bool {
 		}
 	}
 	return false
+}
+
+// hasFPSMode reports whether ffmpeg takes -fps_mode (5.1 and later): it
+// runs a tenth of a second of black through the frame cap with it.
+func hasFPSMode(ctx context.Context, ffmpeg string) bool {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.1", "-vf", frameCap, "-fps_mode", "vfr", "-f", "null", "-")
+	hideWindow(cmd)
+	return cmd.Run() == nil
 }
 
 // testEncode encodes half a second of black with e.

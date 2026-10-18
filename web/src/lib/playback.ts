@@ -277,11 +277,15 @@ export function inBuffered(ranges: { length: number; start(i: number): number; e
 
 /**
  * A live stream URL made unique with a load number n. Once the conversion
- * is complete, the server answers the same /stream URL with the cached
- * file, whose bytes differ from the fragmented stream's: a browser that
- * fetches the URL again (a replay, a seek back, data it evicted) would
- * mix the two and fail to decode. A live stream therefore never shares a
- * URL with the cached file, nor with an earlier load of itself.
+ * is complete the server answers /stream with the cached file, whose
+ * bytes differ from the fragmented stream's: a browser that fetched a
+ * live stream's URL again (a replay, a seek back, data it evicted) would
+ * mix the two and fail to decode. So a live load has a URL of its own,
+ * never the cached file's (whose bytes the browser may hold from another
+ * load); the server refuses a load=n request past byte 0 once the file is
+ * cached, rather than send the wrong bytes (an error the player recovers
+ * from with the cached file); and the player itself loads the cached file
+ * for a replay or a seek once the server says it is there.
  */
 export function liveUrl(url: string, n: number): string {
   return `${url}${url.includes('?') ? '&' : '?'}load=${n}`;

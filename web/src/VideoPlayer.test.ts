@@ -152,13 +152,14 @@ describe('VideoPlayer', () => {
     expect(src()).toBe('/api/l/peter/stream/7?mode=remux&t=9.5&load=2');
     expect(el.querySelector('.time')?.textContent).toMatch(/^0:10 \/ 0:12$/);
 
-    // The seek stream fails: asked for again (a new load), then the full
-    // remux, then given up.
+    // The seek stream fails: asked for again from where the viewer was (a
+    // new load, from the keyframe the server names), then the full remux,
+    // then given up.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const video = () => el.querySelector('video') as HTMLVideoElement;
     video().dispatchEvent(new Event('error'));
     await settle();
-    expect(src()).toBe('/api/l/peter/stream/7?mode=remux&t=9.5&load=3');
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux&t=9&load=3');
     video().dispatchEvent(new Event('error'));
     await settle();
     expect(src()).toBe('/api/l/peter/stream/7?mode=remux&load=4');
@@ -258,6 +259,123 @@ describe('VideoPlayer', () => {
       'video playback failed',
       expect.objectContaining({ mode: 'transcode', live: true, code: 3, message: 'PIPELINE_ERROR_DECODE' }),
     );
+  });
+
+  it('resumes a live stream that drops from where the viewer was, and tries again after good playback', async () => {
+    const { api } = fakeApi();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const settle = async () => {
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 0));
+        await svelte.tick();
+      }
+    };
+    const video = () => el.querySelector('video') as HTMLVideoElement;
+    const src = () => video().getAttribute('src') ?? '';
+    let now = 0;
+    // The same element plays every source.
+    Object.defineProperty(video(), 'currentTime', { configurable: true, get: () => now, set: () => {} });
+    Object.defineProperty(video(), 'videoWidth', { configurable: true, get: () => 1920 });
+    video().dispatchEvent(new Event('loadeddata'));
+    now = 20;
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    // Not cached yet: a seek stream from 20 s, not the full one from 0.
+    expect(src()).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?&t=20&load=2$/);
+    expect(el.querySelector('.time')?.textContent).toMatch(/^0:20 /);
+
+    // Six seconds of good playback: the attempts start again, so the
+    // next drop is again resumed from where it was (not the last resort).
+    video().dispatchEvent(new Event('loadeddata'));
+    for (now = 0; now <= 6; now += 0.25) video().dispatchEvent(new Event('timeupdate'));
+    now = 6;
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    expect(src()).toMatch(/&t=26&load=3$/);
+
+    // Without good playback in between, the second attempt is the full
+    // conversion, and then the player gives up.
+    video().dispatchEvent(new Event('loadeddata'));
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    expect(src()).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?&load=4$/);
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    expect(el.textContent).toContain('Converting this video for playback failed.');
+  });
+
+  it('seeks in the cached file once the conversion is complete, even inside what is buffered', async () => {
+    const real = libApi('peter');
+    let cached = false;
+    const streamStatus = vi.fn(async () => ({ cached, encoding: !cached, bytes: 1, encoders: ['libx264'], tier: 0 }));
+    const api: LibApi = { ...real, streamStatus };
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const video = el.querySelector('video') as HTMLVideoElement;
+    Object.defineProperty(video, 'buffered', { configurable: true, value: { length: 1, start: () => 0, end: () => 12 } });
+    cached = true;
+    const bar = el.querySelector<HTMLInputElement>('input[type=range]');
+    if (!bar) throw new Error('no seek bar');
+    bar.value = '3';
+    bar.dispatchEvent(new Event('change', { bubbles: true }));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await svelte.tick();
+    }
+    const now = el.querySelector('video');
+    expect(now?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?$/);
+    expect(now?.hasAttribute('controls')).toBe(true);
+  });
+
+  it('seeks inside what is buffered while the conversion runs', async () => {
+    const { api } = fakeApi();
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const video = el.querySelector('video') as HTMLVideoElement;
+    const before = video.getAttribute('src');
+    Object.defineProperty(video, 'buffered', { configurable: true, value: { length: 1, start: () => 0, end: () => 12 } });
+    let set = -1;
+    Object.defineProperty(video, 'currentTime', { configurable: true, get: () => 0, set: (v: number) => (set = v) });
+    const bar = el.querySelector<HTMLInputElement>('input[type=range]');
+    if (!bar) throw new Error('no seek bar');
+    bar.value = '3';
+    bar.dispatchEvent(new Event('change', { bubbles: true }));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await svelte.tick();
+    }
+    expect(set).toBe(3);
+    expect(el.querySelector('video')?.getAttribute('src')).toBe(before);
+    // Its events still count: an error is this source's.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    el.querySelector('video')?.dispatchEvent(new Event('error'));
+    await svelte.tick();
+    expect(console.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays an ended live stream from the cached file within the tap, once the server has said it is cached', async () => {
+    const { api } = fakeApi({ cached: false });
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const video = el.querySelector('video') as HTMLVideoElement;
+    expect(video.getAttribute('src')).toMatch(/&load=1$/);
+    // The stream ends; the server then reports the file cached.
+    vi.mocked(api.streamStatus).mockResolvedValue({ cached: true, encoding: false, bytes: 0, encoders: [], tier: 0 });
+    video.dispatchEvent(new Event('ended'));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await svelte.tick();
+    }
+    const calls = vi.mocked(api.streamStatus).mock.calls.length;
+    Object.defineProperty(video, 'ended', { configurable: true, value: true });
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(async () => {});
+    video.click();
+    // Synchronously: the cached file is the source and play() was called in the gesture.
+    expect(el.querySelector('video')?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?$/);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.streamStatus).mock.calls.length).toBe(calls);
   });
 
   it('moves on from a remux that never shows a picture at once', async () => {

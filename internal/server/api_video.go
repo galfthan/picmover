@@ -260,7 +260,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 		s.serveLive(w, r, j, rd)
 		return
 	}
+	refetch := liveRefetch(r)
 	for range 2 {
+		if refetch {
+			if fi, err := os.Stat(final); err == nil && fi.Mode().IsRegular() {
+				// The player's live stream (load=n), asked for again from
+				// the middle: the cached file is not what it was reading.
+				writeError(w, http.StatusConflict, "the conversion is complete: load it without load=")
+				return
+			}
+		}
 		if s.serveCached(w, r, final, src.hash, q) {
 			return
 		}
@@ -281,6 +290,32 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "conversion not available")
+}
+
+// liveRefetch reports whether r asks for a live stream of the player
+// (load=n, docs/design/video-playback.md) from past its first byte: a
+// browser fetching data again that it had from the live fragmented
+// stream. The cached file is a different layout of the same video, so
+// its bytes at that offset must not be served (the browser would mix
+// the two and fail to decode); the request is refused, and the player
+// loads the cached file. A request from byte 0 (a first load that finds
+// the conversion complete) gets the cached file.
+func liveRefetch(r *http.Request) bool {
+	if !r.URL.Query().Has("load") {
+		return false
+	}
+	spec, ok := strings.CutPrefix(r.Header.Get("Range"), "bytes=")
+	if !ok {
+		return false
+	}
+	first, _, _ := strings.Cut(spec, ",")
+	from, _, ok := strings.Cut(strings.TrimSpace(first), "-")
+	if !ok {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(from), 10, 64)
+	// A suffix range (bytes=-500) is from the end: past the start too.
+	return (from == "" && strings.TrimSpace(first) != "-") || (err == nil && n > 0)
 }
 
 // writeStartError answers a conversion that did not start: 409 while

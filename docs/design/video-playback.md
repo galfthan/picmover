@@ -77,20 +77,29 @@ must be a tier; `t` must be finite and non-negative.
   build has both filters; else it is only converted to 8-bit (washed out but
   playable).
 - **Frame timing**: the transcode keeps the source's frame timestamps
-  (`-fps_mode vfr`). A constant-rate output (`-fpsmax 60`, which implies
-  cfr; format version 1) must not come back: phone videos have jittery
-  timestamps (a OnePlus 59.94 fps clip: 16.58 to 16.79 ms apart) and frame
-  durations, taken from irregular decode timestamps, that do not match
-  them (9 ticks of 90 kHz for most frames, 2 to 4 frames for others). cfr
-  then duplicated and dropped about every other frame (dup=1073 drop=1073
-  of 2024), so the output juddered at an uneven ~30 fps (#20). `vfr` has
-  no duplicates or drops on that clip; `passthrough` would also keep them
-  but makes the MP4 muxer fail on a repeated timestamp. Only a source above
-  75 fps (slow motion, from the catalog's frame rate) is thinned, first in
-  the filter chain, by `fps=fps=<n>/1001`: every k-th frame, k the
-  smallest whole divisor bringing it to about 60 fps (120 and 240 → 60,
-  119.88 → 59.94, 90 → 45), so the motion stays even. A source with an
-  unknown rate keeps its timing.
+  (`-fps_mode vfr`; `-vsync vfr` for an ffmpeg before 5.1, which has no
+  `-fps_mode` and would refuse every transcode: Ubuntu 22.04 ships 4.4.
+  The capability probe tries `-fps_mode` once). A constant-rate output
+  (`-fpsmax 60`, which implies cfr; format version 1) must not come back:
+  phone videos have jittery timestamps (a OnePlus 59.94 fps clip: 16.58 to
+  16.79 ms apart) and frame durations, taken from irregular decode
+  timestamps, that do not match them (9 ticks of 90 kHz for most frames,
+  2 to 4 frames for others). cfr then duplicated and dropped about every
+  other frame (dup=1073 drop=1073 of 2024), so the output juddered at an
+  uneven ~30 fps (#20). `vfr` has no duplicates or drops on that clip;
+  `passthrough` would also keep them but makes the MP4 muxer fail on a
+  repeated timestamp.
+- **Slow motion**: video faster than 75 fps (90 to 240 fps) is thinned,
+  first in the filter chain, by
+  `select=isnan(t)+isnan(prev_selected_t)+gte(t-prev_selected_t,1/75)`: a
+  frame is kept when it comes at least 1/75 s after the last kept one. It
+  decides by the frames' own timestamps, so it needs no frame rate from the
+  catalog (an average, which a wrong container duration makes nonsense,
+  absent without ffprobe), and it only drops: the `fps` filter would
+  repeat frames of a source slower than its target. The kept frames are
+  evenly spaced: every 2nd of 90, 100, 119.88 or 120 fps, every 4th of
+  240 fps; up to about 72 fps nothing is dropped, phone jitter included.
+  Checked with ffmpeg 8.1 and 4.4 (`TestFrameCap`).
 
 Both write a **fragmented MP4** (`frag_keyframe+empty_moov+default_base_moof`,
 fragments of at most 1 s) to ffmpeg's stdout. The server appends it to a
@@ -110,11 +119,23 @@ fetches a live stream's URL again after the conversion was cached (a
 replay of an ended stream, a seek back to data it dropped) mixes the two
 and fails to decode (headless Chromium 153: `MEDIA_ERR_DECODE`,
 `PIPELINE_ERROR_DECODE`, on replaying a 34 s 1080p stream; the same
-replay of unchanged bytes plays). So the player gives every live load a
-URL of its own (`&load=<n>`, which the server ignores) and asks for the
-cached file without it; replaying an ended live stream loads the cached
-file (or a new stream); and a conversion that fails after it showed a
-picture is loaded again (below) before the player gives up.
+replay of unchanged bytes plays). So:
+
+- The player gives every live load a URL of its own (`&load=<n>`) and asks
+  for the cached file without it.
+- The server answers a `load` request whose Range starts past byte 0 with
+  409 once the conversion is cached, rather than the cached file's bytes
+  at that offset; the player recovers with the cached file (below). From
+  byte 0 (a first load that finds the conversion complete) it is the
+  cached file, consistent from there on.
+- A seek on a live stream asks `/status` first: once the conversion is
+  complete the cached file is loaded and seeked, even for a time the
+  browser has buffered.
+- When a live stream ends the player asks `/status` (every second, up to
+  20 s, while the faststart rewrite runs) until it is cached; a replay then
+  sets the cached file and calls `play()` inside the tap (iOS plays only
+  from a user gesture). Before that, a replay asks first and relies on
+  autoplay. The viewer's Space key uses the same toggle.
 
 ### Seeking while it encodes
 
@@ -137,13 +158,15 @@ the catalog, a seek bar, mute, full screen.
 - A seek stream keeps the full conversion of the same output running (it
   counts as one of its readers), so a later seek finds it cached.
 - A failed seek stream, or a conversion that failed after it showed a
-  picture, is loaded again: first a new stream from the same seek time,
-  then the full conversion; the cached file at the viewer's time whenever
-  the conversion is complete by then (`/status`). Only then does the
-  player fall back to the next plan, at the same position (a failed remux
-  seek becomes a transcode from there, not from 0). A conversion that
-  never showed a picture (a remux of a codec the browser cannot decode)
-  goes to the next plan at once.
+  picture, is loaded again: first a seek stream from where the viewer was
+  (a remux from the keyframe before it), then the full conversion; the
+  cached file at the viewer's time whenever the conversion is complete by
+  then (`/status`). Only then does the player fall back to the next plan,
+  at the same position (a failed remux seek becomes a transcode from
+  there, not from 0). A conversion that never showed a picture (a remux of
+  a codec the browser cannot decode) goes to the next plan at once. After
+  5 s of good playback the attempts start again, so separate network drops
+  in a long viewing each get theirs.
 - Every failure is logged to the browser console (`video playback
   failed`, with the MediaError code and message, or why without one, the
   mode, tier, offset and URL).

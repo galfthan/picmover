@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -246,7 +245,7 @@ func (v *videoManager) capabilities() ffmpegCaps {
 		start := time.Now()
 		v.caps = probeFFmpeg(context.Background(), v.ffmpeg, v.hw, v.sw)
 		v.log.Info("video conversion", "encoders", strings.Join(v.caps.encoderNames(), ","),
-			"tonemap", v.caps.tonemap, "note", v.caps.note, "probe", time.Since(start).Round(time.Millisecond))
+			"tonemap", v.caps.tonemap, "fps_mode", v.caps.fpsMode, "note", v.caps.note, "probe", time.Since(start).Round(time.Millisecond))
 	})
 	return v.caps
 }
@@ -935,7 +934,7 @@ func (j *encodeJob) encode() error {
 	var lastErr error
 	for _, e := range caps.encoders {
 		j.setEncoder(e.Name)
-		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e))
+		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e, caps.fpsMode))
 		j.mu.Lock()
 		wrote := j.written > 0
 		j.mu.Unlock()
@@ -1155,63 +1154,60 @@ func remuxArgs(src source, q streamReq) []string {
 
 // transcodeArgs convert to H.264 (8-bit 4:2:0) and AAC with encoder e:
 // scaled so the short side is q.tier (never up), HDR tone-mapped to SDR
-// BT.709 when the filters exist, with the source's frame timing (only a
-// source above 60 fps is thinned, by fpsFilter). ffmpeg applies the
-// rotation (autorotate), so the output is upright.
+// BT.709 when the filters exist, with the source's frame timing (only
+// frames closer than 1/75 s are thinned, by frameCap). ffmpeg applies the
+// rotation (autorotate), so the output is upright. fpsMode: this ffmpeg
+// has -fps_mode (5.1 and later; ffmpegCaps.fpsMode), else -vsync is used.
 //
-// -fps_mode vfr keeps each frame's timestamp and drops only a frame that
-// would repeat the previous one's. A constant-rate mode (cfr, or -fpsmax,
-// which implies it) must not be used: phone videos have jittery
-// timestamps and frame durations that do not match them, and cfr then
-// duplicates and drops about every other frame (#20). passthrough is not
-// used either: a repeated timestamp makes the MP4 muxer fail.
-func transcodeArgs(src source, q streamReq, e encoder) []string {
+// vfr keeps each frame's timestamp and drops only a frame that would
+// repeat the previous one's. A constant-rate mode (cfr, or -fpsmax, which
+// implies it) must not be used: phone videos have jittery timestamps and
+// frame durations that do not match them, and cfr then duplicates and
+// drops about every other frame (#20). passthrough is not used either: a
+// repeated timestamp makes the MP4 muxer fail.
+func transcodeArgs(src source, q streamReq, e encoder, fpsMode bool) []string {
 	args := inputArgs(src, q, e.input)
 	args = append(args, "-vf", videoFilter(q.tier, q.tonemap, src.info, e.format))
 	args = append(args, e.args(q.tier)...)
 	if q.tonemap {
 		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
 	}
-	args = append(args, "-fps_mode", "vfr", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
-		"-max_muxing_queue_size", "1024")
+	args = append(args, vfrArgs(fpsMode)...)
+	args = append(args, "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-max_muxing_queue_size", "1024")
 	args = append(args, fragmentFlags...)
 	return append(args, "-f", "mp4", "pipe:1")
 }
 
-func isHDR(transfer string) bool { return transfer == "smpte2084" || transfer == "arib-std-b67" }
-
-// A transcode thins only a source above fpsCapAbove frames per second
-// (slow motion: 90, 120, 240 fps), to about maxFPS; fpsSlack lets a rate
-// a little above maxFPS (an average of jittery timestamps) count as it.
-// Everything else keeps its own timing, a 60 fps video included.
-const (
-	maxFPS      = 60
-	fpsSlack    = 1.02
-	fpsCapAbove = 75
-)
-
-// fpsFilter is the fps filter for a source above fpsCapAbove: it keeps
-// every n-th frame, n the smallest whole divisor that brings the rate to
-// about maxFPS or below (120 -> 60, 240 -> 60, 119.88 -> 59.94,
-// 90 -> 45), so the motion stays even. The rate is written in 1001ths,
-// exact for NTSC (60000/1001) and whole rates (60060/1001) alike. "" for
-// any other source and when the rate is unknown.
-func fpsFilter(info *catalog.VideoInfo) string {
-	if info == nil || !(info.FrameRate > fpsCapAbove) || info.FrameRate > 100_000 {
-		return ""
+// vfrArgs select the variable frame rate output: -fps_mode vfr, or
+// -vsync vfr for an ffmpeg before 5.1, which has no -fps_mode (it exits
+// with "Unrecognized option"). 5.1 and later only deprecate -vsync.
+func vfrArgs(fpsMode bool) []string {
+	if fpsMode {
+		return []string{"-fps_mode", "vfr"}
 	}
-	n := math.Ceil(info.FrameRate / (maxFPS * fpsSlack))
-	return fmt.Sprintf("fps=fps=%d/1001", int64(math.Round(info.FrameRate/n*1001)))
+	return []string{"-vsync", "vfr"}
 }
 
-// videoFilter is the -vf chain: the frame-rate cap (fpsFilter; first, so
+func isHDR(transfer string) bool { return transfer == "smpte2084" || transfer == "arib-std-b67" }
+
+// frameCap thins video faster than 75 frames per second (slow motion
+// recorded at 90, 120 or 240 fps) and leaves everything else alone: a
+// frame is kept when it comes at least 1/75 s after the last kept one, or
+// has no time. It decides by the frames' own timestamps, not by the
+// catalog's frame rate (an average, which a wrong container duration or a
+// very short clip makes nonsense, and which is absent without ffprobe),
+// and it only ever drops frames: unlike the fps filter it never repeats
+// one, so the output keeps the source timing (vfr). The kept frames are
+// evenly spaced: every 2nd of 90, 100 or 120 fps (45, 50, 60 fps), every
+// 4th of 240 fps (60 fps). A 60 fps video (16.7 ms apart, phone jitter
+// about 0.1 ms) loses nothing, nor does anything up to about 72 fps.
+const frameCap = `select=isnan(t)+isnan(prev_selected_t)+gte(t-prev_selected_t\,1/75)`
+
+// videoFilter is the -vf chain: the frame-rate cap (frameCap; first, so
 // the rest handles fewer frames), scale (short side tier, even sizes),
 // optional tone mapping, then the encoder's format (and upload).
 func videoFilter(tier int, tonemap bool, info *catalog.VideoInfo, format string) string {
-	var parts []string
-	if f := fpsFilter(info); f != "" {
-		parts = append(parts, f)
-	}
+	parts := []string{frameCap}
 	if tier > 0 {
 		// Short side = tier for landscape and portrait; -2 keeps the
 		// aspect ratio with an even size.
