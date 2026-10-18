@@ -552,7 +552,7 @@ func TestVideoTiers(t *testing.T) {
 	}
 	// The filter caps the short side for landscape and portrait alike.
 	fl := videoFilter(720, false, nil, "format=yuv420p")
-	if fl != frameCap+`,scale=w=if(gte(iw\,ih)\,-2\,720):h=if(gte(iw\,ih)\,720\,-2),format=yuv420p` {
+	if fl != `scale=w=if(gte(iw\,ih)\,-2\,720):h=if(gte(iw\,ih)\,720\,-2),format=yuv420p` {
 		t.Fatalf("filter %s", fl)
 	}
 	hdr := videoFilter(0, true, &catalog.VideoInfo{ColorTransfer: "arib-std-b67"}, "format=nv12,hwupload")

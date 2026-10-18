@@ -282,10 +282,10 @@ export function inBuffered(ranges: { length: number; start(i: number): number; e
  * live stream's URL again (a replay, a seek back, data it evicted) would
  * mix the two and fail to decode. So a live load has a URL of its own,
  * never the cached file's (whose bytes the browser may hold from another
- * load); the server refuses a load=n request past byte 0 once the file is
- * cached, rather than send the wrong bytes (an error the player recovers
+ * load); the server refuses a load=n request at any offset once the file
+ * is cached, rather than send other bytes (an error the player recovers
  * from with the cached file); and the player itself loads the cached file
- * for a replay or a seek once the server says it is there.
+ * for a replay, or a seek after the end, once the server says it is there.
  */
 export function liveUrl(url: string, n: number): string {
   return `${url}${url.includes('?') ? '&' : '?'}load=${n}`;

@@ -194,12 +194,12 @@ func listHas(listing, name string) bool {
 }
 
 // hasFPSMode reports whether ffmpeg takes -fps_mode (5.1 and later): it
-// runs a tenth of a second of black through the frame cap with it.
+// runs a tenth of a second of black with it.
 func hasFPSMode(ctx context.Context, ffmpeg string) bool {
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.1", "-vf", frameCap, "-fps_mode", "vfr", "-f", "null", "-")
+		"-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=0.1", "-fps_mode", "vfr", "-f", "null", "-")
 	hideWindow(cmd)
 	return cmd.Run() == nil
 }

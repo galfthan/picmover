@@ -184,6 +184,7 @@ func New(opts Options) (*Server, error) {
 
 		bodyTimeout: bodyReadTimeout,
 	}
+	s.video.ffprobe = opts.FFProbe
 	switch {
 	case s.static == nil:
 		if dist, ok := web.Dist(); ok {

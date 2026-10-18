@@ -69,6 +69,10 @@
   let started = false;
   /** Recovery attempts of the current plan since its last good start (see fail, progress). */
   let retries = 0;
+  /** All recovery attempts of the current plan: progress never resets them (MAX_ATTEMPTS). */
+  let attempts = 0;
+  /** Reloads of a live stream that failed before it could be retried otherwise: the cached file, or once more (see recover). */
+  let liveRetries = 0;
   /** Seconds the current source has played without a failure, and its last time (-1: none yet). */
   let goodFor = 0;
   let goodLast = -1;
@@ -95,6 +99,10 @@
     untrack(() => void apply(planPlayback(detail, canPlay), 0, false));
   });
 
+  // Gone: every async step still running (a /status poll after the end,
+  // a pending source change) is dropped.
+  $effect(() => () => void ++gen);
+
   /** The URL of a running conversion's stream (from t), unique per load (liveUrl). */
   function liveSrc(mode: 'remux' | 'transcode', t = 0): string {
     return liveUrl(api.streamUrl(detail.id, mode, tier, t), ++loads);
@@ -108,7 +116,7 @@
   /** Switches to plan p, starting at source time `at`. */
   async function apply(p: Plan, at: number, play: boolean) {
     const my = ++gen;
-    if (p.mode !== plan.mode) retries = 0;
+    if (p.mode !== plan.mode) retries = attempts = liveRetries = 0;
     plan = p;
     live = false;
     offset = 0;
@@ -153,55 +161,96 @@
    * The current source failed: why is the reason when the element has no
    * MediaError (no picture). It is logged to the console for a diagnosis.
    *
-   * A conversion that started from a seek, or that already showed a
-   * picture (a dropped connection; a refetch of a stream that was cached
-   * meanwhile, which the server refuses), is loaded again (reload): first
-   * from where the viewer was (a seek stream), then the full conversion;
-   * the cached file at the viewer's time whenever the conversion is
-   * complete. Only then is the next plan tried, from the same time, so a
-   * failed remux seek does not throw the viewer back to 0. A conversion
-   * that never showed a picture (a remux of a codec the browser cannot
-   * decode) goes to the next plan at once. The attempts start again after
-   * a few seconds of good playback (progress).
+   * A conversion is recovered (recover) before the next plan is tried:
+   * - A live stream that failed with an error (not for want of a
+   *   decoder), even before any picture, is replaced by the cached file
+   *   when the conversion is complete: the server refuses a live load once
+   *   it is (409), also a first load that raced with the end of the
+   *   conversion. Else it is loaded once more (a passing error).
+   * - A conversion that started from a seek, or that already showed a
+   *   picture (a dropped connection), is loaded again: first from where
+   *   the viewer was (a seek stream), then the full conversion; the cached
+   *   file at the viewer's time whenever it is complete. These attempts
+   *   start again after a few seconds of good playback (progress), up to
+   *   MAX_ATTEMPTS in all, so a source that always fails at the same
+   *   point does not restart forever.
+   * Only then is the next plan tried, from the same time, so a failed
+   * remux seek does not throw the viewer back to 0. A conversion that never
+   * showed a picture for want of a decoder (a remux of a codec the browser
+   * cannot decode) goes to the next plan at once.
    */
-  function fail(why: string) {
+  function fail(why: string, noPicture = false) {
     if (plan.mode === 'none' || !src) return;
     const v = videoEl;
     console.warn('video playback failed', describeFailure(v, why, { mode: plan.mode, tier, live, offset, src }));
     const play = !!v && !v.paused;
     const pos = offset + (v?.currentTime ?? 0);
     const at = pos > 0.5 ? pos : resumeAt;
-    if ((plan.mode === 'remux' || plan.mode === 'transcode') && (offset > 0 || started) && retries < 2) {
-      retries++;
-      void reload(plan.mode, at, play, retries === 1);
+    if (plan.mode === 'remux' || plan.mode === 'transcode') void recover(plan.mode, at, play, noPicture);
+    else giveUp(at, play);
+  }
+
+  /** Recovery attempts of one plan in all (see fail). */
+  const MAX_ATTEMPTS = 4;
+
+  async function recover(mode: 'remux' | 'transcode', at: number, play: boolean, noPicture: boolean) {
+    const canRetry = (offset > 0 || started) && retries < 2 && attempts < MAX_ATTEMPTS;
+    const liveRetry = live && !noPicture && liveRetries < 1;
+    if (!canRetry && !liveRetry) {
+      giveUp(at, play);
       return;
     }
+    const my = ++gen;
+    videoEl?.pause();
+    // The first retry resumes where the viewer was (a seek stream).
+    const t = canRetry && retries === 0 && at > 0.5 ? at : 0;
+    const st = await askStatus(mode, t);
+    if (my !== gen) return;
+    if (canRetry) {
+      retries++;
+      attempts++;
+    } else {
+      liveRetries++;
+    }
+    place(mode, at, play, st.cached, t, st.start);
+  }
+
+  /** The next plan, from source time `at`: the player gives up on this one. */
+  function giveUp(at: number, play: boolean) {
+    if (plan.mode === 'none') return;
     const next = nextPlan(plan.mode, detail);
     if (next.mode === 'none') onunplayable?.(src);
     void apply(next, at, play);
   }
 
-  /**
-   * Loads the conversion again: the cached file when it is complete
-   * (seeking to `at` once it has its metadata), else a new stream: with
-   * seek (and `at` past the start) a seek stream from `at` (a remux from
-   * the keyframe before it, which the server names), else the full
-   * conversion, playable from the start while it runs.
-   */
-  async function reload(mode: 'remux' | 'transcode', at: number, play: boolean, seek: boolean) {
-    const my = ++gen;
-    videoEl?.pause();
-    const t = seek && at > 0.5 ? at : 0;
-    let cached = false;
-    let start = t;
+  /** /status: whether the conversion is cached, and where a stream from t starts. */
+  async function askStatus(mode: 'remux' | 'transcode', t: number): Promise<{ cached: boolean; start: number }> {
     try {
       const st = await api.streamStatus(detail.id, mode, tier, t);
-      cached = st.cached;
-      start = st.start ?? t;
+      return { cached: st.cached, start: st.start ?? t };
     } catch {
       // The stream request itself reports a real problem.
+      return { cached: false, start: t };
     }
+  }
+
+  /** Loads the conversion again from the start (a replay): the cached file, or a new stream. */
+  async function reload(mode: 'remux' | 'transcode', play: boolean) {
+    const my = ++gen;
+    videoEl?.pause();
+    const st = await askStatus(mode, 0);
     if (my !== gen) return;
+    place(mode, 0, play, st.cached, 0, 0);
+  }
+
+  /**
+   * Loads the conversion: the cached file when it is complete (seeking to
+   * `at` once it has its metadata), else a new stream: with t > 0 a seek
+   * stream from start (where the server says a stream from t starts: a
+   * remux at the keyframe before it), else the full conversion, playable
+   * from the start while it runs.
+   */
+  function place(mode: 'remux' | 'transcode', at: number, play: boolean, cached: boolean, t: number, start: number) {
     autoplay = play;
     local = 0;
     waiting = false;
@@ -232,7 +281,7 @@
     // Metadata without a picture: the browser parsed the file but has no
     // decoder for its video (HEVC without hardware support, ProRes...).
     if (v.videoWidth === 0 && detail.video?.codec !== '') {
-      fail('no picture: the browser has no decoder for the video');
+      fail('no picture: the browser has no decoder for the video', true);
       return;
     }
     // A live stream cannot seek: a pending seek only applies to a file.
@@ -243,10 +292,12 @@
   }
 
   /**
-   * Seeks a live stream to source time t. Once the conversion is complete
-   * the cached file is loaded and seeked, even for a time the browser has
-   * buffered: the browser may refetch the live URL for it, which the
-   * server then refuses (it would be the cached file's different bytes).
+   * Seeks a live stream to source time t: inside what is buffered at once,
+   * unless the stream has ended and the server said the conversion is
+   * cached (onEnded); then, and beyond the buffer, the cached file when it
+   * is complete, else a new stream from t. A seek in the buffer that makes
+   * the browser refetch the live URL after the conversion was cached gets
+   * the server's 409, and recover loads the cached file.
    */
   async function seekTo(t: number) {
     const v = videoEl;
@@ -254,36 +305,24 @@
     const mode = plan.mode;
     t = Math.max(0, duration ? Math.min(t, duration - 0.1) : t);
     const rel = t - offset;
-    const play = !v.paused;
-    const my = ++gen;
-    let cached = false;
-    try {
-      cached = (await api.streamStatus(detail.id, mode, tier)).cached;
-    } catch {
-      // Seek in the stream.
-    }
-    if (my !== gen) return;
-    if (!cached && rel >= 0 && v.buffered && inBuffered(v.buffered, rel)) {
-      srcGen = gen; // the same source goes on
+    const knownCached = cachedAfterEnd === gen;
+    if (!knownCached && rel >= 0 && v.buffered && inBuffered(v.buffered, rel)) {
       v.currentTime = rel;
       return;
     }
+    const play = !v.paused;
+    const my = ++gen;
+    let cached = knownCached;
     let start = t;
-    if (!cached) {
+    if (!knownCached) {
       waiting = true;
-      try {
-        const st = await api.streamStatus(detail.id, mode, tier, t);
-        cached = st.cached;
-        start = st.start ?? t;
-      } catch {
-        // Try a stream from t.
-      }
+      ({ cached, start } = await askStatus(mode, t));
       if (my !== gen) return;
     }
     waiting = false;
     autoplay = play;
     local = 0;
-    retries = 0;
+    retries = attempts = liveRetries = 0; // the viewer chose a new start
     resumeAt = 0;
     if (cached) {
       live = false;
@@ -366,7 +405,7 @@
         flushSync();
         void videoEl?.play().catch(() => {});
       } else {
-        void reload(plan.mode, 0, true, false);
+        void reload(plan.mode, true);
       }
       return;
     }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -141,6 +142,7 @@ func videoCachePath(root string, hash uint64, variant string) string {
 // client that plays it.
 type videoManager struct {
 	ffmpeg     string // "" = no conversions
+	ffprobe    string // "" = none: slow motion is not thinned (frameCap)
 	log        *slog.Logger
 	cacheBytes int64
 	sem        chan struct{} // slots of full (cacheable) conversions
@@ -429,7 +431,10 @@ type source struct {
 	hash uint64
 	path string // the original, already checked by openOriginal
 	info *catalog.VideoInfo
-	row  catalog.Media
+	// nominalFPS is the stream's r_frame_rate, probed when a transcode of
+	// slow motion starts (frameCap); 0 otherwise.
+	nominalFPS float64
+	row        catalog.Media
 	// busy reports whether the library is in a state where no conversion
 	// may start (a move between libraries runs); nil: never.
 	busy func() bool
@@ -931,10 +936,15 @@ func (j *encodeJob) encode() error {
 	if len(caps.encoders) == 0 {
 		return errors.New(caps.note)
 	}
+	src := j.src
+	if src.info != nil && src.info.FrameRate > capAbove && v.ffprobe != "" {
+		// Slow motion by its average: its nominal rate decides (frameCap).
+		src.nominalFPS = nominalRate(j.ctx, v.ffprobe, src.path)
+	}
 	var lastErr error
 	for _, e := range caps.encoders {
 		j.setEncoder(e.Name)
-		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e, caps.fpsMode))
+		lastErr = j.ffmpeg(transcodeArgs(src, j.req, e, caps.fpsMode))
 		j.mu.Lock()
 		wrote := j.written > 0
 		j.mu.Unlock()
@@ -1155,9 +1165,9 @@ func remuxArgs(src source, q streamReq) []string {
 // transcodeArgs convert to H.264 (8-bit 4:2:0) and AAC with encoder e:
 // scaled so the short side is q.tier (never up), HDR tone-mapped to SDR
 // BT.709 when the filters exist, with the source's frame timing (only
-// frames closer than 1/75 s are thinned, by frameCap). ffmpeg applies the
-// rotation (autorotate), so the output is upright. fpsMode: this ffmpeg
-// has -fps_mode (5.1 and later; ffmpegCaps.fpsMode), else -vsync is used.
+// slow motion is thinned, by frameCap). ffmpeg applies the rotation
+// (autorotate), so the output is upright. fpsMode: this ffmpeg has
+// -fps_mode (5.1 and later; ffmpegCaps.fpsMode), else -vsync is used.
 //
 // vfr keeps each frame's timestamp and drops only a frame that would
 // repeat the previous one's. A constant-rate mode (cfr, or -fpsmax, which
@@ -1167,7 +1177,13 @@ func remuxArgs(src source, q streamReq) []string {
 // repeated timestamp makes the MP4 muxer fail.
 func transcodeArgs(src source, q streamReq, e encoder, fpsMode bool) []string {
 	args := inputArgs(src, q, e.input)
-	args = append(args, "-vf", videoFilter(q.tier, q.tonemap, src.info, e.format))
+	vf := videoFilter(q.tier, q.tonemap, src.info, e.format)
+	if src.info != nil {
+		if fc := frameCap(src.info.FrameRate, src.nominalFPS); fc != "" {
+			vf = fc + "," + vf // first: the rest handles fewer frames
+		}
+	}
+	args = append(args, "-vf", vf)
 	args = append(args, e.args(q.tier)...)
 	if q.tonemap {
 		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
@@ -1190,24 +1206,59 @@ func vfrArgs(fpsMode bool) []string {
 
 func isHDR(transfer string) bool { return transfer == "smpte2084" || transfer == "arib-std-b67" }
 
-// frameCap thins video faster than 75 frames per second (slow motion
-// recorded at 90, 120 or 240 fps) and leaves everything else alone: a
-// frame is kept when it comes at least 1/75 s after the last kept one, or
-// has no time. It decides by the frames' own timestamps, not by the
-// catalog's frame rate (an average, which a wrong container duration or a
-// very short clip makes nonsense, and which is absent without ffprobe),
-// and it only ever drops frames: unlike the fps filter it never repeats
-// one, so the output keeps the source timing (vfr). The kept frames are
-// evenly spaced: every 2nd of 90, 100 or 120 fps (45, 50, 60 fps), every
-// 4th of 240 fps (60 fps). A 60 fps video (16.7 ms apart, phone jitter
-// about 0.1 ms) loses nothing, nor does anything up to about 72 fps.
-const frameCap = `select=isnan(t)+isnan(prev_selected_t)+gte(t-prev_selected_t\,1/75)`
+// Slow motion (capAbove) is thinned to at most maxKeptFPS.
+const (
+	capAbove   = 75
+	maxKeptFPS = 72
+)
 
-// videoFilter is the -vf chain: the frame-rate cap (frameCap; first, so
-// the rest handles fewer frames), scale (short side tier, even sizes),
+// frameCap is the filter that thins slow motion, recorded at 90, 120 or
+// 240 fps and played at normal speed: it keeps every k-th frame, k the
+// smallest whole number that brings the rate to maxKeptFPS or below (120
+// and 240 -> 60, 90 -> 45, 180 -> 60), so the motion stays even and no
+// frame is ever repeated. Only when both rates are above capAbove: the
+// catalog's average (avg) and the stream's nominal rate (nominal,
+// r_frame_rate, probed when the conversion starts). An average alone can
+// be nonsense (a wrong container duration), and a frame-time rule drops
+// frames of a jittery 60 fps phone video. "" for anything else, an unknown
+// rate included: no cap is better than judder.
+func frameCap(avg, nominal float64) string {
+	if !(avg > capAbove) || !(nominal > capAbove) || nominal > 100_000 {
+		return ""
+	}
+	k := int(math.Ceil(nominal / maxKeptFPS))
+	if k < 2 {
+		return ""
+	}
+	return fmt.Sprintf(`select=not(mod(n\,%d))`, k)
+}
+
+// nominalRate is the first video stream's r_frame_rate (the rate its
+// timestamps tick at), from ffprobe; 0 when unknown.
+func nominalRate(ctx context.Context, ffprobe, path string) float64 {
+	ctx, cancel := context.WithTimeout(ctx, videoProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", "file:"+path)
+	hideWindow(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	num, den, ok := strings.Cut(strings.TrimRight(strings.TrimSpace(first), ","), "/")
+	n, err1 := strconv.ParseFloat(num, 64)
+	d, err2 := strconv.ParseFloat(den, 64)
+	if !ok || err1 != nil || err2 != nil || n <= 0 || d <= 0 {
+		return 0
+	}
+	return n / d
+}
+
+// videoFilter is the -vf chain: scale (short side tier, even sizes),
 // optional tone mapping, then the encoder's format (and upload).
 func videoFilter(tier int, tonemap bool, info *catalog.VideoInfo, format string) string {
-	parts := []string{frameCap}
+	var parts []string
 	if tier > 0 {
 		// Short side = tier for landscape and portrait; -2 keeps the
 		// aspect ratio with an even size.

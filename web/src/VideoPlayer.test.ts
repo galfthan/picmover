@@ -154,7 +154,7 @@ describe('VideoPlayer', () => {
 
     // The seek stream fails: asked for again from where the viewer was (a
     // new load, from the keyframe the server names), then the full remux,
-    // then given up.
+    // that once more (a live load that failed), then given up.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const video = () => el.querySelector('video') as HTMLVideoElement;
     video().dispatchEvent(new Event('error'));
@@ -165,9 +165,12 @@ describe('VideoPlayer', () => {
     expect(src()).toBe('/api/l/peter/stream/7?mode=remux&load=4');
     video().dispatchEvent(new Event('error'));
     await settle();
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux&load=5');
+    video().dispatchEvent(new Event('error'));
+    await settle();
     // The next plan (a transcode) starts where the viewer was, not at 0.
     expect(src()).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode.*&t=/);
-    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenCalledTimes(4);
     expect(warn).toHaveBeenLastCalledWith('video playback failed', expect.objectContaining({ mode: 'remux', live: true, code: 0, message: 'error' }));
   });
 
@@ -296,17 +299,21 @@ describe('VideoPlayer', () => {
     expect(src()).toMatch(/&t=26&load=3$/);
 
     // Without good playback in between, the second attempt is the full
-    // conversion, and then the player gives up.
+    // conversion; a live load that fails before a picture is loaded once
+    // more, and then the player gives up.
     video().dispatchEvent(new Event('loadeddata'));
     video().dispatchEvent(new Event('error'));
     await settle();
     expect(src()).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?&load=4$/);
     video().dispatchEvent(new Event('error'));
     await settle();
+    expect(src()).toMatch(/&load=5$/);
+    video().dispatchEvent(new Event('error'));
+    await settle();
     expect(el.textContent).toContain('Converting this video for playback failed.');
   });
 
-  it('seeks in the cached file once the conversion is complete, even inside what is buffered', async () => {
+  it('seeks in the cached file after the stream ended and the server said it is cached, even inside what is buffered', async () => {
     const real = libApi('peter');
     let cached = false;
     const streamStatus = vi.fn(async () => ({ cached, encoding: !cached, bytes: 1, encoders: ['libx264'], tier: 0 }));
@@ -316,6 +323,12 @@ describe('VideoPlayer', () => {
     const video = el.querySelector('video') as HTMLVideoElement;
     Object.defineProperty(video, 'buffered', { configurable: true, value: { length: 1, start: () => 0, end: () => 12 } });
     cached = true;
+    video.dispatchEvent(new Event('ended'));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await svelte.tick();
+    }
+    const calls = streamStatus.mock.calls.length;
     const bar = el.querySelector<HTMLInputElement>('input[type=range]');
     if (!bar) throw new Error('no seek bar');
     bar.value = '3';
@@ -327,10 +340,11 @@ describe('VideoPlayer', () => {
     const now = el.querySelector('video');
     expect(now?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?$/);
     expect(now?.hasAttribute('controls')).toBe(true);
+    expect(streamStatus.mock.calls.length).toBe(calls); // known already
   });
 
-  it('seeks inside what is buffered while the conversion runs', async () => {
-    const { api } = fakeApi();
+  it('seeks inside what is buffered at once while the conversion runs', async () => {
+    const { api, streamStatus } = fakeApi();
     const el = await mountPlayer(api, detail({}));
     const svelte = await import('svelte');
     const video = el.querySelector('video') as HTMLVideoElement;
@@ -340,13 +354,15 @@ describe('VideoPlayer', () => {
     Object.defineProperty(video, 'currentTime', { configurable: true, get: () => 0, set: (v: number) => (set = v) });
     const bar = el.querySelector<HTMLInputElement>('input[type=range]');
     if (!bar) throw new Error('no seek bar');
+    const calls = streamStatus.mock.calls.length;
     bar.value = '3';
     bar.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(set).toBe(3); // synchronously, without asking the server
     for (let i = 0; i < 3; i++) {
       await new Promise((r) => setTimeout(r, 0));
       await svelte.tick();
     }
-    expect(set).toBe(3);
+    expect(streamStatus.mock.calls.length).toBe(calls);
     expect(el.querySelector('video')?.getAttribute('src')).toBe(before);
     // Its events still count: an error is this source's.
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -378,6 +394,71 @@ describe('VideoPlayer', () => {
     expect(vi.mocked(api.streamStatus).mock.calls.length).toBe(calls);
   });
 
+  it('loads the cached file when a first live load finds the conversion complete (409), before any picture', async () => {
+    const real = libApi('peter');
+    let cached = false;
+    const streamStatus = vi.fn(async () => ({ cached, encoding: !cached, bytes: 1, encoders: ['libx264'], tier: 0 }));
+    const api: LibApi = { ...real, streamStatus };
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const video = el.querySelector('video') as HTMLVideoElement;
+    expect(video.getAttribute('src')).toMatch(/&load=1$/);
+    // The conversion finished between /status and the stream request: the
+    // server refused the live load.
+    cached = true;
+    Object.defineProperty(video, 'error', { configurable: true, value: { code: 4, message: 'MEDIA_ELEMENT_ERROR: Format error' } });
+    video.dispatchEvent(new Event('error'));
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 0));
+      await svelte.tick();
+    }
+    expect(el.querySelector('video')?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode(&h=\d+)?$/);
+    expect(el.textContent).not.toContain('failed');
+  });
+
+  it('stops recovering a source that always fails a while after it resumes', async () => {
+    const { api, streamStatus } = fakeApi();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const el = await mountPlayer(api, detail({}));
+    const svelte = await import('svelte');
+    const video = () => el.querySelector('video') as HTMLVideoElement;
+    let now = 0;
+    Object.defineProperty(video(), 'currentTime', { configurable: true, get: () => now, set: () => {} });
+    Object.defineProperty(video(), 'videoWidth', { configurable: true, get: () => 1920 });
+    // Each source plays 8 s (enough to start the attempts again), then fails.
+    for (let i = 0; i < 12 && !el.textContent?.includes('failed'); i++) {
+      video().dispatchEvent(new Event('loadeddata'));
+      for (now = 0; now <= 8; now += 0.25) video().dispatchEvent(new Event('timeupdate'));
+      video().dispatchEvent(new Event('error'));
+      for (let j = 0; j < 3; j++) {
+        await new Promise((r) => setTimeout(r, 0));
+        await svelte.tick();
+      }
+    }
+    expect(el.textContent).toContain('Converting this video for playback failed.');
+    // The first load, 4 recoveries and one more live load: each asked first.
+    expect(streamStatus.mock.calls.length).toBeLessThanOrEqual(1 + 4 + 1);
+  });
+
+  it('stops asking whether the conversion is cached once the player is gone', async () => {
+    const { api, streamStatus } = fakeApi();
+    const el = await mountPlayer(api, detail({}));
+    vi.useFakeTimers();
+    try {
+      el.querySelector('video')?.dispatchEvent(new Event('ended'));
+      await vi.advanceTimersByTimeAsync(2500);
+      const asked = streamStatus.mock.calls.length;
+      expect(asked).toBeGreaterThan(1);
+      cleanup?.();
+      cleanup = null;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(streamStatus.mock.calls.length).toBeLessThanOrEqual(asked + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('moves on from a remux that never shows a picture at once', async () => {
     const { api, streamStatus } = fakeApi();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -385,7 +466,7 @@ describe('VideoPlayer', () => {
     const svelte = await import('svelte');
     const video = el.querySelector('video') as HTMLVideoElement;
     expect(video.getAttribute('src')).toMatch(/mode=remux/);
-    video.dispatchEvent(new Event('error'));
+    video.dispatchEvent(new Event('loadedmetadata')); // videoWidth 0: no decoder
     for (let i = 0; i < 3; i++) {
       await new Promise((r) => setTimeout(r, 0));
       await svelte.tick();
