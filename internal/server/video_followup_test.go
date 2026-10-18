@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,6 +41,14 @@ func TestShareDetailProbesOnlyWithVideo(t *testing.T) {
 		t.Fatalf("a share without video probed the file (%d)", n)
 	}
 	f.update(lib.ID, `{"capabilities": {"video": true, "download": true, "rate": true, "location": true}}`)
+	// Not while a move runs on the library (it renames originals).
+	e := f.srv.ws.entry("peter")
+	e.moving.Add(1)
+	wantStatus(t, f.phone(http.MethodGet, detail, "", cookie), http.StatusOK)
+	if n := probes(); n != 0 {
+		t.Fatalf("probed while moving (%d)", n)
+	}
+	e.moving.Add(-1)
 	wantStatus(t, f.phone(http.MethodGet, detail, "", cookie), http.StatusOK)
 	if n := probes(); n != 1 {
 		t.Fatalf("a share with video did not probe (%d)", n)
@@ -254,4 +263,70 @@ func TestDiskMargin(t *testing.T) {
 	if !v.roomFor("x", 3<<30) || v.roomFor("x", 3<<30+1) {
 		t.Fatal("margin of 2 GiB not kept")
 	}
+}
+
+// TestVideoStalledReaderDropped: a reader that stops reading a
+// conversion too large to cache is dropped after the stall timeout, so
+// ffmpeg goes on for the other reader instead of waiting forever.
+func TestVideoStalledReaderDropped(t *testing.T) {
+	f := newVideoFixture(t, longClips(t), nil)
+	v := f.srv.video
+	v.cacheBytes = 200 << 10
+	v.memWindow = 128 << 10
+	v.stallTimeout = 300 * time.Millisecond
+	// Small socket buffers, so a reader that stops reading holds the
+	// conversion up at once.
+	f.ts.Config.ConnState = func(c net.Conn, st http.ConnState) {
+		if tc, ok := c.(*net.TCPConn); st == http.StateNew && ok {
+			_ = tc.SetWriteBuffer(4 << 10)
+		}
+	}
+	dialer := &net.Dialer{}
+	slow := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dialer.DialContext(ctx, network, addr)
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(4 << 10)
+		}
+		return c, err
+	}}}
+	url := f.url("/api/l/lib/stream/" + itoa64(f.ids["long.mp4"]) + "?mode=transcode&h=0")
+	stalled, err := slow.Get(url)
+	if err != nil || stalled.StatusCode != 200 {
+		t.Fatalf("stalled reader: %v %v", stalled, err)
+	}
+	defer stalled.Body.Close()
+	if _, err := io.ReadFull(stalled.Body, make([]byte, 1024)); err != nil {
+		t.Fatal(err)
+	}
+	// It stops reading here. Another reader joins and reads everything.
+	res, err := http.Get(url)
+	if err != nil || res.StatusCode != 200 {
+		t.Fatalf("reader: %v %v", res, err)
+	}
+	done := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		done <- b
+	}()
+	var body []byte
+	select {
+	case body = <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the conversion waited for the stalled reader")
+	}
+	if v.kicked.Load() == 0 {
+		t.Fatal("no reader dropped")
+	}
+	if n := v.started.Load(); n != 1 {
+		t.Fatalf("%d conversions, want the second reader to join the first", n)
+	}
+	if d := probeDuration(t, f.ffprobe, f.writeTemp("joined.mp4", body)); d < 29 || d > 31 {
+		t.Fatalf("streamed %.2f s of 30", d)
+	}
+	// The dropped reader's stream ends with an error, not a full video.
+	if b, err := io.ReadAll(stalled.Body); err == nil && len(b) > len(body)/2 {
+		t.Fatalf("stalled reader got %d bytes without an error", len(b))
+	}
+	f.waitIdle("after the stall")
 }

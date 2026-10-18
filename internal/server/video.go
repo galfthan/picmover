@@ -59,6 +59,9 @@ const (
 	// defaultMemWindow bounds the bytes a conversion that no longer writes
 	// its partial file keeps in memory for its readers (pass-through).
 	defaultMemWindow = 16 << 20
+	// defaultStallTimeout: a reader that holds up a pass-through
+	// conversion for this long is dropped.
+	defaultStallTimeout = 60 * time.Second
 	// spaceCheckEvery: a conversion writing its partial file checks the
 	// free space of the cache volume again after this many bytes.
 	spaceCheckEvery = 64 << 20
@@ -154,6 +157,10 @@ type videoManager struct {
 	// reports a directory's free and total bytes (tests replace both).
 	memWindow int64
 	diskSpace func(dir string) (free, total int64)
+	// stallTimeout: a pass-through conversion drops a reader that has
+	// not progressed for this long (tests shorten it).
+	stallTimeout time.Duration
+	kicked       atomic.Int64 // readers dropped (tests)
 
 	mu sync.Mutex
 	// blockedHashes counts, per library root and content hash, the trash,
@@ -183,6 +190,7 @@ func newVideoManager(ffmpeg string, cacheBytes int64, log *slog.Logger) *videoMa
 		seekSem:       make(chan struct{}, defaultMaxEncodes),
 		grace:         encodeGrace,
 		memWindow:     defaultMemWindow,
+		stallTimeout:  defaultStallTimeout,
 		diskSpace:     diskSpace,
 		blockedHashes: map[rootHash]int{},
 		ctx:           ctx,
@@ -509,7 +517,33 @@ type encodeJob struct {
 }
 
 // liveReader is one client streaming a running conversion.
-type liveReader struct{ off int64 }
+type liveReader struct {
+	off int64
+	// kicked: the writer dropped this reader (it stalled the conversion);
+	// kick interrupts its response's pending write.
+	kicked bool
+	kick   func()
+}
+
+// kickLocked drops the readers at offset low, which stall a conversion
+// that no longer writes its partial file.
+func (j *encodeJob) kickLocked(low int64) {
+	for rd := range j.live {
+		if rd.off != low {
+			continue
+		}
+		rd.kicked = true
+		delete(j.live, rd)
+		if rd.kick != nil {
+			rd.kick()
+		}
+		j.v.kicked.Add(1)
+		j.v.log.Info("slow video reader dropped", "hash", hexHash(j.src.hash), "variant", j.req.variant(),
+			"offset", rd.off, "stalled", j.v.stallTimeout)
+	}
+	j.dropFileLocked()
+	j.cond.Broadcast()
+}
 
 // join attaches a new reader when the conversion can still be read from
 // its first byte; nil otherwise.
@@ -622,6 +656,19 @@ func (j *encodeJob) write(p []byte) error {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	// A reader that makes no progress for stallTimeout (a paused player,
+	// a vanished client) is dropped, so ffmpeg does not hold its slot
+	// waiting for it forever.
+	var (
+		timer   *time.Timer
+		since   time.Time
+		lastLow int64 = -1
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for len(j.mem) > 0 && int64(len(j.mem))+n > v.memWindow && j.ctx.Err() == nil {
 		// Drop what every reader has sent; without readers, all of it.
 		low := j.written
@@ -632,6 +679,20 @@ func (j *encodeJob) write(p []byte) error {
 			j.mem = j.mem[:copy(j.mem, j.mem[drop:])]
 			j.memBase = low
 			continue
+		}
+		now := time.Now()
+		switch {
+		case low != lastLow:
+			lastLow, since = low, now
+		case now.Sub(since) >= v.stallTimeout:
+			j.kickLocked(low)
+			lastLow = -1
+			continue
+		}
+		if timer == nil {
+			timer = time.AfterFunc(v.stallTimeout, j.wake)
+		} else {
+			timer.Reset(v.stallTimeout - now.Sub(since))
 		}
 		j.cond.Wait()
 	}

@@ -135,7 +135,8 @@ the catalog, a seek bar, mute, full screen.
   in a library's cache after start.
 - A partial file never grows past half the cap. A conversion that reaches
   that (seek streams too) stops writing it: the rest passes through a
-  memory window of 16 MB, ffmpeg waits for the slowest reader, and the
+  memory window of 16 MB, ffmpeg waits for the slowest reader (one that
+  has not progressed for 60 s is dropped: its connection is cut), and the
   partial file is removed once every reader is past it. Such a conversion
   is not cached, and a new request cannot join it (it no longer has the
   first bytes): it gets its own.
@@ -151,7 +152,7 @@ the catalog, a seek bar, mute, full screen.
   those hashes (`/stream` and its status answer 409, the lazy probe
   skips them), then cancel the running ones and wait for their ffmpeg to exit;
   the block lasts until the request ends. A move between libraries marks
-  both libraries moving (409) before it cancels their conversions, when
+  both libraries moving (409, and no lazy probe) before it cancels their conversions, when
   the job runs. The start of a conversion checks both under the manager's
   lock, so none slips in between. A conversion that has not stopped after
   10 s is logged and the file operation goes on. On Windows a file ffmpeg

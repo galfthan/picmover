@@ -77,7 +77,7 @@ func (s *Server) videoInfo(ctx context.Context, l *libHandles, m *catalog.Media)
 	}
 	// Not while a trash, restore, delete or move is about to rename the
 	// file (ffprobe holding it open would make that fail on Windows).
-	if s.video.blocked(l.lib.Root(), m.Hash) {
+	if l.entry.moving.Load() > 0 || s.video.blocked(l.lib.Root(), m.Hash) {
 		return nil
 	}
 	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
@@ -335,13 +335,22 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, j *encodeJob,
 	stop := context.AfterFunc(ctx, j.wake)
 	defer stop()
 	rc := http.NewResponseController(w)
+	j.mu.Lock()
+	// The writer drops this reader when it stalls a conversion too large
+	// to cache: a pending write then fails at once.
+	rd.kick = func() { _ = rc.SetWriteDeadline(time.Now()) }
+	j.mu.Unlock()
 	buf := make([]byte, streamChunk)
 	var off int64
 	sent := false
 	for {
 		j.mu.Lock()
-		for off >= j.written && !j.streamDone && ctx.Err() == nil {
+		for off >= j.written && !j.streamDone && ctx.Err() == nil && !rd.kicked {
 			j.cond.Wait()
+		}
+		if rd.kicked {
+			j.mu.Unlock()
+			panic(http.ErrAbortHandler)
 		}
 		written, done, jerr := j.written, j.streamDone, j.err
 		var (

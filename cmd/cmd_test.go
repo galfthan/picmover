@@ -573,6 +573,43 @@ func TestUpdateMetadataPrintsHomeZone(t *testing.T) {
 	}
 }
 
+// A row whose offset was estimated from nearby photos keeps it (and its
+// offset source) while its instant is unchanged, with or without
+// --timezone: it is not reported or rewritten as a home-zone time.
+func TestUpdateMetadataKeepsNearbyOffset(t *testing.T) {
+	instant := time.Date(2020, 7, 3, 4, 5, 6, 0, time.UTC)
+	rel := "image/2020/07/a.jpg"
+	dir, lib := newLibrary(t)
+	if out, err := run(t, "home-zone", dir, "Europe/Helsinki"); err != nil {
+		t.Fatalf("home-zone: %v %s", err, out)
+	}
+	db, err := catalog.Open(context.Background(), lib.DBPath(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trip := time.FixedZone("", -4*3600)
+	if _, err := db.InsertMedia(context.Background(), nil, &catalog.Media{Hash: 1, Size: 1, RelPath: rel, FileType: "image",
+		Ext: ".jpg", TakenAt: instant.In(trip), OffsetKnown: true, TakenAtSource: "mtime", OffsetSource: "nearby",
+		Width: 16, Height: 16}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	writeBytes(t, lib.Abs(rel), testimg.BareJPEG())
+	if err := os.Chtimes(lib.Abs(rel), instant, instant); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"update-metadata", "--dry-run", dir}, {"update-metadata", dir},
+		{"update-metadata", "--timezone", "Asia/Tokyo", dir}} {
+		out, err := run(t, args...)
+		if err != nil || !strings.Contains(out, "Unchanged: 1") || strings.Contains(out, "Date/Time") {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+	if m := getRow(t, dir, rel); m.OffsetSource != "nearby" || m.TakenAt.Format("-07:00") != "-04:00" || !m.TakenAt.Equal(instant) {
+		t.Fatalf("stored %v source %q", m.TakenAt, m.OffsetSource)
+	}
+}
+
 // Finding 9: a file matching a catalog row only case-insensitively is a
 // case conflict.
 func TestVerifyReportsCaseConflict(t *testing.T) {
