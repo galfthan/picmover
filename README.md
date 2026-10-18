@@ -44,7 +44,7 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
    make build
    ```
 
-   `make build` first builds the web frontend (`make web`, needs Node 24; the Makefile uses `~/.local/node/bin` when it exists) and embeds it in the binary. A plain `go build -tags nodynamic .` works without Node; `picmover serve` then answers the browser with a note that the frontend is not built, while the API works.
+   `make build` first builds the web frontend (`make web`, needs Node 22.22+ or 24; the Makefile uses `~/.local/node/bin` when it exists) and embeds it in the binary. A plain `go build -tags nodynamic .` works without Node; `picmover serve` then answers the browser with a note that the frontend is not built, while the API works.
 
    The Makefile passes `-tags nodynamic` to every `go build`, `go test` and `go vet`, so the HEIC/AVIF/WebP codecs use their embedded WebAssembly builds and never load a system library. Pass the tag yourself when you run the Go tools directly, for example `go test -tags nodynamic ./...`.
 
@@ -53,6 +53,26 @@ PicMover is a robust command-line tool designed to efficiently import, organize,
    - `dist/picmover-windows-amd64.exe`
    - `dist/picmover-darwin-arm64`
    - `dist/picmover-darwin-amd64`
+
+### Development container
+
+If you would rather not install Go and Node, `.devcontainer/` holds a Docker image with both (pinned in its `Dockerfile`), plus gopls, goimports, dlv, tmux and emacs. Only Docker is needed on the host. VS Code and the devcontainer CLI pick it up through `.devcontainer/devcontainer.json`; the Makefile has targets for plain Docker:
+
+```
+make dev-image      # build the image (as your uid/gid, so files in the repo stay yours)
+make dev-shell      # shell in the container, repo mounted at /workspaces/picmover
+make dev-check      # make check in the container
+make dev-install    # make install in the container
+```
+
+`make install` installs the Linux binary and desktop app as `$(INSTALL_DIR)/picmover` and `$(INSTALL_DIR)/picmover-app` (default `~/bin`) and, if `WIN_INSTALL_DIR` is set, copies the Windows builds there as `picmover-win64.exe` and `picmover-app.exe`. On Linux, `picmover-app` writes its own launcher entry and icons when it starts (see [Desktop app](#desktop-app-picmover-app)). `dev-install` mounts both directories into the container, so the binaries land on the host:
+
+```
+make dev-image dev-install INSTALL_DIR=$HOME/.local/bin
+make dev-install WIN_INSTALL_DIR=/mnt/c/Users/<you>/bin    # under WSL
+```
+
+The Go module and build caches and the npm cache live in the Docker volumes `picmover-gomod`, `picmover-gocache` and `picmover-npm`. `dev-shell` passes your `git config` name and email in as environment variables; the image itself holds no git identity.
 
 ## Usage
 
