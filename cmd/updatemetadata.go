@@ -38,7 +38,9 @@ Good metadata is never degraded: a date read from the file's metadata is not
 replaced by a file-time fallback (such rows are counted as skipped), and an
 empty value never replaces a known one. Without --timezone, times derived
 from instants (video UTC, file time) keep their stored offset;
-with --timezone they are converted to that zone. Videos need ffprobe.
+with --timezone they are converted to that zone; the local offset of a
+video that only records a UTC instant is then estimated again from the
+photos taken near it, as by an import. Videos need ffprobe.
 When the orientation of a file changes, its thumbnail state becomes
 'stale' and the next 'picmover thumbs' regenerates its thumbnail and
 preview.
@@ -143,6 +145,14 @@ Exits with status 2 when any row could not be updated.`,
 					return err
 				}
 			}
+			if !dryRun && updated > 0 {
+				// Videos with a UTC instant got the offset of their zone
+				// back: estimate their local offsets again, as an
+				// import does.
+				if _, err := db.InferVideoOffsets(ctx, 0); err != nil {
+					return err
+				}
+			}
 			verb, label := "Update complete.", "Updated"
 			if dryRun {
 				verb, label = "Dry run complete.", "Would update"
@@ -240,10 +250,13 @@ var trustedSources = map[string]bool{"exif": true, "video": true, "video_utc": t
 func mergeInfo(m catalog.Media, info metadata.Info) (merged catalog.Media, keptDate bool) {
 	if (info.Source == "mtime" || info.Source == "none") && trustedSources[m.TakenAtSource] {
 		keptDate = true
-	} else {
+	} else if !sameCapture(m, info) {
+		// A new date takes its default offset source; an estimated one
+		// (a video's 'nearby' offset) is kept while the date is the same.
 		m.TakenAt = info.TakenAt
 		m.OffsetKnown = info.OffsetKnown
 		m.TakenAtSource = info.Source
+		m.OffsetSource = ""
 	}
 	mergeInt(&m.Width, info.Width)
 	mergeInt(&m.Height, info.Height)
@@ -262,6 +275,13 @@ func mergeInfo(m catalog.Media, info metadata.Info) (merged catalog.Media, keptD
 	mergeString(&m.CameraType, info.CameraType)
 	mergeString(&m.Lens, info.Lens)
 	return m, keptDate
+}
+
+// sameCapture reports whether info has the capture time of m: the same
+// source, wall clock and offset.
+func sameCapture(m catalog.Media, info metadata.Info) bool {
+	return m.TakenAtSource == info.Source && m.OffsetKnown == info.OffsetKnown &&
+		formatTakenAt(m.TakenAt, m.OffsetKnown) == formatTakenAt(info.TakenAt, info.OffsetKnown)
 }
 
 func mergeInt(dst *int, v int) {

@@ -1,12 +1,16 @@
 // Package catalog is the SQLite catalog (media.db) of a picmover library:
-// schema v3 and queries. There is no migration: a catalog of another schema
-// version is refused with ErrNeedsRebuild.
+// schema v4 and queries. A version 3 catalog is migrated in place when it
+// is opened for writing (Open, OpenExisting); a catalog of any other
+// schema version is refused with ErrNeedsRebuild.
 //
 // Capture times are stored as the camera's wall-clock time encoded as Unix
 // seconds "as if UTC" in taken_at, with the real zone offset (seconds east of
 // UTC) in taken_at_offset only when it is known. Decoded Media.TakenAt values
 // therefore always format as the wall-clock; their zone is the real offset
-// when OffsetKnown is true and UTC as a placeholder otherwise.
+// when OffsetKnown is true and UTC as a placeholder otherwise. The same
+// instant as a wall clock in the library's home zone is in taken_at_home
+// (Media.TakenAtHome), which orders and groups the timeline; see
+// docs/design/home-time.md.
 package catalog
 
 import (
@@ -23,7 +27,11 @@ import (
 )
 
 // SchemaVersion is the schema version this package reads and writes.
-const SchemaVersion = 3
+const SchemaVersion = 4
+
+// migratableVersion is the older schema version that Open and
+// OpenExisting upgrade in place (migrateFromV3).
+const migratableVersion = 3
 
 const dsnParams = "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(1)&_txlock=immediate"
 
@@ -32,11 +40,24 @@ type DB struct {
 	*sql.DB
 	path   string
 	logger *slog.Logger
+	// v3 is set for a read-only look at a version 3 catalog (PeekFile),
+	// which has no taken_at_home: its queries order by taken_at.
+	v3 bool
+}
+
+// timeCol is the column the timeline orders by: taken_at_home, or
+// taken_at in a version 3 catalog read without migration.
+func (d *DB) timeCol() string {
+	if d.v3 {
+		return "taken_at"
+	}
+	return "taken_at_home"
 }
 
 // ErrNeedsRebuild is returned (wrapped) by Open and OpenExisting when the
-// catalog has a schema other than SchemaVersion. There is no migration: the
-// catalog is derived from the files and is rebuilt instead.
+// catalog has a schema other than SchemaVersion that cannot be migrated
+// (only version 3 is): the catalog is derived from the files and is
+// rebuilt instead.
 var ErrNeedsRebuild = errors.New("catalog format changed; run 'picmover rebuild <library>'")
 
 // ErrNewerSchema is wrapped, next to ErrNeedsRebuild, when the catalog was
@@ -135,6 +156,9 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	if err == nil {
 		err = d.ensureDerived(ctx)
 	}
+	if err == nil && v == migratableVersion {
+		err = d.ensureSchema(ctx)
+	}
 	if err != nil {
 		d.Close()
 		return nil, err
@@ -142,11 +166,12 @@ func OpenExisting(ctx context.Context, path string, logger *slog.Logger) (*DB, e
 	return d, nil
 }
 
-// checkSchema accepts version SchemaVersion, and also an empty database
-// (user_version 0, no media table) when allowFresh is set.
+// checkSchema accepts version SchemaVersion and the migratable version 3,
+// and also an empty database (user_version 0, no media table) when
+// allowFresh is set.
 func checkSchema(path string, v int, hasMedia, allowFresh bool) error {
 	switch {
-	case v == SchemaVersion:
+	case v == SchemaVersion, v == migratableVersion && hasMedia:
 		return nil
 	case v == 0 && !hasMedia:
 		if allowFresh {
@@ -261,8 +286,9 @@ func isBusy(err error) bool {
 	return errors.As(err, &ce) && ce.Code()&0xff == 5 // SQLITE_BUSY
 }
 
-// ensureSchema creates the schema if the database is empty, inside an
-// IMMEDIATE transaction so concurrent openers create it once.
+// ensureSchema creates the schema if the database is empty, or migrates a
+// version 3 catalog, inside an IMMEDIATE transaction so concurrent openers
+// do it once.
 func (d *DB) ensureSchema(ctx context.Context) error {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
@@ -279,7 +305,10 @@ func (d *DB) ensureSchema(ctx context.Context) error {
 	if v == SchemaVersion {
 		return nil
 	}
-	if _, err := tx.ExecContext(ctx, schemaV3); err != nil {
+	if v == migratableVersion {
+		return d.migrateFromV3(ctx, tx)
+	}
+	if _, err := tx.ExecContext(ctx, schemaV4); err != nil {
 		return fmt.Errorf("catalog: create schema: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {

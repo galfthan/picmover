@@ -259,7 +259,12 @@ func TestInsertLookupGetRoundTrip(t *testing.T) {
 	if !got.TakenAt.Equal(full.TakenAt) || got.TakenAt.Format(time.RFC3339) != "2020-03-04T05:06:07+03:00" {
 		t.Errorf("TakenAt = %v", got.TakenAt)
 	}
+	// No home zone: the home time is the recorded wall clock.
+	if got.TakenAtHome.Format(time.DateTime) != "2020-03-04 05:06:07" || got.OffsetSource != OffsetSourceExif {
+		t.Errorf("home %v, offset source %q", got.TakenAtHome, got.OffsetSource)
+	}
 	got.TakenAt, m.TakenAt = time.Time{}, time.Time{}
+	got.TakenAtHome, got.OffsetSource = time.Time{}, ""
 	if got != m {
 		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", got, m)
 	}

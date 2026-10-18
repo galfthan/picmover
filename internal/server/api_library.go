@@ -8,6 +8,13 @@ import (
 	"picmover/internal/catalog"
 )
 
+// homeZoneJSON is the library's home time zone (docs/design/home-time.md).
+type homeZoneJSON struct {
+	// Name is the IANA zone; null when none is set (times are shown as
+	// recorded where they were taken).
+	Name *string `json:"name"`
+}
+
 type libraryJSON struct {
 	ID      string       `json:"id"`
 	Root    string       `json:"root"`
@@ -18,6 +25,8 @@ type libraryJSON struct {
 	FFmpeg  bool         `json:"ffmpeg"`
 	UserDB  userDBJSON   `json:"userdb"`
 	Similar similarJSON  `json:"similar"`
+	// HomeZone is the zone the timeline is on.
+	HomeZone homeZoneJSON `json:"homeZone"`
 }
 
 type userDBJSON struct {
@@ -98,6 +107,11 @@ func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request, l *libHan
 		s.internalError(w, r, err)
 		return
 	}
+	hz, err := homeZoneInfo(ctx, l.db)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
 	out := libraryJSON{
 		ID:      l.id,
 		Root:    l.lib.Root(),
@@ -113,9 +127,49 @@ func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request, l *libHan
 		FFmpeg:  s.ffmpeg != "",
 		UserDB: userDBJSON{Ratings: counts.Ratings, Tags: counts.Tags, Albums: counts.Albums,
 			Trashed: counts.Trashed, IgnoredPairs: counts.IgnoredPairs},
-		Similar: sim,
+		Similar:  sim,
+		HomeZone: hz,
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func homeZoneInfo(ctx context.Context, db *catalog.DB) (homeZoneJSON, error) {
+	name, _, err := db.HomeZone(ctx)
+	if err != nil || name == "" {
+		return homeZoneJSON{}, err
+	}
+	return homeZoneJSON{Name: &name}, nil
+}
+
+// settingsBody is POST /api/l/{lib}/settings.
+type settingsBody struct {
+	HomeZone *string `json:"homeZone"` // IANA zone name; null leaves it unchanged
+}
+
+// handleSettings changes library settings: the home zone, which
+// recomputes every home time (the timeline of the library changes, the
+// files stay where they are). Answers the new homeZone.
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, l *libHandles) {
+	var body settingsBody
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if body.HomeZone != nil {
+		if _, err := catalog.LoadZone(*body.HomeZone); err != nil {
+			writeError(w, http.StatusBadRequest, "homeZone: not a known time zone (use an IANA name such as Europe/Helsinki)")
+			return
+		}
+		if err := l.db.SetHomeZone(r.Context(), *body.HomeZone); err != nil {
+			s.internalError(w, r, err)
+			return
+		}
+	}
+	hz, err := homeZoneInfo(r.Context(), l.db)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, hz)
 }
 
 // similarInfo reads the meta keys of the last near-duplicate run and the
