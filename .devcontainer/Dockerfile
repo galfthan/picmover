@@ -1,5 +1,6 @@
 # Dev container for picmover: Go, Node, the Go editor tools, tmux and
-# emacs. The build context is this directory only.
+# emacs, plus small tmux, emacs, readline and bash configs. The build
+# context is this directory only.
 #
 #   make dev-image     (or: docker build -t picmover-dev .devcontainer)
 #
@@ -77,6 +78,11 @@ RUN set -eux; \
 
 COPY --chown=${USER_UID}:${USER_GID} tmux.conf /home/${USERNAME}/.tmux.conf
 COPY --chown=${USER_UID}:${USER_GID} init.el /home/${USERNAME}/.emacs.d/init.el
+COPY --chown=${USER_UID}:${USER_GID} inputrc /home/${USERNAME}/.inputrc
+# Sourced after Ubuntu's default ~/.bashrc, so it wins over that file's PS1
+# and runs after its dircolors. ~/.profile sources ~/.bashrc for login shells.
+COPY --chown=${USER_UID}:${USER_GID} bashrc /home/${USERNAME}/.bashrc.local
+RUN printf '\n[ -f ~/.bashrc.local ] && . ~/.bashrc.local\n' >> "$HOME/.bashrc"
 RUN emacs --batch -l "$HOME/.emacs.d/init.el" \
         --eval "(unless (package-installed-p 'go-mode) (kill-emacs 1))"
 
