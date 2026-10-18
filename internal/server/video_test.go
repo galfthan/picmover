@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -294,9 +295,9 @@ func TestVideoTranscodeHEVC(t *testing.T) {
 
 	f.waitCached("hdr.mp4", q)
 	// The tone-mapping path is part of the cache key.
-	variant := "-v1-src.mp4"
+	variant := fmt.Sprintf("-v%d-src.mp4", videoFormatVersion)
 	if f.srv.video.capabilities().tonemap {
-		variant = "-v1-src-tm.mp4"
+		variant = fmt.Sprintf("-v%d-src-tm.mp4", videoFormatVersion)
 	}
 	cached := f.cacheFiles(variant)
 	if len(cached) != 1 || len(f.cacheFiles(".part")) != 0 {
@@ -352,7 +353,7 @@ func TestVideoRemuxMTS(t *testing.T) {
 		t.Fatalf("remux output %v / %v", video, audio)
 	}
 	f.waitCached("cam.mts", "mode=remux")
-	if len(f.cacheFiles("-v1-remux.mp4")) != 1 {
+	if len(f.cacheFiles(fmt.Sprintf("-v%d-remux.mp4", videoFormatVersion))) != 1 {
 		t.Fatalf("remux not cached: %v", f.cacheFiles(""))
 	}
 }

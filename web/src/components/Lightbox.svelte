@@ -41,6 +41,7 @@
   let full = $state(false);
   let showInfo = $state(loadJSON(INFO_KEY, isBoolean) ?? true);
   let videoEl: HTMLVideoElement | undefined = $state();
+  let player: VideoPlayer | undefined = $state();
   let dialog: HTMLDivElement | undefined = $state();
   // Captured as early as possible: once the page behind is made inert the
   // browser may already have moved focus away from it.
@@ -290,9 +291,11 @@
     toggleFull();
   }
   function togglePlay() {
-    if (!videoEl) return;
-    if (videoEl.paused) void videoEl.play().catch(() => {});
-    else videoEl.pause();
+    // The player's own toggle: a replay of an ended live stream loads the
+    // cached conversion rather than the live URL again.
+    if (player) player.toggle();
+    else if (videoEl?.paused) void videoEl.play().catch(() => {});
+    else videoEl?.pause();
   }
 
   function onKey(e: KeyboardEvent) {
@@ -445,7 +448,7 @@
       {:else if item}
         {#key item.id}
           {#if playable && d}
-            <VideoPlayer {api} detail={d} bind:videoEl />
+            <VideoPlayer bind:this={player} {api} detail={d} bind:videoEl />
           {:else if full && d}
             <div class="full">
               <img src={api.fileUrl(d.id)} alt="" />

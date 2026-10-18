@@ -69,7 +69,8 @@ describe('phone app', () => {
     vi.resetModules();
     errors.length = 0;
     vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => void errors.push(a));
-    vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => void errors.push(a));
+    // The video player logs the failures these tests cause on purpose.
+    vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => void (a[0] !== 'video playback failed' && errors.push(a)));
   });
 
   afterEach(() => {

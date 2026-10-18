@@ -274,3 +274,37 @@ export function inBuffered(ranges: { length: number; start(i: number): number; e
   }
   return false;
 }
+
+/**
+ * A live stream URL made unique with a load number n. Once the conversion
+ * is complete, the server answers the same /stream URL with the cached
+ * file, whose bytes differ from the fragmented stream's: a browser that
+ * fetches the URL again (a replay, a seek back, data it evicted) would
+ * mix the two and fail to decode. A live stream therefore never shares a
+ * URL with the cached file, nor with an earlier load of itself.
+ */
+export function liveUrl(url: string, n: number): string {
+  return `${url}${url.includes('?') ? '&' : '?'}load=${n}`;
+}
+
+/** The fields of a failed media element worth logging. */
+export interface PlaybackFailure {
+  mode: string;
+  tier: number;
+  live: boolean;
+  offset: number;
+  src: string;
+  /** MediaError.code (1 aborted, 2 network, 3 decode, 4 not supported); 0 without one. */
+  code: number;
+  message: string;
+}
+
+/** What to log about a failed source: the element's MediaError, or why when there is none (no picture). */
+export function describeFailure(
+  el: { error: { code: number; message: string } | null } | undefined,
+  why: string,
+  ctx: Omit<PlaybackFailure, 'code' | 'message'>,
+): PlaybackFailure {
+  const err = el?.error ?? null;
+  return { ...ctx, code: err?.code ?? 0, message: err ? err.message || why : why };
+}

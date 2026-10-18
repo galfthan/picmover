@@ -11,7 +11,17 @@
   // player adds the offset to the times it shows).
   import { untrack } from 'svelte';
   import { formatDuration } from '../lib/format';
-  import { inBuffered, nextPlan, pickTier, planPlayback, type Plan, type PlayerApi, type PlayerDetail } from '../lib/playback';
+  import {
+    describeFailure,
+    inBuffered,
+    liveUrl,
+    nextPlan,
+    pickTier,
+    planPlayback,
+    type Plan,
+    type PlayerApi,
+    type PlayerDetail,
+  } from '../lib/playback';
 
   interface Props {
     /** The admin LibApi or the phone's ShareClient. */
@@ -45,6 +55,18 @@
   let pendingSeek = -1;
   /** Bumped by every source change: an older async step is dropped. */
   let gen = 0;
+  /**
+   * The gen that set the element's current source. While a source change
+   * awaits the server (apply, seekTo, reload: gen bumped, src not yet
+   * replaced), the element still plays the old source: its events are
+   * ignored, so a late error or metadata of the old source is not charged
+   * to the new plan.
+   */
+  let srcGen = 0;
+  /** Live stream loads so far, for unique live URLs (liveUrl). */
+  let loads = 0;
+  /** The current source has shown a picture: a later error is worth a reload (see fail). */
+  let started = false;
   /** Recovery attempts of the current plan since its last good start (see fail). */
   let retries = 0;
   /** Where the viewer was when a seek stream failed and the full conversion was loaded instead. */
@@ -68,6 +90,16 @@
     untrack(() => void apply(planPlayback(detail, canPlay), 0, false));
   });
 
+  /** The URL of a running conversion's stream (from t), unique per load (liveUrl). */
+  function liveSrc(mode: 'remux' | 'transcode', t = 0): string {
+    return liveUrl(api.streamUrl(detail.id, mode, tier, t), ++loads);
+  }
+
+  /** Whether an event of the <video> belongs to its current source (see srcGen). */
+  function current(e: Event): boolean {
+    return e.currentTarget === videoEl && srcGen === gen;
+  }
+
   /** Switches to plan p, starting at source time `at`. */
   async function apply(p: Plan, at: number, play: boolean) {
     const my = ++gen;
@@ -83,9 +115,12 @@
       return;
     }
     if (p.mode === 'direct') {
-      src = api.fileUrl(detail.id);
+      setSrc(api.fileUrl(detail.id));
       return;
     }
+    // The old source (an original without a decoder may play its sound)
+    // stops while the server is asked.
+    videoEl?.pause();
     tier = p.mode === 'transcode' ? pickTier(box?.clientWidth ?? 0, box?.clientHeight ?? 0, window.devicePixelRatio || 1, detail.w, detail.h) : 0;
     preparing = true;
     let cached = false;
@@ -103,44 +138,79 @@
     if (live && at > 0) {
       offset = start;
       pendingSeek = -1;
-      setSrc(api.streamUrl(detail.id, p.mode, tier, start));
+      setSrc(liveSrc(p.mode, start));
     } else {
-      setSrc(api.streamUrl(detail.id, p.mode, tier));
+      setSrc(cached ? api.streamUrl(detail.id, p.mode, tier) : liveSrc(p.mode));
     }
   }
 
   /**
-   * The current source failed. A conversion that started from a seek is
-   * first asked for again from the same time, then the full conversion is
-   * tried (from the start, or the cached file at that time); only then is
-   * the next plan tried, from the same time, so a failed remux seek does
-   * not throw the viewer back to 0.
+   * The current source failed: why is the reason when the element has no
+   * MediaError (no picture). It is logged to the console for a diagnosis.
+   *
+   * A conversion that started from a seek, or that already showed a
+   * picture (a dropped connection; a replay or seek that refetched the
+   * stream after it was cached), is loaded again (reload): first from the
+   * same seek time, then the full conversion, the cached file at the
+   * viewer's time whenever it is complete. Only then is the next plan
+   * tried, from the same time, so a failed remux seek does not throw the
+   * viewer back to 0. A conversion that never showed a picture (a remux of
+   * a codec the browser cannot decode) goes to the next plan at once.
    */
-  function fail() {
+  function fail(why: string) {
     if (plan.mode === 'none' || !src) return;
-    const play = !!videoEl && !videoEl.paused;
-    const pos = offset + (videoEl?.currentTime ?? 0);
+    const v = videoEl;
+    console.warn('video playback failed', describeFailure(v, why, { mode: plan.mode, tier, live, offset, src }));
+    const play = !!v && !v.paused;
+    const pos = offset + (v?.currentTime ?? 0);
     const at = pos > 0.5 ? pos : resumeAt;
-    if ((plan.mode === 'remux' || plan.mode === 'transcode') && offset > 0 && retries < 2) {
-      const mode = plan.mode;
+    if ((plan.mode === 'remux' || plan.mode === 'transcode') && (offset > 0 || started) && retries < 2) {
       retries++;
-      autoplay = play;
-      if (retries === 1) {
-        setSrc(api.streamUrl(detail.id, mode, tier, offset));
-      } else {
-        // The full conversion: playable from the start while it runs,
-        // seekable to `at` once cached (onMetadata).
-        pendingSeek = at;
-        resumeAt = at;
-        offset = 0;
-        local = 0;
-        setSrc(api.streamUrl(detail.id, mode, tier));
-      }
+      void reload(plan.mode, at, play, retries === 1 ? offset : 0);
       return;
     }
     const next = nextPlan(plan.mode, detail);
     if (next.mode === 'none') onunplayable?.(src);
     void apply(next, at, play);
+  }
+
+  /**
+   * Loads the conversion again: the cached file when it is complete
+   * (seeking to `at` once it has its metadata), else a new stream: from
+   * `from` (a seek stream, the times offset by it) or the full conversion,
+   * playable from the start while it runs.
+   */
+  async function reload(mode: 'remux' | 'transcode', at: number, play: boolean, from: number) {
+    const my = ++gen;
+    videoEl?.pause();
+    let cached = false;
+    try {
+      cached = (await api.streamStatus(detail.id, mode, tier)).cached;
+    } catch {
+      // The stream request itself reports a real problem.
+    }
+    if (my !== gen) return;
+    autoplay = play;
+    local = 0;
+    waiting = false;
+    if (cached) {
+      live = false;
+      offset = 0;
+      pendingSeek = at > 0 ? at : -1;
+      resumeAt = at;
+      setSrc(api.streamUrl(detail.id, mode, tier));
+    } else if (from > 0) {
+      live = true;
+      offset = from;
+      pendingSeek = -1;
+      setSrc(liveSrc(mode, from));
+    } else {
+      live = true;
+      offset = 0;
+      pendingSeek = at > 0 ? at : -1;
+      resumeAt = at;
+      setSrc(liveSrc(mode));
+    }
   }
 
   function onMetadata() {
@@ -149,7 +219,7 @@
     // Metadata without a picture: the browser parsed the file but has no
     // decoder for its video (HEVC without hardware support, ProRes...).
     if (v.videoWidth === 0 && detail.video?.codec !== '') {
-      fail();
+      fail('no picture: the browser has no decoder for the video');
       return;
     }
     // A live stream cannot seek: a pending seek only applies to a file.
@@ -197,12 +267,14 @@
       // A remux starts at the keyframe before t: the server says where.
       offset = start;
       pendingSeek = -1;
-      setSrc(api.streamUrl(detail.id, mode, tier, start));
+      setSrc(liveSrc(mode, start));
     }
   }
 
-  /** Loads u, also when it is the current URL (a live stream that is cached now). */
+  /** Loads u as the source of the current gen, also when it is the current URL (load again). */
   function setSrc(u: string) {
+    srcGen = gen;
+    started = false;
     if (u === src && videoEl) videoEl.load();
     else src = u;
   }
@@ -210,6 +282,13 @@
   export function toggle() {
     const v = videoEl;
     if (!v) return;
+    if (live && v.ended && (plan.mode === 'remux' || plan.mode === 'transcode')) {
+      // A replay of a stream that has ended: the conversion is probably
+      // cached by now, and the browser must not refetch the live URL
+      // (liveUrl). Load the cached file, or a new stream, from the start.
+      void reload(plan.mode, 0, true, 0);
+      return;
+    }
     if (v.paused) void v.play().catch(() => {});
     else v.pause();
   }
@@ -239,8 +318,15 @@
       preload="metadata"
       autoplay={autoplay}
       poster={offset > 0 ? undefined : api.previewUrl(detail)}
-      onerror={fail}
-      onloadedmetadata={onMetadata}
+      onerror={(e) => {
+        if (current(e)) fail('error');
+      }}
+      onloadedmetadata={(e) => {
+        if (current(e)) onMetadata();
+      }}
+      onloadeddata={(e) => {
+        if (current(e) && (videoEl?.videoWidth ?? 0) > 0) started = true;
+      }}
       ontimeupdate={() => (local = videoEl?.currentTime ?? 0)}
       onplay={() => (paused = false)}
       onpause={() => (paused = true)}

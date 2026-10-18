@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,8 +34,14 @@ import (
 
 const (
 	// videoFormatVersion is part of every cache file name: bump it when
-	// the encoding changes, and old files age out of the cache.
-	videoFormatVersion = 1
+	// the encoding changes. The files of an older version are removed
+	// before the first conversion in a library (cleanLocked); until then
+	// they count against the cap and are the first to go (LRU).
+	//
+	// 2: the source frame timing is kept (-fps_mode vfr); version 1 forced
+	// a constant rate (-fpsmax 60), which turned the jittery timestamps of
+	// phone videos into hundreds of duplicated and dropped frames (#20).
+	videoFormatVersion = 2
 	// DefaultVideoCacheBytes caps a library's video cache (LRU).
 	DefaultVideoCacheBytes int64 = 5 << 30
 	// MinVideoCacheBytes is the smallest accepted cap.
@@ -366,25 +373,55 @@ func (v *videoManager) cancelWhere(ctx context.Context, why string, match func(*
 	}
 }
 
-// cleanLocked removes the partial files a previous run left in a cache
-// directory, once per directory and process (before its first
-// conversion; v.mu held).
+// cleanLocked removes, from a cache directory, the partial files a
+// previous run left and the complete conversions of an older format
+// version (never served again), once per directory and process (before
+// its first conversion; v.mu held). Only names the cache writes are
+// touched.
 func (v *videoManager) cleanLocked(dir string) {
 	if v.cleaned[dir] {
 		return
 	}
 	v.cleaned[dir] = true
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
+		if err != nil || !d.Type().IsRegular() {
 			return nil
 		}
-		if d.Type().IsRegular() && (strings.HasSuffix(d.Name(), ".part") || strings.HasSuffix(d.Name(), ".tmp")) {
+		name := d.Name()
+		switch {
+		case strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".tmp"):
 			if err := os.Remove(p); err == nil {
 				v.log.Debug("removed partial video conversion", "path", p)
+			}
+		case staleVersion(name):
+			if err := os.Remove(p); err == nil {
+				v.log.Debug("removed video conversion of an older format", "path", p)
 			}
 		}
 		return nil
 	})
+}
+
+// staleVersion reports whether name is a complete conversion of an older
+// format version: <16 hex digits>-v<n>-<variant>.mp4 (videoCachePath)
+// with n below videoFormatVersion. A newer version (written by a newer
+// picmover sharing the library) is left alone.
+func staleVersion(name string) bool {
+	rest, ok := strings.CutSuffix(name, ".mp4")
+	if !ok || len(rest) < 20 || rest[16:18] != "-v" {
+		return false
+	}
+	for _, c := range rest[:16] {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	num, variant, ok := strings.Cut(rest[18:], "-")
+	if !ok || variant == "" {
+		return false
+	}
+	n, err := strconv.Atoi(num)
+	return err == nil && n >= 1 && n < videoFormatVersion && strconv.Itoa(n) == num
 }
 
 // source is what a conversion reads.
@@ -1118,8 +1155,16 @@ func remuxArgs(src source, q streamReq) []string {
 
 // transcodeArgs convert to H.264 (8-bit 4:2:0) and AAC with encoder e:
 // scaled so the short side is q.tier (never up), HDR tone-mapped to SDR
-// BT.709 when the filters exist, at most 60 frames per second. ffmpeg
-// applies the rotation (autorotate), so the output is upright.
+// BT.709 when the filters exist, with the source's frame timing (only a
+// source above 60 fps is thinned, by fpsFilter). ffmpeg applies the
+// rotation (autorotate), so the output is upright.
+//
+// -fps_mode vfr keeps each frame's timestamp and drops only a frame that
+// would repeat the previous one's. A constant-rate mode (cfr, or -fpsmax,
+// which implies it) must not be used: phone videos have jittery
+// timestamps and frame durations that do not match them, and cfr then
+// duplicates and drops about every other frame (#20). passthrough is not
+// used either: a repeated timestamp makes the MP4 muxer fail.
 func transcodeArgs(src source, q streamReq, e encoder) []string {
 	args := inputArgs(src, q, e.input)
 	args = append(args, "-vf", videoFilter(q.tier, q.tonemap, src.info, e.format))
@@ -1127,7 +1172,7 @@ func transcodeArgs(src source, q streamReq, e encoder) []string {
 	if q.tonemap {
 		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
 	}
-	args = append(args, "-fpsmax", "60", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
+	args = append(args, "-fps_mode", "vfr", "-c:a", "aac", "-b:a", "160k", "-ac", "2",
 		"-max_muxing_queue_size", "1024")
 	args = append(args, fragmentFlags...)
 	return append(args, "-f", "mp4", "pipe:1")
@@ -1135,10 +1180,38 @@ func transcodeArgs(src source, q streamReq, e encoder) []string {
 
 func isHDR(transfer string) bool { return transfer == "smpte2084" || transfer == "arib-std-b67" }
 
-// videoFilter is the -vf chain: scale (short side tier, even sizes),
+// A transcode thins only a source above fpsCapAbove frames per second
+// (slow motion: 90, 120, 240 fps), to about maxFPS; fpsSlack lets a rate
+// a little above maxFPS (an average of jittery timestamps) count as it.
+// Everything else keeps its own timing, a 60 fps video included.
+const (
+	maxFPS      = 60
+	fpsSlack    = 1.02
+	fpsCapAbove = 75
+)
+
+// fpsFilter is the fps filter for a source above fpsCapAbove: it keeps
+// every n-th frame, n the smallest whole divisor that brings the rate to
+// about maxFPS or below (120 -> 60, 240 -> 60, 119.88 -> 59.94,
+// 90 -> 45), so the motion stays even. The rate is written in 1001ths,
+// exact for NTSC (60000/1001) and whole rates (60060/1001) alike. "" for
+// any other source and when the rate is unknown.
+func fpsFilter(info *catalog.VideoInfo) string {
+	if info == nil || !(info.FrameRate > fpsCapAbove) || info.FrameRate > 100_000 {
+		return ""
+	}
+	n := math.Ceil(info.FrameRate / (maxFPS * fpsSlack))
+	return fmt.Sprintf("fps=fps=%d/1001", int64(math.Round(info.FrameRate/n*1001)))
+}
+
+// videoFilter is the -vf chain: the frame-rate cap (fpsFilter; first, so
+// the rest handles fewer frames), scale (short side tier, even sizes),
 // optional tone mapping, then the encoder's format (and upload).
 func videoFilter(tier int, tonemap bool, info *catalog.VideoInfo, format string) string {
 	var parts []string
+	if f := fpsFilter(info); f != "" {
+		parts = append(parts, f)
+	}
 	if tier > 0 {
 		// Short side = tier for landscape and portrait; -2 keeps the
 		// aspect ratio with an even size.
