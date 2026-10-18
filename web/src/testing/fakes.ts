@@ -921,6 +921,9 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
           .filter((r) => r.hashes.includes(x.hash))
           .map((r) => ({ id: r.id, name: r.name, startedAt: r.startedAt, mode: r.mode, sourceName: r.sourceName })),
         deletedAt: x.deletedAt ?? null,
+        video: null,
+        canConvert: false,
+        canOpen: false,
       });
     }
     if (method === 'GET' && path === 'tags') return json({ tags: tags.map((t) => ({ ...t, count: items.filter((x) => x.tagIds.includes(t.id)).length })) });

@@ -5,6 +5,8 @@
 // reached through libApi(id); the workspace, file-system and job endpoints
 // are global.
 
+import type { VideoInfo } from './playback';
+
 export type FileType = 'image' | 'image_raw' | 'video';
 export type ThumbState = 'pending' | 'ok' | 'unsupported' | 'error' | 'stale';
 
@@ -76,6 +78,24 @@ export interface MediaDetail extends MediaItem {
   imports?: ImportRef[] | null;
   /** Wall-clock string while the item is in the trash, null when live. */
   deletedAt?: string | null;
+  /** How a video is encoded; null for images and when unknown (absent from older servers). */
+  video?: VideoInfo | null;
+  /** The server has ffmpeg: /stream can remux or transcode a video. */
+  canConvert?: boolean;
+  /** "Open original" works for this client (it runs on the server's computer). */
+  canOpen?: boolean;
+}
+
+/** GET /stream/{id}/status. */
+export interface StreamStatus {
+  /** The complete conversion is cached: served with Range support (seekable). */
+  cached: boolean;
+  encoding: boolean;
+  bytes: number;
+  encoder?: string;
+  encoders: string[];
+  /** The short side produced (0: source size). */
+  tier: number;
 }
 
 export interface Camera {
@@ -812,6 +832,11 @@ export interface LibApi {
   /** The 640 px rendition (derived on demand from the preview by the server). */
   largeUrl(ref: ThumbRef): string;
   fileUrl(id: number, download?: boolean): string;
+  /** A video converted by the server: remuxed, or transcoded to short side h (0: source size), from t seconds. */
+  streamUrl(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): string;
+  streamStatus(id: number, mode: 'remux' | 'transcode', h?: number, signal?: AbortSignal): Promise<StreamStatus>;
+  /** Opens the original in its default program on the server's computer (canOpen). */
+  openOriginal(id: number): Promise<void>;
   getGeoClusters(f: Filters, bbox: BBox, zoom: number, signal?: AbortSignal): Promise<GeoCluster[]>;
   getGeoItems(f: Filters, bbox: BBox, limit: number, signal?: AbortSignal): Promise<{ items: MediaItem[]; total: number }>;
   startJob(req: JobRequest): Promise<Job>;
@@ -862,6 +887,14 @@ function versioned(base: string, kind: 'thumb' | 'large' | 'preview', ref: Thumb
   const u = `${base}/${kind}/${enc(ref.hash)}`;
   const v = ref.thumbAt;
   return typeof v === 'number' && Number.isFinite(v) ? `${u}?v=${enc(String(Math.trunc(v)))}` : u;
+}
+
+/** The query of /stream: mode, h (transcode only, when not 0) and t (when > 0, millisecond precision). */
+function streamQuery(mode: 'remux' | 'transcode', h: number, t: number): string {
+  const q = new URLSearchParams({ mode });
+  if (mode === 'transcode' && h > 0) q.set('h', String(Math.trunc(h)));
+  if (t > 0 && Number.isFinite(t)) q.set('t', (Math.round(t * 1000) / 1000).toString());
+  return q.toString();
 }
 
 function failures(v: unknown): Failure[] {
@@ -916,6 +949,11 @@ function makeLibApi(id: string): LibApi {
     previewUrl: (ref) => versioned(base, 'preview', ref),
     largeUrl: (ref) => versioned(base, 'large', ref),
     fileUrl: (mid, download = false) => `${base}/file/${enc(String(mid))}${download ? '?download=1' : ''}`,
+    streamUrl: (mid, mode, h = 0, t = 0) => `${base}/stream/${encId(mid)}?${streamQuery(mode, h, t)}`,
+    streamStatus: (mid, mode, h = 0, signal) => get<StreamStatus>(`/stream/${encId(mid)}/status?${streamQuery(mode, h, 0)}`, signal),
+    async openOriginal(mid) {
+      await post<unknown>(`/media/${encId(mid)}/open`, {});
+    },
     async getGeoClusters(f, bbox, zoom, signal) {
       const q = filterParams(f, { bbox: bboxParam(bbox), zoom: Math.max(0, Math.min(22, Math.round(zoom))) });
       const r = await get<{ clusters: GeoCluster[] | null }>(withQuery('/geo', q), signal);

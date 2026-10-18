@@ -17,6 +17,8 @@
   import TagInput, { type Pick } from './TagInput.svelte';
   import AlbumPicker from './AlbumPicker.svelte';
   import ConfirmButton from './ConfirmButton.svelte';
+  import VideoPlayer from './VideoPlayer.svelte';
+  import { videoLabel } from '../lib/playback';
 
   interface Props {
     id: number;
@@ -48,7 +50,8 @@
   const d = $derived(detail && detail.id === id ? detail : null);
   const isVideo = $derived(item?.type === 'video');
   const canFull = $derived(!!d && d.displayable && !isVideo);
-  const playable = $derived(!!d && d.displayable && isVideo);
+  // Every video gets the player: it plays the original, a conversion, or explains.
+  const playable = $derived(!!d && isVideo);
   // Rows whose thumbnails cannot exist are not requested (as in Tile).
   const thumbRequestable = $derived(!!item && item.thumb !== 'unsupported' && item.thumb !== 'error');
 
@@ -266,6 +269,12 @@
   }
   const close = () => closeViewer(baseHash);
 
+  function openOriginal() {
+    const cur = d;
+    if (!cur) return;
+    api.openOriginal(cur.id).catch((e: unknown) => toasts.error(`Could not open the original: ${errorMessage(e)}`));
+  }
+
   function toggleInfo() {
     showInfo = !showInfo;
     saveJSON(INFO_KEY, showInfo);
@@ -412,6 +421,9 @@
       {#if d}
         <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original">Download</a>
       {/if}
+      {#if d?.canOpen}
+        <button class="ghost" onclick={openOriginal} title="Open the original in its default program on this computer">Open</button>
+      {/if}
       <button class="ghost" class:on={showInfo} onclick={toggleInfo} title="Info (I)" aria-pressed={showInfo}>Info</button>
     </div>
 
@@ -425,8 +437,7 @@
       {:else if item}
         {#key item.id}
           {#if playable && d}
-            <!-- svelte-ignore a11y_media_has_caption -->
-            <video bind:this={videoEl} controls playsinline preload="metadata" src={api.fileUrl(d.id)} poster={api.previewUrl(d)}></video>
+            <VideoPlayer {api} detail={d} bind:videoEl />
           {:else if full && d}
             <div class="full">
               <img src={api.fileUrl(d.id)} alt="" />
@@ -568,6 +579,10 @@
             <dt>Duration</dt>
             <dd>{formatDuration(d.dur)}</dd>
           {/if}
+          {#if d.video}
+            <dt>Video</dt>
+            <dd>{videoLabel(d.video)}</dd>
+          {/if}
           <dt>Size</dt>
           <dd>{formatBytes(d.size)}</dd>
           <dt>Type</dt>
@@ -693,13 +708,6 @@
   }
   .preview.loaded {
     opacity: 1;
-  }
-  video {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    background: #000;
   }
   .full {
     position: absolute;
