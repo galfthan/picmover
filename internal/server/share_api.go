@@ -493,6 +493,12 @@ type shareDetailJSON struct {
 	Lon          *float64   `json:"lon,omitempty"`
 	Rating       *int       `json:"rating,omitempty"`
 	Albums       *[]refJSON `json:"albums,omitempty"`
+	// Videos only (docs/design/video-playback.md): the encoding, whether
+	// the computer converts it for this share (ffmpeg and `video`), and
+	// whether its container plays in browsers.
+	Video         *videoJSON `json:"video,omitempty"`
+	CanConvert    bool       `json:"canConvert,omitempty"`
+	BrowserFormat bool       `json:"browserFormat,omitempty"`
 }
 
 // handleShareMediaDetail is GET /api/l/{lib}/media/{id}: the redacted
@@ -525,6 +531,11 @@ func (s *Server) handleShareMediaDetail(w http.ResponseWriter, r *http.Request, 
 			_, hoff := m.TakenAt.In(home).Zone()
 			d.HomeOffset = &hoff
 		}
+	}
+	if m.FileType == "video" {
+		d.Video = newVideoJSON(s.videoInfo(ctx, l, &m))
+		d.CanConvert = caps.Video && s.video.ffmpeg != ""
+		d.BrowserFormat = displayable(m.Ext)
 	}
 	if caps.Location && m.HasGPS {
 		lat, lon := m.Lat, m.Lon

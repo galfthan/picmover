@@ -856,22 +856,33 @@ describe('phone app', () => {
       expect(lb.querySelector('.full img')?.getAttribute('src')).toBe('/api/l/peter/file/1');
     });
 
-    it('plays videos inline with a Download fallback, or says they are not available', async () => {
+    it('plays videos inline with a Download fallback', async () => {
       setup('libraries');
       await start('#/l/peter/view/3');
       const video = lightbox()!.querySelector('video')!;
       expect(video.hasAttribute('playsinline')).toBe(true);
       expect(video.getAttribute('src')).toBe('/api/l/peter/file/3');
       // Between the bars (layout.test.ts checks the inset), and a tap on it is the player's, not ours.
-      expect(video.parentElement?.classList.contains('video')).toBe(true);
+      expect(video.closest('.media')?.classList.contains('video')).toBe(true);
       touch(video, 'touchstart', 200, 300);
       touch(video, 'touchend', 200, 300);
       await settle();
       expect(lightbox()!.classList.contains('bare')).toBe(false);
       video.dispatchEvent(new Event('error'));
       await settle();
-      expect(lightbox()!.textContent).toContain('This video cannot be played in this browser');
-      expect(lightbox()!.querySelector('.banner a')?.getAttribute('href')).toBe('/api/l/peter/file/3?download=1');
+      // No conversion on this computer (no ffmpeg): the player says so, with Download.
+      expect(lightbox()!.textContent).toContain("This browser can't play MP4 video files.");
+      expect(lightbox()!.querySelector('.msgbar a')?.getAttribute('href')).toBe('/api/l/peter/file/3?download=1');
+    });
+
+    it('has a video this browser cannot decode converted by the computer', async () => {
+      setup('libraries', { video: { video: { codec: 'hevc', profile: 'Main 10', bitDepth: 10, hdr: true }, canConvert: true, browserFormat: true } });
+      await start('#/l/peter/view/3');
+      expect(server.requests('/api/l/peter/stream/3/status').length).toBe(1);
+      const video = lightbox()!.querySelector('video')!;
+      expect(video.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/3\?mode=transcode/);
+      // The conversion is still running: the player's own seek bar, between the bars.
+      expect(lightbox()!.querySelector('.player input[type=range]')).not.toBeNull();
     });
 
     it('shows a video as its poster when the share does not allow videos', async () => {

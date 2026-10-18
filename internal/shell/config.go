@@ -45,6 +45,9 @@ type Config struct {
 	Window      WindowSize `json:"window"`
 	// LastOpened is when the app last started (RFC 3339).
 	LastOpened string `json:"lastOpened"`
+	// VideoCacheMB caps each library's cache of videos converted for
+	// playback, in MB; 0 = the default (5 GB).
+	VideoCacheMB int `json:"videoCacheMB,omitempty"`
 }
 
 // DefaultConfig is the configuration of a first run.
@@ -56,6 +59,9 @@ func DefaultConfig() Config {
 func (c *Config) normalize() {
 	if c.Port < 0 || c.Port > 65535 {
 		c.Port = 0
+	}
+	if c.VideoCacheMB < 0 || c.VideoCacheMB > 1<<24 {
+		c.VideoCacheMB = 0
 	}
 	if c.Window.Width < minWidth || c.Window.Height < minHeight || c.Window.Width > 16384 || c.Window.Height > 16384 {
 		c.Window = WindowSize{Width: DefaultWidth, Height: DefaultHeight}

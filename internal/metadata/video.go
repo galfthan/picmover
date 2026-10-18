@@ -40,22 +40,37 @@ func (d Default) extractVideo(ctx context.Context, path string, zone *time.Locat
 	}
 	ctx, cancel := context.WithTimeout(ctx, ffprobeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, probe,
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_format",
-		"-show_streams",
-		path)
-	out, err := cmd.Output()
+	out, err := runFFProbe(ctx, probe, path)
 	if err != nil {
 		return Info{}, []string{fmt.Sprintf("ffprobe failed: %v", err)}
 	}
 	return parseFFProbe(out, zone)
 }
 
+// runFFProbe returns ffprobe's JSON description of path (format and
+// streams).
+func runFFProbe(ctx context.Context, probe, path string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, probe,
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		path)
+	return cmd.Output()
+}
+
 type ffprobeOutput struct {
 	Streams []struct {
 		CodecType    string            `json:"codec_type"`
+		CodecName    string            `json:"codec_name"`
+		CodecTag     string            `json:"codec_tag_string"`
+		Profile      string            `json:"profile"`
+		Level        int               `json:"level"`
+		PixFmt       string            `json:"pix_fmt"`
+		BitsPerRaw   string            `json:"bits_per_raw_sample"`
+		ColorTrc     string            `json:"color_transfer"`
+		ColorPrim    string            `json:"color_primaries"`
+		FrameRate    string            `json:"avg_frame_rate"`
 		Width        int               `json:"width"`
 		Height       int               `json:"height"`
 		Tags         map[string]string `json:"tags"`
@@ -63,8 +78,9 @@ type ffprobeOutput struct {
 		Disposition  map[string]int    `json:"disposition"`
 	} `json:"streams"`
 	Format struct {
-		Duration string            `json:"duration"`
-		Tags     map[string]string `json:"tags"`
+		FormatName string            `json:"format_name"`
+		Duration   string            `json:"duration"`
+		Tags       map[string]string `json:"tags"`
 	} `json:"format"`
 }
 
@@ -117,6 +133,7 @@ func parseFFProbe(data []byte, zone *time.Location) (Info, []string) {
 		return info, []string{fmt.Sprintf("parse ffprobe output: %v", err)}
 	}
 	ft := p.Format.Tags
+	info.Video = videoInfoOf(&p)
 
 	// Dimensions (display orientation) from the first video stream.
 	videoIdx := -1

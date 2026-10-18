@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -129,6 +130,14 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request, e *libEntry, p j
 			return
 		}
 		p.target = te
+		// The move renames or removes originals: no ffmpeg may hold one
+		// open (Windows refuses), so the library's conversions stop, and
+		// none start while it runs (handleStream).
+		if lib != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), conversionStopTimeout)
+			s.video.cancelRoot(ctx, lib.Root())
+			cancel()
+		}
 	}
 	if lib != nil && e.checkFolder() != nil {
 		writeJSON(w, http.StatusConflict, stateError{Error: errReplaced.Error(), State: libError})

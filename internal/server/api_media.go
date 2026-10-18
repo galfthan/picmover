@@ -421,6 +421,8 @@ type detailJSON struct {
 	// Imports are the import records that have the item, newest first.
 	Imports   []importRefJSON `json:"imports"`
 	DeletedAt *string         `json:"deletedAt"` // wall clock in the server's zone; null when live
+
+	playbackJSON // video, canConvert, canOpen (api_video.go)
 }
 
 // refJSON names a tag or an album.
@@ -606,6 +608,7 @@ func (s *Server) handleMediaDetail(w http.ResponseWriter, r *http.Request, l *li
 		d.Imports = append(d.Imports, importRefJSON{ID: rec.ID, Name: rec.Name, StartedAt: rfc3339(rec.StartedAt),
 			Mode: rec.Mode, SourceName: rec.SourceName})
 	}
+	d.playbackJSON = s.playback(r, l, &m)
 	writeJSON(w, http.StatusOK, d)
 }
 

@@ -64,6 +64,11 @@ type Info struct {
 	HasAltitude bool
 
 	CameraMake, CameraModel, CameraType, Lens string
+
+	// Video describes the streams of a video for playback decisions
+	// (codec, pixel format, HDR transfer); nil for images and when
+	// ffprobe did not run.
+	Video *VideoInfo
 }
 
 // Extractor reads metadata. warnings are non-fatal problems the caller logs.

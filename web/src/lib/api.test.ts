@@ -50,6 +50,13 @@ describe('thumbnail and preview URLs', () => {
     expect(api.previewUrl({ hash, thumbAt: 1760090000 })).toBe('/api/l/peter/preview/00000000000000ab?v=1760090000');
     expect(api.fileUrl(12, true)).toBe('/api/l/peter/file/12?download=1');
   });
+  it('build video stream URLs: h only for a transcode, t only when after the start', () => {
+    expect(api.streamUrl(12, 'remux')).toBe('/api/l/peter/stream/12?mode=remux');
+    expect(api.streamUrl(12, 'remux', 720)).toBe('/api/l/peter/stream/12?mode=remux');
+    expect(api.streamUrl(12, 'transcode', 720)).toBe('/api/l/peter/stream/12?mode=transcode&h=720');
+    expect(api.streamUrl(12, 'transcode', 0, 12.34567)).toBe('/api/l/peter/stream/12?mode=transcode&t=12.346');
+    expect(() => api.streamUrl(0, 'remux')).toThrow();
+  });
   it('are unversioned without thumbAt (map clusters, older servers)', () => {
     expect(api.thumbUrl({ hash })).toBe('/api/l/peter/thumb/00000000000000ab');
     expect(api.previewUrl({ hash })).toBe('/api/l/peter/preview/00000000000000ab');

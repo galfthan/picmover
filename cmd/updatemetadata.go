@@ -76,6 +76,7 @@ Exits with status 2 when any row could not be updated.`,
 			var (
 				updated, unchanged, degraded, errCount, warnCount int
 				pending                                           []metaUpdate
+				videos                                            []videoUpdate
 			)
 			for _, old := range rows {
 				if err := ctx.Err(); err != nil {
@@ -102,6 +103,9 @@ Exits with status 2 when any row could not be updated.`,
 					fmt.Fprintf(out, "Error getting metadata for %s: %v\n", old.RelPath, err)
 					errCount++
 					continue
+				}
+				if info.Video != nil && !dryRun {
+					videos = append(videos, videoUpdate{old.Hash, catalog.VideoInfo(*info.Video)})
 				}
 				nw, keptDate := mergeInfo(old, info)
 				changes := compareMedia(old, nw)
@@ -144,6 +148,9 @@ Exits with status 2 when any row could not be updated.`,
 				if err != nil {
 					return err
 				}
+			}
+			if err := writeVideoInfo(ctx, db, videos); err != nil {
+				return err
 			}
 			if !dryRun && updated > 0 {
 				// Videos with a UTC instant got the offset of their zone
@@ -208,6 +215,36 @@ func applyUpdates(ctx context.Context, db *catalog.DB, rows []metaUpdate, out io
 		return missing, fmt.Errorf("commit: %w", err)
 	}
 	return missing, nil
+}
+
+// videoUpdate is the video_info of one row (codec, HDR) to record. It is
+// written for every video re-read, changed or not: it is derived data
+// that older catalogs lack.
+type videoUpdate struct {
+	hash uint64
+	v    catalog.VideoInfo
+}
+
+// writeVideoInfo records video infos in transactions of updateBatchSize.
+func writeVideoInfo(ctx context.Context, db *catalog.DB, rows []videoUpdate) error {
+	for len(rows) > 0 {
+		n := min(len(rows), updateBatchSize)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin transaction: %w", err)
+		}
+		for _, r := range rows[:n] {
+			if err := db.PutVideoInfo(ctx, tx, r.hash, r.v); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		rows = rows[n:]
+	}
+	return nil
 }
 
 // findTool locates external tools; a variable so tests can simulate a

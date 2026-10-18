@@ -35,14 +35,15 @@ var (
 
 func newServeCmd() *cobra.Command {
 	var (
-		addr        string
-		noOpen      bool
-		verbose     bool
-		workspace   bool
-		corsOrigins []string
-		shareOn     bool
-		sharePort   int
-		pair        string
+		addr         string
+		noOpen       bool
+		verbose      bool
+		workspace    bool
+		corsOrigins  []string
+		shareOn      bool
+		sharePort    int
+		pair         string
+		videoCacheMB int
 	)
 	c := &cobra.Command{
 		Use:   "serve <library-or-workspace>",
@@ -106,7 +107,7 @@ new one). Without --share, serve never shares.`,
 			}
 			return runServe(cmd, args[0], serveParams{addr: addr, addrGiven: addrGiven, noOpen: noOpen,
 				verbose: verbose, corsOrigins: corsOrigins, workspace: workspace,
-				share: shareOn, sharePort: sharePort, pair: pair})
+				share: shareOn, sharePort: sharePort, pair: pair, videoCacheMB: videoCacheMB})
 		},
 	}
 	f := c.Flags()
@@ -114,6 +115,8 @@ new one). Without --share, serve never shares.`,
 	f.BoolVar(&noOpen, "no-open", false, "do not open the browser")
 	f.StringArrayVar(&corsOrigins, "cors-origin", nil, "allow this origin to call the API cross-origin (repeatable; for frontend development, e.g. http://localhost:5173)")
 	f.BoolVar(&verbose, "verbose", false, "log every request to stderr")
+	f.IntVar(&videoCacheMB, "video-cache-mb", int(server.DefaultVideoCacheBytes>>20),
+		"size cap in MB of each library's cache of videos converted for the browser (least recently played go first; minimum 256)")
 	f.BoolVar(&workspace, "workspace", false, "serve the folder as a workspace of libraries (its subfolders), even when it has none yet")
 	f.BoolVar(&shareOn, "share", false, "also share on the home Wi-Fi with the phones of this folder's shares")
 	f.IntVar(&sharePort, "share-port", 0, "the port of the shared view (default: the saved one, 7443)")
@@ -122,15 +125,16 @@ new one). Without --share, serve never shares.`,
 }
 
 type serveParams struct {
-	addr        string
-	addrGiven   bool
-	noOpen      bool
-	verbose     bool
-	workspace   bool
-	corsOrigins []string
-	share       bool
-	sharePort   int
-	pair        string
+	addr         string
+	addrGiven    bool
+	noOpen       bool
+	verbose      bool
+	workspace    bool
+	corsOrigins  []string
+	share        bool
+	sharePort    int
+	pair         string
+	videoCacheMB int
 }
 
 // Serve modes chosen by serveMode (server.ServeMode).
@@ -168,10 +172,11 @@ func runServe(cmd *cobra.Command, dir string, p serveParams) error {
 	run, err := server.Start(ctx, server.StartOptions{
 		Path: abs, Workspace: p.workspace, Addr: p.addr, AddrGiven: p.addrGiven,
 		CORSOrigins: p.corsOrigins, Version: Version, ErrOut: errOut,
-		Logger:        slog.New(slog.NewTextHandler(errOut, &slog.HandlerOptions{Level: level})),
-		CatalogLogger: stderrLogger(),
-		ShareDir:      shareDir,
-		ShareCmd:      "serve",
+		Logger:          slog.New(slog.NewTextHandler(errOut, &slog.HandlerOptions{Level: level})),
+		CatalogLogger:   stderrLogger(),
+		ShareDir:        shareDir,
+		ShareCmd:        "serve",
+		VideoCacheBytes: int64(p.videoCacheMB) << 20,
 	})
 	if err != nil {
 		var me *server.ModeError
