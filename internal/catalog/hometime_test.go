@@ -52,7 +52,12 @@ func samsungVideo(name string, instant time.Time, importZone *time.Location, ses
 func insertRows(t *testing.T, d *DB, rows ...row) map[string]int64 {
 	t.Helper()
 	ids := map[string]int64{}
+	var base int
+	if err := d.QueryRow("SELECT COALESCE(MAX(id), 0) FROM media").Scan(&base); err != nil {
+		t.Fatal(err)
+	}
 	for i, r := range rows {
+		i += base
 		ft := r.fileType
 		if ft == "" {
 			ft = FileTypeImage
@@ -179,6 +184,19 @@ func TestHomeTimeGroupsByHomeDate(t *testing.T) {
 	items, err := d.BucketItems(ctx, Filter{}, 2024, 8)
 	if err != nil || len(items) != 1 || items[0].ID != ids["late.jpg"] {
 		t.Errorf("August items %v, %v", idsOf(items), err)
+	}
+	// The phone's year facets count home years too: New Year's Eve in
+	// New York is already New Year in Helsinki.
+	insertRows(t, d, photo("nye.jpg", at(ny, 2024, 12, 31, 20, 0), 1))
+	fc, err := d.Facets(context.Background(), Filter{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []YearCount{{2025, 1}, {2024, 2}}; !reflect.DeepEqual(fc.Years, want) {
+		t.Errorf("years %v, want %v", fc.Years, want)
+	}
+	if _, err := d.Exec("DELETE FROM media WHERE rel_path LIKE '%nye.jpg'"); err != nil {
+		t.Fatal(err)
 	}
 	aug := time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
 	for _, c := range []struct {

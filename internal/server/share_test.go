@@ -706,7 +706,7 @@ func TestShareRedaction(t *testing.T) {
 		return out
 	}
 	base := []string{"cameraMake", "cameraModel", "displayable", "dur", "ext", "fileName", "h", "hash", "id", "lens",
-		"offset", "size", "takenAt", "thumbAt", "type", "w"}
+		"homeOffset", "localTakenAt", "offset", "offsetSource", "size", "takenAt", "thumbAt", "type", "w"}
 	want := func(extra ...string) []string {
 		out := append(slices.Clone(base), extra...)
 		sort.Strings(out)

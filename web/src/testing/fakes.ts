@@ -1853,8 +1853,12 @@ export function fakeShareServer(kind: 'libraries' | 'album' = 'libraries', opts:
         id: x.id,
         hash: x.hash,
         type: x.type,
+        // Home times: item 1 was taken on a trip, an hour west of home.
         takenAt: x.takenAt,
-        offset: 7200,
+        localTakenAt: x.id === 1 && x.takenAt ? new Date(Date.parse(x.takenAt + 'Z') - 3600_000).toISOString().slice(0, 19) : x.takenAt,
+        offset: x.id === 1 ? 3600 : 7200,
+        offsetSource: 'exif',
+        homeOffset: 7200,
         w: x.w,
         h: x.h,
         dur: x.dur ?? 0,
