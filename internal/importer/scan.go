@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -55,7 +56,8 @@ func (im *Importer) overlaps(src string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// scan walks src and sends jobs. trash marks a walk of the library's
+// scan walks src and sends jobs, newest first within each directory
+// (walkNewestFirst). trash marks a walk of the library's
 // trash directory (record in place): its files are internal by location,
 // so only the junk and extension rules apply. Non-media files are reported directly.
 // When src overlaps the library the whole tree is listed before any job is
@@ -105,7 +107,7 @@ func (im *Importer) scan(ctx context.Context, src string, srcInfo fs.FileInfo, j
 		return
 	}
 
-	_ = filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+	_ = walkNewestFirst(ctx, src, os.ReadDir, func(p string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return filepath.SkipAll
 		}
