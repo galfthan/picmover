@@ -71,18 +71,13 @@ func (s *Server) playback(r *http.Request, l *libHandles, m *catalog.Media) play
 // with ffprobe now and recorded (rows imported before the table existed,
 // or moved from another library). nil when unknown.
 func (s *Server) videoInfo(ctx context.Context, l *libHandles, m *catalog.Media) *catalog.VideoInfo {
-	if m.FileType != "video" {
-		return nil
+	v, found := s.storedVideoInfo(ctx, l, m)
+	if found || v != nil || m.FileType != "video" || s.ffprobe == "" {
+		return v
 	}
-	v, found, err := l.db.GetVideoInfo(ctx, m.Hash)
-	if err != nil {
-		s.log.Debug("video info", "id", m.ID, "err", err)
-		return nil
-	}
-	if found {
-		return &v
-	}
-	if s.ffprobe == "" {
+	// Not while a trash, restore, delete or move is about to rename the
+	// file (ffprobe holding it open would make that fail on Windows).
+	if s.video.blocked(l.lib.Root(), m.Hash) {
 		return nil
 	}
 	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
@@ -114,6 +109,23 @@ func (s *Server) videoInfo(ctx context.Context, l *libHandles, m *catalog.Media)
 		s.log.Debug("record video info", "id", m.ID, "err", err)
 	}
 	return &cv
+}
+
+// storedVideoInfo returns the recorded video info of m, without probing
+// the file: found is false when there is none (nil then).
+func (s *Server) storedVideoInfo(ctx context.Context, l *libHandles, m *catalog.Media) (_ *catalog.VideoInfo, found bool) {
+	if m.FileType != "video" {
+		return nil, false
+	}
+	v, found, err := l.db.GetVideoInfo(ctx, m.Hash)
+	if err != nil {
+		s.log.Debug("video info", "id", m.ID, "err", err)
+		return nil, true // not probed either: the catalog is the problem
+	}
+	if !found {
+		return nil, false
+	}
+	return &v, true
 }
 
 // parseStreamReq reads mode (remux or transcode), h (a tier, transcode
@@ -173,6 +185,11 @@ func (s *Server) streamTarget(w http.ResponseWriter, r *http.Request, l *libHand
 		writeError(w, http.StatusConflict, errMoving.Error())
 		return source{}, q, false
 	}
+	if s.video.blocked(l.lib.Root(), m.Hash) {
+		// A trash, restore or delete of this file runs.
+		writeError(w, http.StatusConflict, errVideoBusy.Error())
+		return source{}, q, false
+	}
 	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
 	if isMissing(err) {
 		writeError(w, http.StatusNotFound, "file not available")
@@ -182,7 +199,9 @@ func (s *Server) streamTarget(w http.ResponseWriter, r *http.Request, l *libHand
 		s.internalError(w, r, err)
 		return source{}, q, false
 	}
-	src := source{root: l.lib.Root(), hash: m.Hash, row: m, path: f.Name()}
+	entry := l.entry
+	src := source{root: l.lib.Root(), hash: m.Hash, row: m, path: f.Name(),
+		busy: func() bool { return entry.moving.Load() > 0 }}
 	f.Close()
 	src.info = s.videoInfo(r.Context(), l, &m)
 	// Never scale up: a tier at or above the source's short side is the
@@ -233,12 +252,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 		if main := s.video.lookup(final); main != nil {
 			defer main.detach()
 		}
-		j, err := s.video.start(src, q)
+		j, rd, err := s.video.start(src, q)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeStartError(w, err)
 			return
 		}
-		s.serveLive(w, r, j)
+		s.serveLive(w, r, j, rd)
 		return
 	}
 	for range 2 {
@@ -250,18 +269,28 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		j, err := s.video.start(src, q)
+		j, rd, err := s.video.start(src, q)
 		if errors.Is(err, errCachedNow) {
 			continue
 		}
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeStartError(w, err)
 			return
 		}
-		s.serveLive(w, r, j)
+		s.serveLive(w, r, j, rd)
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "conversion not available")
+}
+
+// writeStartError answers a conversion that did not start: 409 while
+// the file is about to be moved or deleted, else 503.
+func writeStartError(w http.ResponseWriter, err error) {
+	code := http.StatusServiceUnavailable
+	if errors.Is(err, errVideoBusy) {
+		code = http.StatusConflict
+	}
+	writeError(w, code, err.Error())
 }
 
 // serveCached answers with the complete conversion at final, if there is
@@ -299,8 +328,9 @@ func liveHeaders(w http.ResponseWriter) {
 // the partial file as ffmpeg writes it. When the conversion fails after
 // bytes were sent, the connection is aborted so the player sees an error
 // rather than a short video.
-func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, j *encodeJob) {
+func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, j *encodeJob, rd *liveReader) {
 	defer j.detach()
+	defer j.leave(rd)
 	ctx := r.Context()
 	stop := context.AfterFunc(ctx, j.wake)
 	defer stop()
@@ -313,9 +343,26 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, j *encodeJob)
 		for off >= j.written && !j.streamDone && ctx.Err() == nil {
 			j.cond.Wait()
 		}
-		written, done, jerr, f := j.written, j.streamDone, j.err, j.f
+		written, done, jerr := j.written, j.streamDone, j.err
+		var (
+			n    int
+			f    *os.File
+			gone bool
+		)
+		if off < written {
+			n, f, gone = j.readAtLocked(buf, off)
+		}
 		j.mu.Unlock()
 		if ctx.Err() != nil {
+			return
+		}
+		if gone {
+			// The bytes this reader needs are no longer kept (a conversion
+			// too large to cache keeps only a window in memory).
+			if sent {
+				panic(http.ErrAbortHandler)
+			}
+			writeError(w, http.StatusServiceUnavailable, "the conversion is too far along to join; try again")
 			return
 		}
 		if off < written {
@@ -324,15 +371,23 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request, j *encodeJob)
 				w.WriteHeader(http.StatusOK)
 				sent = true
 			}
-			n := min(written-off, int64(len(buf)))
-			if _, err := f.ReadAt(buf[:n], off); err != nil {
-				s.log.Warn("read video conversion", "err", err)
-				panic(http.ErrAbortHandler)
+			if f != nil {
+				if _, err := f.ReadAt(buf[:n], off); err != nil {
+					s.log.Warn("read video conversion", "err", err)
+					panic(http.ErrAbortHandler)
+				}
 			}
 			if _, err := w.Write(buf[:n]); err != nil {
 				return
 			}
-			off += n
+			off += int64(n)
+			j.mu.Lock()
+			rd.off = off
+			if j.over {
+				j.dropFileLocked()
+				j.cond.Broadcast() // the writer may wait for this reader
+			}
+			j.mu.Unlock()
 			_ = rc.Flush()
 			continue
 		}
@@ -394,13 +449,14 @@ func (s *Server) handleStreamStatus(w http.ResponseWriter, r *http.Request, l *l
 // trash, restore, delete or move touches their files.
 const conversionStopTimeout = 10 * time.Second
 
-// stopConversions cancels the conversions of hashes and waits for their
+// stopConversions blocks new conversions of hashes in l's library (the
+// stream answers 409), cancels the running ones and waits for their
 // ffmpeg processes to exit, so the files can be renamed or removed (on
-// Windows an open file cannot).
-func (s *Server) stopConversions(r *http.Request, hashes []uint64) {
+// Windows an open file cannot). The block lasts until release.
+func (s *Server) stopConversions(r *http.Request, l *libHandles, hashes []uint64) (release func()) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), conversionStopTimeout)
 	defer cancel()
-	s.video.cancelHash(ctx, hashes...)
+	return s.video.stopHashes(ctx, l.lib.Root(), hashes)
 }
 
 // keyframeBefore returns the time (seconds from the start of the file, as

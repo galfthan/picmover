@@ -461,6 +461,23 @@ func lockPair(a, b *libEntry) func() {
 	}
 }
 
+// stopConversions stops the video conversions of both sides of a move,
+// which renames or removes originals: on Windows a file ffmpeg holds open
+// cannot be. The libraries are marked moving (lockPair) before, so no
+// conversion starts until the move ends (source.busy, streamTarget).
+func (m *jobManager) stopConversions(sides ...transfer.Side) {
+	if m.video == nil {
+		return
+	}
+	roots := make([]string, 0, len(sides))
+	for _, sd := range sides {
+		roots = append(roots, sd.Lib.Root())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), conversionStopTimeout)
+	defer cancel()
+	m.video.stopRoots(ctx, roots...)
+}
+
 // lockTrash takes e's trash lock for a request; false, holding nothing,
 // while a move runs on e (it holds the lock for the whole run, so the
 // request would wait for all of it).
@@ -657,6 +674,7 @@ func (m *jobManager) moveOnce(j *job, res *transferResultJSON, opts transfer.Opt
 		return err
 	}
 	defer closeTo()
+	m.stopConversions(from, to)
 	r, err := transfer.Run(j.ctx, from, to, j.params.hashes, opts)
 	addResult(res, r)
 	return err
@@ -702,6 +720,7 @@ func (m *jobManager) resumeAll(j *job, res *transferResultJSON, opts transfer.Op
 				return err
 			}
 			defer closeTo()
+			m.stopConversions(from, to)
 			// The journal's path under this process's spelling of the root.
 			path := filepath.Join(to.Lib.Root(), library.MetaDir, transfer.JournalDir, filepath.Base(li.in.Path))
 			r, err := transfer.Recover(j.ctx, from, to, path, opts)

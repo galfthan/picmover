@@ -129,19 +129,33 @@ the catalog, a seek bar, mute, full screen.
   `videoCacheMB`; default 5 GB, minimum 256 MB). Everything in the
   directory counts, partial and temporary files too. Before the faststart
   rewrite the oldest files go until the copy fits next to the partial file;
-  after it, again until all fits. A conversion larger than half the cap is
-  only streamed, never cached. Serving a cached file renews its time (at
-  most once a minute). Running conversions can still exceed the cap
-  briefly: their size is not known in advance. Partial files
+  after it, again until all fits. Serving a cached file renews its time
+  (at most once a minute). Partial files
   (`*.part`, `*.tmp`) left by a crash are removed before the first conversion
   in a library's cache after start.
+- A partial file never grows past half the cap. A conversion that reaches
+  that (seek streams too) stops writing it: the rest passes through a
+  memory window of 16 MB, ffmpeg waits for the slowest reader, and the
+  partial file is removed once every reader is past it. Such a conversion
+  is not cached, and a new request cannot join it (it no longer has the
+  first bytes): it gets its own.
+- The cache volume holds the originals: a conversion starts writing a
+  partial file only when the volume keeps a margin (2 GB, or 5% of the
+  volume when less) after half the cap; else it streams through memory
+  from the start. A growing partial file checks again every 64 MB, and the
+  faststart copy is made only when it fits with the margin.
 - Shutdown (`StopJobs`) cancels the import job and every conversion (seek
   streams and faststart rewrites included: they all derive from the
   manager's context) and waits for both in parallel within its timeout.
-- Trash, restore and permanent delete first cancel the conversions of
-  those hashes and wait for their ffmpeg to exit; a move between libraries
-  cancels the library's conversions and `/stream` answers 409 while a move
-  runs. On Windows a file ffmpeg holds open cannot be renamed or removed.
+- Trash, restore and permanent delete first block new conversions of
+  those hashes (`/stream` and its status answer 409, the lazy probe
+  skips them), then cancel the running ones and wait for their ffmpeg to exit;
+  the block lasts until the request ends. A move between libraries marks
+  both libraries moving (409) before it cancels their conversions, when
+  the job runs. The start of a conversion checks both under the manager's
+  lock, so none slips in between. A conversion that has not stopped after
+  10 s is logged and the file operation goes on. On Windows a file ffmpeg
+  holds open cannot be renamed or removed.
 
 ## Phones (LAN share)
 
@@ -152,7 +166,9 @@ live row visible in the share's scope and a video (else the share's 404),
 and the `video` capability (else 403). They then run the admin handlers,
 so caching, slots and seek streams are shared with the computer's viewer.
 The redacted detail adds `video`, `canConvert` (ffmpeg and `video`) and
-`browserFormat` (the container plays in browsers). The phone lightbox uses
+`browserFormat` (the container plays in browsers); `video` is what the
+catalog has recorded, and only a share with `video` makes the computer
+probe a video without it (ffprobe, then recorded). The phone lightbox uses
 the same `VideoPlayer` (with Download only under `download`); when it gives
 up after a load error, the lightbox still asks the URL why (capability
 turned off, computer unreachable or busy). The share mux has no route to

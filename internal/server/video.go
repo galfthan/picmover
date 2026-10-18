@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,16 @@ const (
 	// touchAfter: serving a cached file renews its LRU time (mtime) when
 	// it is older than this.
 	touchAfter = time.Minute
+	// defaultMemWindow bounds the bytes a conversion that no longer writes
+	// its partial file keeps in memory for its readers (pass-through).
+	defaultMemWindow = 16 << 20
+	// spaceCheckEvery: a conversion writing its partial file checks the
+	// free space of the cache volume again after this many bytes.
+	spaceCheckEvery = 64 << 20
+	// diskMarginMax is the most free space a conversion leaves on the
+	// cache volume (the volume of the originals); 5% of the volume when
+	// that is less.
+	diskMarginMax int64 = 2 << 30
 )
 
 // The conversion modes of /stream.
@@ -139,14 +150,23 @@ type videoManager struct {
 
 	started atomic.Int64 // conversions started (tests)
 
-	mu      sync.Mutex
-	jobs    map[string]*encodeJob // full conversions by final cache path
-	seeks   map[string]*encodeJob // the latest seek stream by its full conversion's cache path
-	all     map[*encodeJob]bool   // every running conversion, seek streams included
-	cleaned map[string]bool       // cache dirs whose partial files were removed
-	noInfo  map[probeKey]bool     // files ffprobe failed on (lazy probe)
-	closed  bool
-	wg      sync.WaitGroup
+	// memWindow bounds a pass-through conversion's memory; diskSpace
+	// reports a directory's free and total bytes (tests replace both).
+	memWindow int64
+	diskSpace func(dir string) (free, total int64)
+
+	mu sync.Mutex
+	// blockedHashes counts, per library root and content hash, the trash,
+	// restore and delete requests about to rename or remove the file: no
+	// conversion of it starts meanwhile.
+	blockedHashes map[rootHash]int
+	jobs          map[string]*encodeJob // full conversions by final cache path
+	seeks         map[string]*encodeJob // the latest seek stream by its full conversion's cache path
+	all           map[*encodeJob]bool   // every running conversion, seek streams included
+	cleaned       map[string]bool       // cache dirs whose partial files were removed
+	noInfo        map[probeKey]bool     // files ffprobe failed on (lazy probe)
+	closed        bool
+	wg            sync.WaitGroup
 }
 
 func newVideoManager(ffmpeg string, cacheBytes int64, log *slog.Logger) *videoManager {
@@ -156,21 +176,24 @@ func newVideoManager(ffmpeg string, cacheBytes int64, log *slog.Logger) *videoMa
 	cacheBytes = max(cacheBytes, MinVideoCacheBytes)
 	ctx, stop := context.WithCancel(context.Background())
 	return &videoManager{
-		ffmpeg:     ffmpeg,
-		log:        log,
-		cacheBytes: cacheBytes,
-		sem:        make(chan struct{}, defaultMaxEncodes),
-		seekSem:    make(chan struct{}, defaultMaxEncodes),
-		grace:      encodeGrace,
-		ctx:        ctx,
-		stop:       stop,
-		hw:         hardwareEncoders(goos),
-		sw:         softwareEncoders(),
-		jobs:       map[string]*encodeJob{},
-		seeks:      map[string]*encodeJob{},
-		all:        map[*encodeJob]bool{},
-		cleaned:    map[string]bool{},
-		noInfo:     map[probeKey]bool{},
+		ffmpeg:        ffmpeg,
+		log:           log,
+		cacheBytes:    cacheBytes,
+		sem:           make(chan struct{}, defaultMaxEncodes),
+		seekSem:       make(chan struct{}, defaultMaxEncodes),
+		grace:         encodeGrace,
+		memWindow:     defaultMemWindow,
+		diskSpace:     diskSpace,
+		blockedHashes: map[rootHash]int{},
+		ctx:           ctx,
+		stop:          stop,
+		hw:            hardwareEncoders(goos),
+		sw:            softwareEncoders(),
+		jobs:          map[string]*encodeJob{},
+		seeks:         map[string]*encodeJob{},
+		all:           map[*encodeJob]bool{},
+		cleaned:       map[string]bool{},
+		noInfo:        map[probeKey]bool{},
 	}
 }
 
@@ -244,38 +267,92 @@ func (v *videoManager) shutdown(ctx context.Context) {
 	}
 }
 
-// cancelRoot cancels every conversion of the library at root and waits,
-// bounded by ctx, for their ffmpeg processes to exit.
-func (v *videoManager) cancelRoot(ctx context.Context, root string) {
-	v.cancelWhere(ctx, func(j *encodeJob) bool { return j.src.root == root })
+// errVideoBusy answers a conversion of a file that a trash, restore,
+// delete or move between libraries is about to rename or remove.
+var errVideoBusy = errors.New("the file is being moved or deleted; try again when that has finished")
+
+// rootHash names a file of a library for blocking its conversions.
+type rootHash struct {
+	root string
+	hash uint64
 }
 
-// cancelHash cancels every conversion reading the content hash (before a
-// trash, restore, delete or move touches its file: on Windows a file
-// ffmpeg has open cannot be renamed or removed) and waits, bounded by
-// ctx, for their ffmpeg processes to exit.
-func (v *videoManager) cancelHash(ctx context.Context, hashes ...uint64) {
+// blocked reports whether conversions of hash in the library at root are
+// blocked (a trash, restore or delete of it runs).
+func (v *videoManager) blocked(root string, hash uint64) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.blockedHashes[rootHash{root, hash}] > 0
+}
+
+// stopHashes blocks new conversions of hashes in the library at root,
+// then cancels the running ones and waits, bounded by ctx, for their
+// ffmpeg processes to exit (before a trash, restore or delete renames or
+// removes the files: on Windows a file ffmpeg has open cannot be). The
+// block stays until release is called.
+func (v *videoManager) stopHashes(ctx context.Context, root string, hashes []uint64) (release func()) {
+	keys := make([]rootHash, 0, len(hashes))
 	want := make(map[uint64]bool, len(hashes))
+	v.mu.Lock()
 	for _, h := range hashes {
-		want[h] = true
+		if !want[h] {
+			want[h] = true
+			k := rootHash{root, h}
+			keys = append(keys, k)
+			v.blockedHashes[k]++
+		}
 	}
-	v.cancelWhere(ctx, func(j *encodeJob) bool { return want[j.src.hash] })
+	v.mu.Unlock()
+	v.cancelWhere(ctx, "trash", func(j *encodeJob) bool { return j.src.root == root && want[j.src.hash] })
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			v.mu.Lock()
+			defer v.mu.Unlock()
+			for _, k := range keys {
+				if v.blockedHashes[k]--; v.blockedHashes[k] <= 0 {
+					delete(v.blockedHashes, k)
+				}
+			}
+		})
+	}
 }
 
-func (v *videoManager) cancelWhere(ctx context.Context, match func(*encodeJob) bool) {
-	var dones []chan struct{}
+// stopRoots cancels every conversion of the libraries at roots and
+// waits, bounded by ctx, for their ffmpeg processes to exit. The caller
+// has blocked new ones first (a move marks the libraries moving, which
+// source.busy reports).
+func (v *videoManager) stopRoots(ctx context.Context, roots ...string) {
+	v.cancelWhere(ctx, "move", func(j *encodeJob) bool { return slices.Contains(roots, j.src.root) })
+}
+
+// cancelWhere cancels the conversions match selects and waits, bounded
+// by ctx, for their ffmpeg processes to exit; a timeout is logged (the
+// file operation that follows may then fail on Windows).
+func (v *videoManager) cancelWhere(ctx context.Context, why string, match func(*encodeJob) bool) {
+	var jobs []*encodeJob
 	v.mu.Lock()
 	for j := range v.all {
 		if match(j) {
 			j.cancel()
-			dones = append(dones, j.done)
+			jobs = append(jobs, j)
 		}
 	}
 	v.mu.Unlock()
-	for _, d := range dones {
+	for i, j := range jobs {
 		select {
-		case <-d:
+		case <-j.done:
 		case <-ctx.Done():
+			left := 0
+			for _, k := range jobs[i:] {
+				select {
+				case <-k.done:
+				default:
+					left++
+				}
+			}
+			v.log.Warn("video conversions did not stop in time", "for", why, "running", left,
+				"hash", hexHash(j.src.hash), "err", ctx.Err())
 			return
 		}
 	}
@@ -309,6 +386,9 @@ type source struct {
 	path string // the original, already checked by openOriginal
 	info *catalog.VideoInfo
 	row  catalog.Media
+	// busy reports whether the library is in a state where no conversion
+	// may start (a move between libraries runs); nil: never.
+	busy func() bool
 }
 
 // lookup returns the running conversion for final, attached (detach it
@@ -331,32 +411,43 @@ func (v *videoManager) peek(final string) *encodeJob {
 	return v.jobs[final]
 }
 
-// start returns the conversion of src for q, attached: the running one
-// for the same output, else a new one. A request with a start time gets
-// its own, uncached conversion (a seek stream), which replaces the
-// previous seek stream of the same output: a viewer has one at a time.
-func (v *videoManager) start(src source, q streamReq) (*encodeJob, error) {
+// start returns the conversion of src for q, attached, and the reader
+// to stream it with (serveLive): the running one for the same output
+// when it can still be read from its first byte, else a new one. A
+// request with a start time gets its own, uncached conversion (a seek
+// stream), which replaces the previous seek stream of the same output: a
+// viewer has one at a time. errVideoBusy while a trash, restore, delete
+// or move is about to rename or remove the file.
+func (v *videoManager) start(src source, q streamReq) (*encodeJob, *liveReader, error) {
 	final := videoCachePath(src.root, src.hash, q.variant())
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.closed {
-		return nil, errVideoClosed
+		return nil, nil, errVideoClosed
+	}
+	// Checked under v.mu: a stop that blocks first and then cancels under
+	// v.mu either sees this conversion or is seen here.
+	if v.blockedHashes[rootHash{src.root, src.hash}] > 0 || (src.busy != nil && src.busy()) {
+		return nil, nil, errVideoBusy
 	}
 	cached := q.start == 0
 	if cached {
 		if j := v.jobs[final]; j != nil && j.ctx.Err() == nil {
-			j.attach()
-			return j, nil
+			if rd := j.join(); rd != nil {
+				return j, rd, nil
+			}
+			// Too far along to serve from its first byte: a new one.
 		}
 		// A conversion that just finished has left its file behind.
 		if fi, err := os.Stat(final); err == nil && fi.Mode().IsRegular() {
-			return nil, errCachedNow
+			return nil, nil, errCachedNow
 		}
 	}
 	v.cleanLocked(videoCacheDir(src.root))
 	ctx, cancel := context.WithCancel(v.ctx)
+	rd := &liveReader{}
 	j := &encodeJob{v: v, src: src, req: q, ctx: ctx, cancel: cancel, readers: 1, running: true,
-		done: make(chan struct{})}
+		done: make(chan struct{}), live: map[*liveReader]bool{rd: true}}
 	j.cond = sync.NewCond(&j.mu)
 	if cached {
 		j.final = final
@@ -372,7 +463,7 @@ func (v *videoManager) start(src source, q streamReq) (*encodeJob, error) {
 	v.wg.Add(1)
 	v.started.Add(1)
 	go j.run()
-	return j, nil
+	return j, rd, nil
 }
 
 // encodeJob is one ffmpeg conversion. Its output goes to a partial file
@@ -401,6 +492,177 @@ type encodeJob struct {
 	readers    int
 	running    bool // the run goroutine has not finished (it may still use the file)
 	idle       *time.Timer
+
+	// live are the readers streaming the conversion (serveLive), with
+	// the offset each has sent.
+	live map[*liveReader]bool
+	// over: the partial file no longer grows (the conversion is too large
+	// to cache, or the cache volume is short of space); it holds bytes
+	// [0, fileEnd) until every reader is past them, and the rest passes
+	// through memory: mem holds bytes [memBase, written), at most about
+	// memWindow, and ffmpeg waits for the slowest reader. Never cached.
+	over      bool
+	fileEnd   int64
+	mem       []byte
+	memBase   int64
+	checkedAt int64 // written when the free space was last checked
+}
+
+// liveReader is one client streaming a running conversion.
+type liveReader struct{ off int64 }
+
+// join attaches a new reader when the conversion can still be read from
+// its first byte; nil otherwise.
+func (j *encodeJob) join() *liveReader {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.over && (j.memBase > j.fileEnd || (j.fileEnd > 0 && j.f == nil)) {
+		return nil
+	}
+	j.readers++
+	if j.idle != nil {
+		j.idle.Stop()
+		j.idle = nil
+	}
+	rd := &liveReader{}
+	j.live[rd] = true
+	return rd
+}
+
+// leave unregisters a reader of serveLive (it still detaches).
+func (j *encodeJob) leave(rd *liveReader) {
+	j.mu.Lock()
+	delete(j.live, rd)
+	j.dropFileLocked()
+	j.cond.Broadcast() // the writer may wait for this reader
+	j.mu.Unlock()
+}
+
+// dropFileLocked closes and removes the partial file of a conversion
+// that no longer writes it once no reader still needs its bytes.
+func (j *encodeJob) dropFileLocked() {
+	if !j.over || j.f == nil {
+		return
+	}
+	for rd := range j.live {
+		if rd.off < j.fileEnd {
+			return
+		}
+	}
+	j.f.Close()
+	j.f = nil
+	if err := os.Remove(j.part); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		j.v.log.Debug("remove partial video conversion", "path", j.part, "err", err)
+	}
+}
+
+// spillLocked stops writing the partial file: the rest of the conversion
+// passes through memory and is not cached.
+func (j *encodeJob) spillLocked(why string) {
+	j.over = true
+	j.fileEnd = j.written
+	j.memBase = j.written
+	j.v.log.Info("video conversion not cached: "+why, "hash", hexHash(j.src.hash), "variant", j.req.variant(),
+		"written", j.written, "cap", j.v.cacheBytes)
+	j.dropFileLocked()
+}
+
+// partLimit is the largest conversion kept in the cache.
+func (v *videoManager) partLimit() int64 { return v.cacheBytes / 2 }
+
+// diskMargin is the free space conversions leave on a volume of total
+// bytes: 2 GB, or 5% of the volume when that is less.
+func diskMargin(total int64) int64 {
+	return min(diskMarginMax, total/20)
+}
+
+// roomFor reports whether dir's volume has room for need more bytes and
+// the safety margin (true when unknown).
+func (v *videoManager) roomFor(dir string, need int64) bool {
+	free, total := v.diskSpace(dir)
+	if free < 0 || total <= 0 {
+		return true
+	}
+	return free-need >= diskMargin(total)
+}
+
+// write appends p to the conversion: to the partial file, or, once that
+// stopped growing, to the memory window, waiting while it is full for the
+// slowest reader. Only the ffmpeg goroutine calls it (it alone changes
+// written, over and the file's contents).
+func (j *encodeJob) write(p []byte) error {
+	v := j.v
+	n := int64(len(p))
+	if !j.over {
+		why := ""
+		switch {
+		case j.written+n > v.partLimit():
+			why = "larger than half the cache"
+		case j.written-j.checkedAt >= spaceCheckEvery:
+			j.checkedAt = j.written
+			if !v.roomFor(filepath.Dir(j.part), spaceCheckEvery) {
+				why = "the cache volume is short of space"
+			}
+		}
+		if why != "" {
+			j.mu.Lock()
+			j.spillLocked(why)
+			j.mu.Unlock()
+		}
+	}
+	if !j.over {
+		if _, err := j.f.WriteAt(p, j.written); err != nil {
+			return err
+		}
+		j.mu.Lock()
+		j.written += n
+		j.cond.Broadcast()
+		j.mu.Unlock()
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for len(j.mem) > 0 && int64(len(j.mem))+n > v.memWindow && j.ctx.Err() == nil {
+		// Drop what every reader has sent; without readers, all of it.
+		low := j.written
+		for rd := range j.live {
+			low = min(low, rd.off)
+		}
+		if drop := low - j.memBase; drop > 0 && (drop >= v.memWindow/4 || low == j.written) {
+			j.mem = j.mem[:copy(j.mem, j.mem[drop:])]
+			j.memBase = low
+			continue
+		}
+		j.cond.Wait()
+	}
+	if err := j.ctx.Err(); err != nil {
+		return err
+	}
+	j.mem = append(j.mem, p...)
+	j.written += n
+	j.cond.Broadcast()
+	return nil
+}
+
+// readAtLocked serves a reader at off (below written) into buf: from
+// memory, copied now (f nil), or n bytes to read from the file f outside
+// the lock. gone: those bytes are no longer kept (the reader joined or
+// fell behind a conversion that no longer writes its file).
+func (j *encodeJob) readAtLocked(buf []byte, off int64) (n int, f *os.File, gone bool) {
+	n = int(min(j.written-off, int64(len(buf))))
+	if !j.over || off < j.fileEnd {
+		if j.over {
+			n = int(min(int64(n), j.fileEnd-off))
+		}
+		if j.f == nil {
+			return 0, nil, true
+		}
+		return n, j.f, false
+	}
+	if off < j.memBase {
+		return 0, nil, true
+	}
+	return copy(buf[:n], j.mem[off-j.memBase:]), nil, false
 }
 
 // attach counts a reader.
@@ -491,13 +753,15 @@ func (j *encodeJob) run() {
 
 	if err == nil && j.final != "" {
 		j.mu.Lock()
-		size := j.written
+		size, over := j.written, j.over
 		j.mu.Unlock()
-		if size > v.cacheBytes/2 {
-			// Too big to keep: it was streamed, it is not cached.
-			v.log.Info("video conversion too large to cache", "hash", hexHash(j.src.hash), "variant", j.req.variant(),
-				"size", size, "cap", v.cacheBytes)
-		} else {
+		switch {
+		case over:
+			// Too big to keep, or no room: it was streamed, not cached.
+		case !v.roomFor(filepath.Dir(j.part), size):
+			v.log.Info("video conversion not cached: the cache volume is short of space", "hash", hexHash(j.src.hash),
+				"variant", j.req.variant(), "size", size)
+		default:
 			// Room for the finished copy next to the partial file first.
 			v.evict(videoCacheDir(j.src.root), "", size)
 			if ferr := j.finalize(); ferr != nil {
@@ -547,13 +811,20 @@ func (j *encodeJob) encode() error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, hexHash(j.src.hash)+"-*.part")
-	if err != nil {
-		return err
+	if v.roomFor(dir, v.partLimit()) {
+		f, err := os.CreateTemp(dir, hexHash(j.src.hash)+"-*.part")
+		if err != nil {
+			return err
+		}
+		j.mu.Lock()
+		j.f, j.part = f, f.Name()
+		j.mu.Unlock()
+	} else {
+		// Never fill the volume of the originals: stream without a file.
+		j.mu.Lock()
+		j.spillLocked("the cache volume is short of space")
+		j.mu.Unlock()
 	}
-	j.mu.Lock()
-	j.f, j.part = f, f.Name()
-	j.mu.Unlock()
 
 	if j.req.mode == modeRemux {
 		j.setEncoder("copy")
@@ -600,20 +871,14 @@ func (j *encodeJob) ffmpeg(args []string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("ffmpeg: %w", err)
 	}
+	stopWake := context.AfterFunc(j.ctx, j.wake) // a write waiting for readers
+	defer stopWake()
 	buf := make([]byte, 64<<10)
 	var werr error
 	for {
 		n, rerr := out.Read(buf)
 		if n > 0 && werr == nil {
-			j.mu.Lock()
-			off := j.written
-			j.mu.Unlock()
-			if _, werr = j.f.WriteAt(buf[:n], off); werr == nil {
-				j.mu.Lock()
-				j.written += int64(n)
-				j.cond.Broadcast()
-				j.mu.Unlock()
-			} else {
+			if werr = j.write(buf[:n]); werr != nil {
 				j.cancel() // stop ffmpeg; the disk is full or gone
 			}
 		}

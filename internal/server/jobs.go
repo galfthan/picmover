@@ -656,6 +656,9 @@ type jobManager struct {
 	ffmpeg string
 	log    *slog.Logger
 	adjust func(*importer.Options)
+	// video stops the conversions of the libraries a move runs on (nil:
+	// none to stop).
+	video *videoManager
 
 	mu      sync.Mutex
 	nextID  int64

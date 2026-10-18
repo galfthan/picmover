@@ -655,7 +655,6 @@ function withQuery(path: string, q: URLSearchParams): string {
   return s ? `${path}?${s}` : path;
 }
 
-/** "w,s,e,n", each number exactly (a cluster's bounds sent back must keep the photos on their edges). */
 /** The query of /stream, as the admin client builds it. */
 function streamQuery(mode: 'remux' | 'transcode', h: number, t: number): string {
   const q = new URLSearchParams({ mode });
@@ -664,6 +663,7 @@ function streamQuery(mode: 'remux' | 'transcode', h: number, t: number): string 
   return q.toString();
 }
 
+/** "w,s,e,n", each number exactly (a cluster's bounds sent back must keep the photos on their edges). */
 function bboxParam(b: GeoBox): string {
   return [b.west, b.south, b.east, b.north].map(String).join(',');
 }

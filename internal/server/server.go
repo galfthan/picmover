@@ -199,6 +199,7 @@ func New(opts Options) (*Server, error) {
 		s.opener = newSysOpener()
 	}
 	s.jobs = newJobManager(ws, s.ffmpeg, log, opts.jobOptions)
+	s.jobs.video = s.video
 	ws.ownedImports = s.jobs.ownedImports
 	s.share = newSharing(s, opts.ShareDir, opts.ShareCmd)
 	s.handler = s.middleware(s.routes())

@@ -67,6 +67,13 @@ Exits with status 2 when any row could not be updated.`,
 			if err != nil {
 				return err
 			}
+			// Instants whose local offset is unknown are stored in the
+			// home zone (catalog.OffsetSourceHome): compare and print them
+			// as stored, not in the zone they were extracted in.
+			_, home, err := db.HomeZone(ctx)
+			if err != nil {
+				return err
+			}
 			if hasVideo(rows) {
 				if _, err := findTool("ffprobe"); err != nil {
 					return fmt.Errorf("ffprobe not found; video metadata would be lost (install ffprobe or use --type to skip videos): %w", err)
@@ -104,6 +111,7 @@ Exits with status 2 when any row could not be updated.`,
 					errCount++
 					continue
 				}
+				info.TakenAt = asStored(info, home)
 				if info.Video != nil && !dryRun {
 					videos = append(videos, videoUpdate{old.Hash, catalog.VideoInfo(*info.Video)})
 				}
@@ -275,6 +283,18 @@ func rowZone(m catalog.Media, def *time.Location, explicit bool) *time.Location 
 		return time.FixedZone("", off)
 	}
 	return def
+}
+
+// asStored returns info's capture time as the catalog stores it: an
+// instant with no local offset of its own (an mtime or a video's UTC
+// time, offset source "home") is shown in the home zone, whatever zone it
+// was extracted in (--timezone). Unchanged when there is no home zone.
+func asStored(info metadata.Info, home *time.Location) time.Time {
+	if home == nil || info.TakenAt.IsZero() ||
+		catalog.DefaultOffsetSource(info.Source, info.OffsetKnown) != catalog.OffsetSourceHome {
+		return info.TakenAt
+	}
+	return info.TakenAt.In(home)
 }
 
 // trustedSources are date sources read from the file's own metadata.

@@ -533,7 +533,14 @@ func (s *Server) handleShareMediaDetail(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	if m.FileType == "video" {
-		d.Video = newVideoJSON(s.videoInfo(ctx, l, &m))
+		// Only a share with `video` may make the computer probe the
+		// file (and record the result); otherwise what is recorded.
+		if caps.Video {
+			d.Video = newVideoJSON(s.videoInfo(ctx, l, &m))
+		} else {
+			info, _ := s.storedVideoInfo(ctx, l, &m)
+			d.Video = newVideoJSON(info)
+		}
 		d.CanConvert = caps.Video && s.video.ffmpeg != ""
 		d.BrowserFormat = displayable(m.Ext)
 	}
