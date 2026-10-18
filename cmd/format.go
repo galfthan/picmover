@@ -91,7 +91,8 @@ func openExistingLocked(ctx context.Context, dir, lockName string, errOut io.Wri
 	}
 	// The catalog is opened (and a catalog of another format refused,
 	// untouched) before the lock is taken, so a refused library gets no
-	// .picmover directory. Opening writes nothing.
+	// .picmover directory. Opening writes nothing, except the one-time
+	// in-place upgrade of a version 3 catalog.
 	db, err = catalog.OpenExisting(ctx, lib.DBPath(), stderrLogger())
 	if err != nil {
 		return nil, nil, nil, catalogError(lib.Root(), err)

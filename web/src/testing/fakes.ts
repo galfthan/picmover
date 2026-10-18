@@ -315,6 +315,7 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
   const openErrors = new Map<string, string>();
   /** user.db counts that differ from the catalog's (null: the same). */
   const userdb: { trashed: number | null } = { trashed: null };
+  const settings: { homeZone: string | null } = { homeZone: null };
   /** The library JSON `thumbs` counts (tests set `largeMissing`). */
   const thumbCounts: { pending: number; ok: number; unsupported: number; error: number; largeMissing?: number } = { pending: 0, ok: 9, unsupported: 0, error: 0, largeMissing: 0 };
   /** Hashes whose large cannot be derived: the large route answers the thumb bytes with no-store. */
@@ -874,7 +875,16 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         ffmpeg: true,
         userdb: { ratings: items.filter((x) => x.rating).length, tags: tags.length, albums: albums.length, trashed: userdb.trashed ?? items.length - live().length, ignoredPairs: ignoredPairs.size },
         similar: { at: 1760090000, distance: 6, items: 8, pairs: 1 },
+        homeZone: { name: settings.homeZone },
       });
+    }
+    if (method === 'POST' && path === 'settings') {
+      const zone = (body as { homeZone?: string }).homeZone;
+      if (zone !== undefined) {
+        if (!/^[A-Za-z_]+\/[A-Za-z_]+$/.test(zone) && zone !== 'UTC') return json({ error: 'homeZone: not a known time zone' }, 400);
+        settings.homeZone = zone;
+      }
+      return json({ name: settings.homeZone });
     }
     if (method === 'GET' && path === 'timeline') {
       const m = new Map<string, { year: number; month: number; count: number }>();
@@ -901,7 +911,10 @@ export function fakeServer(mode: 'workspace' | 'single' | 'unset' = 'workspace')
         relPath: `image/2024/07/${x.id}.jpg`,
         ext: '.jpg',
         size: 1000,
+        localTakenAt: x.takenAt,
         offset: null,
+        offsetSource: null,
+        homeOffset: null,
         takenAtSource: 'exif',
         orientation: 1,
         cameraMake: '',

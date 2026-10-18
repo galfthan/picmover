@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   bucketLabel,
   formatBytes,
+  formatCapture,
   formatCount,
   formatDuration,
   formatElapsed,
@@ -35,6 +36,54 @@ describe('parseWallClock', () => {
     expect(parseWallClock(null)).toBeNull();
     expect(parseWallClock('')).toBeNull();
     expect(parseWallClock('yesterday')).toBeNull();
+  });
+});
+
+describe('formatCapture', () => {
+  it('shows the home time alone when the local clock agrees', () => {
+    expect(
+      formatCapture({ takenAt: '2024-07-14T15:30:00', homeOffset: 10800, localTakenAt: '2024-07-14T15:30:00', offset: 10800, offsetSource: 'exif' }),
+    ).toEqual({ home: '14/07/2024 15:30:00 UTC+03:00', local: null, note: null });
+  });
+  it('adds the local time of a trip photo', () => {
+    // Summer: CEST trip, EEST home.
+    expect(
+      formatCapture({ takenAt: '2024-07-14T15:30:00', homeOffset: 10800, localTakenAt: '2024-07-14T14:30:00', offset: 7200, offsetSource: 'exif' }),
+    ).toEqual({ home: '14/07/2024 15:30:00 UTC+03:00', local: '14:30 local (UTC+02:00)', note: null });
+    // Winter: CET trip, EET home.
+    expect(
+      formatCapture({ takenAt: '2024-01-14T15:30:00', homeOffset: 7200, localTakenAt: '2024-01-14T14:30:00', offset: 3600, offsetSource: 'exif' }).local,
+    ).toBe('14:30 local (UTC+01:00)');
+  });
+  it('names the local date when it differs', () => {
+    expect(
+      formatCapture({ takenAt: '2024-08-01T03:30:00', homeOffset: 10800, localTakenAt: '2024-07-31T20:30:00', offset: -14400, offsetSource: 'exif' }).local,
+    ).toBe('31/07/2024 20:30 local (UTC-04:00)');
+  });
+  it('marks an estimated local time', () => {
+    const c = formatCapture({ takenAt: '2024-07-14T15:40:00', homeOffset: 10800, localTakenAt: '2024-07-14T14:40:00', offset: 7200, offsetSource: 'nearby' });
+    expect(c.local).toBe('≈ 14:40 local (UTC+02:00)');
+    expect(c.note).toBe('Local time estimated from photos taken nearby');
+  });
+  it('does not repeat a local time that is only the home zone', () => {
+    expect(
+      formatCapture({ takenAt: '2024-07-14T15:40:00', homeOffset: 10800, localTakenAt: '2024-07-14T12:40:00', offset: 0, offsetSource: 'home' }),
+    ).toEqual({ home: '14/07/2024 15:40:00 UTC+03:00', local: null, note: null });
+  });
+  it('handles unknown offsets, no home zone and older servers', () => {
+    // Zoneless EXIF: no offset anywhere.
+    expect(formatCapture({ takenAt: '2010-06-01T12:00:00', homeOffset: null, localTakenAt: '2010-06-01T12:00:00', offset: null, offsetSource: null })).toEqual({
+      home: '01/06/2010 12:00:00',
+      local: null,
+      note: null,
+    });
+    // No home zone set: the recorded time with its offset, as before.
+    expect(formatCapture({ takenAt: '2024-07-14T14:30:00', homeOffset: null, localTakenAt: '2024-07-14T14:30:00', offset: 7200, offsetSource: 'exif' }).home).toBe(
+      '14/07/2024 14:30:00 UTC+02:00',
+    );
+    // A server without home times.
+    expect(formatCapture({ takenAt: '2024-07-14T14:30:00', offset: 7200 })).toEqual({ home: '14/07/2024 14:30:00 UTC+02:00', local: null, note: null });
+    expect(formatCapture({ takenAt: null, homeOffset: null, localTakenAt: null, offset: null }).home).toBe('Undated');
   });
 });
 

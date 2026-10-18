@@ -7,6 +7,7 @@
   import { isNumber, loadJSON, saveJSON } from '../lib/storage';
   import { library } from '../lib/library.svelte';
   import { isWithin, joinPath } from '../lib/paths';
+  import { browserZone as currentZone, zoneList } from '../lib/zones';
   import FolderPicker from '../components/FolderPicker.svelte';
   import JobProgress from '../components/JobProgress.svelte';
   import ResultsList from '../components/ResultsList.svelte';
@@ -49,25 +50,9 @@
   let move = $state(false);
   let minDimension = $state(0);
   let noThumbs = $state(false);
-  const browserZone = (() => {
-    try {
-      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    } catch {
-      return 'UTC';
-    }
-  })();
+  const browserZone = currentZone();
   let timezone = $state(browserZone);
-  const zones = (() => {
-    let list: string[] = [];
-    try {
-      list = Intl.supportedValuesOf('timeZone');
-    } catch {
-      list = [];
-    }
-    const out = new Set(['UTC', ...list]);
-    out.add(browserZone);
-    return [...out].sort((a, b) => (a === 'UTC' ? -1 : b === 'UTC' ? 1 : a.localeCompare(b)));
-  })();
+  const zones = zoneList(browserZone);
 
   let starting = $state(false);
   let startError = $state('');
@@ -309,7 +294,7 @@
             <select bind:value={timezone}>
               {#each zones as z (z)}<option value={z}>{z}</option>{/each}
             </select>
-            <span class="muted small">Used for files without zone information.</span>
+            <span class="muted small">Used for files without zone information, and as the library's home zone if it has none yet.</span>
           </label>
 
           <label class="field check">
