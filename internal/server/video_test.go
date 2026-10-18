@@ -293,7 +293,12 @@ func TestVideoTranscodeHEVC(t *testing.T) {
 	}
 
 	f.waitCached("hdr.mp4", q)
-	cached := f.cacheFiles("-v1-src.mp4")
+	// The tone-mapping path is part of the cache key.
+	variant := "-v1-src.mp4"
+	if f.srv.video.capabilities().tonemap {
+		variant = "-v1-src-tm.mp4"
+	}
+	cached := f.cacheFiles(variant)
 	if len(cached) != 1 || len(f.cacheFiles(".part")) != 0 {
 		t.Fatalf("cache files %v, partial %v", cached, f.cacheFiles(".part"))
 	}
@@ -570,8 +575,8 @@ func TestVideoCacheEviction(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	writeFile(t, filepath.Join(dir, "ab", "x.part"), make([]byte, 1000)) // not counted, not evicted here
-	v.evict(dir, filepath.Join(dir, "ab", "keep.mp4"))
+	writeFile(t, filepath.Join(dir, "ab", "x.part"), make([]byte, 50)) // counted, never evicted
+	v.evict(dir, filepath.Join(dir, "ab", "keep.mp4"), 0)
 	for name, want := range map[string]bool{"old.mp4": false, "mid.mp4": false, "new.mp4": true, "keep.mp4": true, "x.part": true} {
 		_, err := os.Stat(filepath.Join(dir, "ab", name))
 		if (err == nil) != want {

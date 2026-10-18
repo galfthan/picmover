@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"net/http"
+
+	"picmover/internal/metadata"
 )
 
 // remoteKey marks a request that came through a listener for other
@@ -65,6 +67,12 @@ func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request, l *libHandle
 	}
 	m, ok := s.mediaRow(w, r, l)
 	if !ok {
+		return
+	}
+	// Only media files go to the opener: a row naming anything else (an
+	// executable, a script) is refused before the OS sees it.
+	if _, media := metadata.Classify(m.RelPath); !media {
+		writeError(w, http.StatusBadRequest, "not a photo or video file")
 		return
 	}
 	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())

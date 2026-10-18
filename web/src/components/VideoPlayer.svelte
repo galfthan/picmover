@@ -41,6 +41,10 @@
   let pendingSeek = -1;
   /** Bumped by every source change: an older async step is dropped. */
   let gen = 0;
+  /** Recovery attempts of the current plan since its last good start (see fail). */
+  let retries = 0;
+  /** Where the viewer was when a seek stream failed and the full conversion was loaded instead. */
+  let resumeAt = 0;
 
   const duration = $derived(detail.dur && detail.dur > 0 ? detail.dur / 1000 : 0);
   const shown = $derived(scrub ?? offset + local);
@@ -63,6 +67,7 @@
   /** Switches to plan p, starting at source time `at`. */
   async function apply(p: Plan, at: number, play: boolean) {
     const my = ++gen;
+    if (p.mode !== plan.mode) retries = 0;
     plan = p;
     live = false;
     offset = 0;
@@ -80,8 +85,11 @@
     tier = p.mode === 'transcode' ? pickTier(box?.clientWidth ?? 0, box?.clientHeight ?? 0, window.devicePixelRatio || 1, detail.w, detail.h) : 0;
     preparing = true;
     let cached = false;
+    let start = at;
     try {
-      cached = (await api.streamStatus(detail.id, p.mode, tier)).cached;
+      const st = await api.streamStatus(detail.id, p.mode, tier, at);
+      cached = st.cached;
+      start = st.start ?? at;
     } catch {
       // The stream request itself reports a real problem.
     }
@@ -89,19 +97,44 @@
     preparing = false;
     live = !cached;
     if (live && at > 0) {
-      offset = at;
+      offset = start;
       pendingSeek = -1;
-      src = api.streamUrl(detail.id, p.mode, tier, at);
+      setSrc(api.streamUrl(detail.id, p.mode, tier, start));
     } else {
-      src = api.streamUrl(detail.id, p.mode, tier);
+      setSrc(api.streamUrl(detail.id, p.mode, tier));
     }
   }
 
-  /** The current source cannot be played: go on to the next plan. */
+  /**
+   * The current source failed. A conversion that started from a seek is
+   * first asked for again from the same time, then the full conversion is
+   * tried (from the start, or the cached file at that time); only then is
+   * the next plan tried, from the same time, so a failed remux seek does
+   * not throw the viewer back to 0.
+   */
   function fail() {
     if (plan.mode === 'none' || !src) return;
-    const wasPlaying = !!videoEl && !videoEl.paused;
-    void apply(nextPlan(plan.mode, detail), 0, wasPlaying);
+    const play = !!videoEl && !videoEl.paused;
+    const pos = offset + (videoEl?.currentTime ?? 0);
+    const at = pos > 0.5 ? pos : resumeAt;
+    if ((plan.mode === 'remux' || plan.mode === 'transcode') && offset > 0 && retries < 2) {
+      const mode = plan.mode;
+      retries++;
+      autoplay = play;
+      if (retries === 1) {
+        setSrc(api.streamUrl(detail.id, mode, tier, offset));
+      } else {
+        // The full conversion: playable from the start while it runs,
+        // seekable to `at` once cached (onMetadata).
+        pendingSeek = at;
+        resumeAt = at;
+        offset = 0;
+        local = 0;
+        setSrc(api.streamUrl(detail.id, mode, tier));
+      }
+      return;
+    }
+    void apply(nextPlan(plan.mode, detail), at, play);
   }
 
   function onMetadata() {
@@ -113,10 +146,11 @@
       fail();
       return;
     }
-    if (pendingSeek > 0) {
+    // A live stream cannot seek: a pending seek only applies to a file.
+    if (pendingSeek > 0 && v.duration > pendingSeek && v.seekable.length > 0) {
       v.currentTime = Math.max(0, pendingSeek - offset);
-      pendingSeek = -1;
     }
+    pendingSeek = -1;
   }
 
   /** Seeks a live stream to source time t. */
@@ -126,7 +160,7 @@
     const mode = plan.mode;
     t = Math.max(0, duration ? Math.min(t, duration - 0.1) : t);
     const rel = t - offset;
-    if (rel >= 0 && inBuffered(v.buffered, rel)) {
+    if (rel >= 0 && v.buffered && inBuffered(v.buffered, rel)) {
       v.currentTime = rel;
       return;
     }
@@ -134,8 +168,11 @@
     const my = ++gen;
     waiting = true;
     let cached = false;
+    let start = t;
     try {
-      cached = (await api.streamStatus(detail.id, mode, tier)).cached;
+      const st = await api.streamStatus(detail.id, mode, tier, t);
+      cached = st.cached;
+      start = st.start ?? t;
     } catch {
       // Try a stream from t.
     }
@@ -143,15 +180,18 @@
     waiting = false;
     autoplay = play;
     local = 0;
+    retries = 0;
+    resumeAt = 0;
     if (cached) {
       live = false;
       offset = 0;
       pendingSeek = t;
       setSrc(api.streamUrl(detail.id, mode, tier));
     } else {
-      offset = t;
+      // A remux starts at the keyframe before t: the server says where.
+      offset = start;
       pendingSeek = -1;
-      setSrc(api.streamUrl(detail.id, mode, tier, t));
+      setSrc(api.streamUrl(detail.id, mode, tier, start));
     }
   }
 

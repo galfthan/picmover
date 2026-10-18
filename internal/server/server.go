@@ -290,8 +290,12 @@ func (s *Server) StopJobs(ctx context.Context) error {
 	s.share.shutdown() // phones first: nothing new reaches the libraries
 	ctx, cancel := context.WithTimeout(ctx, jobShutdownTimeout)
 	defer cancel()
+	// The job is cancelled first; the video conversions are cancelled
+	// alongside and both are waited for in parallel, within one timeout.
+	jobErr := make(chan error, 1)
+	go func() { jobErr <- s.jobs.shutdown(ctx) }()
 	s.video.shutdown(ctx)
-	return s.jobs.shutdown(ctx)
+	return <-jobErr
 }
 
 // Close is the last phase of a shutdown, after the HTTP server has

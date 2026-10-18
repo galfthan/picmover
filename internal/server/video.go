@@ -84,17 +84,24 @@ type streamReq struct {
 	mode  string  // modeRemux or modeTranscode
 	tier  int     // transcode: short side of the output, 0 = source size
 	start float64 // seconds; > 0 is an uncached stream from that time
+	// tonemap: an HDR source is tone-mapped (zscale and tonemap exist);
+	// part of the cache key, as the output differs.
+	tonemap bool
 }
 
 // variant names the output in the cache file name.
 func (q streamReq) variant() string {
+	v := "h" + strconv.Itoa(q.tier)
 	switch {
 	case q.mode == modeRemux:
 		return "remux"
 	case q.tier == 0:
-		return "src"
+		v = "src"
 	}
-	return "h" + strconv.Itoa(q.tier)
+	if q.tonemap {
+		v += "-tm"
+	}
+	return v
 }
 
 // videoCacheDir is a library's conversion cache.
@@ -116,8 +123,14 @@ type videoManager struct {
 	ffmpeg     string // "" = no conversions
 	log        *slog.Logger
 	cacheBytes int64
-	sem        chan struct{}
+	sem        chan struct{} // slots of full (cacheable) conversions
+	seekSem    chan struct{} // slots of seek streams, so a seek never waits for a whole conversion
 	grace      time.Duration
+
+	// ctx is cancelled by shutdown: every conversion and finalize derives
+	// from it.
+	ctx  context.Context
+	stop context.CancelFunc
 
 	// hw and sw are the encoder candidates (tests replace them).
 	hw, sw   []encoder
@@ -127,8 +140,11 @@ type videoManager struct {
 	started atomic.Int64 // conversions started (tests)
 
 	mu      sync.Mutex
-	jobs    map[string]*encodeJob // by final cache path
+	jobs    map[string]*encodeJob // full conversions by final cache path
+	seeks   map[string]*encodeJob // the latest seek stream by its full conversion's cache path
+	all     map[*encodeJob]bool   // every running conversion, seek streams included
 	cleaned map[string]bool       // cache dirs whose partial files were removed
+	noInfo  map[probeKey]bool     // files ffprobe failed on (lazy probe)
 	closed  bool
 	wg      sync.WaitGroup
 }
@@ -138,17 +154,48 @@ func newVideoManager(ffmpeg string, cacheBytes int64, log *slog.Logger) *videoMa
 		cacheBytes = DefaultVideoCacheBytes
 	}
 	cacheBytes = max(cacheBytes, MinVideoCacheBytes)
+	ctx, stop := context.WithCancel(context.Background())
 	return &videoManager{
 		ffmpeg:     ffmpeg,
 		log:        log,
 		cacheBytes: cacheBytes,
 		sem:        make(chan struct{}, defaultMaxEncodes),
+		seekSem:    make(chan struct{}, defaultMaxEncodes),
 		grace:      encodeGrace,
+		ctx:        ctx,
+		stop:       stop,
 		hw:         hardwareEncoders(goos),
 		sw:         softwareEncoders(),
 		jobs:       map[string]*encodeJob{},
+		seeks:      map[string]*encodeJob{},
+		all:        map[*encodeJob]bool{},
 		cleaned:    map[string]bool{},
+		noInfo:     map[probeKey]bool{},
 	}
+}
+
+// probeKey names a file version for the lazy probe's negative cache.
+type probeKey struct {
+	hash        uint64
+	size, mtime int64
+}
+
+// maxNoInfo bounds the negative cache.
+const maxNoInfo = 10000
+
+func (v *videoManager) probeFailed(k probeKey) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.noInfo[k]
+}
+
+func (v *videoManager) noteProbeFailed(k probeKey) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.noInfo) >= maxNoInfo {
+		clear(v.noInfo)
+	}
+	v.noInfo[k] = true
 }
 
 // capabilities probes ffmpeg once (encoders, tone mapping).
@@ -181,20 +228,56 @@ var errVideoClosed = errors.New("the server is shutting down")
 // already (it finished since the caller looked).
 var errCachedNow = errors.New("conversion is cached")
 
-// shutdown cancels every conversion and waits (bounded by ctx) for their
-// ffmpeg processes to exit and their partial files to be removed.
+// shutdown cancels every conversion (seek streams and finalizing ones
+// included) and waits (bounded by ctx) for their ffmpeg processes to exit
+// and their partial files to be removed.
 func (v *videoManager) shutdown(ctx context.Context) {
 	v.mu.Lock()
 	v.closed = true
-	for _, j := range v.jobs {
-		j.cancel()
-	}
 	v.mu.Unlock()
+	v.stop()
 	done := make(chan struct{})
 	go func() { v.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-ctx.Done():
+	}
+}
+
+// cancelRoot cancels every conversion of the library at root and waits,
+// bounded by ctx, for their ffmpeg processes to exit.
+func (v *videoManager) cancelRoot(ctx context.Context, root string) {
+	v.cancelWhere(ctx, func(j *encodeJob) bool { return j.src.root == root })
+}
+
+// cancelHash cancels every conversion reading the content hash (before a
+// trash, restore, delete or move touches its file: on Windows a file
+// ffmpeg has open cannot be renamed or removed) and waits, bounded by
+// ctx, for their ffmpeg processes to exit.
+func (v *videoManager) cancelHash(ctx context.Context, hashes ...uint64) {
+	want := make(map[uint64]bool, len(hashes))
+	for _, h := range hashes {
+		want[h] = true
+	}
+	v.cancelWhere(ctx, func(j *encodeJob) bool { return want[j.src.hash] })
+}
+
+func (v *videoManager) cancelWhere(ctx context.Context, match func(*encodeJob) bool) {
+	var dones []chan struct{}
+	v.mu.Lock()
+	for j := range v.all {
+		if match(j) {
+			j.cancel()
+			dones = append(dones, j.done)
+		}
+	}
+	v.mu.Unlock()
+	for _, d := range dones {
+		select {
+		case <-d:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -250,7 +333,8 @@ func (v *videoManager) peek(final string) *encodeJob {
 
 // start returns the conversion of src for q, attached: the running one
 // for the same output, else a new one. A request with a start time gets
-// its own, uncached conversion.
+// its own, uncached conversion (a seek stream), which replaces the
+// previous seek stream of the same output: a viewer has one at a time.
 func (v *videoManager) start(src source, q streamReq) (*encodeJob, error) {
 	final := videoCachePath(src.root, src.hash, q.variant())
 	v.mu.Lock()
@@ -270,13 +354,21 @@ func (v *videoManager) start(src source, q streamReq) (*encodeJob, error) {
 		}
 	}
 	v.cleanLocked(videoCacheDir(src.root))
-	ctx, cancel := context.WithCancel(context.Background())
-	j := &encodeJob{v: v, src: src, req: q, ctx: ctx, cancel: cancel, readers: 1, running: true}
+	ctx, cancel := context.WithCancel(v.ctx)
+	j := &encodeJob{v: v, src: src, req: q, ctx: ctx, cancel: cancel, readers: 1, running: true,
+		done: make(chan struct{})}
 	j.cond = sync.NewCond(&j.mu)
 	if cached {
 		j.final = final
 		v.jobs[final] = j
+	} else {
+		if old := v.seeks[final]; old != nil {
+			old.cancel()
+		}
+		v.seeks[final] = j
+		j.seekOf = final
 	}
+	v.all[j] = true
 	v.wg.Add(1)
 	v.started.Add(1)
 	go j.run()
@@ -291,8 +383,10 @@ type encodeJob struct {
 	src    source
 	req    streamReq
 	final  string // cache path; "" for an uncached (seek) stream
+	seekOf string // a seek stream: its full conversion's cache path
 	ctx    context.Context
 	cancel context.CancelFunc
+	done   chan struct{} // closed when the run goroutine has finished
 
 	mu      sync.Mutex
 	cond    *sync.Cond // broadcast when written, streamDone or a reader's context changes
@@ -396,10 +490,21 @@ func (j *encodeJob) run() {
 	j.mu.Unlock()
 
 	if err == nil && j.final != "" {
-		if ferr := j.finalize(); ferr != nil {
-			v.log.Warn("video conversion not cached", "hash", hexHash(j.src.hash), "variant", j.req.variant(), "err", ferr)
+		j.mu.Lock()
+		size := j.written
+		j.mu.Unlock()
+		if size > v.cacheBytes/2 {
+			// Too big to keep: it was streamed, it is not cached.
+			v.log.Info("video conversion too large to cache", "hash", hexHash(j.src.hash), "variant", j.req.variant(),
+				"size", size, "cap", v.cacheBytes)
 		} else {
-			v.evict(videoCacheDir(j.src.root), j.final)
+			// Room for the finished copy next to the partial file first.
+			v.evict(videoCacheDir(j.src.root), "", size)
+			if ferr := j.finalize(); ferr != nil {
+				v.log.Warn("video conversion not cached", "hash", hexHash(j.src.hash), "variant", j.req.variant(), "err", ferr)
+			} else {
+				v.evict(videoCacheDir(j.src.root), j.final, 0)
+			}
 		}
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -410,11 +515,16 @@ func (j *encodeJob) run() {
 	if j.final != "" && v.jobs[j.final] == j {
 		delete(v.jobs, j.final)
 	}
+	if j.seekOf != "" && v.seeks[j.seekOf] == j {
+		delete(v.seeks, j.seekOf)
+	}
+	delete(v.all, j)
 	v.mu.Unlock()
 	j.mu.Lock()
 	j.running = false
 	j.cleanupLocked()
 	j.mu.Unlock()
+	close(j.done)
 }
 
 // encode waits for a slot and runs ffmpeg with the first encoder that
@@ -422,12 +532,16 @@ func (j *encodeJob) run() {
 // replaced by the software one.
 func (j *encodeJob) encode() error {
 	v := j.v
+	sem := v.sem
+	if j.final == "" {
+		sem = v.seekSem
+	}
 	select {
-	case v.sem <- struct{}{}:
+	case sem <- struct{}{}:
 	case <-j.ctx.Done():
 		return j.ctx.Err()
 	}
-	defer func() { <-v.sem }()
+	defer func() { <-sem }()
 
 	dir := filepath.Dir(videoCachePath(j.src.root, j.src.hash, j.req.variant()))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -452,7 +566,7 @@ func (j *encodeJob) encode() error {
 	var lastErr error
 	for _, e := range caps.encoders {
 		j.setEncoder(e.Name)
-		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e, caps.tonemap))
+		lastErr = j.ffmpeg(transcodeArgs(j.src, j.req, e))
 		j.mu.Lock()
 		wrote := j.written > 0
 		j.mu.Unlock()
@@ -532,7 +646,7 @@ func (j *encodeJob) ffmpeg(args []string) error {
 // index first (-movflags +faststart): a file a browser seeks in with Range
 // requests. Streams are copied, so it takes seconds.
 func (j *encodeJob) finalize() error {
-	ctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
+	ctx, cancel := context.WithTimeout(j.v.ctx, finalizeTimeout) // shutdown cancels it
 	defer cancel()
 	j.mu.Lock()
 	part := j.part
@@ -554,25 +668,29 @@ func (j *encodeJob) finalize() error {
 }
 
 // evict removes the least recently used complete conversions in dir
-// until they fit the cap; keep (the one just written) stays.
-func (v *videoManager) evict(dir, keep string) {
+// until everything there (partial and temporary files too) plus reserve
+// bytes about to be written fits the cap; keep (the one just written)
+// stays.
+func (v *videoManager) evict(dir, keep string, reserve int64) {
 	type entry struct {
 		path string
 		size int64
 		at   time.Time
 	}
 	var files []entry
-	var total int64
+	total := reserve
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() || !strings.HasSuffix(d.Name(), ".mp4") {
+		if err != nil || !d.Type().IsRegular() {
 			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		files = append(files, entry{p, fi.Size(), fi.ModTime()})
 		total += fi.Size()
+		if strings.HasSuffix(d.Name(), ".mp4") {
+			files = append(files, entry{p, fi.Size(), fi.ModTime()})
+		}
 		return nil
 	})
 	if total <= v.cacheBytes {
@@ -637,7 +755,13 @@ func inputArgs(src source, q streamReq, pre []string) []string {
 	args := []string{"-hide_banner", "-nostdin", "-loglevel", "error"}
 	args = append(args, pre...)
 	if q.start > 0 {
-		args = append(args, "-ss", strconv.FormatFloat(q.start, 'f', 3, 64))
+		ss := q.start
+		if q.mode == modeRemux {
+			// q.start is the keyframe (floored to ms): seek just after it,
+			// so the copy starts at it, not at the one before.
+			ss += 0.001
+		}
+		args = append(args, "-ss", strconv.FormatFloat(ss, 'f', 3, 64))
 	}
 	// "file:" stops ffmpeg from reading a protocol or option out of the path.
 	return append(args, "-i", "file:"+src.path,
@@ -670,12 +794,11 @@ func remuxArgs(src source, q streamReq) []string {
 // scaled so the short side is q.tier (never up), HDR tone-mapped to SDR
 // BT.709 when the filters exist, at most 60 frames per second. ffmpeg
 // applies the rotation (autorotate), so the output is upright.
-func transcodeArgs(src source, q streamReq, e encoder, tonemap bool) []string {
+func transcodeArgs(src source, q streamReq, e encoder) []string {
 	args := inputArgs(src, q, e.input)
-	hdr := src.info != nil && isHDR(src.info.ColorTransfer)
-	args = append(args, "-vf", videoFilter(q.tier, hdr && tonemap, src.info, e.format))
+	args = append(args, "-vf", videoFilter(q.tier, q.tonemap, src.info, e.format))
 	args = append(args, e.args(q.tier)...)
-	if hdr && tonemap {
+	if q.tonemap {
 		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
 	}
 	args = append(args, "-fpsmax", "60", "-c:a", "aac", "-b:a", "160k", "-ac", "2",

@@ -96,6 +96,8 @@ export interface StreamStatus {
   encoders: string[];
   /** The short side produced (0: source size). */
   tier: number;
+  /** Where a stream asked for with t really starts (a remux starts at the keyframe before t); absent from older servers. */
+  start?: number;
 }
 
 export interface Camera {
@@ -834,7 +836,8 @@ export interface LibApi {
   fileUrl(id: number, download?: boolean): string;
   /** A video converted by the server: remuxed, or transcoded to short side h (0: source size), from t seconds. */
   streamUrl(id: number, mode: 'remux' | 'transcode', h?: number, t?: number): string;
-  streamStatus(id: number, mode: 'remux' | 'transcode', h?: number, signal?: AbortSignal): Promise<StreamStatus>;
+  /** The conversion's state; with t, also where a stream from t really starts (`start`). */
+  streamStatus(id: number, mode: 'remux' | 'transcode', h?: number, t?: number, signal?: AbortSignal): Promise<StreamStatus>;
   /** Opens the original in its default program on the server's computer (canOpen). */
   openOriginal(id: number): Promise<void>;
   getGeoClusters(f: Filters, bbox: BBox, zoom: number, signal?: AbortSignal): Promise<GeoCluster[]>;
@@ -950,7 +953,7 @@ function makeLibApi(id: string): LibApi {
     largeUrl: (ref) => versioned(base, 'large', ref),
     fileUrl: (mid, download = false) => `${base}/file/${enc(String(mid))}${download ? '?download=1' : ''}`,
     streamUrl: (mid, mode, h = 0, t = 0) => `${base}/stream/${encId(mid)}?${streamQuery(mode, h, t)}`,
-    streamStatus: (mid, mode, h = 0, signal) => get<StreamStatus>(`/stream/${encId(mid)}/status?${streamQuery(mode, h, 0)}`, signal),
+    streamStatus: (mid, mode, h = 0, t = 0, signal) => get<StreamStatus>(`/stream/${encId(mid)}/status?${streamQuery(mode, h, t)}`, signal),
     async openOriginal(mid) {
       await post<unknown>(`/media/${encId(mid)}/open`, {});
     },

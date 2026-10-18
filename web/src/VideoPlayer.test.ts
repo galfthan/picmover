@@ -78,7 +78,7 @@ describe('VideoPlayer', () => {
   it('streams a transcode with its own controls while the conversion runs', async () => {
     const { api, streamStatus } = fakeApi();
     const el = await mountPlayer(api, detail({}));
-    expect(streamStatus).toHaveBeenCalledWith(7, 'transcode', expect.any(Number));
+    expect(streamStatus).toHaveBeenCalledWith(7, 'transcode', expect.any(Number), 0);
     const video = el.querySelector('video');
     expect(video?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode/);
     expect(video?.hasAttribute('controls')).toBe(false);
@@ -98,7 +98,7 @@ describe('VideoPlayer', () => {
   it('remuxes an MTS file', async () => {
     const { api, streamStatus } = fakeApi({ cached: true });
     const el = await mountPlayer(api, detail({ ext: '.mts', displayable: false, video: null }));
-    expect(streamStatus).toHaveBeenCalledWith(7, 'remux', 0);
+    expect(streamStatus).toHaveBeenCalledWith(7, 'remux', 0, 0);
     expect(el.querySelector('video')?.getAttribute('src')).toBe('/api/l/peter/stream/7?mode=remux');
   });
 
@@ -113,6 +113,53 @@ describe('VideoPlayer', () => {
     const svelte = await import('svelte');
     await svelte.tick();
     expect(el.querySelector('video')?.getAttribute('src')).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode/);
+  });
+
+  it('seeks a live remux from the keyframe the server names, and recovers from a failed seek stream', async () => {
+    const real = libApi('peter');
+    const streamStatus = vi.fn(async (_id: number, _mode: string, _h?: number, t?: number) => ({
+      cached: false,
+      encoding: true,
+      bytes: 1,
+      encoders: [],
+      tier: 0,
+      start: t ? t - 0.5 : 0, // the keyframe half a second before
+    }));
+    const api: LibApi = { ...real, streamStatus };
+    const el = await mountPlayer(api, detail({ ext: '.mts', displayable: false, video: null }));
+    const svelte = await import('svelte');
+    const settle = async () => {
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 0));
+        await svelte.tick();
+      }
+    };
+    const src = () => el.querySelector('video')?.getAttribute('src');
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux');
+
+    const bar = el.querySelector<HTMLInputElement>('input[type=range]');
+    if (!bar) throw new Error('no seek bar');
+    bar.value = '10';
+    bar.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    expect(streamStatus).toHaveBeenLastCalledWith(7, 'remux', 0, 10);
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux&t=9.5');
+    expect(el.querySelector('.time')?.textContent).toMatch(/^0:10 \/ 0:12$/);
+
+    // The seek stream fails: asked for again, then the full remux, then given up.
+    const video = () => el.querySelector('video') as HTMLVideoElement;
+    const load = vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(() => {});
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux&t=9.5');
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    expect(src()).toBe('/api/l/peter/stream/7?mode=remux');
+    video().dispatchEvent(new Event('error'));
+    await settle();
+    // The next plan (a transcode) starts where the viewer was, not at 0.
+    expect(src()).toMatch(/^\/api\/l\/peter\/stream\/7\?mode=transcode.*&t=/);
   });
 
   it('explains when the server cannot convert', async () => {

@@ -122,6 +122,7 @@ func (s *Server) handleTrash(w http.ResponseWriter, r *http.Request, l *libHandl
 		return
 	}
 	defer l.entry.trashMu.Unlock()
+	s.stopConversions(r, hashes)
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)
 		return
@@ -193,6 +194,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request, l *libHan
 		return
 	}
 	defer l.entry.trashMu.Unlock()
+	s.stopConversions(r, hashes)
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)
 		return
@@ -269,6 +271,7 @@ func (s *Server) handleTrashDelete(w http.ResponseWriter, r *http.Request, l *li
 		return
 	}
 	defer l.entry.trashMu.Unlock()
+	s.stopConversions(r, hashes)
 	if l.entry.checkFolder() != nil {
 		folderReplaced(w)
 		return
@@ -290,6 +293,9 @@ func (s *Server) handleTrashDelete(w http.ResponseWriter, r *http.Request, l *li
 	} else if rows, err = trashRows(ctx, l, hashes, &out.Failed); err != nil {
 		s.internalError(w, r, err)
 		return
+	}
+	if body.All {
+		s.stopConversions(r, hashes)
 	}
 	var store *thumbs.Store // writer, opened on first use
 	defer func() {

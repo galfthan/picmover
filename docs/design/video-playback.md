@@ -50,15 +50,17 @@ before keeps working (`internal/catalog/video.go`). It is filled at import
 (from the same ffprobe run as the other metadata), by `update-metadata`
 (also on rows whose other metadata did not change), and lazily by the
 server for a video row without one (first detail or stream request:
-ffprobe, then recorded). The media detail carries it as `video`, plus
+ffprobe, then recorded). A file ffprobe fails on is remembered for the
+process (hash, size, modification time) and not probed again until it
+changes. The media detail carries it as `video`, plus
 `canConvert` and `canOpen`.
 
 ## Conversion endpoints
 
 ```
 GET /api/l/{lib}/stream/{id}?mode=remux|transcode[&h=480|720|1080|1440|2160|0][&t=seconds]
-GET /api/l/{lib}/stream/{id}/status?mode=...&h=...
-    -> {cached, encoding, bytes, encoder, encoders, tier}
+GET /api/l/{lib}/stream/{id}/status?mode=...&h=...[&t=...]
+    -> {cached, encoding, bytes, encoder, encoders, tier, start}
 ```
 
 Ordinary scoped GETs: any client the server answers can use them (the LAN
@@ -82,7 +84,9 @@ grows, so the first picture arrives as soon as the first fragment exists
 and a late client still starts at byte 0. When ffmpeg finishes, the
 fragmented file is rewritten with `-c copy -movflags +faststart` into
 `<library>/.picmover/video/<hh>/<hash>-v1-<variant>.mp4` (`variant` is
-`remux`, `src` or `h<tier>`; `v1` is the format version), which is then
+`remux`, `src` or `h<tier>`, plus `-tm` when an HDR source was
+tone-mapped, so a build without zscale never serves another build's
+output; `v1` is the format version), which is then
 served with `http.ServeContent`: Range requests, seeking, ETag.
 
 ### Seeking while it encodes
@@ -97,27 +101,47 @@ the catalog, a seek bar, mute, full screen.
 - A seek beyond it asks `/status`: when the conversion has finished
   meanwhile, the player loads the cached file (native controls) and seeks
   there; otherwise it loads `...&t=<seconds>`, a new uncached stream that
-  starts at that time (`-ss` before `-i`, exact for a transcode, from the
-  previous keyframe for a remux), and adds the offset to the times it shows.
+  starts at that time (`-ss` before `-i`), and adds the offset to the times
+  it shows. A transcode starts exactly there. A remux copies from a
+  keyframe: the status call (with `t`) answers `start`, the last video
+  keyframe at or before t (ffprobe of the packets of the 30 s before), and
+  the player asks for and counts from that time (the stream also says it in
+  `X-Picmover-Start`).
 - A seek stream keeps the full conversion of the same output running (it
   counts as one of its readers), so a later seek finds it cached.
+- A failed seek stream is asked for once more, then the full conversion is
+  loaded (seeking in it once cached); only then does the player fall back
+  to the next plan, at the same position (a failed remux seek becomes a
+  transcode from there, not from 0).
 
 ### Concurrency, cancellation, cache
 
 - One conversion per (library, hash, variant); readers attach to it. Seek
   streams are separate and never cached.
-- At most 2 ffmpeg conversions at a time (`defaultMaxEncodes`); others wait
-  for a slot (their request waits with them).
+- At most 2 full conversions at a time (`defaultMaxEncodes`); others wait
+  for a slot (their request waits with them). Seek streams have their own 2
+  slots, so a seek never waits for a whole conversion, and a new seek of
+  the same output cancels the previous seek stream (one per viewer).
 - A conversion nobody reads any more is cancelled after 5 s (1 s for a seek
   stream): browsers often drop a media request and issue it again. ffmpeg is
   killed (`exec.CommandContext`), the partial file removed.
 - The cache is capped per library (`--video-cache-mb`, app.json
-  `videoCacheMB`; default 5 GB, minimum 256 MB). After each finished
-  conversion the oldest files by modification time go until it fits; serving
-  a cached file renews its time (at most once a minute). Partial files
+  `videoCacheMB`; default 5 GB, minimum 256 MB). Everything in the
+  directory counts, partial and temporary files too. Before the faststart
+  rewrite the oldest files go until the copy fits next to the partial file;
+  after it, again until all fits. A conversion larger than half the cap is
+  only streamed, never cached. Serving a cached file renews its time (at
+  most once a minute). Running conversions can still exceed the cap
+  briefly: their size is not known in advance. Partial files
   (`*.part`, `*.tmp`) left by a crash are removed before the first conversion
   in a library's cache after start.
-- Shutdown (`StopJobs`) cancels every conversion and waits for them.
+- Shutdown (`StopJobs`) cancels the import job and every conversion (seek
+  streams and faststart rewrites included: they all derive from the
+  manager's context) and waits for both in parallel within its timeout.
+- Trash, restore and permanent delete first cancel the conversions of
+  those hashes and wait for their ffmpeg to exit; a move between libraries
+  cancels the library's conversions and `/stream` answers 409 while a move
+  runs. On Windows a file ffmpeg holds open cannot be renamed or removed.
 
 ## Encoder choice
 
@@ -142,7 +166,7 @@ and `^` in file names). Only for requests from that computer: a loopback
 remote address, and not through a listener wrapped with
 `server.RemoteOnly` (the LAN share must wrap its handler with it); 403
 otherwise. The path comes only from the row and passes the same checks as
-`/file`. The detail's `canOpen` tells the viewer whether to offer the
+`/file`, and only a photo or video extension reaches the opener. The detail's `canOpen` tells the viewer whether to offer the
 button (false for other devices and when there is no opener).
 
 ## Measured (RTX 4070 Ti SUPER, ffmpeg 8.1)

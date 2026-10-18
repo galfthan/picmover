@@ -7,7 +7,9 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"picmover/internal/catalog"
@@ -88,10 +90,23 @@ func (s *Server) videoInfo(ctx context.Context, l *libHandles, m *catalog.Media)
 		return nil
 	}
 	path := f.Name()
+	st, err := f.Stat()
 	f.Close()
+	if err != nil {
+		return nil
+	}
+	// A file ffprobe failed on is not probed again while it is unchanged
+	// (each try can take the whole timeout).
+	key := probeKey{hash: m.Hash, size: st.Size(), mtime: st.ModTime().UnixNano()}
+	if s.video.probeFailed(key) {
+		return nil
+	}
 	mv, err := metadata.ProbeVideo(ctx, s.ffprobe, path, videoProbeTimeout)
 	if err != nil {
 		s.log.Debug("probe video", "id", m.ID, "err", err)
+		if ctx.Err() == nil {
+			s.video.noteProbeFailed(key)
+		}
 		return nil
 	}
 	cv := catalog.VideoInfo(mv)
@@ -131,8 +146,10 @@ func parseStreamReq(w http.ResponseWriter, r *http.Request) (streamReq, bool) {
 	return q, true
 }
 
-// streamTarget resolves a /stream request: the row (a video), the
-// request with its tier capped at the source size, and the source.
+// streamTarget resolves a /stream request: the row (a video) and its
+// original, and the request with its tier capped at the source size, the
+// tone mapping decided, and (remux) its start moved back to the keyframe
+// the stream will really start at.
 func (s *Server) streamTarget(w http.ResponseWriter, r *http.Request, l *libHandles) (source, streamReq, bool) {
 	q, ok := parseStreamReq(w, r)
 	if !ok {
@@ -146,12 +163,46 @@ func (s *Server) streamTarget(w http.ResponseWriter, r *http.Request, l *libHand
 		writeError(w, http.StatusBadRequest, "not a video")
 		return source{}, q, false
 	}
+	if s.video.ffmpeg == "" {
+		writeError(w, http.StatusNotImplemented, "ffmpeg is not available on the server")
+		return source{}, q, false
+	}
+	if l.entry.moving.Load() > 0 {
+		// The move renames originals; ffmpeg holding one open would make
+		// it fail on Windows.
+		writeError(w, http.StatusConflict, errMoving.Error())
+		return source{}, q, false
+	}
+	f, err := s.openOriginal(l.lib, m.RelPath, !m.DeletedAt.IsZero())
+	if isMissing(err) {
+		writeError(w, http.StatusNotFound, "file not available")
+		return source{}, q, false
+	}
+	if err != nil {
+		s.internalError(w, r, err)
+		return source{}, q, false
+	}
+	src := source{root: l.lib.Root(), hash: m.Hash, row: m, path: f.Name()}
+	f.Close()
+	src.info = s.videoInfo(r.Context(), l, &m)
 	// Never scale up: a tier at or above the source's short side is the
 	// source size (one cache entry for all of them).
 	if q.tier > 0 && m.Width > 0 && m.Height > 0 && q.tier >= min(m.Width, m.Height) {
 		q.tier = 0
 	}
-	return source{root: l.lib.Root(), hash: m.Hash, row: m}, q, true
+	if q.mode == modeTranscode && src.info != nil && isHDR(src.info.ColorTransfer) {
+		q.tonemap = s.video.capabilities().tonemap
+	}
+	if q.mode == modeRemux && q.start > 0 && s.ffprobe != "" {
+		// A copy starts at a keyframe: find it, so the client's clock
+		// matches the picture.
+		if k, err := keyframeBefore(r.Context(), s.ffprobe, src.path, q.start); err == nil {
+			q.start = k
+		} else {
+			s.log.Debug("find keyframe", "id", m.ID, "err", err)
+		}
+	}
+	return src, q, true
 }
 
 // handleStream serves a video converted for the browser:
@@ -168,25 +219,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, l *libHand
 	if !ok {
 		return
 	}
-	if s.video.ffmpeg == "" {
-		writeError(w, http.StatusNotImplemented, "ffmpeg is not available on the server")
-		return
-	}
-	f, err := s.openOriginal(l.lib, src.row.RelPath, !src.row.DeletedAt.IsZero())
-	if isMissing(err) {
-		writeError(w, http.StatusNotFound, "file not available")
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	src.path = f.Name()
-	f.Close()
-	src.info = s.videoInfo(r.Context(), l, &src.row)
 	final := videoCachePath(src.root, src.hash, q.variant())
-
+	if q.start > 0 && r.Method == http.MethodHead {
+		liveHeaders(w)
+		w.Header().Set("X-Picmover-Start", strconv.FormatFloat(q.start, 'f', 3, 64))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if q.start > 0 {
+		w.Header().Set("X-Picmover-Start", strconv.FormatFloat(q.start, 'f', 3, 64))
 		// Keep the full conversion going while the client watches from
 		// t: it is what a later seek will use.
 		if main := s.video.lookup(final); main != nil {
@@ -326,6 +367,10 @@ type streamStatusJSON struct {
 	Encoders []string `json:"encoders"`
 	// Tier is the short side that will be produced (0: source size).
 	Tier int `json:"tier"`
+	// Start is where a stream asked for with t really starts (a remux
+	// starts at the keyframe before t); the player adds it to the
+	// stream's times. 0 without t.
+	Start float64 `json:"start"`
 }
 
 func (s *Server) handleStreamStatus(w http.ResponseWriter, r *http.Request, l *libHandles) {
@@ -333,12 +378,8 @@ func (s *Server) handleStreamStatus(w http.ResponseWriter, r *http.Request, l *l
 	if !ok {
 		return
 	}
-	if s.video.ffmpeg == "" {
-		writeError(w, http.StatusNotImplemented, "ffmpeg is not available on the server")
-		return
-	}
 	final := videoCachePath(src.root, src.hash, q.variant())
-	out := streamStatusJSON{Tier: q.tier, Encoders: s.video.capabilities().encoderNames()}
+	out := streamStatusJSON{Tier: q.tier, Encoders: s.video.capabilities().encoderNames(), Start: q.start}
 	if fi, err := os.Stat(final); err == nil && fi.Mode().IsRegular() {
 		out.Cached = true
 	}
@@ -347,4 +388,62 @@ func (s *Server) handleStreamStatus(w http.ResponseWriter, r *http.Request, l *l
 		out.Bytes, out.Encoder = j.state()
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// conversionStopTimeout bounds waiting for conversions to stop before a
+// trash, restore, delete or move touches their files.
+const conversionStopTimeout = 10 * time.Second
+
+// stopConversions cancels the conversions of hashes and waits for their
+// ffmpeg processes to exit, so the files can be renamed or removed (on
+// Windows an open file cannot).
+func (s *Server) stopConversions(r *http.Request, hashes []uint64) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), conversionStopTimeout)
+	defer cancel()
+	s.video.cancelHash(ctx, hashes...)
+}
+
+// keyframeBefore returns the time (seconds from the start of the file, as
+// ffmpeg's -ss counts) of the last video keyframe at or before t: where a
+// stream copy started with -ss t begins.
+func keyframeBefore(ctx context.Context, ffprobe, path string, t float64) (float64, error) {
+	ctx, cancel := context.WithTimeout(ctx, videoProbeTimeout)
+	defer cancel()
+	run := func(args ...string) (string, error) {
+		cmd := exec.CommandContext(ctx, ffprobe, append([]string{"-v", "error"}, args...)...)
+		hideWindow(cmd)
+		out, err := cmd.Output()
+		return string(out), err
+	}
+	out, err := run("-show_entries", "format=start_time", "-of", "csv=p=0", "file:"+path)
+	if err != nil {
+		return 0, err
+	}
+	start, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+	if err != nil || math.IsNaN(start) || math.IsInf(start, 0) {
+		start = 0
+	}
+	at := start + t + 0.0015 // t may have been floored or rounded to milliseconds
+	from := max(start, at-30)
+	out, err = run("-select_streams", "v:0", "-read_intervals", fmt.Sprintf("%.6f%%%.6f", from, at),
+		"-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", "file:"+path)
+	if err != nil {
+		return 0, err
+	}
+	best := -1.0
+	for _, line := range strings.Split(out, "\n") {
+		pts, flags, ok := strings.Cut(strings.TrimSpace(line), ",")
+		if !ok || !strings.HasPrefix(flags, "K") {
+			continue
+		}
+		p, err := strconv.ParseFloat(pts, 64)
+		if err != nil || p > at {
+			continue
+		}
+		best = max(best, p)
+	}
+	if best < 0 {
+		return 0, fmt.Errorf("no keyframe within 30 s before %.3f s", t)
+	}
+	return max(0, math.Floor((best-start)*1000)/1000), nil
 }
