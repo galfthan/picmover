@@ -10,7 +10,7 @@ export const TRASH_TITLE = 'Move to the trash. It can be restored from the Trash
 export const DELETE_TITLE = 'Delete from the disk. This cannot be undone.';
 
 /** Restore (of trashed items): ratings, tags and albums were kept while in the trash. */
-export const RESTORE_TITLE = 'Put back in the library where it was, with its rating, tags and albums.';
+export const RESTORE_TITLE = 'Put back in the library at its old path (or a free name beside it), with its rating, tags and albums.';
 
 /** Move to another library. */
 export const MOVE_TITLE =
@@ -31,4 +31,4 @@ export const IMPORT_COPY_TITLE = 'Copy each file into the library. Nothing on th
  * never removed (internal/importer, deleteSrc).
  */
 export const IMPORT_MOVE_TITLE =
-  'Delete each source file (on the card, phone or folder) once it is in the library. Duplicates, skipped files and zip archives stay on the source. The deletion cannot be undone.';
+  'Delete each source file (on the card, phone or folder) once it is in the library. Duplicates, small images, non-media files (such as sidecars) and zip archives stay on the source. The deletion cannot be undone.';

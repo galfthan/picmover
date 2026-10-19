@@ -101,15 +101,19 @@
   const summary = $derived(cur ? outcome(cur) : null);
   /** "Show imported": the job's import record when it has one, else its catalog session. */
   const shownHref = $derived(cur ? importedHref(lib, cur) : null);
-  /** What each summary row counts; the source of a file that was not imported is left as it is, also in a move. */
+  /**
+   * What each summary row counts. In a move, the source of an imported file (also one restored from the trash) and of an
+   * identical file already at its destination is deleted; duplicates, skipped files and non-media are left as they are.
+   */
   const rowTitles: Record<string, string> = {
     Scanned: 'Files found under the source folder, including inside zip archives.',
-    Imported: 'Files added to the library by this import.',
-    'Already in place': 'Files already at their place in the library, or an identical file was already there; nothing was copied.',
-    Duplicates: 'Files whose content is already in the library (or in the trash), or came twice in this import. Not imported; the source file is left as it is.',
+    Imported: 'Files added to the library by this import, including files restored from the trash because their content was there.',
+    'Already in place': 'Files already at their place in the library, or an identical file was already there; nothing was copied. In a move, a source outside the library is deleted, as for an imported file.',
+    Duplicates:
+      'Files whose content is already in the library, or came twice in this import. Not imported; the source file is left as it is. (Content found in the trash is restored instead and counted as Imported; in a move its source is then deleted.)',
     'Skipped (small)': 'Images smaller than the minimum dimension. Not imported; the source file is left as it is.',
     'Non-media': 'Files that are not photos or videos. Ignored; the source file is left as it is.',
-    Errors: 'Files that could not be imported; the list and the log say why. The source file is left as it is.',
+    Errors: 'Files that could not be imported; the list and the log say why. The source file is normally left as it is; the list says otherwise.',
     Copied: 'Bytes written into the library.',
   };
   const summaryRows = $derived.by(() => {
@@ -292,8 +296,8 @@
             <label class="opt" title={IMPORT_MOVE_TITLE}>
               <input type="radio" name="mode" value="move" checked={move} onchange={() => (move = true)} />
               <span>
-                <strong>Move</strong> — source files are deleted after each batch has been copied, verified and committed to
-                the catalog.
+                <strong>Move</strong> — source files are deleted after each batch has been copied and committed to the catalog,
+                and each source has been read again and its hash matched. The copy is not read back from disk.
               </span>
             </label>
           </fieldset>

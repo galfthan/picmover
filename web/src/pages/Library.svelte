@@ -242,7 +242,7 @@
               confirmLabel="Regenerate"
               cancelLabel="Cancel"
               disabled={!!active || starting}
-              title="Make every thumbnail and preview again. Only the cache in .picmover changes; the original files are only read."
+              title="Make every thumbnail and preview again. Only the thumbnail cache and the catalog’s thumbnail records change; the original files are only read."
               onconfirm={() => thumbs(true)}
             />
             {#if active}<span class="muted small">Another job is running.</span>{/if}

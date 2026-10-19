@@ -87,7 +87,7 @@ describe('safety tooltips', () => {
     click(check(9));
     await settle();
     expect(title(button(bar(), 'Delete permanently'))).toBe('Delete from the disk. This cannot be undone.');
-    expect(title(button(bar(), 'Restore'))).toBe('Put back in the library where it was, with its rating, tags and albums.');
+    expect(title(button(bar(), 'Restore'))).toBe('Put back in the library at its old path (or a free name beside it), with its rating, tags and albums.');
 
     // The viewer's own Delete permanently says the same.
     await go('#/l/peter/view/9');
@@ -105,7 +105,7 @@ describe('safety tooltips', () => {
     const move = document.querySelector<HTMLInputElement>('input[name="mode"][value="move"]')!.closest('label');
     expect(title(copy)).toBe('Copy each file into the library. Nothing on the source (card, phone or folder) is changed or deleted.');
     expect(title(move)).toBe(
-      'Delete each source file (on the card, phone or folder) once it is in the library. Duplicates, skipped files and zip archives stay on the source. The deletion cannot be undone.',
+      'Delete each source file (on the card, phone or folder) once it is in the library. Duplicates, small images, non-media files (such as sidecars) and zip archives stay on the source. The deletion cannot be undone.',
     );
     const submit = () => document.querySelector<HTMLButtonElement>('form.options button[type="submit"]');
     expect(title(submit())).toBe('Start the import. The source is not changed.');

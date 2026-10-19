@@ -434,7 +434,7 @@
         <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original file. The copy in the library is not changed.">Download</a>
       {/if}
       {#if d?.canOpen}
-        <button class="ghost" onclick={openOriginal} title="Open the original in its default program on this computer. Edits saved there change the file in the library.">Open</button>
+        <button class="ghost" onclick={openOriginal} title="Open the original in its default program on this computer. Edits or deletions made there change the library’s original; picmover keeps no other copy.">Open</button>
       {/if}
       <button class="ghost" class:on={showInfo} onclick={toggleInfo} title="Show or hide the details (I)" aria-pressed={showInfo}>Info</button>
     </div>
