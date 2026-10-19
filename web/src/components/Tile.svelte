@@ -204,6 +204,7 @@
       type="checkbox"
       checked={selected}
       aria-label="Select {label}"
+      title="Select. Shift-click selects every item between this one and the last one clicked."
       onmousedown={noTextSelection}
       onclick={(e) => {
         const box = e.currentTarget;

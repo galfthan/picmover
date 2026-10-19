@@ -22,6 +22,7 @@
     undoTrash,
   } from '../lib/actions';
   import { canMove, moves, movingOn, MOVING_TEXT } from '../lib/moves.svelte';
+  import { DELETE_TITLE, MOVE_TITLE, RESTORE_TITLE, TRASH_TITLE } from '../lib/tooltips';
   import RatingStars from './RatingStars.svelte';
   import TagInput, { type Pick } from './TagInput.svelte';
   import AlbumPicker from './AlbumPicker.svelte';
@@ -173,7 +174,7 @@
     <span class="spacer"></span>
 
     {#if mode === 'trash'}
-      <button class="primary" disabled={!!busy || locked} onclick={restore}>Restore</button>
+      <button class="primary" disabled={!!busy || locked} onclick={restore} title={RESTORE_TITLE}>Restore</button>
       <ConfirmButton
         label="Delete permanently"
         question={`Delete ${items(n)} permanently? This cannot be undone.`}
@@ -181,19 +182,27 @@
         cancelLabel="Cancel"
         danger
         disabled={!!busy || locked}
+        title={DELETE_TITLE}
         onconfirm={deleteForever}
       />
     {:else}
       <RatingStars value={currentRating} onchange={rate} label="Rate selected" disabled={!!busy || locked} />
       <TagInput options={library.tags} label="Tag selected" up disabled={!!busy || locked} onpick={tag} />
-      <AlbumPicker albums={library.albums} exclude={albumId !== null ? [albumId] : []} label="Album" disabled={!!busy || locked} onpick={album} />
+      <AlbumPicker
+        albums={library.albums}
+        exclude={albumId !== null ? [albumId] : []}
+        label="Album"
+        title="Add the selected items to an album, or to a new one."
+        disabled={!!busy || locked}
+        onpick={album}
+      />
       {#if mode === 'album'}
-        <button disabled={!!busy || locked} onclick={removeAlbum}>Remove from album</button>
+        <button disabled={!!busy || locked} onclick={removeAlbum} title="Take the selected items out of this album. They stay in the library.">Remove from album</button>
       {/if}
       {#if canMove()}
-        <button disabled={!!busy} onclick={() => moves.open(api.id, selection.list(), 'selection')} title="Move the selected items to another library">Move to…</button>
+        <button disabled={!!busy} onclick={() => moves.open(api.id, selection.list(), 'selection')} title={MOVE_TITLE}>Move to…</button>
       {/if}
-      <button class="danger" disabled={!!busy || locked} onclick={trash}>Trash</button>
+      <button class="danger" disabled={!!busy || locked} onclick={trash} title={TRASH_TITLE}>Trash</button>
     {/if}
     <button class="ghost" onclick={() => selection.clear()} title="Clear the selection (Esc)">Clear</button>
     {#if error}

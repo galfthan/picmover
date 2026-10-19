@@ -12,6 +12,7 @@
   import JobProgress from '../components/JobProgress.svelte';
   import ResultsList from '../components/ResultsList.svelte';
   import CopyButton from '../components/CopyButton.svelte';
+  import { IMPORT_COPY_TITLE, IMPORT_MOVE_TITLE } from '../lib/tooltips';
 
   const LAST_SOURCE_KEY = 'picmover.import.lastSource';
   const DISMISSED_KEY = 'picmover.import.dismissed';
@@ -100,6 +101,17 @@
   const summary = $derived(cur ? outcome(cur) : null);
   /** "Show imported": the job's import record when it has one, else its catalog session. */
   const shownHref = $derived(cur ? importedHref(lib, cur) : null);
+  /** What each summary row counts; the source of a file that was not imported is left as it is, also in a move. */
+  const rowTitles: Record<string, string> = {
+    Scanned: 'Files found under the source folder, including inside zip archives.',
+    Imported: 'Files added to the library by this import.',
+    'Already in place': 'Files already at their place in the library, or an identical file was already there; nothing was copied.',
+    Duplicates: 'Files whose content is already in the library (or in the trash), or came twice in this import. Not imported; the source file is left as it is.',
+    'Skipped (small)': 'Images smaller than the minimum dimension. Not imported; the source file is left as it is.',
+    'Non-media': 'Files that are not photos or videos. Ignored; the source file is left as it is.',
+    Errors: 'Files that could not be imported; the list and the log say why. The source file is left as it is.',
+    Copied: 'Bytes written into the library.',
+  };
   const summaryRows = $derived.by(() => {
     if (!cur) return [];
     const s = cur.stats;
@@ -196,7 +208,7 @@
             <caption class="muted">Import summary{elapsed !== null ? ` · ${formatElapsed(elapsed)}` : ''}</caption>
             <tbody>
               {#each summaryRows as [k, v] (k)}
-                <tr class:bad={k === 'Errors' && cur.stats.errors > 0} class:part={k.startsWith('·')}><th>{k}</th><td class="num">{v}</td></tr>
+                <tr class:bad={k === 'Errors' && cur.stats.errors > 0} class:part={k.startsWith('·')}><th title={rowTitles[k]}>{k}</th><td class="num">{v}</td></tr>
               {/each}
             </tbody>
           </table>
@@ -273,11 +285,11 @@
 
           <fieldset class="field">
             <legend class="label">Copy or move</legend>
-            <label class="opt">
+            <label class="opt" title={IMPORT_COPY_TITLE}>
               <input type="radio" name="mode" value="copy" checked={!move} onchange={() => (move = false)} />
               <span><strong>Copy</strong> — the source is left untouched.</span>
             </label>
-            <label class="opt">
+            <label class="opt" title={IMPORT_MOVE_TITLE}>
               <input type="radio" name="mode" value="move" checked={move} onchange={() => (move = true)} />
               <span>
                 <strong>Move</strong> — source files are deleted after each batch has been copied, verified and committed to
@@ -309,7 +321,14 @@
 
           <div class="row actions">
             <button type="button" onclick={() => (step = 'source')}>Back</button>
-            <button type="submit" class="primary" disabled={starting || !!jobs.active}>
+            <button
+              type="submit"
+              class="primary"
+              disabled={starting || !!jobs.active}
+              title={move
+                ? 'Start the import. Each source file is deleted once it is in the library; this cannot be undone.'
+                : 'Start the import. The source is not changed.'}
+            >
               {starting ? 'Starting…' : 'Start import'}
             </button>
           </div>

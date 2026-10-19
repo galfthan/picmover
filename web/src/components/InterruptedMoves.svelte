@@ -42,7 +42,9 @@
       <span class="line">
         <span>{interruptedFor(lib, m, nameOf)}</span>
         {#if !m.problem}
-          <button class="small" disabled={busy || moves.running || !!jobs.active} onclick={() => finish(m.to)}>Finish moving</button>
+          <button class="small" disabled={busy || moves.running || !!jobs.active} onclick={() => finish(m.to)}
+            title="Finish the interrupted move from its journal. Each photo ends up in one of the two libraries; none is lost.">Finish moving</button
+          >
         {/if}
       </span>
     {/each}

@@ -154,7 +154,7 @@
 
       <section class="card global" aria-label="Sharing">
         <div class="row">
-          <label class="switch">
+          <label class="switch" title="Let paired phones on this network view the shares below. Phones can view, and rate where a share allows it; they cannot delete or change files.">
             <input
               type="checkbox"
               checked={st.state === 'on' || st.state === 'paused'}
@@ -167,7 +167,12 @@
             {st.state === 'on' ? 'On' : st.state === 'paused' ? 'Paused' : st.state === 'error' ? 'Failed' : 'Off'}
           </span>
           {#if st.state === 'paused'}
-            <button class="small" disabled={ro || working} onclick={() => act(() => sharing.set({ enabled: true }))}>Resume on this network</button>
+            <button
+              class="small"
+              disabled={ro || working}
+              onclick={() => act(() => sharing.set({ enabled: true }))}
+              title="Sharing paused because the network changed. Share again on the network this computer is on now.">Resume on this network</button
+            >
           {/if}
         </div>
         {#if st.reason}<p class={st.state === 'error' ? 'error-box small' : 'muted small'}>{st.reason}</p>{/if}
@@ -264,7 +269,12 @@
               On the first visit the phone warns that the connection is not private. Compare the start of the fingerprint in the phone's
               warning or padlock menu with the one here.
             </span>
-            <button class="small" disabled={ro || working} onclick={() => act(() => sharing.renewCert())}>Renew certificate</button>
+            <button
+              class="small"
+              disabled={ro || working}
+              onclick={() => act(() => sharing.renewCert())}
+              title="Make a new certificate for this computer (the CA is kept). Phones that did not install the CA show the not-private warning once more.">Renew certificate</button
+            >
           </dd>
         </dl>
 
@@ -281,8 +291,8 @@
       <div class="row head">
         <h2>Shares</h2>
         <span class="spacer"></span>
-        <button disabled={ro} onclick={() => create('libraries')}>Share libraries…</button>
-        <button disabled={ro} onclick={() => create('album')}>Share album…</button>
+        <button disabled={ro} onclick={() => create('libraries')} title="Share whole libraries, for example with your own phone.">Share libraries…</button>
+        <button disabled={ro} onclick={() => create('album')} title="Share one album, for example with guests.">Share album…</button>
       </div>
 
       {#if st.shares.length === 0}
@@ -315,16 +325,16 @@
           {#if s.notice}<p class="notice small" role="status">{s.notice}</p>{/if}
 
           <div class="row buttons">
-            <button class="primary" disabled={!canPair(s)} title={canPair(s) ? '' : sharing.on ? 'The share is not active' : 'Turn on sharing first'} onclick={() => (pairFor = s.id)}>
+            <button class="primary" disabled={!canPair(s)} title={canPair(s) ? 'Show a code to scan with the phone, so it can view this share.' : sharing.on ? 'The share is not active' : 'Turn on sharing first'} onclick={() => (pairFor = s.id)}>
               Pair a phone
             </button>
-            <button disabled={ro} onclick={() => (dialog = { kind: 'edit', share: s })}>Edit</button>
+            <button disabled={ro} onclick={() => (dialog = { kind: 'edit', share: s })} title="Change the name, what is shared, what phones may do and the expiry.">Edit</button>
             {#if s.state === 'expired'}
-              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { expiresAt: extendBy30() }))}>Extend 30 days</button>
+              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { expiresAt: extendBy30() }))} title="Let the share run 30 more days. Its phones stay paired.">Extend 30 days</button>
             {:else if s.state === 'paused'}
-              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { paused: false }))}>Resume</button>
+              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { paused: false }))} title="Let the paired phones in again, without pairing again.">Resume</button>
             {:else if s.state === 'active'}
-              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { paused: true }))}>Pause</button>
+              <button disabled={ro || working} onclick={() => act(() => sharing.update(s.id, { paused: true }))} title="Shut the phones out of this share for now. They stay paired; Resume lets them in again.">Pause</button>
             {/if}
             {#if s.devices.length}
               <ConfirmButton
@@ -334,6 +344,7 @@
                 cancelLabel="Cancel"
                 danger
                 disabled={ro || working}
+                title="Unpair every phone of this share. The share stays; phones must pair again to view it."
                 onconfirm={() => act(() => sharing.revokeAll(s.id))}
               />
             {/if}
@@ -344,6 +355,7 @@
               cancelLabel="Cancel"
               danger
               disabled={ro || working}
+              title="Delete this share and unpair its phones. Nothing in the library is deleted."
               onconfirm={() => act(() => sharing.remove(s.id))}
             />
           </div>
@@ -392,6 +404,7 @@
                     cancelLabel="Cancel"
                     danger
                     disabled={ro || working}
+                    title="Unpair this phone. It must pair again to view the share."
                     onconfirm={() => act(() => sharing.revokeDevice(d.id))}
                   />
                 </li>

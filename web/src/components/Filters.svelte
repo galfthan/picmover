@@ -108,7 +108,7 @@
   </select>
 
   {#if !hideGps}
-    <label class="check">
+    <label class="check" title="Show only items that have GPS coordinates.">
       <input type="checkbox" checked={!!filters.gps} onchange={(e) => set({ gps: e.currentTarget.checked || undefined })} />
       Has location
     </label>
@@ -140,7 +140,7 @@
       {#each filters.tags ?? [] as id (id)}
         <span class="chip">
           {tagName(id)}
-          <button class="ghost small" aria-label="Remove tag filter {tagName(id)}" onclick={() => removeTag(id)}>×</button>
+          <button class="ghost small" aria-label="Remove tag filter {tagName(id)}" title="Remove this tag filter" onclick={() => removeTag(id)}>×</button>
         </span>
       {/each}
       <TagInput options={tags} exclude={filters.tags ?? []} allowCreate={false} placeholder="Tag…" label="Filter by tag" onpick={addTag} />
@@ -162,19 +162,19 @@
   {#if filters.session}
     <span class="chip">
       This import (#{filters.session})
-      <button class="ghost small" aria-label="Remove import session filter" onclick={() => set({ session: undefined })}>×</button>
+      <button class="ghost small" aria-label="Remove import session filter" title="Remove this filter" onclick={() => set({ session: undefined })}>×</button>
     </span>
   {/if}
 
   {#if filters.import && !hideImport}
     <span class="chip">
       Import: {importName}
-      <button class="ghost small" aria-label="Remove import filter {importName}" onclick={() => set({ import: undefined })}>×</button>
+      <button class="ghost small" aria-label="Remove import filter {importName}" title="Remove this filter" onclick={() => set({ import: undefined })}>×</button>
     </span>
   {/if}
 
   {#if hasFilters(filters, { album: hideAlbum, import: hideImport })}
-    <button class="ghost small" onclick={() => onchange({})}>Clear</button>
+    <button class="ghost small" onclick={() => onchange({})} title="Remove all filters">Clear</button>
   {/if}
 </div>
 

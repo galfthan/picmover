@@ -10,12 +10,14 @@
     /** Albums the item is already in (not offered). */
     exclude?: readonly number[];
     label?: string;
+    /** Tooltip of the button. */
+    title?: string;
     disabled?: boolean;
     open?: boolean;
     /** Where the popover opens: above the button (the selection bar) or below it. */
     placement?: 'up' | 'down';
   }
-  let { albums, onpick, exclude = [], label = 'Album', disabled = false, open = $bindable(false), placement = 'up' }: Props = $props();
+  let { albums, onpick, exclude = [], label = 'Album', title, disabled = false, open = $bindable(false), placement = 'up' }: Props = $props();
 
   let wrap: HTMLSpanElement | undefined = $state();
   let input: HTMLInputElement | undefined = $state();
@@ -42,7 +44,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <span class="picker" class:down={placement === 'down'} bind:this={wrap} onkeydown={onKeydown}>
-  <button type="button" aria-haspopup="true" aria-expanded={open} {disabled} onclick={() => (open = !open)}>{label}</button>
+  <button type="button" aria-haspopup="true" aria-expanded={open} {disabled} {title} onclick={() => (open = !open)}>{label}</button>
   {#if open}
     <span class="pop">
       <TagInput

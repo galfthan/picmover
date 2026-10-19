@@ -89,7 +89,7 @@
 </script>
 
 {#if job}
-  <button class="pill" onclick={open} title="Show progress{libName ? ` (library ${libName})` : ''}">
+  <button class="pill" onclick={open} title="{libName ? `${libName}: ` : ''}{label} Click to show the progress.">
     <span class="dot" aria-hidden="true"></span>
     {#if libName}<span class="lib">{libName}</span>{/if}
     <span class="text">{label}</span>

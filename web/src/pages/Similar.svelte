@@ -252,7 +252,7 @@
           {/if}
         </span>
         <span class="spacer"></span>
-        <label class="dist">
+        <label class="dist" title="How different two photos may look and still count as near-duplicates: 1 finds only almost identical photos, 7 also finds looser matches.">
           Distance
           <select
             value={String(distance)}
@@ -266,7 +266,7 @@
             {/each}
           </select>
         </label>
-        <button class="primary" disabled={starting || !!job || otherActive} onclick={run}>Run</button>
+        <button class="primary" disabled={starting || !!job || otherActive} onclick={run} title="Search the library for near-duplicate photos. Nothing is changed or deleted.">Run</button>
       </div>
       {#if otherActive}<p class="muted small">Another job is running; run the search when it has finished.</p>{/if}
       {#if runError}<div class="error-box">{runError}</div>{/if}
@@ -306,7 +306,7 @@
                   <a class="thumb" href={viewerHref(api.id, it.id)} onclick={(e) => open(e, it.id)} aria-label="View {formatWallDate(it.takenAt)}">
                     <img src={api.thumbUrl(it)} alt="" loading="lazy" decoding="async" />
                   </a>
-                  <label class="keep">
+                  <label class="keep" title="The photo to keep: Trash the others moves the rest of the group to the trash.">
                     <input
                       type="radio"
                       name="keep-{key}"
@@ -325,12 +325,21 @@
               {/each}
             </div>
             <div class="actions">
-              <span class="muted small">distance ≤ {g.maxDistance}</span>
+              <span class="muted small" title="The largest difference between two photos of this group (0 = look identical).">distance ≤ {g.maxDistance}</span>
               <span class="spacer"></span>
-              <button class="danger small" disabled={busyGroup !== null} onclick={() => trashOthers(g)}
+              <button
+                class="danger small"
+                disabled={busyGroup !== null}
+                onclick={() => trashOthers(g)}
+                title="Move every photo of this group except the one marked Keep to the trash. They can be restored from the Trash page until it is emptied."
                 >Trash the others ({g.items.length - 1})</button
               >
-              <button class="small" disabled={busyGroup !== null} onclick={() => ignore(g)}>Ignore group</button>
+              <button
+                class="small"
+                disabled={busyGroup !== null}
+                onclick={() => ignore(g)}
+                title="Stop showing these photos as duplicates of each other. Nothing is deleted. The app has no way to undo this."
+              >Ignore group</button>
             </div>
             {#if groupError[key]}<div class="error-box small">{groupError[key]}</div>{/if}
           </li>

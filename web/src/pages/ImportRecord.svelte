@@ -140,7 +140,12 @@
       {/if}
       <span class="spacer"></span>
       <button class="small" disabled={!rec} onclick={() => show('rename')}>Rename</button>
-      <button class="small" disabled={!rec} onclick={() => show('delete')}>Delete record</button>
+      <button
+        class="small"
+        disabled={!rec}
+        onclick={() => show('delete')}
+        title="Remove this entry from the import history. The photos and videos stay in the library; no file is touched.">Delete record</button
+      >
     </div>
     {#if rec}
       <p class="facts muted small">
