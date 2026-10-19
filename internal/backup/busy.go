@@ -55,21 +55,36 @@ func IsBusy(err error) bool {
 	return strings.Contains(err.Error(), "database is locked")
 }
 
+// setBusyError is a write of the set (backup.db on the target) that
+// gave up because the database stayed busy: RunError names it.
+type setBusyError struct{ err error }
+
+func (e *setBusyError) Error() string { return e.err.Error() }
+func (e *setBusyError) Unwrap() error { return e.err }
+
 // retryBusy runs fn until it succeeds, fails with anything but a busy
 // database, or budget has passed; it waits between attempts (100 ms,
-// doubling up to busyBackoffMax) and stops waiting when ctx is done. A
-// ctx already done when it is called still gets cancelGrace. fn gets a
-// context that is not cancelled with ctx: a write that has started
-// finishes. what names the write in the warnings.
+// doubling up to busyBackoffMax). Once ctx is done (also before the
+// call) at most cancelGrace is left: the rows of files that are done are
+// still worth writing, but a cancel must not wait the whole budget. fn
+// gets a context that is not cancelled with ctx: a write that has
+// started finishes. what names the write in the warnings. A busy error
+// it gives up on is a *setBusyError.
 func (s *Set) retryBusy(ctx context.Context, budget time.Duration, what string, fn func(context.Context) error) error {
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), min(cancelGrace, budget))
-		defer cancel()
-	}
 	run := context.WithoutCancel(ctx)
 	start := time.Now()
 	deadline := start.Add(budget)
+	done := ctx.Done()
+	graced := false
+	grace := func() {
+		if !graced {
+			graced, done = true, nil
+			deadline = minTime(deadline, time.Now().Add(cancelGrace))
+		}
+	}
+	if ctx.Err() != nil {
+		grace()
+	}
 	wait := 100 * time.Millisecond
 	var lastWarn time.Time
 	for attempt := 1; ; attempt++ {
@@ -83,23 +98,30 @@ func (s *Set) retryBusy(ctx context.Context, budget time.Duration, what string, 
 		if !IsBusy(err) {
 			return err
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%w (gave up after %s of retries)", err, time.Since(start).Round(time.Second))
+		if !time.Now().Before(deadline) {
+			return &setBusyError{fmt.Errorf("%w (gave up after %s of retries)", err, time.Since(start).Round(time.Second))}
 		}
 		if lastWarn.IsZero() || time.Since(lastWarn) >= time.Minute {
 			s.logger().Warn("backup.db on the target is busy (another program or page is reading it); waiting to write",
 				"what", what, "waited", time.Since(start).Round(time.Second).String(), "gives_up_after", budget.String())
 			lastWarn = time.Now()
 		}
-		t := time.NewTimer(wait)
+		t := time.NewTimer(min(wait, max(time.Until(deadline), time.Millisecond)))
 		select {
-		case <-ctx.Done():
+		case <-done:
 			t.Stop()
-			return err
+			grace() // cancelled while waiting: cancelGrace more, then give up
 		case <-t.C:
 		}
 		wait = min(wait*2, busyBackoffMax)
 	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // logger is the run's logger, or the default one outside a run.
@@ -129,9 +151,13 @@ func KnownRunError(err error) string {
 	switch {
 	case err == nil, errors.Is(err, context.Canceled):
 		return ""
-	case IsBusy(err):
+	case errors.As(err, new(*setBusyError)):
 		return "the backup database on the target stayed busy (another program or page kept it open for reading); " +
 			"the files copied so far are kept, and Back up now continues from there"
+	case IsBusy(err):
+		// Another database (the library's user.db or media.db, or a
+		// read of backup.db that is not retried).
+		return "a database stayed busy (another program is using it); try again in a moment"
 	case errors.Is(err, errTargetGone):
 		return errTargetGone.Error()
 	case errors.As(err, &ns):
@@ -153,17 +179,36 @@ func KnownRunError(err error) string {
 }
 
 // SetHeld reports whether a backup, scrub, prune or restore (of this
-// process or another) holds the lock of the set called name on t, without
-// taking the lock or writing anything: its holder when one is recorded
-// in the lock file and, on this host, its process is alive (a killed
-// holder leaves its record behind). The Backups page then does not plan:
+// process or another, on any host) holds the lock of the set called name
+// on t, and names the holder from the lock file's record. It probes the
+// OS lock through a read-only handle, released at once, and writes
+// nothing; only where that cannot tell does it go by the record (a live
+// process on this host; a record from another host counts as held). The
+// Backups page then does not plan:
 // a plan reads every row of backup.db, which would make the run's
 // commits wait.
 func SetHeld(t *Target, name string) (*library.ErrLocked, bool) {
 	if !ValidSetName(name) {
 		return nil, false
 	}
-	h, ok := library.PeekHolder(filepath.Join(t.Root, name, library.MetaDir, lockName))
+	p := filepath.Join(t.Root, name, library.MetaDir, lockName)
+	// The OS lock tells a live holder from a record that a crashed or
+	// unplugged holder, or one on another host, left behind (probed
+	// read-only: nothing is written, also on a write-protected target).
+	if held, known := library.ProbeLock(p); known {
+		if !held {
+			return nil, false
+		}
+		h, ok := library.PeekHolder(p)
+		if !ok {
+			h = &library.ErrLocked{Path: p}
+		}
+		h.What = "backup set"
+		return h, true
+	}
+	// The file system cannot lock (or not through a read-only handle):
+	// the record, checked for a live process on this host.
+	h, ok := library.PeekHolder(p)
 	if !ok || h.Cmd == "check" {
 		return nil, false
 	}
@@ -210,4 +255,13 @@ func SetBusyLimitsForTest(timeout, budget time.Duration) (restore func()) {
 	return func() {
 		setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace = oldTimeout, oldBudget, oldBackoff, oldFinish, oldGrace
 	}
+}
+
+// RecordsAttempt reports whether a backup run that ended with err is
+// recorded as an attempt (Attempt): not one refused because another
+// backup, scrub, prune or restore holds the set, which did nothing and
+// says nothing about the backup on the target.
+func RecordsAttempt(err error) bool {
+	var le *library.ErrLocked
+	return !errors.As(err, &le)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -174,4 +175,30 @@ func readHolder(p string) *ErrLocked {
 		}
 	}
 	return e
+}
+
+// ProbeLock reports whether another holder has the OS lock on the file
+// at p, without writing anything: it opens the file read-only, tries the
+// lock without blocking and lets go at once. known is false when that
+// cannot tell (the file system or platform cannot lock, or not through a
+// read-only handle); a missing file is not held. A crashed or unplugged
+// holder leaves its record in the file (PeekHolder) but not its lock, so
+// this is what tells a live holder from a stale record.
+func ProbeLock(p string) (held, known bool) {
+	f, err := os.Open(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, true
+	}
+	if err != nil {
+		return false, false
+	}
+	defer f.Close()
+	switch err := lockFile(f); {
+	case err == nil:
+		_ = unlockFile(f)
+		return false, true
+	case errors.Is(err, errWouldBlock):
+		return true, true
+	}
+	return false, false
 }

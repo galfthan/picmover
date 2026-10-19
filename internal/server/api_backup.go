@@ -512,7 +512,7 @@ func (s *Server) backupError(err error) string {
 	case errors.Is(err, context.Canceled):
 		return "cancelled"
 	case backup.IsBusy(err):
-		return "the backup database on the target is busy (another program or job is using it); try again in a moment"
+		return "a database was busy (another program or job is using it); try again in a moment"
 	}
 	s.log.Error("backup", "err", err)
 	return "the backup target could not be used (see the server log)"
@@ -1148,8 +1148,11 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 		// pages read it): the target's backup.db may not have recorded
 		// it. When that fails as well, the job (in memory) and the
 		// library's log still have it.
-		if aerr := h.user.RecordBackupAttempt(context.WithoutCancel(ctx), bc.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
-			logger.Error("record the backup attempt", "err", aerr)
+		// A run refused because another one holds the set did nothing.
+		if backup.RecordsAttempt(err) {
+			if aerr := h.user.RecordBackupAttempt(context.WithoutCancel(ctx), bc.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
+				logger.Error("record the backup attempt", "err", aerr)
+			}
 		}
 		if err != nil {
 			return fail(err)

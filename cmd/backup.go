@@ -622,8 +622,11 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 	done()
 	// The outcome is kept in user.db too: the target's backup.db may not
 	// have recorded it.
-	if aerr := b.user.RecordBackupAttempt(context.WithoutCancel(ctx), rt.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
-		logger.Error("record the backup attempt", "err", aerr)
+	// A run refused because another one holds the set did nothing.
+	if backup.RecordsAttempt(err) {
+		if aerr := b.user.RecordBackupAttempt(context.WithoutCancel(ctx), rt.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
+			logger.Error("record the backup attempt", "err", aerr)
+		}
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {

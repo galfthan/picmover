@@ -390,7 +390,7 @@
         bind:this={backupBtn}
         disabled={!canRun || starting}
         onclick={backupNow}
-        title="Copy new and changed files from the library to this target and check each copy by reading it back. Nothing on the target is deleted; replaced versions are kept in its .picmover/previous folder.">Back up now</button
+        title="Copy new and changed files from the library to this target and check each copy by reading it back. Never deletes backed-up photos or videos: the earlier version of a changed file is kept in the target's .picmover/previous folder.">Back up now</button
       >
       <span class="scrub">
         <select

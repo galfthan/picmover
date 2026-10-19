@@ -195,19 +195,64 @@ func TestFilesChunks(t *testing.T) {
 	}
 }
 
-// TestRunErrorNames: the client text names the cause.
+// TestRunErrorNames: the client text names the cause; the busy wording
+// for the target is only for writes of backup.db that gave up.
 func TestRunErrorNames(t *testing.T) {
+	locked := errors.New("database is locked (5) (SQLITE_BUSY)")
 	for err, want := range map[error]string{
 		nil:                                "",
 		context.Canceled:                   "",
 		errors.New("x"):                    "unexpected",
 		fmt.Errorf("w: %w", errTargetGone): "unplugged",
-		errors.New("backup: write rows: database is locked (5) (SQLITE_BUSY)"): "busy",
+		fmt.Errorf("backup: write rows: %w", &setBusyError{locked}): "the backup database on the target stayed busy",
+		fmt.Errorf("userdata: content hash: %w", locked):            "a database stayed busy",
 	} {
 		got := RunError(err)
 		if (want == "" && got != "") || !strings.Contains(got, want) {
 			t.Errorf("RunError(%v) = %q, want %q", err, got, want)
 		}
+	}
+	if RecordsAttempt(&library.ErrLocked{Cmd: "scrub"}) || RecordsAttempt(fmt.Errorf("w: %w", &library.ErrLocked{})) {
+		t.Error("a run refused for the lock is recorded")
+	}
+	if !RecordsAttempt(nil) || !RecordsAttempt(locked) {
+		t.Error("RecordsAttempt")
+	}
+}
+
+// TestRetryBusyGraceOnCancel: a write waiting for a busy backup.db when
+// the run is cancelled still gets cancelGrace, and lands when the reader
+// lets go within it.
+func TestRetryBusyGraceOnCancel(t *testing.T) {
+	shortBusy(t, time.Minute)
+	cancelGrace = 3 * time.Second
+	f := newFx(t)
+	f.run(Options{})
+	set := f.set(false)
+	r := holdRead(t, set)
+	ctx, cancel := context.WithCancel(f.ctx)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel() // during the backoff
+		time.Sleep(700 * time.Millisecond)
+		r.release() // within the grace
+	}()
+	start := time.Now()
+	if err := set.SetMeta(ctx, "probe", "1"); err != nil {
+		t.Fatalf("write after cancel within the grace: %v", err)
+	}
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("took %s", el)
+	}
+	// Past the grace it gives up (does not wait the whole budget).
+	r2 := holdRead(t, set)
+	defer r2.release()
+	ctx2, cancel2 := context.WithCancel(f.ctx)
+	cancel2()
+	start = time.Now()
+	err := set.SetMeta(ctx2, "probe", "2")
+	if !IsBusy(err) || time.Since(start) > 10*time.Second {
+		t.Fatalf("cancelled write: %v after %s", err, time.Since(start))
 	}
 }
 
@@ -235,5 +280,31 @@ func TestSetHeld(t *testing.T) {
 	unlock()
 	if _, held := SetHeld(f.target, "photos"); held {
 		t.Fatal("held after unlock")
+	}
+}
+
+// TestSetHeldStaleRecord: a record left by a holder that crashed or was
+// unplugged (here: from another host, with no live lock) is not held,
+// so the Backups page plans and Prune and Restore open again.
+func TestSetHeldStaleRecord(t *testing.T) {
+	f := newFx(t)
+	f.run(Options{})
+	p := filepath.Join(f.target.Root, "photos", library.MetaDir, lockName)
+	write(t, p, "pid=4242 cmd=backup since=2026-10-18T23:00:15+03:00 host=another-machine\n")
+	if _, held := SetHeld(f.target, "photos"); held {
+		if held, known := library.ProbeLock(p); !known {
+			t.Skip("no OS locking here: the record is all there is")
+		} else {
+			t.Fatalf("stale record from another host counts as held (probe %v)", held)
+		}
+	}
+	// A live lock (another handle) with that record is held, and named.
+	unlock, err := library.LockFile(p, "backup")
+	if err != nil {
+		t.Skipf("no locking here: %v", err)
+	}
+	defer unlock()
+	if h, held := SetHeld(f.target, "photos"); !held || h.Cmd != "backup" {
+		t.Fatalf("live lock: %v %+v", held, h)
 	}
 }
