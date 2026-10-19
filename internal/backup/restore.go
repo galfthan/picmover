@@ -139,6 +139,7 @@ func Restore(ctx context.Context, set *Set, lib *library.Library, opts RestoreOp
 		recorder = nil
 		if rw, err := OpenSet(ctx, set.Target, set.Name, false); err == nil {
 			defer rw.Close()
+			rw.log = log
 			recorder = rw
 		}
 	}

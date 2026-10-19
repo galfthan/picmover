@@ -120,6 +120,12 @@ func (s *Set) Claim(ctx context.Context, id Identity, owned, takeOver bool) erro
 	if id.LibraryID == "" || id.Instance == "" {
 		return errors.New("backup: the library's identity is unknown")
 	}
+	return s.retryBusy(ctx, busyBudget, "the set's owner", func(ctx context.Context) error {
+		return s.claimOnce(ctx, id, owned, takeOver)
+	})
+}
+
+func (s *Set) claimOnce(ctx context.Context, id Identity, owned, takeOver bool) error {
 	tx, err := s.db.BeginTx(ctx, nil) // immediate (setDSN)
 	if err != nil {
 		return fmt.Errorf("backup: claim: %w", err)
