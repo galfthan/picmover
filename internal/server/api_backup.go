@@ -82,14 +82,17 @@ type behindJSON struct {
 }
 
 type setJSON struct {
-	Name       string      `json:"name"`
-	Files      int64       `json:"files"`
-	Bytes      int64       `json:"bytes"`
-	Behind     *behindJSON `json:"behind"` // null when no plan could be made
-	Extras     int64       `json:"extras"`
-	Damaged    int64       `json:"damaged"` // damaged and not repaired in the last scrub
-	Unverified int64       `json:"unverified"`
-	Restorable int64       `json:"restorable"` // the plan's restore.count (0 without a plan)
+	Name  string `json:"name"`
+	Files int64  `json:"files"`
+	Bytes int64  `json:"bytes"`
+	// LibraryFiles is the number of files of the library by the plan
+	// (current, new, changed and moved); 0 without a plan.
+	LibraryFiles int64       `json:"libraryFiles"`
+	Behind       *behindJSON `json:"behind"` // null when no plan could be made
+	Extras       int64       `json:"extras"`
+	Damaged      int64       `json:"damaged"` // damaged and not repaired in the last scrub
+	Unverified   int64       `json:"unverified"`
+	Restorable   int64       `json:"restorable"` // the plan's restore.count (0 without a plan)
 }
 
 // targetJSON is a target of GET /backups and of the target endpoints.
@@ -105,6 +108,29 @@ type targetJSON struct {
 	// Foreign: the set belongs to this library but was last written by
 	// another copy of it; a job with takeOver adopts it.
 	Foreign bool `json:"foreign,omitempty"`
+	// Busy: a backup, scrub, prune or restore (of this server or another
+	// process) holds the set; the text names it. The plan is not made
+	// again meanwhile (set.behind is the cached one, or null).
+	Busy string `json:"busy,omitempty"`
+	// LastAttempt is the outcome of the newest backup job to the target,
+	// as user.db recorded it (null when none is recorded).
+	LastAttempt *attemptJSON `json:"lastAttempt"`
+}
+
+// attemptJSON is a target's last backup attempt.
+type attemptJSON struct {
+	At        int64  `json:"at"`
+	Error     string `json:"error,omitempty"` // why it stopped; "" when it finished
+	Cancelled bool   `json:"cancelled,omitempty"`
+	SetFiles  int64  `json:"setFiles"`     // files on the target after it (-1: unknown)
+	Library   int64  `json:"libraryFiles"` // files of the library it planned (0: unknown)
+}
+
+func attemptOf(a userdata.BackupAttempt, ok bool) *attemptJSON {
+	if !ok {
+		return nil
+	}
+	return &attemptJSON{At: a.At.Unix(), Error: a.Error, Cancelled: a.Cancelled, SetFiles: a.SetFiles, Library: a.LibraryFiles}
 }
 
 type backupsJSON struct {
@@ -340,10 +366,20 @@ func (e *libEntry) clearPlans() {
 }
 
 // describeTarget builds the target object. With plan, the behind numbers
-// are computed again when the cached plan is older than maxAge.
-func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.BackupTarget, maxAge time.Duration) targetJSON {
+// are computed again when the cached plan is older than maxAge, unless
+// a job holds the set: a plan reads every row of backup.db, and the
+// job's commits would wait for it (its rollback journal), so the cached
+// plan (of any age) is served then and the client counts down from the
+// job's progress. attempts are the recorded backup attempts (nil: read
+// them).
+func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.BackupTarget, maxAge time.Duration, attempts map[string]userdata.BackupAttempt) targetJSON {
 	out := targetJSON{ID: bt.ID, Label: bt.Label, Path: bt.LastPath,
 		LastBackupAt: unixOrNull(bt.LastBackupAt), LastScrubAt: unixOrNull(bt.LastScrubAt)}
+	if attempts == nil && h.user != nil {
+		attempts, _ = h.user.BackupAttempts(ctx)
+	}
+	a, ok := attempts[bt.ID]
+	out.LastAttempt = attemptOf(a, ok)
 	bc, err := s.openBackup(ctx, h, bt.ID, false, false)
 	if errors.Is(err, errUnreachable) {
 		return out
@@ -379,7 +415,15 @@ func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.
 		}
 		set.Close()
 	}
+	if le, held := backup.SetHeld(bc.t, bc.setName); held {
+		out.Busy = le.Error()
+		maxAge = time.Duration(1<<63 - 1)
+	}
 	plan, ok := h.entry.cachedPlanOf(bt.ID, maxAge)
+	if !ok && out.Busy != "" {
+		out.Set = sj // behind null: not planned while the job runs
+		return out
+	}
 	if !ok {
 		var err error
 		if plan, err = s.computePlan(ctx, bc, backup.DefaultKeep); err != nil {
@@ -392,6 +436,7 @@ func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.
 		Bytes: plan.New.Bytes + plan.Changed.Bytes}
 	sj.Extras = plan.Extra.Count
 	sj.Restorable = plan.Restore.Count
+	sj.LibraryFiles = plan.Current.Count + plan.New.Count + plan.Changed.Count + plan.Moved.Count
 	out.Set = sj
 	return out
 }
@@ -453,9 +498,22 @@ func (s *Server) backupError(err error) string {
 		return "the target is read-only"
 	case errors.Is(err, context.Canceled):
 		return "cancelled"
+	case backup.IsBusy(err):
+		return "the backup database on the target is busy (another program or job is using it); try again in a moment"
 	}
 	s.log.Error("backup", "err", err)
 	return "the backup target could not be used (see the server log)"
+}
+
+// jobError is the client text of the error that ended a backup-kind job:
+// the cause when the backup package can name it (a busy backup.db, a
+// target that went away, a full disk, ...), else backupError's text,
+// which names the conditions that make a target unusable.
+func (s *Server) jobError(err error) string {
+	if msg := backup.KnownRunError(err); msg != "" {
+		return msg
+	}
+	return s.backupError(err)
 }
 
 // rootError returns the sentinel error a wrapped error names (its text
@@ -519,9 +577,14 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, l *libHan
 		s.internalError(w, r, err)
 		return
 	}
+	attempts, err := l.user.BackupAttempts(r.Context())
+	if err != nil {
+		s.log.Warn("backup attempts", "err", err)
+		attempts = map[string]userdata.BackupAttempt{}
+	}
 	out := backupsJSON{Targets: []targetJSON{}}
 	for _, bt := range ts {
-		out.Targets = append(out.Targets, s.describeTarget(r.Context(), l, bt, maxAge))
+		out.Targets = append(out.Targets, s.describeTarget(r.Context(), l, bt, maxAge, attempts))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -724,7 +787,7 @@ func (s *Server) handleTargetAdd(w http.ResponseWriter, r *http.Request, l *libH
 		}
 	}
 	l.entry.clearPlans()
-	writeJSON(w, http.StatusCreated, s.describeTarget(ctx, l, bt, planTTL))
+	writeJSON(w, http.StatusCreated, s.describeTarget(ctx, l, bt, planTTL, nil))
 }
 
 type targetUpdateBody struct {
@@ -780,7 +843,7 @@ func (s *Server) handleTargetUpdate(w http.ResponseWriter, r *http.Request, l *l
 		return
 	}
 	l.entry.clearPlans()
-	writeJSON(w, http.StatusOK, s.describeTarget(r.Context(), l, bt, planTTL))
+	writeJSON(w, http.StatusOK, s.describeTarget(r.Context(), l, bt, planTTL, nil))
 }
 
 // handleTargetForget is POST /api/l/{lib}/backups/targets/{id}/forget:
@@ -835,6 +898,12 @@ func (s *Server) handleTargetPlan(w http.ResponseWriter, r *http.Request, l *lib
 	bc, err := s.openBackup(r.Context(), l, bt.ID, false, false)
 	if err != nil {
 		s.backupStateError(w, r, err)
+		return
+	}
+	// Not while a job holds the set: the plan reads every row of
+	// backup.db, which would hold up the job's writes.
+	if le, held := backup.SetHeld(bc.t, bc.setName); held {
+		writeError(w, http.StatusConflict, le.Error()+"; try again when it has finished")
 		return
 	}
 	plan, err := s.computePlan(r.Context(), bc, keep)
@@ -1026,8 +1095,8 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 			return stateCancelled, 130, stats, 0, ""
 		}
 		logger.Error(kind+" failed", "err", err)
-		m.log.Info("job finished", "id", j.id, "kind", kind, "state", stateFailed, "exit_code", 2)
-		return stateFailed, 2, stats, 0, srv.backupError(err)
+		m.log.Info("job finished", "id", j.id, "kind", kind, "state", stateFailed, "exit_code", 2, "err", err)
+		return stateFailed, 2, stats, 0, srv.jobError(err)
 	}
 	ctx := j.ctx
 	bc, err := srv.openBackup(ctx, h, j.params.Target, j.params.TakeOver, true)
@@ -1062,6 +1131,13 @@ func (m *jobManager) runBackupJob(j *job) (state string, code int, stats importe
 			Workers: j.params.Workers, Partial: j.params.Partial, OnProgress: j.onBackupProgress,
 			OnFailure: j.onBackupFailure, Logger: logger})
 		j.setResult(&st)
+		// The outcome is kept in user.db too (the Backups and Libraries
+		// pages read it): the target's backup.db may not have recorded
+		// it. When that fails as well, the job (in memory) and the
+		// library's log still have it.
+		if aerr := h.user.RecordBackupAttempt(context.WithoutCancel(ctx), bc.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
+			logger.Error("record the backup attempt", "err", aerr)
+		}
 		if err != nil {
 			return fail(err)
 		}

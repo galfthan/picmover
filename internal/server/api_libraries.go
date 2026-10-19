@@ -41,6 +41,25 @@ type libBackupJSON struct {
 	LastBackupAt *int64 `json:"lastBackupAt"`
 	Label        string `json:"label,omitempty"`
 	Behind       *int64 `json:"behind,omitempty"`
+	// Incomplete: a target no backup finished to yet holds files of an
+	// interrupted or failed one (the one with the most files).
+	Incomplete *libIncompleteJSON `json:"incomplete,omitempty"`
+	// Failure: the newest backup that stopped before it was done, when
+	// none to that target finished after it.
+	Failure *libFailureJSON `json:"failure,omitempty"`
+}
+
+type libIncompleteJSON struct {
+	Label        string `json:"label"`
+	Files        int64  `json:"files"`
+	LibraryFiles int64  `json:"libraryFiles"` // 0: unknown
+}
+
+type libFailureJSON struct {
+	Label     string `json:"label"`
+	At        int64  `json:"at"`
+	Error     string `json:"error,omitempty"`
+	Cancelled bool   `json:"cancelled,omitempty"`
 }
 
 // holderJSON describes the process holding a library's lock; fields are
@@ -149,6 +168,12 @@ func (s *Server) libBackup(ctx context.Context, l listed, e *libEntry) *libBacku
 		return nil
 	}
 	out := &libBackupJSON{Targets: sum.Targets, LastBackupAt: unixOrNull(sum.LastBackupAt), Label: sum.LastLabel}
+	if i := sum.Incomplete; i != nil {
+		out.Incomplete = &libIncompleteJSON{Label: i.Label, Files: i.Files, LibraryFiles: i.LibraryFiles}
+	}
+	if f := sum.Failure; f != nil {
+		out.Failure = &libFailureJSON{Label: f.Label, At: f.At.Unix(), Error: f.Error, Cancelled: f.Cancelled}
+	}
 	if e != nil && sum.LastID != "" {
 		if plan, ok := e.cachedPlanOf(sum.LastID, planTTL); ok {
 			n := plan.New.Count + plan.Changed.Count + plan.Moved.Count

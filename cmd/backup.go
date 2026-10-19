@@ -620,9 +620,17 @@ func backupOne(ctx context.Context, cmd *cobra.Command, b *backupLib, bt userdat
 	st, err := backup.Run(ctx, b.source(), set, backup.Options{Owner: b.id, TakeOver: fl.takeOver, Library: b.lib.Root(),
 		Workers: fl.workers, Partial: fl.partial, OnProgress: progress, Logger: logger})
 	done()
+	// The outcome is kept in user.db too: the target's backup.db may not
+	// have recorded it.
+	if aerr := b.user.RecordBackupAttempt(context.WithoutCancel(ctx), rt.bt.ID, backup.Attempt(ctx, set, &st, err)); aerr != nil {
+		logger.Error("record the backup attempt", "err", aerr)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			fmt.Fprintf(out, "Backup cancelled: %d files copied; the next run continues.\n", st.Copied)
+		}
+		if msg := backup.KnownRunError(err); msg != "" && backup.IsBusy(err) {
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", msg)
 		}
 		return exitUnusable, setError(err, b, rt.t, rt.bt)
 	}

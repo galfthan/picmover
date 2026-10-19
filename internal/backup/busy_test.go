@@ -21,11 +21,7 @@ import (
 // USB drive is with the real 10 s busy_timeout).
 func shortBusy(t *testing.T, budget time.Duration) {
 	t.Helper()
-	oldTimeout, oldBudget, oldBackoff, oldFinish, oldGrace := setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace
-	setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace = 50*time.Millisecond, budget, 50*time.Millisecond, budget, budget
-	t.Cleanup(func() {
-		setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace = oldTimeout, oldBudget, oldBackoff, oldFinish, oldGrace
-	})
+	t.Cleanup(SetBusyLimitsForTest(50*time.Millisecond, budget))
 }
 
 // reader holds a read transaction on the set's backup.db (SQLite's

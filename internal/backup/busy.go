@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"picmover/internal/library"
+	"picmover/internal/userdata"
 )
 
 // backup.db keeps journal_mode DELETE (see setDSN): a writer's commit
@@ -171,4 +172,42 @@ func SetHeld(t *Target, name string) (*library.ErrLocked, bool) {
 	}
 	h.What = "backup set"
 	return h, true
+}
+
+// Attempt is the user.db record (userdata.BackupAttempt) of a backup run
+// that ended with st and err: kept in the library, so a run whose end
+// backup.db on the target could not record is still known, and the
+// Libraries page can tell an incomplete backup from none. It reads the
+// set's counts (one short read).
+func Attempt(ctx context.Context, set *Set, st *Stats, err error) userdata.BackupAttempt {
+	a := userdata.BackupAttempt{At: time.Now(), SetFiles: -1, SetBytes: -1}
+	if st != nil {
+		a.LibraryFiles = st.Current + st.New + st.Changed + st.Moved
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		a.Cancelled = true
+	case err != nil:
+		a.Error = RunError(err)
+	}
+	if set != nil {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if sum, err := set.Summary(sctx); err == nil {
+			a.SetFiles, a.SetBytes = sum.Files, sum.Bytes
+		}
+	}
+	return a
+}
+
+// SetBusyLimitsForTest sets backup.db's busy_timeout and the retry
+// budgets (busyBudget, finishBudget, cancelGrace) for the tests of other
+// packages, and returns a function that restores them. Not for
+// production use; sets opened before keep their busy_timeout.
+func SetBusyLimitsForTest(timeout, budget time.Duration) (restore func()) {
+	oldTimeout, oldBudget, oldBackoff, oldFinish, oldGrace := setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace
+	setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace = timeout, budget, timeout, budget, budget
+	return func() {
+		setBusyTimeout, busyBudget, busyBackoffMax, finishBudget, cancelGrace = oldTimeout, oldBudget, oldBackoff, oldFinish, oldGrace
+	}
 }
