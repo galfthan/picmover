@@ -85,7 +85,7 @@ describe('backups', () => {
     expect(facts).toContain('Last backup 2 hours ago');
     expect(facts).toContain('Last scrub last week');
     expect(facts).toContain('On the target 8 files, 7.8 KiB');
-    expect(facts).toContain('Not verified yet 2 files');
+    expect(facts).toContain('Not scrubbed yet 2 files');
     expect(facts).toContain('Damaged 1 file');
     expect(facts).toContain('Not in the library 3 files');
 

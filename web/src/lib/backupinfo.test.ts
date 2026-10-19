@@ -7,6 +7,9 @@ import type { BackupRun, BackupTarget, Job } from './api';
 import {
   RateMeter,
   behindText,
+  incompleteText,
+  liveLeft,
+  stoppedText,
   etaMs,
   etaText,
   formatRate,
@@ -78,7 +81,7 @@ describe('status line', () => {
   });
   it('warns without a target, before the first backup and after 30 days', () => {
     expect(statusLine(summaryFromTargets([]), NOW)).toEqual({ tone: 'muted', stale: true, text: 'No backup target yet' });
-    expect(statusLine(summaryFromTargets([target({ lastBackupAt: null })]), NOW)).toEqual({ tone: 'warn', stale: true, text: 'Never backed up (1 target)' });
+    expect(statusLine(summaryFromTargets([target({ lastBackupAt: null, set: null })]), NOW)).toEqual({ tone: 'warn', stale: true, text: 'Never backed up (1 target)' });
     const old = statusLine(summaryFromTargets([target({ lastBackupAt: sec('2026-09-09T11:00:00Z') })]), NOW);
     expect(old.stale).toBe(true);
     expect(old.tone).toBe('warn');
@@ -278,5 +281,82 @@ describe('backup job outcomes', () => {
     expect(outcome(j({ exitCode: 2, state: 'failed', error: 'the target is not reachable' }))).toEqual({ tone: 'error', text: 'Backup failed: the target is not reachable' });
     expect(outcome(j({ state: 'cancelled', exitCode: 130 }))).toEqual({ tone: 'warn', text: 'Backup cancelled.' });
     expect(outcome(j({ state: 'cancelled', exitCode: 130, result: { copied: 3, bytes: 0 } })).text).toBe('Backup cancelled (copied 3 files).');
+  });
+});
+
+// Issue #22: a running backup counts down, a backup that never finished is
+// "incomplete" with its counts, and a stopped run is a problem with its
+// real cause wherever it was recorded.
+describe('running, incomplete and stopped backups', () => {
+  const partial = (p: Partial<BackupTarget> = {}) =>
+    target({
+      lastBackupAt: null,
+      set: { name: 'peter', files: 98543, bytes: 546 * 1024 ** 3, behind: { new: 94615, changed: 0, moved: 0, bytes: 571 * 1024 ** 3 }, extras: 0, damaged: 0, unverified: 98543, libraryFiles: 193158 },
+      ...p,
+    });
+  const job = (p: Partial<Job>): Job => ({ id: 7, kind: 'backup', state: 'failed', startedAt: null, finishedAt: null, stats: {} as Job['stats'], error: null, ...p });
+
+  it('counts the headline down from the copy progress', () => {
+    const live = liveLeft({ phase: 'copy', files: 15, bytes: 15 * 1024 ** 3, totalFiles: 94615, totalBytes: 571 * 1024 ** 3 });
+    expect(live).toEqual({ files: 94600, bytes: 556 * 1024 ** 3 });
+    expect(behindText(partial(), live)).toBe('94,600 files, 556.0 GiB not backed up yet');
+    expect(behindText(partial(), { files: 0, bytes: 0 })).toBe('Finishing the backup…');
+    // Outside the copy phase the plan's numbers stay.
+    expect(liveLeft({ phase: 'plan', files: 0, bytes: 0, totalFiles: 0, totalBytes: 0 })).toBeNull();
+    expect(liveLeft(null)).toBeNull();
+    expect(behindText(partial(), null)).toBe('94,615 files, 571.0 GiB not backed up yet');
+  });
+
+  it('calls a set without a finished backup incomplete, with its counts', () => {
+    expect(incompleteText(partial())).toBe('Incomplete: 98,543 of 193,158 files backed up. Continue with Back up now.');
+    expect(incompleteText(partial(), true)).toBe('Incomplete: 98,543 of 193,158 files backed up.');
+    // The library's count from the last attempt when there is no plan.
+    const noPlan = partial({ set: { name: 'peter', files: 5, bytes: 5, behind: null, extras: 0, damaged: 0, unverified: 5 }, lastAttempt: { at: sec('2026-10-10T07:26:00Z'), error: 'x', cancelled: false, setFiles: 5, libraryFiles: 9 } });
+    expect(incompleteText(noPlan)).toBe('Incomplete: 5 of 9 files backed up. Continue with Back up now.');
+    // Unknown total.
+    expect(incompleteText(partial({ set: { name: 'peter', files: 1, bytes: 5, behind: null, extras: 0, damaged: 0, unverified: 1 } }))).toBe(
+      'Incomplete: 1 file backed up so far; no backup has finished yet. Continue with Back up now.',
+    );
+    // A finished backup, an empty set, an unreachable target: not incomplete.
+    expect(incompleteText(target())).toBeNull();
+    expect(incompleteText(partial({ set: null }))).toBeNull();
+    expect(incompleteText(partial({ reachable: false }))).toBeNull();
+    // The status line says so instead of "Never backed up".
+    expect(statusLine(summaryFromTargets([partial()]), NOW)).toEqual({ tone: 'warn', stale: true, text: 'Incomplete: 98,543 of 193,158 files backed up to Red WD drive' });
+    // An unreachable target is incomplete by the last attempt user.db recorded.
+    const away = partial({ reachable: false, set: null, lastAttempt: { at: sec('2026-10-10T07:26:00Z'), error: 'the backup database on the target stayed busy', cancelled: false, setFiles: 98543, libraryFiles: 193158 } });
+    expect(statusLine(summaryFromTargets([away]), NOW).text).toBe('Incomplete: 98,543 of 193,158 files backed up to Red WD drive; the last backup to Red WD drive failed');
+  });
+
+  it('reads incomplete and failed backups from the workspace listing', () => {
+    const s = summaryFromListing({ targets: 1, lastBackupAt: null, incomplete: { label: 'Red WD drive', files: 98543, libraryFiles: 193158 }, failure: { label: 'Red WD drive', at: 1, error: 'busy' } });
+    expect(statusLine(s!, NOW)).toEqual({ tone: 'warn', stale: true, text: 'Incomplete: 98,543 of 193,158 files backed up to Red WD drive; the last backup to Red WD drive failed' });
+    const done = summaryFromListing({ targets: 1, lastBackupAt: sec('2026-10-10T10:00:00Z'), label: 'Red', failure: { label: 'NAS', at: 1, cancelled: true } });
+    expect(statusLine(done!, NOW)).toEqual({ tone: 'warn', stale: false, text: 'Backed up 2 hours ago to Red; the last backup to NAS was cancelled' });
+  });
+
+  it('names why the last backup stopped, from the job, user.db or backup.db', () => {
+    const busy = 'the backup database on the target stayed busy (another program or page kept it open for reading)';
+    // The job this server ran wins.
+    expect(stoppedText(partial(), [], job({ exitCode: 2, error: busy }))).toBe(`The last backup stopped: ${busy}.`);
+    expect(stoppedText(partial(), [], job({ state: 'cancelled', exitCode: 130 }))).toContain('cancelled before it finished');
+    // Exit 1 (some files failed) finished: those are listed as copy failures.
+    expect(stoppedText(partial(), [], job({ exitCode: 1, error: '1 files could not be backed up' }))).toBeNull();
+    expect(stoppedText(partial(), [], job({ state: 'done', exitCode: 0 }))).toBeNull();
+    // After a restart: the attempt user.db recorded, also when backup.db has no run of it.
+    const attempt = { at: sec('2026-10-10T07:26:00Z'), error: busy, cancelled: false, setFiles: 98543, libraryFiles: 193158 };
+    expect(stoppedText(partial({ lastAttempt: attempt }), [], null)).toBe(`The last backup stopped: ${busy}.`);
+    // A later finished backup clears it.
+    expect(stoppedText(target({ lastAttempt: attempt }), [], null)).toBeNull();
+    // Else the newest backup run in backup.db.
+    const run = (stats: Record<string, unknown>): BackupRun => ({ id: 1, kind: 'backup', startedAt: 1, finishedAt: 1, stats });
+    expect(stoppedText(partial(), [run({ error: 'the target is full' })], null)).toBe('The last backup stopped: the target is full.');
+    expect(stoppedText(partial(), [run({ interrupted: true })], null)).toContain('interrupted');
+    expect(stoppedText(partial(), [run({ copied: 3 })], null)).toBeNull();
+    // A stopped backup counts as a problem: never "No problems" after a failure.
+    const p = runProblems([]);
+    expect(problemCount(p, 'x')).toBe(1);
+    expect(problemTotal(p, 'x')).toBe(1);
+    expect(problemCount(p)).toBe(0);
   });
 });

@@ -17,6 +17,9 @@
   import FolderPicker from '../components/FolderPicker.svelte';
   import TargetCard from '../components/TargetCard.svelte';
 
+  /** How often the targets are read again while a backup-kind job runs. */
+  const LIVE_RELOAD_MS = 15_000;
+
   interface Props {
     lib: string;
   }
@@ -45,6 +48,17 @@
     if (d === seenDone) return;
     seenDone = d;
     untrack(() => void backups.refresh());
+  });
+
+  // While a backup-kind job of this library runs, the targets are read
+  // again now and then: the set's counts ("On the target") come from
+  // backup.db, which the server reads in one short query (it does not plan
+  // while the job holds the set).
+  const running = $derived(!!jobs.active && isBackupKind(jobs.active.kind) && (!jobs.active.library || jobs.active.library === lib));
+  $effect(() => {
+    if (!running) return;
+    const t = setInterval(() => void backups.load(), LIVE_RELOAD_MS);
+    return () => clearInterval(t);
   });
 
   const root = $derived(library.info?.root ?? '');
@@ -112,9 +126,13 @@
       <h1>Backups</h1>
       <span class="spacer"></span>
       {#if backups.targets.length}
-        <button disabled={backups.loading} onclick={() => backups.refresh()}>Check now</button>
+        <button
+          disabled={backups.loading}
+          onclick={() => backups.refresh()}
+          title="Compare the library with each target again and refresh the numbers and the last runs. Nothing is copied.">Check now</button
+        >
       {/if}
-      <button class="primary" onclick={openAdd}>Add target</button>
+      <button class="primary" onclick={openAdd} title="Add a folder on another drive or a network share to back this library up to.">Add target</button>
     </div>
 
     <section class="dest" aria-label="Library being backed up">
@@ -155,7 +173,7 @@
       <div class="empty">
         <h2>No backup targets yet</h2>
         <p>Add a folder on another drive or a network share. picmover marks it as a target, so it is recognized wherever it is mounted.</p>
-        <button class="primary" onclick={openAdd}>Add target</button>
+        <button class="primary" onclick={openAdd} title="Add a folder on another drive or a network share to back this library up to.">Add target</button>
       </div>
     {:else}
       <ul class="targets" aria-label="Backup targets">

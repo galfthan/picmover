@@ -18,11 +18,15 @@
     agoText,
     behindCount,
     behindText,
+    incompleteFiles,
+    incompleteText,
+    liveLeft,
     problemCount,
     problemTotal,
     runProblems,
     TRUNCATED_NOTE,
     SCRUB_BUDGETS,
+    stoppedText,
     targetPathProblem,
     type ProblemList,
   } from '../lib/backupinfo';
@@ -40,11 +44,17 @@
   const id = $derived(target.id);
   const set = $derived(target.set);
   const behind = $derived(behindCount(set?.behind));
-  const headline = $derived(behindText(target));
-  const headTone = $derived(!target.reachable || target.error ? 'warn' : behind === null ? 'muted' : behind === 0 ? 'ok' : 'warn');
 
   /** The running job of this target in this library (another library's job on the same drive is not ours). */
   const job = $derived(jobs.active && backups.isFor(jobs.active, id) ? jobs.active : null);
+  /** A backup of this target runs: the headline counts down from its progress, not the plan made before it. */
+  const backingUp = $derived(!!job && job.kind === 'backup');
+  const live = $derived(backingUp ? liveLeft(job?.phase) : null);
+  const headline = $derived(behindText(target, live));
+  const headTone = $derived(!target.reachable || target.error ? 'warn' : live ? 'muted' : behind === null ? 'muted' : behind === 0 ? 'ok' : 'warn');
+  /** Files on the target from a backup that never finished ("Incomplete: …"). */
+  const incomplete = $derived(incompleteText(target, backingUp));
+  const neverFinished = $derived(incompleteFiles(target) > 0);
   /** The newest finished job of this target and library seen by this server process. */
   const lastJob = $derived<Job | null>(jobs.jobs.find((j) => !isActive(j) && backups.isFor(j, id)) ?? null);
   const lastOutcome = $derived(lastJob ? outcome(lastJob) : null);
@@ -56,8 +66,10 @@
   const announce = $derived(job ? backupStatusText(job) : (lastOutcome?.text ?? ''));
 
   const problems = $derived(runProblems(backups.runs[id] ?? []));
-  const nProblems = $derived(problemCount(problems));
-  const nListed = $derived(problemTotal(problems));
+  /** Why the newest backup stopped before it was done (from this server's job, user.db or backup.db); null when it finished. */
+  const stopped = $derived(job ? null : stoppedText(target, backups.runs[id] ?? [], lastJob));
+  const nProblems = $derived(problemCount(problems, stopped));
+  const nListed = $derived(problemTotal(problems, stopped));
 
   // ---- Focus: buttons that disappear must not leave focus on <body> ----
 
@@ -273,6 +285,7 @@
   }
 
   const SHOWN = 100;
+  const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
   const files = (k: number) => `${formatCount(k)} ${k === 1 ? 'file' : 'files'}`;
   const when = (v: number | string | null) => {
     const d = parseWhen(v);
@@ -313,7 +326,7 @@
     <h2 class="label">{target.label || 'Unnamed target'}</h2>
     <span class="badge" class:ok={target.reachable} class:bad={!target.reachable}>{target.reachable ? 'Connected' : 'Not found'}</span>
     <span class="spacer"></span>
-    {#if !editing}<button class="small" bind:this={editBtn} onclick={startEdit}>Edit</button>{/if}
+    {#if !editing}<button class="small" bind:this={editBtn} onclick={startEdit} title="Rename the target, or point it at the folder where the drive or share is mounted now.">Edit</button>{/if}
   </div>
 
   {#if editing}
@@ -341,17 +354,19 @@
   {/if}
 
   <p class="headline tone-{headTone}">{headline}</p>
+  {#if incomplete}<p class="incomplete small tone-warn">{incomplete}</p>{/if}
+  {#if target.busy && !job}<p class="muted small busy">{capitalize(target.busy)}; the numbers are updated when it has finished.</p>{/if}
 
   <dl class="facts small">
-    <dt>Last backup</dt>
-    <dd title={when(target.lastBackupAt)}>{agoText(target.lastBackupAt)}</dd>
-    <dt>Last scrub</dt>
+    <dt title="When a backup to this target last finished.">Last backup</dt>
+    <dd title={when(target.lastBackupAt)}>{neverFinished && !target.lastBackupAt ? 'never finished' : agoText(target.lastBackupAt)}</dd>
+    <dt title="When a scrub last re-read the backup on this target.">Last scrub</dt>
     <dd title={when(target.lastScrubAt)}>{agoText(target.lastScrubAt)}</dd>
     {#if set}
-      <dt>On the target</dt>
+      <dt title="The files of this library in the backup on the target, as the target's backup.db records them{backingUp ? '; updated while the backup runs' : ''}.">On the target</dt>
       <dd>{files(set.files)}, {formatBytes(set.bytes)}</dd>
       {#if set.unverified}
-        <dt>Not verified yet</dt>
+        <dt title="Every copy was checked by reading it back when it was written. These files have not been re-read by a scrub since; Scrub checks them for damage on the drive.">Not scrubbed yet</dt>
         <dd>{files(set.unverified)}</dd>
       {/if}
       {#if set.damaged}
@@ -370,17 +385,40 @@
     <div class="progress"><BackupProgress {job} budget={backups.budgetOf(job)} live={false} /></div>
   {:else}
     <div class="row actions">
-      <button class="primary" bind:this={backupBtn} disabled={!canRun || starting} onclick={backupNow}>Back up now</button>
+      <button
+        class="primary"
+        bind:this={backupBtn}
+        disabled={!canRun || starting}
+        onclick={backupNow}
+        title="Copy new and changed files from the library to this target and check each copy by reading it back. Nothing on the target is deleted; replaced versions are kept in its .picmover/previous folder.">Back up now</button
+      >
       <span class="scrub">
-        <select bind:value={budget} aria-label="Scrub budget" disabled={!canRun || starting}>
+        <select
+          bind:value={budget}
+          aria-label="Scrub budget"
+          disabled={!canRun || starting}
+          title="How long the scrub may read. A scrub that runs out of time continues where it stopped the next time; All reads the whole backup.">
           {#each SCRUB_BUDGETS as b (b.label)}<option value={String(b.seconds)}>{b.label}</option>{/each}
         </select>
-        <button disabled={!canRun || starting} onclick={scrub}>Scrub</button>
+        <button
+          disabled={!canRun || starting}
+          onclick={scrub}
+          title="Re-read the backup and compare each file with its checksum, to find damaged or missing copies. Those are copied again from the library when it still has them.">Scrub</button
+        >
       </span>
-      <button disabled={!canRun || starting} onclick={() => openDialog('prune')}>Prune…</button>
-      <button disabled={!canRun || starting} onclick={() => openDialog('restore')}>Restore missing…</button>
+      <button
+        disabled={!canRun || starting}
+        onclick={() => openDialog('prune')}
+        title="List the files on the target that the library no longer has, and earlier versions kept for more than 30 days. Nothing is deleted until you confirm the count.">Prune…</button
+      >
+      <button
+        disabled={!canRun || starting}
+        onclick={() => openDialog('restore')}
+        title="List the files of this backup that are missing from the library, and copy them back after you confirm. Files in the library are never overwritten.">Restore missing…</button
+      >
       {#if canTakeOver}
         <button
+          title="Make this library the writer of this backup set and back up now."
           disabled={busy || starting}
           onclick={() => {
             dialogError = '';
@@ -391,6 +429,7 @@
       <span class="spacer"></span>
       <ConfirmButton
         label="Forget"
+        title="Remove this target from the library's list. Nothing on the drive is deleted; add the same folder again to continue."
         question="Forget this target? The files on it are not touched."
         confirmLabel="Forget"
         cancelLabel="Keep"
@@ -414,6 +453,12 @@
     <summary>
       {#if nProblems > 0}Problems <span class="count">{formatCount(nProblems)}</span>{:else if nListed > 0}No open problems in the last runs{:else}No problems in the last runs{/if}
     </summary>
+    {#if stopped}
+      <div class="plist stopped">
+        <h4>The last backup did not finish</h4>
+        <p class="small">{stopped}</p>
+      </div>
+    {/if}
     {@render list('Damaged files in the last scrub', problems.damaged, 'damaged')}
     {@render list('Copy failures in the last backup', problems.failed, 'failed')}
     {@render list('Unknown files on the target', problems.unknown, 'unknown')}

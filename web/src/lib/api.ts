@@ -244,6 +244,10 @@ export interface LibBackup {
   targets?: number | unknown[] | null;
   /** Label of the target of the newest backup, when sent. */
   label?: string | null;
+  /** A target no backup finished to yet holds files of a stopped one (the one with the most files). */
+  incomplete?: { label?: string; files?: number; libraryFiles?: number } | null;
+  /** The newest backup that stopped before it was done, when none to that target finished after it. */
+  failure?: { label?: string; at?: number; error?: string; cancelled?: boolean } | null;
 }
 
 /** A plain subfolder of the workspace root (no media.db); its id is its name. */
@@ -412,7 +416,23 @@ export interface BackupSet {
   behind: BackupBehind | null;
   extras: number;
   damaged: number;
+  /** Rows not scrubbed yet (every copy was read back when it was written; this counts the ones no scrub has re-read). */
   unverified: number;
+  /** Files of the library by the plan (current + new + changed + moved); 0 or absent when no plan was made. */
+  libraryFiles?: number;
+}
+
+/** The outcome of the newest backup job to a target, as the library's user.db keeps it. */
+export interface BackupAttempt {
+  /** Unix seconds. */
+  at: number;
+  /** Why it stopped ("" when it finished). */
+  error: string;
+  cancelled: boolean;
+  /** Files on the target after it (-1 unknown). */
+  setFiles: number;
+  /** Files of the library it planned (0 unknown). */
+  libraryFiles: number;
 }
 
 export interface BackupTarget {
@@ -435,6 +455,10 @@ export interface BackupTarget {
    * backup with `takeOver` makes this library the set's writer.
    */
   foreign?: boolean;
+  /** A backup, scrub, prune or restore holds the set (this server or another process); names it. The plan is not made again meanwhile. */
+  busy?: string;
+  /** The newest backup job's outcome from user.db; null or absent when none is recorded. */
+  lastAttempt?: BackupAttempt | null;
 }
 
 export type PlanClassName = 'current' | 'moved' | 'changed' | 'new' | 'extra';
@@ -1334,6 +1358,18 @@ function toSet(v: unknown): BackupSet | null {
     extras: num(v.extras),
     damaged: num(v.damaged),
     unverified: num(v.unverified),
+    libraryFiles: num(v.libraryFiles),
+  };
+}
+
+function toAttempt(v: unknown): BackupAttempt | null {
+  if (!isRecord(v) || typeof v.at !== 'number') return null;
+  return {
+    at: v.at,
+    error: typeof v.error === 'string' ? v.error : '',
+    cancelled: v.cancelled === true,
+    setFiles: typeof v.setFiles === 'number' ? v.setFiles : -1,
+    libraryFiles: num(v.libraryFiles),
   };
 }
 
@@ -1350,6 +1386,8 @@ export function toTarget(v: unknown): BackupTarget {
     set: toSet(r.set),
     ...(typeof r.error === 'string' && r.error !== '' ? { error: r.error } : {}),
     ...(r.foreign === true ? { foreign: true } : {}),
+    ...(typeof r.busy === 'string' && r.busy !== '' ? { busy: r.busy } : {}),
+    lastAttempt: toAttempt(r.lastAttempt),
   };
 }
 
