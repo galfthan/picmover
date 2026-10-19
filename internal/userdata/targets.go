@@ -219,7 +219,8 @@ func (d *DB) ForgetBackupTarget(ctx context.Context, id string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return fmt.Errorf("backup target %s: %w", id, ErrNotFound)
 		}
-		return nil
+		_, err = tx.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, attemptPrefix+id)
+		return err
 	})
 }
 
@@ -253,6 +254,28 @@ type BackupSummary struct {
 	LastBackupAt time.Time // newest last_backup_at; zero: never
 	LastLabel    string    // the label of that target
 	LastID       string    // and its id
+	// Incomplete is the target with the most files among those no
+	// backup finished to yet that hold files of an interrupted or
+	// failed one (nil: none).
+	Incomplete *IncompleteBackup
+	// Failure is the newest backup that stopped before it was done,
+	// when no backup to that target finished after it (nil: none).
+	Failure *FailedBackup
+}
+
+// IncompleteBackup is a target that holds part of the library.
+type IncompleteBackup struct {
+	ID, Label    string
+	Files        int64 // files on the target
+	LibraryFiles int64 // files of the library (0: unknown)
+}
+
+// FailedBackup is a backup run that stopped before it was done.
+type FailedBackup struct {
+	ID, Label string
+	At        time.Time
+	Error     string // "" for a cancelled run
+	Cancelled bool
 }
 
 // BackupSummary returns the backup summary from an open database.
@@ -260,9 +283,7 @@ func (d *DB) BackupSummary(ctx context.Context) (BackupSummary, error) {
 	return backupSummary(ctx, d.db)
 }
 
-func backupSummary(ctx context.Context, q interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}) (BackupSummary, error) {
+func backupSummary(ctx context.Context, q querier) (BackupSummary, error) {
 	var (
 		s     BackupSummary
 		last  sql.NullInt64
@@ -281,5 +302,42 @@ func backupSummary(ctx context.Context, q interface {
 		s.LastBackupAt = time.Unix(last.Int64, 0)
 		s.LastLabel, s.LastID = label.String, id.String
 	}
+	if err := attemptSummary(ctx, q, &s); err != nil {
+		return BackupSummary{}, err
+	}
 	return s, nil
+}
+
+// attemptSummary fills s.Incomplete and s.Failure from the recorded
+// backup attempts.
+func attemptSummary(ctx context.Context, q querier, s *BackupSummary) error {
+	attempts, err := backupAttempts(ctx, q)
+	if err != nil || len(attempts) == 0 {
+		return err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id, label, last_backup_at FROM backup_targets ORDER BY added_at, rowid`)
+	if err != nil {
+		return fmt.Errorf("userdata: backup summary: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id, label string
+			last      sql.NullInt64
+		)
+		if err := rows.Scan(&id, &label, &last); err != nil {
+			return fmt.Errorf("userdata: backup summary: %w", err)
+		}
+		a, ok := attempts[id]
+		if !ok {
+			continue
+		}
+		if !last.Valid && a.SetFiles > 0 && (s.Incomplete == nil || a.SetFiles > s.Incomplete.Files) {
+			s.Incomplete = &IncompleteBackup{ID: id, Label: label, Files: a.SetFiles, LibraryFiles: a.LibraryFiles}
+		}
+		if a.Failed() && (!last.Valid || a.At.Unix() >= last.Int64) && (s.Failure == nil || a.At.After(s.Failure.At)) {
+			s.Failure = &FailedBackup{ID: id, Label: label, At: a.At, Error: a.Error, Cancelled: a.Cancelled}
+		}
+	}
+	return rows.Err()
 }

@@ -3,7 +3,7 @@
 // pages with the 30-day warning, run problems, transfer rate and ETA, and
 // the target path check. See backupinfo.test.ts.
 
-import { isRecord, type BackupBehind, type BackupRun, type BackupTarget, type Lib, type LibBackup } from './api';
+import { isRecord, type BackupBehind, type BackupRun, type BackupTarget, type Job, type JobPhase, type Lib, type LibBackup } from './api';
 import { formatAgo, formatBytes, formatCount, formatElapsed, parseWhen } from './format';
 
 /** A last backup older than this is a warning. */
@@ -26,14 +26,30 @@ export function behindCount(b: BackupBehind | number | null | undefined): number
   return b.new + b.changed + b.moved;
 }
 
+/** Files and bytes a running backup still has to do, from its copy-phase progress; null outside the copy phase. */
+export interface LiveLeft {
+  files: number;
+  bytes: number;
+}
+
+export function liveLeft(p: JobPhase | null | undefined): LiveLeft | null {
+  if (!p || p.phase !== 'copy' || !isNum(p.totalFiles) || p.totalFiles <= 0) return null;
+  const files = isNum(p.files) ? p.files : 0;
+  const bytes = isNum(p.bytes) ? p.bytes : 0;
+  return { files: Math.max(0, p.totalFiles - files), bytes: Math.max(0, (isNum(p.totalBytes) ? p.totalBytes : 0) - bytes) };
+}
+
 /**
  * The card's headline: "1,204 files, 3.2 GiB not backed up yet", "Up to
  * date", "1 file to move", … A target the server reports an `error` for
- * (its set belongs to another library, …) shows that instead.
+ * (its set belongs to another library, …) shows that instead. While a
+ * backup of the target copies, `live` (liveLeft) counts down instead of
+ * the plan made before it started.
  */
-export function behindText(t: BackupTarget): string {
+export function behindText(t: BackupTarget, live: LiveLeft | null = null): string {
   if (!t.reachable) return 'Not reachable';
   if (t.error) return t.error;
+  if (live) return live.files === 0 ? 'Finishing the backup…' : `${plural(live.files, 'file')}, ${formatBytes(live.bytes)} not backed up yet`;
   const b = t.set?.behind ?? null;
   if (!t.set && !b) return 'Nothing backed up here yet';
   const n = behindCount(b);
@@ -56,19 +72,65 @@ export interface BackupSummary {
   label: string;
   /** Files behind on that target; null when unknown. */
   behind: number | null;
+  /** A target no backup finished to yet that holds files of a stopped one (the one with the most). */
+  incomplete?: { label: string; files: number; libraryFiles: number } | null;
+  /** The newest backup that stopped before it was done, when none to that target finished after it. */
+  failure?: { label: string; error: string; cancelled: boolean } | null;
+}
+
+/** Files on a target that no backup finished to yet (from the set, else the last attempt); 0 when none or when one finished. */
+export function incompleteFiles(t: BackupTarget): number {
+  if (parseWhen(t.lastBackupAt)) return 0;
+  const files = t.set?.files ?? 0;
+  if (files > 0) return files;
+  return t.lastAttempt && t.lastAttempt.setFiles > 0 ? t.lastAttempt.setFiles : 0;
+}
+
+/** The library's file count as the plan or the last attempt knows it; 0 when unknown. */
+const libraryFilesOf = (t: BackupTarget) => t.set?.libraryFiles || t.lastAttempt?.libraryFiles || 0;
+
+/**
+ * "Incomplete: 98,543 of 193,158 files backed up. Continue with Back up now."
+ * for a target that holds files of a backup that never finished; null
+ * otherwise. `running`: a backup of it runs now (no call to action).
+ */
+export function incompleteText(t: BackupTarget, running = false): string | null {
+  if (!t.reachable || t.error) return null;
+  const files = incompleteFiles(t);
+  if (files <= 0) return null;
+  const of = libraryFilesOf(t);
+  const head = of > files ? `Incomplete: ${formatCount(files)} of ${formatCount(of)} files backed up.` : `Incomplete: ${plural(files, 'file')} backed up so far; no backup has finished yet.`;
+  return running ? head : `${head} Continue with Back up now.`;
+}
+
+/** The target's last backup attempt stopped (an error or a cancel) and no backup finished after it. */
+function attemptStopped(t: BackupTarget): boolean {
+  const a = t.lastAttempt;
+  if (!a || (!a.error && !a.cancelled)) return false;
+  const last = parseWhen(t.lastBackupAt);
+  return !last || a.at * 1000 >= last.getTime();
 }
 
 export function summaryFromTargets(ts: readonly BackupTarget[]): BackupSummary {
   let best: BackupTarget | null = null;
   let bestAt: Date | null = null;
+  let incomplete: BackupSummary['incomplete'] = null;
+  let failure: BackupSummary['failure'] = null;
+  let failureAt = -1;
   for (const t of ts) {
     const at = parseWhen(t.lastBackupAt);
     if (at && (!bestAt || at.getTime() > bestAt.getTime())) {
       best = t;
       bestAt = at;
     }
+    const files = incompleteFiles(t);
+    if (files > 0 && (!incomplete || files > incomplete.files)) incomplete = { label: t.label, files, libraryFiles: libraryFilesOf(t) };
+    if (attemptStopped(t) && t.lastAttempt && t.lastAttempt.at > failureAt) {
+      failureAt = t.lastAttempt.at;
+      failure = { label: t.label, error: t.lastAttempt.error, cancelled: t.lastAttempt.cancelled };
+    }
   }
-  return { targets: ts.length, lastBackupAt: bestAt, label: best?.label ?? '', behind: best ? behindCount(best.set?.behind) : null };
+  return { targets: ts.length, lastBackupAt: bestAt, label: best?.label ?? '', behind: best ? behindCount(best.set?.behind) : null, incomplete, failure };
 }
 
 /**
@@ -87,7 +149,17 @@ export function summaryFromListing(b: LibBackup | null | undefined): BackupSumma
   const targets = Array.isArray(b.targets) ? b.targets.length : typeof b.targets === 'number' ? b.targets : 0;
   const behind = isRecord(b.behind) ? behindCount(b.behind as unknown as BackupBehind) : behindCount(typeof b.behind === 'number' ? b.behind : null);
   const at = b.lastBackupAt;
-  return { targets, lastBackupAt: parseWhen(typeof at === 'number' || typeof at === 'string' ? at : null), label: typeof b.label === 'string' ? b.label : '', behind };
+  const inc = isRecord(b.incomplete) ? b.incomplete : null;
+  const fail = isRecord(b.failure) ? b.failure : null;
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  return {
+    targets,
+    lastBackupAt: parseWhen(typeof at === 'number' || typeof at === 'string' ? at : null),
+    label: typeof b.label === 'string' ? b.label : '',
+    behind,
+    incomplete: inc && isNum(inc.files) && inc.files > 0 ? { label: str(inc.label), files: inc.files, libraryFiles: isNum(inc.libraryFiles) ? inc.libraryFiles : 0 } : null,
+    failure: fail && (str(fail.error) || fail.cancelled === true) ? { label: str(fail.label), error: str(fail.error), cancelled: fail.cancelled === true } : null,
+  };
 }
 
 export interface StatusLine {
@@ -98,16 +170,32 @@ export interface StatusLine {
   stale: boolean;
 }
 
-/** "Backed up 2 hours ago to Red WD drive; 0 behind", with the warnings of the contract. */
+/**
+ * "Backed up 2 hours ago to Red WD drive; 0 behind", with the warnings of
+ * the contract; "Incomplete: 98,543 of 193,158 files backed up to Red WD
+ * drive" when no backup finished yet but one copied files; a stopped
+ * backup is named ("; the last backup to NAS failed").
+ */
 export function statusLine(s: BackupSummary, now: number = Date.now()): StatusLine {
   if (s.targets === 0) return { tone: 'muted', stale: true, text: 'No backup target yet' };
-  if (!s.lastBackupAt) return { tone: 'warn', stale: true, text: `Never backed up (${plural(s.targets, 'target')})` };
+  const f = s.failure;
+  const failNote = f ? `; the last backup${f.label ? ` to ${f.label}` : ''} ${f.cancelled && !f.error ? 'was cancelled' : 'failed'}` : '';
+  if (!s.lastBackupAt) {
+    const inc = s.incomplete;
+    if (inc && inc.files > 0) {
+      const to = inc.label ? ` to ${inc.label}` : '';
+      const head = inc.libraryFiles > inc.files ? `Incomplete: ${formatCount(inc.files)} of ${formatCount(inc.libraryFiles)} files backed up${to}` : `Incomplete: ${plural(inc.files, 'file')} backed up${to}, no backup finished yet`;
+      return { tone: 'warn', stale: true, text: head + failNote };
+    }
+    return { tone: 'warn', stale: true, text: `Never backed up (${plural(s.targets, 'target')})${failNote}` };
+  }
   let text = `Backed up ${formatAgo(s.lastBackupAt, now)}`;
   if (s.label) text += ` to ${s.label}`;
   if (s.behind !== null) text += `; ${formatCount(s.behind)} behind`;
   const stale = now - s.lastBackupAt.getTime() > STALE_DAYS * DAY_MS;
   if (stale) text += ` (older than ${STALE_DAYS} days)`;
-  return { tone: stale ? 'warn' : 'ok', stale, text };
+  text += failNote;
+  return { tone: stale || f ? 'warn' : 'ok', stale, text };
 }
 
 /** "3 hours ago", or "never". */
@@ -224,14 +312,47 @@ export function runProblems(runs: readonly BackupRun[]): RunProblems {
   };
 }
 
-/** Problems still open (repaired files are not counted). */
-export function problemCount(p: RunProblems): number {
-  return p.damaged.open + p.unknown.open + p.missing.open + p.failed.open;
+/** Problems still open (repaired files are not counted); a stopped backup (stoppedText) counts as one. */
+export function problemCount(p: RunProblems, stopped: string | null = null): number {
+  return p.damaged.open + p.unknown.open + p.missing.open + p.failed.open + (stopped ? 1 : 0);
 }
 
 /** Everything listed, repaired files included. */
-export function problemTotal(p: RunProblems): number {
-  return p.damaged.count + p.unknown.count + p.missing.count + p.failed.count;
+export function problemTotal(p: RunProblems, stopped: string | null = null): number {
+  return p.damaged.count + p.unknown.count + p.missing.count + p.failed.count + (stopped ? 1 : 0);
+}
+
+const CONTINUE = 'the files copied so far are kept; Back up now continues from there';
+
+/**
+ * Why the newest backup of a target stopped before it was done, or null
+ * when it finished (or none is known). The newest source wins: the job
+ * this server ran (`lastJob`, in memory); else the newer of the attempt
+ * user.db recorded (at its end) and the newest backup run in backup.db
+ * (by its start: a run killed after the last attempt is newer), the run
+ * by its `error`, `interrupted` or `cancelled`, or as interrupted when it
+ * has no end and nothing holds the set (a killed process). A run whose
+ * end the target could not record is still known from the first two.
+ */
+export function stoppedText(t: BackupTarget, runs: readonly BackupRun[], lastJob: Job | null): string | null {
+  if (lastJob && lastJob.kind === 'backup') {
+    if (lastJob.state === 'cancelled' || lastJob.exitCode === 130) return `The last backup was cancelled before it finished; ${CONTINUE}.`;
+    if (lastJob.state === 'failed' && (lastJob.exitCode ?? 2) >= 2) return `The last backup stopped: ${lastJob.error || 'unknown error'}.`;
+    return null;
+  }
+  const a = t.lastAttempt;
+  const run = runs.find((r) => r.kind === 'backup') ?? null;
+  const runAt = run ? parseWhen(run.startedAt) : null;
+  if (a && (!run || !runAt || a.at * 1000 >= runAt.getTime())) {
+    if (!attemptStopped(t)) return null;
+    return a.error ? `The last backup stopped: ${a.error}.` : `The last backup was cancelled before it finished; ${CONTINUE}.`;
+  }
+  if (!run) return null;
+  const st = run.stats ?? {};
+  if (typeof st.error === 'string' && st.error) return `The last backup stopped: ${st.error}.`;
+  if (st.interrupted === true || (run.finishedAt === null && !t.busy)) return `The last backup was interrupted (the program was stopped); ${CONTINUE}.`;
+  if (st.cancelled === true) return `The last backup was cancelled before it finished; ${CONTINUE}.`;
+  return null;
 }
 
 const n = (v: unknown): number => (isNum(v) ? v : Array.isArray(v) ? v.length : 0);

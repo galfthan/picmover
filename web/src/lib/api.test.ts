@@ -235,7 +235,8 @@ describe('backups', () => {
       reachable: true,
       lastBackupAt: 1760090000,
       lastScrubAt: null,
-      set: { name: '', files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2 },
+      set: { name: '', files: 3, bytes: 9, behind: { new: 1, changed: 0, moved: 2, bytes: 5 }, extras: 1, damaged: 0, unverified: 2, libraryFiles: 0 },
+      lastAttempt: null,
     });
     expect(list[1]).toMatchObject({ reachable: false, lastBackupAt: null, set: null });
     expect(list[1]).not.toHaveProperty('error');

@@ -105,7 +105,11 @@ interface FakeTarget {
   reachable: boolean;
   lastBackupAt: number | null;
   lastScrubAt: number | null;
-  set: { name: string; files: number; bytes: number; extras: number; damaged: number; unverified: number } | null;
+  set: { name: string; files: number; bytes: number; extras: number; damaged: number; unverified: number; libraryFiles?: number } | null;
+  /** The newest backup job's outcome as user.db keeps it (GET …/backups `lastAttempt`). */
+  lastAttempt?: { at: number; error?: string; cancelled?: boolean; setFiles: number; libraryFiles: number } | null;
+  /** A job holds the set (GET …/backups `busy`). */
+  busy?: string;
   /** As the server's describeTarget: the set cannot be used (another library's set under this name). */
   error?: string;
   /** With `error`: the set was last written by another copy of this library; a backup with `takeOver` claims it. */

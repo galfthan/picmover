@@ -97,7 +97,10 @@ type Stats struct {
 	MediaSnapshotUnchanged bool   `json:"mediaSnapshotUnchanged,omitempty"`
 	SnapshotError          string `json:"snapshotError,omitempty"`
 	Cancelled              bool   `json:"cancelled"`
-	Seconds                int64  `json:"seconds"`
+	// Error is why the run stopped before it was done (RunError: no
+	// paths), "" when it was not stopped by an error.
+	Error   string `json:"error,omitempty"`
+	Seconds int64  `json:"seconds"`
 }
 
 // ExitCode is the CLI exit status of a finished run: 0 when everything
@@ -239,6 +242,7 @@ func Run(ctx context.Context, src Source, set *Set, opts Options) (Stats, error)
 			return st, ctx.Err()
 		}
 		log.Error("backup failed", "err", err)
+		st.Error = RunError(err)
 		finish()
 		return st, err
 	}
@@ -359,8 +363,9 @@ func (r *runner) pipeline(ctx context.Context, items []Item, workers int) error 
 			library.SyncDir(d)
 		}
 		clear(dirs)
-		// Rows are written even when ctx is cancelled: their files are done.
-		if err := r.set.apply(context.WithoutCancel(ctx), batch); err != nil {
+		// Rows are written even when ctx is cancelled (apply's grace):
+		// their files are done.
+		if err := r.set.apply(ctx, batch); err != nil {
 			werr = err
 			cancel()
 		}
@@ -857,9 +862,19 @@ func syncFile(p string) error {
 }
 
 // setLogger returns a logger writing to a new log in the set's logs
-// folder (<prefix>_<time>.log) and to extra; the close function closes
-// the log file.
+// folder (<prefix>_<time>.log) and to extra, and makes it the set's log
+// (the busy warnings of its writes); the close function closes the log
+// file.
 func setLogger(set *Set, prefix string, extra *slog.Logger) (*slog.Logger, func()) {
+	l, closeFn := newSetLogger(set, prefix, extra)
+	set.log = l
+	return l, func() {
+		set.log = extra
+		closeFn()
+	}
+}
+
+func newSetLogger(set *Set, prefix string, extra *slog.Logger) (*slog.Logger, func()) {
 	var handlers []slog.Handler
 	if extra != nil {
 		handlers = append(handlers, extra.Handler())

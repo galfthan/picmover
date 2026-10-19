@@ -7,6 +7,8 @@
     cancelLabel?: string;
     danger?: boolean;
     disabled?: boolean;
+    /** Tooltip of the button. */
+    title?: string;
     onconfirm: () => void;
   }
   let {
@@ -16,6 +18,7 @@
     cancelLabel = 'No',
     danger = false,
     disabled = false,
+    title,
     onconfirm,
   }: Props = $props();
   let asking = $state(false);
@@ -40,7 +43,7 @@
     <button onclick={() => (asking = false)}>{cancelLabel}</button>
   </span>
 {:else}
-  <button class={danger ? 'danger' : ''} {disabled} onclick={() => (asking = true)}>{label}</button>
+  <button class={danger ? 'danger' : ''} {disabled} {title} onclick={() => (asking = true)}>{label}</button>
 {/if}
 
 <style>

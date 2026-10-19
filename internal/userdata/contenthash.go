@@ -41,12 +41,17 @@ func (d *DB) ContentHash(ctx context.Context) (uint64, error) {
 	}
 	fmt.Fprintf(h, "v%d\x00", v)
 	for _, t := range tables {
-		cols := "*"
-		if t == "backup_targets" {
+		cols, where := "*", ""
+		switch t {
+		case "backup_targets":
 			cols = "id, label, last_path, last_host, added_at, set_name"
+		case "meta":
+			// The backup attempts (attempts.go) are a backup's own
+			// bookkeeping too.
+			where = ` WHERE key NOT LIKE 'backup\_attempt:%' ESCAPE '\'`
 		}
 		// Table names come from sqlite_master; quoted as identifiers.
-		q := `SELECT ` + cols + ` FROM "` + strings.ReplaceAll(t, `"`, `""`) + `" ORDER BY rowid`
+		q := `SELECT ` + cols + ` FROM "` + strings.ReplaceAll(t, `"`, `""`) + `"` + where + ` ORDER BY rowid`
 		if err := hashRows(ctx, d, h, t, q); err != nil {
 			return 0, err
 		}

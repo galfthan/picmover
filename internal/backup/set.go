@@ -42,9 +42,26 @@ const (
 	MediaSnapshot = library.DBName
 )
 
-// WAL is off: targets are often network shares, where SQLite's shared
-// memory does not work.
-const setDSN = "?_pragma=busy_timeout(10000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(FULL)&_txlock=immediate"
+// WAL is off, on purpose: targets are often network shares (SMB, NFS),
+// where SQLite's shared memory (-shm, a mapped file) does not work and a
+// WAL database can be corrupted; removable drives (exFAT, FAT, NTFS
+// through FUSE or ntfs3) are not safe for it either, a set must stay one
+// self-contained file when the drive is unplugged or moved to another
+// machine, and a WAL database cannot be read from a write-protected
+// target. Telling a local file system apart from these is not reliable,
+// so every set keeps the rollback journal (DELETE). Its cost is that a
+// commit waits for every reader to finish: writers retry while backup.db
+// is busy (retryBusy) and readers keep their reads short (Files reads in
+// chunks; the server does not plan while a job holds the set).
+func setDSN() string {
+	return fmt.Sprintf("?_pragma=busy_timeout(%d)&_pragma=journal_mode(DELETE)&_pragma=synchronous(FULL)&_txlock=immediate",
+		setBusyTimeout.Milliseconds())
+}
+
+// setBusyTimeout is SQLite's busy_timeout on backup.db: how long one
+// statement waits for a lock before it fails with SQLITE_BUSY. Tests
+// shorten it.
+var setBusyTimeout = 10 * time.Second
 
 const setSchema = `
 CREATE TABLE files (
@@ -164,6 +181,9 @@ type Set struct {
 	now    func() time.Time
 	// readOnly: opened with OpenSetReadOnly (backup.db mode=ro).
 	readOnly bool
+	// log is the log of the run using the set (setLogger), for the
+	// warnings while backup.db is busy; nil: slog.Default.
+	log *slog.Logger
 }
 
 // SetExists reports whether the target has a set called name (a folder
@@ -228,7 +248,7 @@ func OpenSet(ctx context.Context, t *Target, name string, create bool) (*Set, er
 	if fi, err := os.Lstat(dbPath); err == nil && !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", dbPath)
 	}
-	db, err := sql.Open("sqlite", dbPath+setDSN)
+	db, err := sql.Open("sqlite", dbPath+setDSN())
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +288,7 @@ func OpenSetReadOnly(ctx context.Context, t *Target, name string) (*Set, error) 
 		p = "/" + p
 	}
 	u := url.URL{Scheme: "file", Path: p}
-	db, err := sql.Open("sqlite", u.String()+"?mode=ro&_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", u.String()+fmt.Sprintf("?mode=ro&_pragma=busy_timeout(%d)", setBusyTimeout.Milliseconds()))
 	if err != nil {
 		return nil, err
 	}
@@ -323,14 +343,21 @@ func (s *Set) Lock(cmd string) (unlock func(), held bool, err error) {
 // as finished at their start, with "interrupted": true in their stats.
 // The caller holds the set lock, so no other run is going on.
 func (s *Set) closeInterrupted(ctx context.Context, log *slog.Logger) {
-	res, err := s.db.ExecContext(ctx, `UPDATE runs SET finished_at = started_at,
-		stats = json_set(CASE WHEN json_valid(stats) THEN stats ELSE '{}' END, '$.interrupted', json('true'))
-		WHERE finished_at IS NULL`)
+	var n int64
+	err := s.retryBusy(ctx, busyBudget, "close interrupted runs", func(ctx context.Context) error {
+		res, err := s.db.ExecContext(ctx, `UPDATE runs SET finished_at = started_at,
+			stats = json_set(CASE WHEN json_valid(stats) THEN stats ELSE '{}' END, '$.interrupted', json('true'))
+			WHERE finished_at IS NULL`)
+		if err == nil {
+			n, _ = res.RowsAffected()
+		}
+		return err
+	})
 	if err != nil {
 		log.Error("close interrupted runs", "err", err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	if n > 0 {
 		log.Info("earlier runs were interrupted", "count", n)
 	}
 }
@@ -497,8 +524,11 @@ func (s *Set) Meta(ctx context.Context, key string) (string, error) {
 
 // SetMeta stores a meta value.
 func (s *Set) SetMeta(ctx context.Context, key, value string) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO meta (key, value) VALUES (?, ?)
-		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+	if err := s.retryBusy(ctx, busyBudget, "meta "+key, func(ctx context.Context) error {
+		_, err := s.db.ExecContext(ctx, `INSERT INTO meta (key, value) VALUES (?, ?)
+			ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
+		return err
+	}); err != nil {
 		return fmt.Errorf("backup: meta: %w", err)
 	}
 	return nil
@@ -574,32 +604,70 @@ func readSetLibraryID(ctx context.Context, t *Target, name string) (string, erro
 	return s.LibraryID(ctx)
 }
 
+// filesChunk is the number of rows Files reads in one query.
+var filesChunk = 2000
+
 // Files returns every row of the files table (rows whose path is not a
-// valid set path are dropped: they are never acted on).
+// valid set path are dropped: they are never acted on). The rows are
+// read filesChunk at a time, in path order, each chunk its own short
+// read: a reader of a large set on a slow drive never holds backup.db's
+// read lock long enough to make a running backup's commit wait (the
+// rollback journal, see setDSN). The chunks are not one snapshot: rows
+// a concurrent writer changes in between may be missed or seen twice,
+// which only a reader that does not hold the set lock (a plan for the
+// Backups page) can meet, and the server does not plan while a job
+// holds the set.
 func (s *Set) Files(ctx context.Context) ([]FileRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT rel_path, hash, size, mtime_ns, backed_at, coalesce(verified_at, 0) FROM files`)
+	var (
+		out   []FileRow
+		after string
+		first = true
+	)
+	for {
+		n, last, err := s.filesAfter(ctx, after, first, &out)
+		if err != nil {
+			return nil, fmt.Errorf("backup: files: %w", err)
+		}
+		if n < filesChunk {
+			return out, nil
+		}
+		after, first = last, false
+	}
+}
+
+// filesAfter appends the next filesChunk rows after the path after (from
+// the start when first) to out; n is the number read, last the path of
+// the last one.
+func (s *Set) filesAfter(ctx context.Context, after string, first bool, out *[]FileRow) (n int, last string, err error) {
+	// Two queries, so the one with a cursor is a range scan of the
+	// primary key's index (rel_path's NOCASE order, a unique key).
+	const cols = `SELECT rel_path, hash, size, mtime_ns, backed_at, coalesce(verified_at, 0) FROM files`
+	var rows *sql.Rows
+	if first {
+		rows, err = s.db.QueryContext(ctx, cols+` ORDER BY rel_path LIMIT ?`, filesChunk)
+	} else {
+		rows, err = s.db.QueryContext(ctx, cols+` WHERE rel_path > ? ORDER BY rel_path LIMIT ?`, after, filesChunk)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("backup: files: %w", err)
+		return 0, "", err
 	}
 	defer rows.Close()
-	var out []FileRow
 	for rows.Next() {
 		var (
 			r FileRow
 			h int64
 		)
 		if err := rows.Scan(&r.RelPath, &h, &r.Size, &r.MTime, &r.BackedAt, &r.VerifiedAt); err != nil {
-			return nil, fmt.Errorf("backup: files: %w", err)
+			return 0, "", err
 		}
+		n++
+		last = r.RelPath
 		r.Hash = uint64(h)
 		if validSetPath(r.RelPath) {
-			out = append(out, r)
+			*out = append(*out, r)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("backup: files: %w", err)
-	}
-	return out, nil
+	return n, last, rows.Err()
 }
 
 // SetSummary counts the set's rows.
@@ -688,24 +756,37 @@ func (s *Set) LastRun(ctx context.Context, kind string) (RunRecord, bool, error)
 
 // beginRun inserts an unfinished runs row and returns its id.
 func (s *Set) beginRun(ctx context.Context, kind, lib string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `INSERT INTO runs (kind, started_at, library) VALUES (?, ?, ?)`,
-		kind, s.now().Unix(), lib)
+	started := s.now().Unix()
+	var id int64
+	err := s.retryBusy(ctx, busyBudget, "the start of the run", func(ctx context.Context) error {
+		res, err := s.db.ExecContext(ctx, `INSERT INTO runs (kind, started_at, library) VALUES (?, ?, ?)`, kind, started, lib)
+		if err != nil {
+			return err
+		}
+		id, err = res.LastInsertId()
+		return err
+	})
 	if err != nil {
 		return 0, fmt.Errorf("backup: begin run: %w", err)
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 // finishRun records the end of a run and its stats. It uses its own
-// context so a cancelled run is still recorded.
+// context so a cancelled run is still recorded, and keeps trying for
+// finishBudget while backup.db is busy.
 func (s *Set) finishRun(id int64, stats any) error {
 	b, err := json.Marshal(stats)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err = s.db.ExecContext(ctx, `UPDATE runs SET finished_at = ?, stats = ? WHERE id = ?`, s.now().Unix(), string(b), id)
+	finished := s.now().Unix()
+	err = s.retryBusy(context.Background(), finishBudget, "the end of the run", func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second+setBusyTimeout)
+		defer cancel()
+		_, err := s.db.ExecContext(ctx, `UPDATE runs SET finished_at = ?, stats = ? WHERE id = ?`, finished, string(b), id)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("backup: finish run: %w", err)
 	}
@@ -719,11 +800,20 @@ type rowOp struct {
 	delete string   // delete this row
 }
 
-// apply writes ops in one transaction.
+// apply writes ops in one transaction, trying again (the whole
+// transaction, which a failure rolls back) while backup.db is busy, for
+// busyBudget; a cancelled ctx still gets cancelGrace (see retryBusy):
+// the rows are of files that are done.
 func (s *Set) apply(ctx context.Context, ops []rowOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
+	return s.retryBusy(ctx, busyBudget, fmt.Sprintf("%d file rows", len(ops)), func(ctx context.Context) error {
+		return s.applyOnce(ctx, ops)
+	})
+}
+
+func (s *Set) applyOnce(ctx context.Context, ops []rowOp) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("backup: write rows: %w", err)

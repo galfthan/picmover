@@ -85,7 +85,7 @@ describe('backups', () => {
     expect(facts).toContain('Last backup 2 hours ago');
     expect(facts).toContain('Last scrub last week');
     expect(facts).toContain('On the target 8 files, 7.8 KiB');
-    expect(facts).toContain('Not verified yet 2 files');
+    expect(facts).toContain('Not scrubbed yet 2 files');
     expect(facts).toContain('Damaged 1 file');
     expect(facts).toContain('Not in the library 3 files');
 
@@ -636,6 +636,100 @@ describe('backups', () => {
     expect(text(document.querySelector('table.data'))).not.toContain('imported');
   });
 
+  it('counts down while a backup runs and reads the set counts again (issue #22)', async () => {
+    await start('#/l/peter/backups');
+    expect(card('Red WD drive').querySelector('.headline')?.textContent).toBe('2 files, 2.0 KiB not backed up yet; 1 to move');
+    button(card('Red WD drive'), 'Back up now')!.click();
+    await settle();
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('progress', { phase: 'copy', files: 1, bytes: 1 * MiB, totalFiles: 4, totalBytes: 25 * MiB, current: 'image/2024/07/1.jpg', failed: 0 });
+    await micro();
+    expect(card('Red WD drive').querySelector('.headline')?.textContent).toBe('3 files, 24.0 MiB not backed up yet');
+    es.emit('progress', { phase: 'copy', files: 3, bytes: 20 * MiB, totalFiles: 4, totalBytes: 25 * MiB, current: 'image/2024/07/2.jpg', failed: 0 });
+    await micro();
+    expect(card('Red WD drive').querySelector('.headline')?.textContent).toBe('1 file, 5.0 MiB not backed up yet');
+    // The set's counts are read again while the job runs (the server does not plan meanwhile).
+    const loads = gets('l/peter/backups').length;
+    server.backup.targets[0]!.set!.files = 11;
+    await vi.advanceTimersByTimeAsync(15_000);
+    await micro();
+    expect(gets('l/peter/backups').length).toBeGreaterThan(loads);
+    expect(gets('l/peter/backups?plan=1')).toHaveLength(0);
+    expect(text(card('Red WD drive').querySelector('.facts'))).toContain('On the target 11 files');
+    server.finish(1, { result: { new: 4, copied: 4, bytes: 25 * MiB } });
+    await settle();
+    expect(card('Red WD drive').querySelector('.headline')?.textContent).toBe('2 files, 2.0 KiB not backed up yet; 1 to move');
+    // No more reloads once it has finished.
+    const after = gets('l/peter/backups').length + gets('l/peter/backups?plan=1').length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(gets('l/peter/backups').length + gets('l/peter/backups?plan=1').length).toBe(after);
+  });
+
+  it('shows a set without a finished backup as incomplete, with the real cause of the stop (issue #22)', async () => {
+    const busy = 'the backup database on the target stayed busy (another program or page kept it open for reading); the files copied so far are kept, and Back up now continues from there';
+    server.backup.targets.splice(1, 1);
+    const red = server.backup.targets[0]!;
+    red.lastBackupAt = null;
+    red.set = { name: 'peter', files: 98543, bytes: 546 * 1024 ** 3, extras: 0, damaged: 0, unverified: 98543, libraryFiles: 193158 };
+    red.lastAttempt = { at: unix('2026-10-10T07:26:00'), error: busy, setFiles: 98543, libraryFiles: 193158 };
+    // The run could not be recorded on the target: backup.db has none.
+    server.backup.runs[T1] = [];
+    await start('#/l/peter/backups');
+    const c = card('Red WD drive');
+    expect(text(c.querySelector('.incomplete'))).toBe('Incomplete: 98,543 of 193,158 files backed up. Continue with Back up now.');
+    expect(text(c.querySelector('.facts'))).toContain('Last backup never finished');
+    expect(text(c.querySelector('.facts'))).not.toContain('Never backed up');
+    const problems = c.querySelector<HTMLDetailsElement>('details.problems')!;
+    expect(problems.open).toBe(true);
+    expect(text(problems.querySelector('summary'))).toBe('Problems 1');
+    expect(text(problems.querySelector('.stopped'))).toBe(`The last backup did not finish The last backup stopped: ${busy}.`);
+    expect(document.querySelector('.dest .status')?.textContent).toBe('Incomplete: 98,543 of 193,158 files backed up to Red WD drive; the last backup to Red WD drive failed');
+  });
+
+  it('lists a backup that just failed under problems, never "No problems" (issue #22)', async () => {
+    server.backup.runs[T1] = [];
+    await start('#/l/peter/backups');
+    expect(text(card('Red WD drive').querySelector('details.problems summary'))).toBe('No problems in the last runs');
+    button(card('Red WD drive'), 'Back up now')!.click();
+    await settle();
+    const msg = 'the backup database on the target stayed busy (another program or page kept it open for reading)';
+    server.finish(1, { exitCode: 2, error: msg });
+    await settle();
+    const c = card('Red WD drive');
+    expect(text(c.querySelector('.outcome'))).toBe(`Backup failed: ${msg}`);
+    expect(text(c.querySelector('details.problems summary'))).toBe('Problems 1');
+    expect(text(c.querySelector('details.problems .stopped p'))).toBe(`The last backup stopped: ${msg}.`);
+    expect(text(c)).not.toContain('No problems');
+  });
+
+  it('reports a backup killed after the last recorded attempt (issue #22 review)', async () => {
+    const red = server.backup.targets[0]!;
+    red.lastAttempt = { at: unix('2026-10-10T10:00:00'), setFiles: 8, libraryFiles: 8 };
+    // The next backup was killed: no attempt, and a runs row without an end.
+    server.backup.runs[T1] = [{ id: 4, kind: 'backup', startedAt: unix('2026-10-10T11:00:00'), finishedAt: null, stats: runResult('backup', {}) }];
+    await start('#/l/peter/backups');
+    const c = card('Red WD drive');
+    expect(text(c.querySelector('details.problems summary'))).toBe('Problems 1');
+    expect(text(c.querySelector('details.problems .stopped p'))).toContain('The last backup was interrupted');
+    expect(text(c)).not.toContain('No problems');
+  });
+
+  it('explains the controls and the facts in tooltips', async () => {
+    await start('#/l/peter/backups');
+    const c = card('Red WD drive');
+    const tip = (label: string) => button(c, label)?.title ?? '';
+    expect(tip('Forget')).toBe("Remove this target from the library's list. Nothing on the drive is deleted; add the same folder again to continue.");
+    expect(tip('Scrub')).toContain('Re-read the backup and compare each file with its checksum, to find damaged or missing copies.');
+    for (const b of ['Back up now', 'Prune…', 'Restore missing…', 'Edit']) expect(tip(b)).not.toBe('');
+    expect(c.querySelector<HTMLSelectElement>('select[aria-label="Scrub budget"]')?.title).toContain('continues where it stopped');
+    const dt = (name: string) => [...c.querySelectorAll<HTMLElement>('.facts dt')].find((d) => d.textContent === name);
+    expect(dt('Not scrubbed yet')?.title).toContain('checked by reading it back when it was written');
+    expect(dt('On the target')?.title).toContain("backup.db");
+    const head = document.querySelector('.head')!;
+    expect(button(head, 'Check now')?.title).toContain('Compare the library with each target again');
+    expect(button(head, 'Add target')?.title).toContain('Add a folder');
+  });
+
   it("links the Import page's notice about a running backup to Backups (L10)", async () => {
     server.backup.jobs.push(backupJobJSON({ id: 3, kind: 'scrub', target: T1 }));
     await start('#/l/peter/import');
@@ -682,6 +776,19 @@ describe('Libraries page backup lines', () => {
     expect(libcard('scans').querySelector('.backup')).toBeNull();
     // The listing is enough: no library-scoped backup requests from this page.
     expect(server.calls.some((c) => c.path.includes('/backups'))).toBe(false);
+  });
+
+  it('shows an incomplete backup in the listing, not "Never backed up" (issue #22)', async () => {
+    server.libs.find((l) => l.id === 'peter')!.backup = {
+      lastBackupAt: null,
+      targets: 1,
+      incomplete: { label: 'Red WD drive', files: 98543, libraryFiles: 193158 },
+      failure: { label: 'Red WD drive', at: unix('2026-10-10T07:26:00'), error: 'the backup database on the target stayed busy' },
+    };
+    await start('#/');
+    const peter = [...document.querySelectorAll<HTMLElement>('.libcard')].find((c) => c.querySelector('.name')?.textContent === 'peter')!.querySelector('.backup');
+    expect(text(peter)).toBe('⚠ Incomplete: 98,543 of 193,158 files backed up to Red WD drive; the last backup to Red WD drive failed');
+    expect(peter?.classList.contains('tone-warn')).toBe(true);
   });
 
   it('warns about a stale backup in the listing', async () => {

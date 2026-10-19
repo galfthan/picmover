@@ -215,7 +215,8 @@ func Scrub(ctx context.Context, set *Set, opts ScrubOptions) (ScrubStats, error)
 		lastFlush = time.Now()
 	)
 	flush := func() error {
-		if err := set.applyVerified(context.WithoutCancel(ctx), pending, cur); err != nil {
+		// A cancelled scrub still writes what it verified (retryBusy's grace).
+		if err := set.applyVerified(ctx, pending, cur); err != nil {
 			return err
 		}
 		pending, lastFlush = pending[:0], time.Now()
@@ -337,13 +338,20 @@ type verifyOp struct {
 	at  int64
 }
 
-// applyVerified writes scrub results and the cursor in one transaction.
+// applyVerified writes scrub results and the cursor in one transaction,
+// trying again while backup.db is busy (see apply).
 func (s *Set) applyVerified(ctx context.Context, ops []verifyOp, c scrubCursor) error {
 	cursor := ""
 	if c.Pass != 0 {
 		b, _ := json.Marshal(c)
 		cursor = string(b)
 	}
+	return s.retryBusy(ctx, busyBudget, fmt.Sprintf("%d scrub results", len(ops)), func(ctx context.Context) error {
+		return s.applyVerifiedOnce(ctx, ops, cursor)
+	})
+}
+
+func (s *Set) applyVerifiedOnce(ctx context.Context, ops []verifyOp, cursor string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("backup: verified: %w", err)
