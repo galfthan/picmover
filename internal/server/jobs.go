@@ -1217,3 +1217,13 @@ func (m *jobManager) runRebuild(j *job) (state string, code int, stats importer.
 	m.log.Info("job finished", "id", j.id, "kind", kindRebuild, "state", state, "exit_code", code)
 	return state, code, stats, sessionID, msg
 }
+
+// holdsSet reports whether this server's running job is a backup-kind job
+// of library libID for the target target: it holds that backup set even
+// where the file system cannot lock (SetHeld cannot see it then).
+func (m *jobManager) holdsSet(libID, target string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j := m.running
+	return j != nil && isBackupKind(j.params.Kind) && j.entry != nil && j.entry.id == libID && j.params.Target == target
+}

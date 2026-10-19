@@ -346,6 +346,20 @@ func (s *Server) computePlan(ctx context.Context, bc *backupContext, keep time.D
 	return out, nil
 }
 
+// setBusy names what holds the target's backup set ("" when nothing
+// does): a backup, scrub, prune or restore of this or another process
+// (its holder in the set's lock file), or this server's job on it (also
+// where the file system cannot lock).
+func (s *Server) setBusy(h *libHandles, bc *backupContext) string {
+	if le, held := backup.SetHeld(bc.t, bc.setName); held {
+		return le.Error()
+	}
+	if s.jobs != nil && s.jobs.holdsSet(h.entry.id, bc.bt.ID) {
+		return "a job of this library is using the backup set"
+	}
+	return ""
+}
+
 // cachedPlanOf returns the cached plan of a target when it is younger
 // than maxAge.
 func (e *libEntry) cachedPlanOf(id string, maxAge time.Duration) (planJSON, bool) {
@@ -415,8 +429,7 @@ func (s *Server) describeTarget(ctx context.Context, h *libHandles, bt userdata.
 		}
 		set.Close()
 	}
-	if le, held := backup.SetHeld(bc.t, bc.setName); held {
-		out.Busy = le.Error()
+	if out.Busy = s.setBusy(h, bc); out.Busy != "" {
 		maxAge = time.Duration(1<<63 - 1)
 	}
 	plan, ok := h.entry.cachedPlanOf(bt.ID, maxAge)
@@ -902,8 +915,8 @@ func (s *Server) handleTargetPlan(w http.ResponseWriter, r *http.Request, l *lib
 	}
 	// Not while a job holds the set: the plan reads every row of
 	// backup.db, which would hold up the job's writes.
-	if le, held := backup.SetHeld(bc.t, bc.setName); held {
-		writeError(w, http.StatusConflict, le.Error()+"; try again when it has finished")
+	if busy := s.setBusy(l, bc); busy != "" {
+		writeError(w, http.StatusConflict, busy+"; try again when it has finished")
 		return
 	}
 	plan, err := s.computePlan(r.Context(), bc, keep)
