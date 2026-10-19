@@ -1164,14 +1164,21 @@ keeps the rollback journal and the fix is on both sides of the lock:
   (`busyBudget`; the end-of-run row 2 minutes more), logging a warning
   once a minute. A failed attempt rolls its transaction back (the driver
   rolls back a failed COMMIT), so a retry starts clean. A cancelled run
-  still gets 30 s to write the rows of the files it finished. When the
-  budget is spent the run stops with `RunError` "the backup database on
-  the target stayed busy (...); the files copied so far are kept, and
-  Back up now continues from there".
+  still gets 30 s (also a write already waiting when the cancel comes) to
+  write the rows of the files it finished. When the budget is spent the
+  write fails with a `setBusyError`, and the run stops with `RunError`
+  "the backup database on the target stayed busy (...); the files copied
+  so far are kept, and Back up now continues from there". That wording is
+  only for those writes; another busy database (user.db, media.db) is "a
+  database stayed busy".
 - **Readers are short**: `Set.Files` reads 2,000 rows per query (keyset on
   the primary key), each its own read lock. While a backup, scrub, prune or
-  restore holds the set (`SetHeld`: the holder in the set's lock file,
-  alive on this host; seen without taking the lock or writing),
+  restore holds the set (`SetHeld`: `library.ProbeLock` tries the set's OS
+  lock through a read-only handle and lets go at once, so a record a
+  crashed, killed or unplugged holder left behind, from any host, does
+  not count; only where the file system cannot lock that way does it go
+  by the record, with a liveness check on this host; or this server's own
+  job on the target),
   `GET …/backups` reads only the set's counts and last scrub (one-row
   queries) and serves the cached plan of any age, or `behind: null`, with
   `busy` naming the holder; `GET …/plan` is 409. Scrub, prune and restore
@@ -1198,7 +1205,8 @@ listing derives `backup.incomplete` (`{label, files, libraryFiles}`: a
 target without a finished backup that holds files) and `backup.failure`
 (`{label, at, error?, cancelled?}`: the newest stopped backup with no
 finished one after it). The job (in memory) and the library's log keep it
-too when `user.db` cannot be written.
+too when `user.db` cannot be written. A run refused because another one
+holds the set is not recorded (it did nothing).
 
 **Job errors.** A backup-kind job that stops on an error keeps exit 2 (the
 documented "not done" status for scheduled runs), but its message is
@@ -1218,8 +1226,10 @@ database on opening is "the backup database on the target is busy".
   never finished"; the library line says "Incomplete: 98,543 of 193,158
   files backed up to Red WD drive", also on the Libraries page.
 - A stopped backup is a problem ("The last backup did not finish", with its
-  cause) from the newest source: this server's job, else `lastAttempt`,
-  else the newest backup run's `error`/`interrupted`/`cancelled`; it is
+  cause) from the newest source: this server's job, else the newer of
+  `lastAttempt` (by its end) and the newest backup run (by its start; its
+  `error`/`interrupted`/`cancelled`, or no `finishedAt` while nothing holds
+  the set: a killed run before `closeInterrupted`); it is
   counted, so "No problems" never follows a failure. A library line names
   it ("; the last backup to Red WD drive failed").
 - "Not verified yet" is now "Not scrubbed yet", with a tooltip saying each

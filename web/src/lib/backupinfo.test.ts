@@ -353,6 +353,18 @@ describe('running, incomplete and stopped backups', () => {
     expect(stoppedText(partial(), [run({ error: 'the target is full' })], null)).toBe('The last backup stopped: the target is full.');
     expect(stoppedText(partial(), [run({ interrupted: true })], null)).toContain('interrupted');
     expect(stoppedText(partial(), [run({ copied: 3 })], null)).toBeNull();
+    // A backup killed after the last attempt (no attempt of its own) is newer: its run wins.
+    const ok = { at: sec('2026-10-09T10:00:00Z'), error: '', cancelled: false, setFiles: 10, libraryFiles: 10 };
+    const killed: BackupRun = { id: 5, kind: 'backup', startedAt: sec('2026-10-10T09:00:00Z'), finishedAt: sec('2026-10-10T09:00:00Z'), stats: { interrupted: true } };
+    expect(stoppedText(target({ lastAttempt: ok }), [killed], null)).toContain('interrupted');
+    // Before closeInterrupted: an unfinished run, nothing holding the set.
+    const open: BackupRun = { ...killed, finishedAt: null, stats: {} };
+    expect(stoppedText(target({ lastAttempt: ok }), [open], null)).toContain('interrupted');
+    // ...unless a job holds the set (it may be running now).
+    expect(stoppedText(target({ lastAttempt: ok, busy: 'the backup set is in use by pid 9' }), [open], null)).toBeNull();
+    // The run of the attempt itself (started before it ended) does not override it.
+    const same: BackupRun = { ...killed, startedAt: sec('2026-10-09T09:00:00Z'), stats: {} };
+    expect(stoppedText(target({ lastAttempt: ok }), [same], null)).toBeNull();
     // A stopped backup counts as a problem: never "No problems" after a failure.
     const p = runProblems([]);
     expect(problemCount(p, 'x')).toBe(1);

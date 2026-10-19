@@ -702,6 +702,18 @@ describe('backups', () => {
     expect(text(c)).not.toContain('No problems');
   });
 
+  it('reports a backup killed after the last recorded attempt (issue #22 review)', async () => {
+    const red = server.backup.targets[0]!;
+    red.lastAttempt = { at: unix('2026-10-10T10:00:00'), setFiles: 8, libraryFiles: 8 };
+    // The next backup was killed: no attempt, and a runs row without an end.
+    server.backup.runs[T1] = [{ id: 4, kind: 'backup', startedAt: unix('2026-10-10T11:00:00'), finishedAt: null, stats: runResult('backup', {}) }];
+    await start('#/l/peter/backups');
+    const c = card('Red WD drive');
+    expect(text(c.querySelector('details.problems summary'))).toBe('Problems 1');
+    expect(text(c.querySelector('details.problems .stopped p'))).toContain('The last backup was interrupted');
+    expect(text(c)).not.toContain('No problems');
+  });
+
   it('explains the controls and the facts in tooltips', async () => {
     await start('#/l/peter/backups');
     const c = card('Red WD drive');

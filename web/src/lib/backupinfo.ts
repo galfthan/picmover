@@ -327,10 +327,12 @@ const CONTINUE = 'the files copied so far are kept; Back up now continues from t
 /**
  * Why the newest backup of a target stopped before it was done, or null
  * when it finished (or none is known). The newest source wins: the job
- * this server ran (`lastJob`, in memory), else the attempt user.db
- * recorded, else the newest backup run in backup.db (its `error`,
- * `interrupted` or `cancelled`). A run whose end the target could not
- * record is still known from the first two.
+ * this server ran (`lastJob`, in memory); else the newer of the attempt
+ * user.db recorded (at its end) and the newest backup run in backup.db
+ * (by its start: a run killed after the last attempt is newer), the run
+ * by its `error`, `interrupted` or `cancelled`, or as interrupted when it
+ * has no end and nothing holds the set (a killed process). A run whose
+ * end the target could not record is still known from the first two.
  */
 export function stoppedText(t: BackupTarget, runs: readonly BackupRun[], lastJob: Job | null): string | null {
   if (lastJob && lastJob.kind === 'backup') {
@@ -339,15 +341,16 @@ export function stoppedText(t: BackupTarget, runs: readonly BackupRun[], lastJob
     return null;
   }
   const a = t.lastAttempt;
-  if (a) {
+  const run = runs.find((r) => r.kind === 'backup') ?? null;
+  const runAt = run ? parseWhen(run.startedAt) : null;
+  if (a && (!run || !runAt || a.at * 1000 >= runAt.getTime())) {
     if (!attemptStopped(t)) return null;
     return a.error ? `The last backup stopped: ${a.error}.` : `The last backup was cancelled before it finished; ${CONTINUE}.`;
   }
-  const run = runs.find((r) => r.kind === 'backup');
   if (!run) return null;
   const st = run.stats ?? {};
   if (typeof st.error === 'string' && st.error) return `The last backup stopped: ${st.error}.`;
-  if (st.interrupted === true) return `The last backup was interrupted (the program was stopped); ${CONTINUE}.`;
+  if (st.interrupted === true || (run.finishedAt === null && !t.busy)) return `The last backup was interrupted (the program was stopped); ${CONTINUE}.`;
   if (st.cancelled === true) return `The last backup was cancelled before it finished; ${CONTINUE}.`;
   return null;
 }
