@@ -235,7 +235,7 @@ and `<set>/.picmover/logs/`.
 
 | Method | Path | Body → Result |
 |---|---|---|
-| GET | `/api/l/{lib}/backups` | `{targets: [{id, label, path, reachable, lastBackupAt, lastScrubAt, set: {files, bytes, behind: {new, changed, moved, bytes}, extras, damaged, unverified}}]}` (the set summary is read from `backup.db` and a cached plan; `behind` is computed at most every 60 s or on demand with `?plan=1`) |
+| GET | `/api/l/{lib}/backups` | `{targets: [{id, label, path, reachable, lastBackupAt, lastScrubAt, set: {files, bytes, behind: {new, changed, moved, bytes}, extras, damaged, unverified, libraryFiles}, busy?, lastAttempt}]}` (the set summary is read from `backup.db` and a cached plan; `behind` is computed at most every 60 s or on demand with `?plan=1`, never while a job holds the set, see "Busy backup.db and backup status (issue #22)") |
 | POST | `/api/l/{lib}/backups/targets` | `{path, label}` → 201 target; creates the marker when the folder is empty; 409 when the folder holds another library's set under the same name |
 | POST | `/api/l/{lib}/backups/targets/{id}` | `{label?, path?}` → target (re-point: the marker id must match) |
 | POST | `/api/l/{lib}/backups/targets/{id}/forget` | → `{}` |
@@ -1134,3 +1134,106 @@ without `behind`), `lib/backupinfo.test.ts` (real result shapes, counts,
 truncation, missing repair rules, server rate/ETA, move headlines,
 `summaryFromLib`, error headline), `lib/api.test.ts` (`error`, `foreign`,
 `set.name`, `plan.restore`, `takeOver` body).
+
+## Busy backup.db and backup status (issue #22)
+
+A backup of a 193k-file library to an NTFS3 USB drive failed after 8 hours
+with `write rows: database is locked (SQLITE_BUSY)`: the Backups page's
+GET routes planned over the set, reading every row of `backup.db` in one
+query, and over USB that read held SQLite's SHARED lock longer than the
+10 s `busy_timeout` the run's commit waits for. The end of the run could
+not be recorded either, and the page then said "Never backed up" next to
+98,543 files on the target, and "the backup target could not be used"
+above "No problems in the last runs".
+
+**Journal mode: DELETE stays.** WAL would let a writer commit while readers
+read, but targets are often SMB/NFS shares, where WAL's shared memory
+(`-shm`, a mapped file) is unsupported and can corrupt the database;
+removable drives (exFAT, FAT, NTFS through FUSE or ntfs3) are not safe for
+it either; a set must stay one self-contained file when a drive is
+unplugged or moved to another machine; and a WAL database cannot be read
+from a write-protected target (restore supports those). A "local file
+system" test is not reliable across Linux, macOS and Windows, so every set
+keeps the rollback journal and the fix is on both sides of the lock:
+
+- **Writers retry** (`busy.go` `retryBusy`): every write of the set (the
+  row batches, `runs` start and end, `meta` and the snapshot hashes,
+  `Claim`, `closeInterrupted`, scrub results) is tried again while
+  SQLite answers SQLITE_BUSY/LOCKED, with backoff (100 ms doubling to
+  5 s, each attempt also waiting `busy_timeout`), for 10 minutes
+  (`busyBudget`; the end-of-run row 2 minutes more), logging a warning
+  once a minute. A failed attempt rolls its transaction back (the driver
+  rolls back a failed COMMIT), so a retry starts clean. A cancelled run
+  still gets 30 s to write the rows of the files it finished. When the
+  budget is spent the run stops with `RunError` "the backup database on
+  the target stayed busy (...); the files copied so far are kept, and
+  Back up now continues from there".
+- **Readers are short**: `Set.Files` reads 2,000 rows per query (keyset on
+  the primary key), each its own read lock. While a backup, scrub, prune or
+  restore holds the set (`SetHeld`: the holder in the set's lock file,
+  alive on this host; seen without taking the lock or writing),
+  `GET …/backups` reads only the set's counts and last scrub (one-row
+  queries) and serves the cached plan of any age, or `behind: null`, with
+  `busy` naming the holder; `GET …/plan` is 409. Scrub, prune and restore
+  read under the set lock, so only other programs' readers can meet their
+  writes, and the retries cover those.
+
+**Rows lost to a failed commit.** The files of a batch whose rows were not
+written stay on the target as verified copies without a row. The next run
+finds them at their paths, hashes them, and records them when they match
+the library ("adopted", as for an interrupted run); a file that does not
+match is reported as a conflict and left alone. Nothing on the target is
+removed, and no row gets a `verified_at` it did not earn: copies are
+recorded with `verified_at` NULL ("not scrubbed yet"; their read-back at
+copy time is not a scrub), adopted ones too.
+
+**Where a stopped run is known.** The run's stats get `error` (the
+`RunError` text) when it stops on an error. Because `backup.db` may be the
+thing that failed, the server and the CLI also record every backup's
+outcome in the library's `user.db` (`meta` key `backup_attempt:<target
+id>`: time, error or cancelled, files and bytes on the target after the
+run, files of the library by the plan; left out of `ContentHash`, removed
+with Forget). `GET …/backups` sends it as `lastAttempt`; the libraries
+listing derives `backup.incomplete` (`{label, files, libraryFiles}`: a
+target without a finished backup that holds files) and `backup.failure`
+(`{label, at, error?, cancelled?}`: the newest stopped backup with no
+finished one after it). The job (in memory) and the library's log keep it
+too when `user.db` cannot be written.
+
+**Job errors.** A backup-kind job that stops on an error keeps exit 2 (the
+documented "not done" status for scheduled runs), but its message is
+`KnownRunError` when the cause is known (busy database, target unplugged,
+full or read-only disk, I/O error, quota, permission), else the target
+conditions `backupError` names; the catch-all is "the backup target could
+not be used (see the server log)" only for errors opening a target. A busy
+database on opening is "the backup database on the target is busy".
+
+**Frontend.**
+- While a backup of a target copies, its headline counts down from the
+  job's copy progress (`liveLeft`: total minus done files and bytes), and
+  the page reads the targets again every 15 s (no plan) so "On the target"
+  follows `backup.db`; at the end everything is reloaded with a plan.
+- A target with files but no finished backup says "Incomplete: 98,543 of
+  193,158 files backed up. Continue with Back up now." and "Last backup:
+  never finished"; the library line says "Incomplete: 98,543 of 193,158
+  files backed up to Red WD drive", also on the Libraries page.
+- A stopped backup is a problem ("The last backup did not finish", with its
+  cause) from the newest source: this server's job, else `lastAttempt`,
+  else the newest backup run's `error`/`interrupted`/`cancelled`; it is
+  counted, so "No problems" never follows a failure. A library line names
+  it ("; the last backup to Red WD drive failed").
+- "Not verified yet" is now "Not scrubbed yet", with a tooltip saying each
+  copy was read back when written. The Backups page's controls (Back up
+  now, the scrub budget, Scrub, Prune…, Restore missing…, Forget, Edit,
+  Take over…, Check now, Add target) and the facts rows have `title`
+  tooltips.
+
+Tests: `internal/backup/busy_test.go` (a read transaction held on
+`backup.db` during a backup: the run waits, warns and completes; a reader
+that outlasts the budget: busy error, copy kept, adopted by the next run;
+chunked `Files`; `RunError`; `SetHeld`), `internal/userdata/attempts_test.go`,
+`internal/server/backup_busy_test.go` (busy job message, attempt in the
+listings, no plan while held, incomplete in the libraries listing),
+`web/src/lib/backupinfo.test.ts` and `web/src/Backups.test.ts` (countdown
+and reloads, incomplete, stopped run under problems, tooltips, Libraries
+line).
