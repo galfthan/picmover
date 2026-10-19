@@ -10,6 +10,7 @@
   import { formatCount } from '../lib/format';
   import { libPath } from '../lib/routes';
   import { joinPath } from '../lib/paths';
+  import { EMPTY_TRASH_TITLE } from '../lib/tooltips';
   import Grid from './Grid.svelte';
   import Dialog from '../components/Dialog.svelte';
 
@@ -65,7 +66,7 @@
         the trash is emptied.
       </span>
       <span class="spacer"></span>
-      <button class="danger" disabled={count === 0} onclick={ask}>Empty trash</button>
+      <button class="danger" disabled={count === 0} onclick={ask} title={EMPTY_TRASH_TITLE}>Empty trash</button>
     </div>
   {/snippet}
 </Grid>

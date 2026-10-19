@@ -12,6 +12,7 @@
   import JobProgress from '../components/JobProgress.svelte';
   import ResultsList from '../components/ResultsList.svelte';
   import CopyButton from '../components/CopyButton.svelte';
+  import { IMPORT_COPY_TITLE, IMPORT_MOVE_TITLE } from '../lib/tooltips';
 
   const LAST_SOURCE_KEY = 'picmover.import.lastSource';
   const DISMISSED_KEY = 'picmover.import.dismissed';
@@ -100,6 +101,21 @@
   const summary = $derived(cur ? outcome(cur) : null);
   /** "Show imported": the job's import record when it has one, else its catalog session. */
   const shownHref = $derived(cur ? importedHref(lib, cur) : null);
+  /**
+   * What each summary row counts. In a move, the source of an imported file (also one restored from the trash) and of an
+   * identical file already at its destination is deleted; duplicates, skipped files and non-media are left as they are.
+   */
+  const rowTitles: Record<string, string> = {
+    Scanned: 'Files found under the source folder, including inside zip archives.',
+    Imported: 'Files added to the library by this import, including files restored from the trash because their content was there.',
+    'Already in place': 'Files already at their place in the library, or an identical file was already there; nothing was copied. In a move, a source outside the library is deleted, as for an imported file.',
+    Duplicates:
+      'Files whose content is already in the library, or came twice in this import. Not imported; the source file is left as it is. (Content found in the trash is restored instead and counted as Imported; in a move its source is then deleted.)',
+    'Skipped (small)': 'Images smaller than the minimum dimension. Not imported; the source file is left as it is.',
+    'Non-media': 'Files that are not photos or videos. Ignored; the source file is left as it is.',
+    Errors: 'Files that could not be imported; the list and the log say why. The source file is normally left as it is; the list says otherwise.',
+    Copied: 'Bytes written into the library.',
+  };
   const summaryRows = $derived.by(() => {
     if (!cur) return [];
     const s = cur.stats;
@@ -196,7 +212,7 @@
             <caption class="muted">Import summary{elapsed !== null ? ` · ${formatElapsed(elapsed)}` : ''}</caption>
             <tbody>
               {#each summaryRows as [k, v] (k)}
-                <tr class:bad={k === 'Errors' && cur.stats.errors > 0} class:part={k.startsWith('·')}><th>{k}</th><td class="num">{v}</td></tr>
+                <tr class:bad={k === 'Errors' && cur.stats.errors > 0} class:part={k.startsWith('·')}><th title={rowTitles[k]}>{k}</th><td class="num">{v}</td></tr>
               {/each}
             </tbody>
           </table>
@@ -273,15 +289,15 @@
 
           <fieldset class="field">
             <legend class="label">Copy or move</legend>
-            <label class="opt">
+            <label class="opt" title={IMPORT_COPY_TITLE}>
               <input type="radio" name="mode" value="copy" checked={!move} onchange={() => (move = false)} />
               <span><strong>Copy</strong> — the source is left untouched.</span>
             </label>
-            <label class="opt">
+            <label class="opt" title={IMPORT_MOVE_TITLE}>
               <input type="radio" name="mode" value="move" checked={move} onchange={() => (move = true)} />
               <span>
-                <strong>Move</strong> — source files are deleted after each batch has been copied, verified and committed to
-                the catalog.
+                <strong>Move</strong> — source files are deleted after each batch has been copied and committed to the catalog,
+                and each source has been read again and its hash matched. The copy is not read back from disk.
               </span>
             </label>
           </fieldset>
@@ -309,7 +325,14 @@
 
           <div class="row actions">
             <button type="button" onclick={() => (step = 'source')}>Back</button>
-            <button type="submit" class="primary" disabled={starting || !!jobs.active}>
+            <button
+              type="submit"
+              class="primary"
+              disabled={starting || !!jobs.active}
+              title={move
+                ? 'Start the import. Each source file is deleted once it is in the library; this cannot be undone.'
+                : 'Start the import. The source is not changed.'}
+            >
               {starting ? 'Starting…' : 'Start import'}
             </button>
           </div>

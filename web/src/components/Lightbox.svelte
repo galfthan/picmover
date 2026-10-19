@@ -19,6 +19,7 @@
   import ConfirmButton from './ConfirmButton.svelte';
   import VideoPlayer from './VideoPlayer.svelte';
   import { videoLabel } from '../lib/playback';
+  import { DELETE_TITLE, MOVE_TITLE, RESTORE_TITLE, TRASH_TITLE, USERDATA_TITLE } from '../lib/tooltips';
 
   interface Props {
     id: number;
@@ -425,17 +426,17 @@
         <button class="ghost" class:on={full} onclick={toggleFull} title="Original size (F, or double-click)">1:1</button>
       {/if}
       {#if d && !trashed}
-        <button class="ghost" onclick={trash} disabled={working || locked} title="Move to the trash (Delete)">Trash</button>
+        <button class="ghost" onclick={trash} disabled={working || locked} title="{TRASH_TITLE} Key: Delete.">Trash</button>
       {:else if d}
-        <button class="ghost" onclick={restore} disabled={working || locked} title="Restore (R)">Restore</button>
+        <button class="ghost" onclick={restore} disabled={working || locked} title="{RESTORE_TITLE} Key: R.">Restore</button>
       {/if}
       {#if d}
-        <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original">Download</a>
+        <a class="btn ghost" href={api.fileUrl(d.id, true)} download title="Download the original file. The copy in the library is not changed.">Download</a>
       {/if}
       {#if d?.canOpen}
-        <button class="ghost" onclick={openOriginal} title="Open the original in its default program on this computer">Open</button>
+        <button class="ghost" onclick={openOriginal} title="Open the original in its default program on this computer. Edits or deletions made there change the library’s original; picmover keeps no other copy.">Open</button>
       {/if}
-      <button class="ghost" class:on={showInfo} onclick={toggleInfo} title="Info (I)" aria-pressed={showInfo}>Info</button>
+      <button class="ghost" class:on={showInfo} onclick={toggleInfo} title="Show or hide the details (I)" aria-pressed={showInfo}>Info</button>
     </div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -501,7 +502,7 @@
               Deleted {formatAgo(parseLocalWallClock(d.deletedAt))}{#if d.deletedAt}&nbsp;({formatWallDate(d.deletedAt)}){/if}
             </span>
             <div class="row">
-              <button class="primary small" disabled={working || locked} onclick={restore}>Restore</button>
+              <button class="primary small" disabled={working || locked} onclick={restore} title={RESTORE_TITLE}>Restore</button>
               <ConfirmButton
                 label="Delete permanently"
                 question="Delete this file permanently?"
@@ -509,6 +510,7 @@
                 cancelLabel="Cancel"
                 danger
                 disabled={working || locked}
+                title={DELETE_TITLE}
                 onconfirm={deleteForever}
               />
             </div>
@@ -517,15 +519,15 @@
         {#if editError}<div class="error-box small" role="alert">{editError}</div>{:else if locked}<p class="muted small">{MOVING_TEXT}</p>{/if}
         <dl>
           {#if !trashed}
-            <dt>Rating</dt>
+            <dt title={USERDATA_TITLE}>Rating</dt>
             <dd><RatingStars value={rating} onchange={rate} disabled={working || locked} /></dd>
 
-            <dt>Tags</dt>
+            <dt title={USERDATA_TITLE}>Tags</dt>
             <dd class="chips">
               {#each itemTags as t (t.id)}
                 <span class="chip">
                   <a href={libHref(api.id, '', { tag: t.id })}>{t.name}</a>
-                  <button class="ghost small" aria-label="Remove tag {t.name}" disabled={working || locked} onclick={() => removeTag(t.id)}>×</button>
+                  <button class="ghost small" aria-label="Remove tag {t.name}" title="Remove the tag {t.name}" disabled={working || locked} onclick={() => removeTag(t.id)}>×</button>
                 </span>
               {/each}
               <TagInput
@@ -539,12 +541,12 @@
               />
             </dd>
 
-            <dt>Albums</dt>
+            <dt title={USERDATA_TITLE}>Albums</dt>
             <dd class="chips">
               {#each itemAlbums as a (a.id)}
                 <span class="chip">
                   <a href={libHref(api.id, `albums/${a.id}`)}>{a.name}</a>
-                  <button class="ghost small" aria-label="Remove from album {a.name}" disabled={working || locked} onclick={() => removeAlbum(a.id)}>×</button>
+                  <button class="ghost small" aria-label="Remove from album {a.name}" title="Remove from the album {a.name}. The photo stays in the library." disabled={working || locked} onclick={() => removeAlbum(a.id)}>×</button>
                 </span>
               {/each}
               <AlbumPicker
@@ -562,7 +564,7 @@
               <dt>Library</dt>
               <dd class="chips">
                 <span>{libraries.find(api.id)?.name ?? api.id}</span>
-                <button class="small" disabled={working || moves.running} onclick={move} title="Move to another library (M)">Move to…</button>
+                <button class="small" disabled={working || moves.running} onclick={move} title="{MOVE_TITLE} Key: M.">Move to…</button>
               </dd>
             {/if}
           {/if}

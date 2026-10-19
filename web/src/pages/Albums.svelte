@@ -132,6 +132,7 @@
               <button
                 class="ghost small"
                 aria-label="Album actions for {a.name}"
+                title="Rename or delete this album"
                 aria-haspopup="menu"
                 aria-expanded={menuFor === a.id}
                 onclick={() => (menuFor = menuFor === a.id ? null : a.id)}>⋯</button
@@ -139,7 +140,12 @@
               {#if menuFor === a.id}
                 <span class="menu" role="menu">
                   <button role="menuitem" class="ghost small" onclick={() => show({ kind: 'rename', album: a })}>Rename</button>
-                  <button role="menuitem" class="ghost small danger-text" onclick={() => show({ kind: 'delete', album: a })}>Delete</button>
+                  <button
+                    role="menuitem"
+                    class="ghost small danger-text"
+                    onclick={() => show({ kind: 'delete', album: a })}
+                    title="Delete the album. Its photos and videos stay in the library.">Delete</button
+                  >
                 </span>
               {/if}
             </span>

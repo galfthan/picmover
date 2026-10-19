@@ -489,7 +489,8 @@
           onclick={() => {
             if (videoEl) videoEl.muted = !videoEl.muted;
           }}
-          aria-label={muted ? 'Unmute' : 'Mute'}>{muted ? '🔇' : '🔊'}</button
+          aria-label={muted ? 'Unmute' : 'Mute'}
+          title={muted ? 'Unmute' : 'Mute'}>{muted ? '🔇' : '🔊'}</button
         >
         <button class="ghost small" onclick={fullscreen} aria-label="Full screen" title="Full screen">⛶</button>
       </div>

@@ -150,13 +150,13 @@
             >https://developer.microsoft.com/microsoft-edge/webview2/</a
           > for a native window.
         </span>
-        <button class="ghost small" aria-label="Dismiss" onclick={() => app.dismissWebView2Notice()}>×</button>
+        <button class="ghost small" aria-label="Dismiss" title="Dismiss" onclick={() => app.dismissWebView2Notice()}>×</button>
       </div>
     {/if}
     {#if app.showWindowFailedNotice}
       <div class="notice appnotice windowfailed" role="status">
         <span>The native window could not be created, so the app opened in your browser. Details are in the app log.</span>
-        <button class="ghost small" aria-label="Dismiss" onclick={() => app.dismissWindowFailedNotice()}>×</button>
+        <button class="ghost small" aria-label="Dismiss" title="Dismiss" onclick={() => app.dismissWindowFailedNotice()}>×</button>
       </div>
     {/if}
     <div class="head">
@@ -238,7 +238,13 @@
                 <button class="small" onclick={() => retry(l.id)} disabled={libraries.opening.has(l.id)}>Retry</button>
               {:else if l.state === 'error'}
                 <span class="small muted err">{l.error || 'The catalog cannot be read.'}</span>
-                <button class="small" onclick={() => record(l.id)} disabled={starting !== null || !!jobs.active}>Rebuild</button>
+                <button
+                  class="small"
+                  onclick={() => record(l.id)}
+                  disabled={starting !== null || !!jobs.active}
+                  title="Record the library's files in a new catalog; the old one is kept as a backup. Ratings, tags, albums and the trash are kept. No photo is moved or copied."
+                  >Rebuild</button
+                >
               {:else if l.state === 'rebuilding' && job}
                 <span class="small muted">Recording {formatCount(job.stats.scanned)} files…</span>
               {/if}
@@ -262,7 +268,13 @@
               {#if job}
                 <div class="progress"><JobProgress {job} /></div>
               {:else}
-                <button class="small" onclick={() => record(f.name)} disabled={starting !== null || !!jobs.active}>Record files in place</button>
+                <button
+                  class="small"
+                  onclick={() => record(f.name)}
+                  disabled={starting !== null || !!jobs.active}
+                  title="Make this folder a library: add every photo and video under it to a new catalog without moving or copying anything."
+                  >Record files in place</button
+                >
               {/if}
             </div>
             {#if errors[f.name]}<div class="error-box small">{errors[f.name]}</div>{/if}

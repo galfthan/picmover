@@ -145,7 +145,7 @@
           <a class="stat link" href={libHref(lib, 'map')}><span class="v">{formatCount(s.withGps)}</span><span class="k">With location</span></a>
           <div class="stat"><span class="v">{formatBytes(s.bytes)}</span><span class="k">Size</span></div>
           {#if s.deleted}
-            <div class="stat"><span class="v">{formatCount(s.deleted)}</span><span class="k">Deleted</span></div>
+            <div class="stat" title="Items in the trash. Their files are still on the disk until the trash is emptied."><span class="v">{formatCount(s.deleted)}</span><span class="k">Deleted</span></div>
           {/if}
         </div>
         {#if s.earliest || s.latest}
@@ -174,7 +174,7 @@
           <div class="stat"><span class="v">{formatCount(u?.tags ?? 0)}</span><span class="k">Tags</span></div>
           <a class="stat link" href={libHref(lib, 'albums')}><span class="v">{formatCount(u?.albums ?? 0)}</span><span class="k">Albums</span></a>
           <a class="stat link" href={libHref(lib, 'trash')}><span class="v">{formatCount(u?.trashed ?? s.deleted)}</span><span class="k">In the trash</span></a>
-          <a class="stat link" href={libHref(lib, 'similar')}
+          <a class="stat link" href={libHref(lib, 'similar')} title="Pairs of near-duplicate photos found by the last duplicate search. Open Duplicates to review them."
             ><span class="v">{sim && sim.pairs !== null ? formatCount(sim.pairs) : '–'}</span><span class="k">Similar pairs</span></a
           >
         </div>
@@ -191,7 +191,12 @@
           <select bind:value={zoneChoice} aria-label="Home time zone" disabled={zoneSaving}>
             {#each zones as z (z)}<option value={z}>{z}</option>{/each}
           </select>
-          <button class="primary" disabled={zoneSaving || !zoneChoice || zoneChoice === homeZone} onclick={saveZone}>
+          <button
+            class="primary"
+            disabled={zoneSaving || !zoneChoice || zoneChoice === homeZone}
+            onclick={saveZone}
+            title="Put the timeline on this zone's clock. Files and their recorded times are not changed."
+          >
             {zoneSaving ? 'Saving…' : homeZone ? 'Change' : 'Set'}
           </button>
           {#if !homeZone}
@@ -205,11 +210,11 @@
         <h2>Thumbnails</h2>
         <div class="stats">
           <div class="stat"><span class="v">{formatCount(t.ok)}</span><span class="k">Ready</span></div>
-          <div class="stat"><span class="v">{formatCount(t.pending)}</span><span class="k">Missing</span></div>
-          <div class="stat"><span class="v">{formatCount(t.unsupported)}</span><span class="k">Unsupported</span></div>
-          <div class="stat" class:bad={t.error > 0}><span class="v">{formatCount(t.error)}</span><span class="k">Failed</span></div>
+          <div class="stat" title="Not made yet, or outdated. Generate missing thumbnails makes them."><span class="v">{formatCount(t.pending)}</span><span class="k">Missing</span></div>
+          <div class="stat" title="Files picmover cannot make a thumbnail of, such as videos when ffmpeg is missing, or RAW files without an embedded preview."><span class="v">{formatCount(t.unsupported)}</span><span class="k">Unsupported</span></div>
+          <div class="stat" class:bad={t.error > 0} title="Thumbnails that could not be made. Generate missing thumbnails tries them again."><span class="v">{formatCount(t.error)}</span><span class="k">Failed</span></div>
           {#if t.stale}
-            <div class="stat"><span class="v">{formatCount(t.stale)}</span><span class="k">Outdated</span></div>
+            <div class="stat" title="Made before the photo's orientation changed; counted in Missing too. Generate missing thumbnails makes them again."><span class="v">{formatCount(t.stale)}</span><span class="k">Outdated</span></div>
           {/if}
         </div>
         {#if (t.largeMissing ?? 0) > 0}
@@ -225,13 +230,19 @@
           <div class="job"><JobProgress job={active} /></div>
         {:else}
           <div class="row actions">
-            <button class="primary" disabled={!!active || starting} onclick={() => thumbs(false)}>Generate missing thumbnails</button>
+            <button
+              class="primary"
+              disabled={!!active || starting}
+              onclick={() => thumbs(false)}
+              title="Make the missing and outdated thumbnails, and try the failed ones again. The original files are only read."
+            >Generate missing thumbnails</button>
             <ConfirmButton
               label="Regenerate all"
               question="Rebuild every thumbnail and preview? This can take a long time."
               confirmLabel="Regenerate"
               cancelLabel="Cancel"
               disabled={!!active || starting}
+              title="Make every thumbnail and preview again. Only the thumbnail cache and the catalog’s thumbnail records change; the original files are only read."
               onconfirm={() => thumbs(true)}
             />
             {#if active}<span class="muted small">Another job is running.</span>{/if}
