@@ -127,6 +127,15 @@ func copyReadBack(ctx context.Context, src, dst, tmpDir string, want *uint64, sy
 // that does not read back as written.
 var readBack = readBackUncached
 
+// ReadBackUncached returns the xxhash64 digest and size of the file at p
+// read back from the disk where the platform allows it (readBackUncached).
+// The file must have been fsynced, as Commit and CopyReadBack do, or its
+// dirty pages stay cached. The importer uses it to check a library copy
+// before a source is deleted, or a copy import is reported.
+func ReadBackUncached(ctx context.Context, p string) (uint64, int64, error) {
+	return readBackUncached(ctx, p)
+}
+
 // readBackUncached hashes the written (and fsynced) copy, first asking
 // the kernel to drop its cached pages where it can (Linux:
 // posix_fadvise DONTNEED), so the bytes come from the disk rather than
