@@ -9,7 +9,9 @@ can proceed in parallel. Read the whole file before writing code.
 1. **Data safety.** A file is recorded in the catalog only after it has been
    copied through a temp file, hashed on the way, fsynced and renamed into
    place. Sources of a `--move` are deleted only after the catalog
-   transaction that records them has committed. Nothing is ever overwritten.
+   transaction that records them has committed and the library copy has
+   been read back from the disk and matched (#27). Nothing is ever
+   overwritten.
 2. **Cross-platform library.** The catalog stores paths relative to the
    library root with forward slashes. The same `media.db` must work when the
    library is seen as `D:\images` from Windows, `/mnt/d/images` from WSL or

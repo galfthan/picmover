@@ -20,8 +20,9 @@
 //     staged one nothing is placed and the source is kept. A restore from
 //     the trash is checked the same way before its source is deleted. So
 //     the original is deleted only after a second read has proved the
-//     bytes. The copy is committed into place with library.Commit (fsync,
-//     rename); the recorded hash is that of the bytes written.
+//     bytes, and the library copy has been read back (below). The copy is
+//     committed into place with library.Commit (fsync, rename); the
+//     recorded hash is that of the bytes written.
 //   - Hash-first, for everything else (record in place, zip entries,
 //     symlinks, files inside the library, same-device moves): the file is
 //     hashed, duplicates are dropped, metadata is extracted from the file,
@@ -39,9 +40,19 @@
 // (one warning) the rest of the run reads through FUSE. Every staged temp
 // file not placed
 // is removed. A single writer batches the finished files into catalog
-// transactions. Only after a transaction has committed are move sources
-// deleted; if an insert loses a hash race or the commit fails, the file
-// operations of the affected items are undone. Nothing is ever overwritten.
+// transactions; if an insert loses a hash race or the commit fails, the
+// file operations of the affected items are undone. Nothing is ever
+// overwritten. A committed batch goes to a finisher (finish), which runs
+// while the writer collects the next batch: every library file the import
+// copied, or accepted as an identical file at its destination, is read
+// back from the disk (library.ReadBackUncached; on Linux the cached pages
+// are dropped first) and its hash compared with the catalog's, in a copy
+// as in a move. Only then is the file reported imported and a move source
+// deleted. A file that does not read back keeps its source and is an
+// error result; its new row, and the copy this import wrote, are removed
+// (readBackFailed), so a later import copies it again rather than calling
+// it a duplicate. A trashed copy is read back the same way before it is
+// restored (restoreTrashed).
 //
 // After the copy stage, unless Options.NoThumbs, Run runs the thumbnail
 // stage (RunThumbs) over the rows of this session: N workers generate the
@@ -127,6 +138,11 @@ type Stats struct {
 	// during the run (a phone or card unplugged): the run stops and Run
 	// returns ErrSourceDisconnected. See sourceGone.
 	SourceDisconnected bool
+	// Verifying is set once the run was cancelled (or stopped by a
+	// disconnect or a fatal error) while files already recorded still
+	// wait for their read-back (finish): how many. They are checked, and
+	// their move sources deleted, before Run returns. 0 otherwise.
+	Verifying int64
 }
 
 // Options configure an import.
@@ -194,6 +210,14 @@ type Options struct {
 }
 
 const (
+	// readBackWorkers bounds the concurrent read-backs of a committed
+	// batch (finish). They run on the library drive while the workers
+	// write the next files to it. On a local NVMe drive one, two and four
+	// readers gave the same import time within the measurement noise
+	// (docs/design/import-copy-first.md, "Read-back"); fewer streams seek
+	// less on a hard disk.
+	readBackWorkers = 2
+
 	maxWorkers    = 64 // Options.Workers is clamped to this
 	batchSize     = 256
 	batchInterval = 500 * time.Millisecond
@@ -244,11 +268,23 @@ type Importer struct {
 	gioOK      func() bool                                                              // gvfs.Available
 	statRoot   func(string) (fs.FileInfo, error)                                        // os.Stat, for sourceGone
 	readDir    func(string) ([]fs.DirEntry, error)                                      // os.ReadDir, for sourceGone
+	readBack   func(ctx context.Context, p string) (uint64, int64, error)               // library.ReadBackUncached, for readBackAt
 
 	scanned, imported, existing, duplicates, skippedSmall, nonMedia, errs, bytesCopied atomic.Int64
 	importedPhotos, importedRaw, importedVideos                                        atomic.Int64
 	thumbsDone, thumbsUnsupported, thumbsFailed, largeDone                             atomic.Int64
 	rate                                                                               atomic.Int64 // last computed Stats.Rate
+
+	// batchMax is the writer's batch size (batchSize; tests lower it).
+	batchMax int
+	// runCtx is Run's pipeline context: once it is done the run is
+	// stopping, and the read-backs still pending are reported as
+	// Stats.Verifying. nil outside Run.
+	runCtx context.Context
+	// pendingChecks counts the recorded files whose read-back has not
+	// finished (handed to finish, or waiting for it).
+	pendingChecks atomic.Int64
+	verifyLogged  atomic.Bool // the "verifying" line was logged after the stop
 }
 
 // pending is a file that is fully on disk in the library and waits for the
@@ -264,7 +300,12 @@ type pending struct {
 	copied    bool   // the destination was created by a copy
 	bytes     int64  // bytes written by the copy
 	deleteSrc bool   // remove src after commit
-	trash     bool   // a trash file recorded in place
+	// readBack: after the commit the library file is read back from the
+	// disk and checked against hash (readBackAt) before the result
+	// is reported and before src is deleted. Set for a copy (copied) and
+	// for an identical file accepted at the destination, in both modes.
+	readBack bool
+	trash    bool // a trash file recorded in place
 	// video is the video's encoding (codec, HDR), recorded in video_info
 	// with the row; nil for images or without ffprobe.
 	video *metadata.VideoInfo
@@ -297,6 +338,8 @@ func New(lib *library.Library, db *catalog.DB, opts Options) *Importer {
 		gioOK:      gvfs.Available,
 		statRoot:   os.Stat,
 		readDir:    os.ReadDir,
+		readBack:   library.ReadBackUncached,
+		batchMax:   batchSize,
 	}
 }
 
@@ -376,6 +419,7 @@ func (im *Importer) Run(ctx context.Context) (Stats, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	im.cancel = cancel
+	im.runCtx = runCtx
 
 	stopProgress := im.startProgress()
 	defer func() {
@@ -612,6 +656,7 @@ func (im *Importer) Stats() Stats {
 		ImportedVideos: im.importedVideos.Load(),
 
 		SourceDisconnected: im.disconnected.Load(),
+		Verifying:          im.verifying(),
 
 		ThumbsDone:        im.thumbsDone.Load(),
 		ThumbsUnsupported: im.thumbsUnsupported.Load(),
@@ -931,6 +976,7 @@ func (im *Importer) process(ctx context.Context, srcPath, origin string, fromZip
 		copied:    copied,
 		bytes:     nbytes,
 		deleteSrc: im.opts.Move && !fromZip && !inPlace && !moved,
+		readBack:  copied || (identical && !inPlace),
 		video:     info.Video,
 	}, nil
 }
@@ -1289,10 +1335,33 @@ func moveFile(src, dst string) error {
 
 // writer records pending items in batches. It returns the first catalog
 // error; after one, it keeps draining, undoing and reporting every item.
+//
+// A committed batch goes to a finisher goroutine (finish: read the
+// library copies back, delete move sources, report), so the next batch
+// is collected and committed while the copies of the previous one are
+// read back. writer returns only after the finisher is done.
 func (im *Importer) writer(pend <-chan *pending) error {
-	batch := make([]*pending, 0, batchSize)
+	size := im.batchMax
+	if size <= 0 {
+		size = batchSize
+	}
+	batch := make([]*pending, 0, size)
 	tick := time.NewTicker(batchInterval)
 	defer tick.Stop()
+	type committed struct {
+		batch    []*pending
+		inserted []bool
+	}
+	// One committed batch waits while the previous one is finished: the
+	// writer runs at most one batch ahead of the read-backs.
+	done := make(chan committed, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for c := range done {
+			im.finish(c.batch, c.inserted)
+		}
+	}()
 	var fatal error
 	flush := func() {
 		if len(batch) == 0 {
@@ -1300,12 +1369,17 @@ func (im *Importer) writer(pend <-chan *pending) error {
 		}
 		if fatal != nil {
 			im.failBatch(batch, fatal)
-		} else if err := im.commit(batch); err != nil {
+		} else if inserted, err := im.record(batch); err != nil {
 			fatal = err
 			im.log.Error("catalog write failed; stopping import", "err", err)
 			if im.cancel != nil {
 				im.cancel()
 			}
+		} else {
+			im.pendingChecks.Add(int64(len(toCheck(batch, inserted))))
+			done <- committed{batch: batch, inserted: inserted}
+			batch = make([]*pending, 0, size) // the finisher owns the old one
+			return
 		}
 		clear(batch)
 		batch = batch[:0]
@@ -1315,10 +1389,12 @@ func (im *Importer) writer(pend <-chan *pending) error {
 		case p, ok := <-pend:
 			if !ok {
 				flush()
+				close(done)
+				<-finished
 				return fatal
 			}
 			batch = append(batch, p)
-			if len(batch) >= batchSize {
+			if len(batch) >= size {
 				flush()
 			}
 		case <-tick.C:
@@ -1327,16 +1403,51 @@ func (im *Importer) writer(pend <-chan *pending) error {
 	}
 }
 
-// commit records one batch in a transaction, then finishes each item:
-// undo on a lost hash race, release, delete move sources, report. It uses
-// context.Background so cancellation never aborts recording completed copies.
+// commit records one batch and finishes it on the caller's goroutine
+// (record, then finish).
 func (im *Importer) commit(batch []*pending) error {
+	inserted, err := im.record(batch)
+	if err != nil {
+		return err
+	}
+	im.pendingChecks.Add(int64(len(toCheck(batch, inserted))))
+	im.finish(batch, inserted)
+	return nil
+}
+
+// toCheck returns the indexes of the items of a recorded batch whose
+// library copy finish reads back: every inserted item with readBack, and
+// always one whose source is deleted.
+func toCheck(batch []*pending, inserted []bool) []int {
+	var out []int
+	for i, p := range batch {
+		if inserted[i] && (p.readBack || p.deleteSrc) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// verifying is Stats.Verifying: the read-backs still pending once the run
+// is stopping, else 0.
+func (im *Importer) verifying() int64 {
+	if im.runCtx == nil || im.runCtx.Err() == nil {
+		return 0
+	}
+	return max(im.pendingChecks.Load(), 0)
+}
+
+// record inserts one batch in a transaction and returns which items were
+// inserted (false: the hash was recorded concurrently). On an error the
+// batch is undone and reported (failBatch). It uses context.Background
+// so cancellation never aborts recording completed copies.
+func (im *Importer) record(batch []*pending) ([]bool, error) {
 	ctx := context.Background()
 	tx, err := im.db.BeginTx(ctx, nil)
 	if err != nil {
 		err = fmt.Errorf("importer: begin transaction: %w", err)
 		im.failBatch(batch, err)
-		return err
+		return nil, err
 	}
 	inserted := make([]bool, len(batch))
 	for i, p := range batch {
@@ -1344,14 +1455,14 @@ func (im *Importer) commit(batch []*pending) error {
 		if err != nil {
 			_ = tx.Rollback()
 			im.failBatch(batch, err)
-			return err
+			return nil, err
 		}
 		inserted[i] = ok
 		if ok && p.video != nil {
 			if err := im.db.PutVideoInfo(ctx, tx, p.hash, catalog.VideoInfo(*p.video)); err != nil {
 				_ = tx.Rollback()
 				im.failBatch(batch, err)
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -1359,7 +1470,44 @@ func (im *Importer) commit(batch []*pending) error {
 		_ = tx.Rollback()
 		err = fmt.Errorf("importer: commit: %w", err)
 		im.failBatch(batch, err)
-		return err
+		return nil, err
+	}
+	return inserted, nil
+}
+
+// finish completes a committed batch. An item that lost the hash race is
+// undone. For every other item that needs it (toCheck: readBack, and
+// always one whose source is deleted) the library copy is read back from
+// the disk, uncached, and checked against the catalog hash (readBackAt),
+// readBackWorkers at a time. Only an item whose copy checks out is
+// reported imported or existing and has its move source deleted. One
+// that does not keeps its source, loses its new catalog row and the copy
+// this import wrote, and is an error result naming the cause
+// (readBackFailed), so importing it again copies it again.
+func (im *Importer) finish(batch []*pending, inserted []bool) {
+	ctx := context.Background()
+	checks := make([]error, len(batch))
+	todo := toCheck(batch, inserted)
+	if n := im.verifying(); n > 0 && im.verifyLogged.CompareAndSwap(false, true) {
+		im.log.Info("stopping: verifying the copies already recorded", "files", n)
+	}
+	if len(todo) > 0 {
+		next := make(chan int)
+		var wg sync.WaitGroup
+		for range min(readBackWorkers, max(im.opts.Workers, 1), len(todo)) {
+			wg.Go(func() {
+				for i := range next {
+					p := batch[i]
+					checks[i] = im.readBackAt(im.lib.Abs(p.media.RelPath), p.hash, p.media.Size)
+					im.pendingChecks.Add(-1)
+				}
+			})
+		}
+		for _, i := range todo {
+			next <- i
+		}
+		close(next)
+		wg.Wait()
 	}
 
 	for i, p := range batch {
@@ -1370,6 +1518,12 @@ func (im *Importer) commit(batch []*pending) error {
 			if rel, found, err := im.db.LookupHash(ctx, p.hash); err == nil && found {
 				r.Dest = rel
 			}
+			im.report(r)
+			continue
+		}
+		if err := checks[i]; err != nil {
+			r := im.readBackFailed(p, err)
+			im.release(p) // after the row is gone
 			im.report(r)
 			continue
 		}
@@ -1395,7 +1549,60 @@ func (im *Importer) commit(batch []*pending) error {
 		}
 		im.report(r)
 	}
+}
+
+// readBackAt reads the library file at p back from the disk
+// (library.ReadBackUncached: on Linux its cached pages are dropped first,
+// so the bytes come from the drive, not from the page cache the copy
+// filled) and returns nil only when it has hash and, when size > 0, size.
+// A mismatch wraps library.ErrHashMismatch; a read error is returned as
+// it is. It is the last check before a move source is deleted and before
+// a copy is reported imported. It is not cancellable: a recorded file is
+// always checked before it is reported.
+func (im *Importer) readBackAt(p string, hash uint64, size int64) error {
+	h, n, err := im.readBack(context.Background(), p)
+	if err != nil {
+		return err
+	}
+	if h != hash || (size > 0 && n != size) {
+		return fmt.Errorf("%w: %s reads back from the disk as %016x (%d bytes), not %016x (%d bytes)",
+			library.ErrHashMismatch, p, h, n, hash, size)
+	}
 	return nil
+}
+
+// readBackFailed undoes the recorded item p whose library copy failed
+// readBackAt with err, and returns its error result. The source is never
+// deleted. The new catalog row is removed, so the content is not in the
+// catalog and importing the kept source again copies it again (or fails
+// here again) instead of calling it a duplicate. A copy this import wrote
+// (p.copied) is removed with the row; an identical file that was already
+// at the destination is left there, as it was before the import. If the
+// row cannot be removed, the row and the file are kept and the message
+// says so ('picmover verify --rehash' then lists the file).
+func (im *Importer) readBackFailed(p *pending, err error) Result {
+	rel := p.media.RelPath
+	im.log.Error("library copy read-back failed", "source", p.origin, "dest", rel, "err", err)
+	msg := "the library copy could not be read back from the disk"
+	if errors.Is(err, library.ErrHashMismatch) {
+		msg = "the library copy does not read back from the disk as written"
+	}
+	if rerr := im.db.Remove(context.Background(), p.hash); rerr != nil {
+		im.log.Error("remove the row of a copy that failed its read-back", "dest", rel, "err", rerr)
+		msg += "; its catalog row could not be removed, so the copy and its row are kept ('picmover verify --rehash' lists it)"
+	} else if p.copied {
+		im.undo(p)
+		msg += "; the copy was removed and the file is not imported"
+	} else {
+		msg += "; the file already at this path was left as it was and the file is not imported"
+	}
+	if p.deleteSrc {
+		msg += "; the source is kept"
+	} else {
+		msg += "; keep the source"
+	}
+	msg += "; check the library drive, then import again"
+	return Result{Status: StatusError, Source: p.origin, Dest: rel, Kind: metadata.Kind(p.media.FileType), Message: msg, Err: err}
 }
 
 // failBatch undoes and reports every item of a batch that was not recorded.

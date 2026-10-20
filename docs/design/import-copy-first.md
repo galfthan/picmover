@@ -522,3 +522,151 @@ Fixes for the review of `fix/import-gio` (27da386..b74a5cd).
    longer pre-creates the destination; the differing verification pull
    in `TestDevicePullMoveVerifies` keeps the source's size, so it still
    tests the hash mismatch rather than the new size fallback.
+
+## Read-back of the library copy (#27)
+
+Branch `fix/import-move-readback`. Before this, nothing read the library
+copy back from the medium: the copy was hashed as it was written, fsynced
+and renamed into place, the catalog committed, and a move source was then
+deleted. Silent corruption below `write()` (USB-SATA bridges, firmware,
+NTFS/exFAT drivers, bit flips after the user buffer was hashed) went
+unnoticed, and in a move the only other copy was gone. The inter-library
+move and the backup already read their copies back (`CopyReadBack`).
+Users also clear a card by hand after a Copy import, so Copy gets the
+same check as Move.
+
+### Rule
+
+Every library file an import produced or accepted is read back from the
+disk and its hash compared with the catalog hash before its result is
+reported as imported or existing, and before a move source is deleted:
+
+| path | read back | source deleted after it (Move) |
+| --- | --- | --- |
+| copy-first copy (`library.Commit`) | yes | yes (cross-device or `ForceCopy` move) |
+| hash-first `CopyVerified` (symlink source, cross-device rename fallback, zip entries) | yes | yes, except zip entries |
+| identical file accepted at the destination (copy-first and hash-first) | yes | yes |
+| restore from the trash (`restoreTrashed`) | yes, the trashed copy before the rename out of the trash | yes |
+| same-device rename, file in place, record in place | no (no new bytes) | no source left / nothing deleted |
+
+`library.ReadBackUncached` (the existing `readBackUncached` that
+`CopyReadBack` uses) reads the file through a fresh descriptor after
+`posix_fadvise(POSIX_FADV_DONTNEED)` on Linux. On Windows, macOS and the
+BSDs `dropCache` is a no-op, so there the read may come from the cache:
+it then proves the bytes reached the file system, not the drive. (Ways
+to bypass the cache there, untested and not done: `F_NOCACHE` on macOS,
+which does not evict pages that are already cached, and
+`FILE_FLAG_NO_BUFFERING` on Windows, which needs sector-aligned buffers
+and reads.)
+
+The source is never read again for this; the check compares against the
+hash in the catalog row, which is the hash of the bytes staged (and, in a
+move, re-read from the source by `verifySource`).
+
+### Where it runs
+
+The writer commits a batch (`record`) and hands it to a finisher
+goroutine (`finish`) through a channel with room for one batch, then
+collects and commits the next batch while the finisher reads the copies
+of the previous one back, `readBackWorkers` (2) at a time. `finish`
+undoes items that lost the hash race (as before), checks the others
+(`readBackAt`), then reports each one and deletes a move source
+only after its check passed. `commit` (record + finish on one
+goroutine) is kept for the tests. `writer` returns only after the
+finisher is done, so `pipeline` and `Run` still return after every
+result. The read-back is not cancellable: a committed file is always
+checked before it is reported; after a cancellation the finisher still
+finishes the batches already committed (at most two).
+`Stats.Verifying` counts the read-backs still pending once the run's
+context is done (0 otherwise), the log gets one "stopping: verifying the
+copies already recorded" line, the CLI status line shows `Verifying N
+recorded copies` and the web job card says it is reading them back.
+
+`restoreTrashed` runs the same check, in a worker, on the trashed copy
+before the restore (a rename within the library, which does not touch
+the bytes), in Copy as in Move.
+
+### On a failure
+
+A copy that reads back with another hash or size
+(`library.ErrHashMismatch`, "reads back from the disk as …, not …") or
+that cannot be read (the read error as it is) is an error result
+(`readBackFailed`), with `Dest` the library path. The source is never
+deleted. The item is taken back out of the library, so that the content
+is not in the catalog: its new row is removed (`catalog.Remove`, a
+transaction of its own) and, for a copy this import wrote (`copied`),
+the library file too (`undo`, which also takes its bytes off
+`BytesCopied`). An identical file that was already at the destination
+is left as it was; only the row this import added goes. The message is
+"the library copy does not read back from the disk as written" or "the
+library copy could not be read back from the disk", then "; the copy
+was removed and the file is not imported" or "; the file already at
+this path was left as it was and the file is not imported", then "; the
+source is kept" (Move) or "; keep the source" (Copy), then "; check the
+library drive, then import again". The claims and the in-flight hash are
+released only after the row is gone.
+
+Why undo rather than keep: a kept row holds the source's hash, so the
+next import of the same source found it in the catalog and reported a
+duplicate with no error. The user would then clear the card and keep
+only the damaged copy. With the row gone a retry copies the file again
+(or fails the same way again), and a transient read error of a sound
+copy costs only a second copy. If the row cannot be removed, the row and
+the file are kept and the message says so, pointing at `verify
+--rehash`.
+
+A trashed copy that fails its read-back is not restored: the row stays
+trashed and the file stays in the trash, the source is kept, and the
+error is "the file is in the trash, but its trashed copy does not read
+back from the disk as written; delete it in the trash, then import
+again; the source file is kept". Every later import of that content
+fails the same way (never a duplicate) until the copy is deleted.
+
+The import counts these under Errors and exits 2, like any other file
+it could not import.
+
+Not covered (follow-up): rows recorded before a crash or a kill, whose
+read-back never ran, are never read back later; their move sources were
+not deleted either, so a later import of them reports duplicates.
+
+### Is the read uncached on Linux?
+
+`DONTNEED` drops only clean pages. `library.Commit` and `CopyVerified`
+fsync the temp file before the rename, so by the time of the read-back
+the pages are clean. Measured with `mincore` on ext4 (a 64 MiB file
+written with `os.WriteFile`): 16384/16384 pages resident after the
+write; 2048/16384 after `DONTNEED` without an fsync (only the pages
+already written back were dropped); 0/16384 after fsync + `DONTNEED`.
+An identical file at the destination and a file restored from the trash
+were not written by this import, so their pages are clean too. The
+libraries here are on `ntfs3` (a kernel driver that uses the page cache
+of the file, so `DONTNEED` applies the same way). It cannot bypass the
+drive's own cache. A FUSE file system such as ntfs-3g reads through the
+block device's cache, which `DONTNEED` on the file does not drop.
+
+### Cost
+
+Synthetic import into a library on the system NVMe drive (ext4, 91 %
+full), source on the same drive with its pages dropped before each run,
+300 files of 10 MiB (3 GiB) of random bytes, a stub extractor, no
+thumbnails, 4 workers, cross-device forced for Move. Seconds per run,
+four runs each, the arms interleaved in one test binary (no read-back
+vs. read-back), `readBackWorkers` 2:
+
+| | no read-back | read-back | median |
+| --- | --- | --- | --- |
+| Copy | 8.6, 9.9, 10.8, 11.7 | 12.5, 13.3, 14.8, 27.8 | 10.3 → 14.0 s (+35 %) |
+| Move | 8.6, 11.2, 14.3, 21.8 | 11.9, 11.9, 12.9, 14.2 | 12.8 → 12.4 s (within noise) |
+
+The read-backs of a run summed 22–27 s of reader time (51 s in the
+outlier), all overlapped with the copy of the following batches. Single
+runs of about 28 s occurred in every arm, also without the read-back:
+background writeback on the drive. Earlier runs with 1 and 4 readers
+gave the same medians within that noise (Copy 13.6 and 11.9 s against
+9.3 s before the change, built from master). On this drive the source,
+the copies and the read-back share one device, so Copy pays for reading
+3 GiB more. When the source is a card or a phone, it is usually slower
+than the library drive and the read-back runs while the next files are
+read from the source. When the library drive is the bottleneck (a USB
+hard disk), expect up to the time it takes to read the imported data
+from that drive.

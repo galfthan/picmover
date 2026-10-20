@@ -534,6 +534,8 @@ export interface JobStats {
   largeDone: number;
   /** The import's source went away (a phone unplugged): the run stops with one status. */
   sourceDisconnected: boolean;
+  /** The import is stopping and this many recorded copies are still being read back from the library disk. */
+  verifying?: number;
 }
 
 /**

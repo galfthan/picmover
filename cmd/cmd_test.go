@@ -924,3 +924,16 @@ func TestStatusTransferRate(t *testing.T) {
 		t.Errorf("idle status shows a rate: %q", got)
 	}
 }
+
+// While a cancelled import reads back the copies it recorded, the status
+// line says so.
+func TestStatusVerifying(t *testing.T) {
+	s := importer.Stats{Imported: 1}
+	if got := formatStatus(s); strings.Contains(got, "Verifying") {
+		t.Errorf("status = %q", got)
+	}
+	s.Verifying = 3
+	if got := formatStatus(s); !strings.Contains(got, "| Verifying 3 recorded copies") {
+		t.Errorf("status = %q", got)
+	}
+}
