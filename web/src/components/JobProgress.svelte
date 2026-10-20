@@ -77,6 +77,11 @@
   {#if cancelError}<div class="error-box">{cancelError}</div>{/if}
   {#if jobs.reconnecting}<div class="notice">Connection lost; reconnecting…</div>{/if}
   {#if job.kind === 'import' && s.sourceDisconnected}<div class="notice disconnected" role="status">{DISCONNECTED_MESSAGE}</div>{/if}
+  {#if job.kind === 'import' && (s.verifying ?? 0) > 0}
+    <div class="notice" role="status">
+      Stopping: reading back {s.verifying} recorded {s.verifying === 1 ? 'copy' : 'copies'} from the library disk before the import ends…
+    </div>
+  {/if}
 
   {#if fraction !== null}
     <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(fraction * 100)}>

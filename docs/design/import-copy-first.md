@@ -546,7 +546,7 @@ reported as imported or existing, and before a move source is deleted:
 | copy-first copy (`library.Commit`) | yes | yes (cross-device or `ForceCopy` move) |
 | hash-first `CopyVerified` (symlink source, cross-device rename fallback, zip entries) | yes | yes, except zip entries |
 | identical file accepted at the destination (copy-first and hash-first) | yes | yes |
-| restore from the trash (`restoreTrashed`) | yes | yes |
+| restore from the trash (`restoreTrashed`) | yes, the trashed copy before the rename out of the trash | yes |
 | same-device rename, file in place, record in place | no (no new bytes) | no source left / nothing deleted |
 
 `library.ReadBackUncached` (the existing `readBackUncached` that
@@ -570,38 +570,64 @@ goroutine (`finish`) through a channel with room for one batch, then
 collects and commits the next batch while the finisher reads the copies
 of the previous one back, `readBackWorkers` (2) at a time. `finish`
 undoes items that lost the hash race (as before), checks the others
-(`checkLibraryCopy`), then reports each one and deletes a move source
+(`readBackAt`), then reports each one and deletes a move source
 only after its check passed. `commit` (record + finish on one
 goroutine) is kept for the tests. `writer` returns only after the
 finisher is done, so `pipeline` and `Run` still return after every
 result. The read-back is not cancellable: a committed file is always
 checked before it is reported; after a cancellation the finisher still
 finishes the batches already committed (at most two).
+`Stats.Verifying` counts the read-backs still pending once the run's
+context is done (0 otherwise), the log gets one "stopping: verifying the
+copies already recorded" line, the CLI status line shows `Verifying N
+recorded copies` and the web job card says it is reading them back.
 
-`restoreTrashed` runs the same check, in a worker, right after the
-restore, in Copy as in Move.
+`restoreTrashed` runs the same check, in a worker, on the trashed copy
+before the restore (a rename within the library, which does not touch
+the bytes), in Copy as in Move.
 
 ### On a failure
 
 A copy that reads back with another hash or size
 (`library.ErrHashMismatch`, "reads back from the disk as …, not …") or
 that cannot be read (the read error as it is) is an error result
-(`readBackFailed`): `Dest` is the library path, the message is "the
-library copy does not read back from the disk as written" or "the
-library copy could not be read back from the disk", followed by "; the
-source is kept" (Move) or "; keep the source" (Copy) and "; the library
-copy and its catalog row are kept ('picmover verify --rehash' lists
-it)". A restore's message starts with "restored from trash, but", and
-the result has `Restored` set.
+(`readBackFailed`), with `Dest` the library path. The source is never
+deleted. The item is taken back out of the library, so that the content
+is not in the catalog: its new row is removed (`catalog.Remove`, a
+transaction of its own) and, for a copy this import wrote (`copied`),
+the library file too (`undo`, which also takes its bytes off
+`BytesCopied`). An identical file that was already at the destination
+is left as it was; only the row this import added goes. The message is
+"the library copy does not read back from the disk as written" or "the
+library copy could not be read back from the disk", then "; the copy
+was removed and the file is not imported" or "; the file already at
+this path was left as it was and the file is not imported", then "; the
+source is kept" (Move) or "; keep the source" (Copy), then "; check the
+library drive, then import again". The claims and the in-flight hash are
+released only after the row is gone.
 
-The source is never deleted. The library copy and its catalog row are
-kept, not undone: the row holds the source's hash, so `verify --rehash`
-reports the file as a hash mismatch, the existing way to find damaged
-library files. Undoing would remove the evidence of a failing drive and
-could itself fail on that drive. To import the file again the user moves
-it to the trash and deletes it there, then imports the kept source
-(README, "Imports"). The import counts it under Errors and exits 2,
-like any other file it could not import.
+Why undo rather than keep: a kept row holds the source's hash, so the
+next import of the same source found it in the catalog and reported a
+duplicate with no error. The user would then clear the card and keep
+only the damaged copy. With the row gone a retry copies the file again
+(or fails the same way again), and a transient read error of a sound
+copy costs only a second copy. If the row cannot be removed, the row and
+the file are kept and the message says so, pointing at `verify
+--rehash`.
+
+A trashed copy that fails its read-back is not restored: the row stays
+trashed and the file stays in the trash, the source is kept, and the
+error is "the file is in the trash, but its trashed copy does not read
+back from the disk as written; delete it in the trash, then import
+again; the source file is kept". Every later import of that content
+fails the same way (never a duplicate) until the copy is deleted.
+
+The import counts these under Errors and exits 2, like any other file
+it could not import.
+
+Not covered (follow-up): rows recorded before a crash or a kill, whose
+read-back never ran, are never read back later; their move sources were
+not deleted either, so a later import of them reports duplicates.
 
 ### Is the read uncached on Linux?
 

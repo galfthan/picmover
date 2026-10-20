@@ -390,6 +390,10 @@ func formatStatus(s importer.Stats) string {
 	if s.SourceDisconnected {
 		line += " | Source disconnected"
 	}
+	if s.Verifying > 0 {
+		// Stopping: the copies already recorded are read back first.
+		line += fmt.Sprintf(" | Verifying %d recorded copies", s.Verifying)
+	}
 	return line
 }
 

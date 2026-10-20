@@ -119,6 +119,9 @@ type statsJSON struct {
 	// SourceDisconnected: the import's source went away; the job stops
 	// with one status (importer.DisconnectedMessage).
 	SourceDisconnected bool `json:"sourceDisconnected"`
+	// Verifying: the import is stopping and this many recorded copies
+	// are still being read back (importer.Stats.Verifying); 0 otherwise.
+	Verifying int64 `json:"verifying"`
 }
 
 func newStats(s importer.Stats) statsJSON {
@@ -130,6 +133,7 @@ func newStats(s importer.Stats) statsJSON {
 		Rate:       s.Rate,
 		ThumbsDone: s.ThumbsDone, ThumbsUnsupported: s.ThumbsUnsupported, ThumbsFailed: s.ThumbsFailed,
 		LargeDone: s.LargeDone,
+		Verifying: s.Verifying,
 	}
 }
 
