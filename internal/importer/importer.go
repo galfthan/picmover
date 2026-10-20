@@ -204,6 +204,14 @@ type Options struct {
 }
 
 const (
+	// readBackWorkers bounds the concurrent read-backs of a committed
+	// batch (finish). They run on the library drive while the workers
+	// write the next files to it. On a local NVMe drive one, two and four
+	// readers gave the same import time within the measurement noise
+	// (docs/design/import-copy-first.md, "Read-back"); fewer streams seek
+	// less on a hard disk.
+	readBackWorkers = 2
+
 	maxWorkers    = 64 // Options.Workers is clamped to this
 	batchSize     = 256
 	batchInterval = 500 * time.Millisecond
@@ -1423,7 +1431,7 @@ func (im *Importer) record(batch []*pending) ([]bool, error) {
 // undone. For every other item that needs it (readBack, and always one
 // whose source is deleted) the library copy is read back from the disk,
 // uncached, and checked against the catalog hash (checkLibraryCopy),
-// Workers at a time. Only an item whose copy checks out is reported
+// readBackWorkers at a time. Only an item whose copy checks out is reported
 // imported or existing and has its move source deleted. One that does
 // not keeps its source, its library copy and its catalog row, and is an
 // error result naming the cause (readBackFailed).
@@ -1439,7 +1447,7 @@ func (im *Importer) finish(batch []*pending, inserted []bool) {
 	if len(todo) > 0 {
 		next := make(chan int)
 		var wg sync.WaitGroup
-		for range min(max(im.opts.Workers, 1), len(todo)) {
+		for range min(readBackWorkers, max(im.opts.Workers, 1), len(todo)) {
 			wg.Go(func() {
 				for i := range next {
 					p := batch[i]

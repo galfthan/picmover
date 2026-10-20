@@ -275,13 +275,16 @@
             <legend class="label">Copy or move</legend>
             <label class="opt">
               <input type="radio" name="mode" value="copy" checked={!move} onchange={() => (move = false)} />
-              <span><strong>Copy</strong> — the source is left untouched.</span>
+              <span>
+                <strong>Copy</strong> — the source is left untouched. Each copy is read back from the library disk and its hash
+                matched before it counts as imported.
+              </span>
             </label>
             <label class="opt">
               <input type="radio" name="mode" value="move" checked={move} onchange={() => (move = true)} />
               <span>
-                <strong>Move</strong> — source files are deleted after each batch has been copied, verified and committed to
-                the catalog.
+                <strong>Move</strong> — source files are deleted after each batch has been copied and committed to the catalog,
+                each source has been read again, and each copy has been read back from the library disk and its hash matched.
               </span>
             </label>
           </fieldset>

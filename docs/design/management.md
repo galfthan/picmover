@@ -923,9 +923,12 @@ notes above where they differ.
     endpoint's code path, under the library's trash lock, with a unique
     name on collision.
   - The `user.db` trash row is removed.
-  - The file is reported `imported` with the message `restored from
-    trash`. With `move`, the source is deleted only after the restored
-    copy hashes to the row's hash.
+  - The restored file is read back from the disk, uncached where the
+    platform allows (`checkLibraryCopy`, in a copy as in a move), and
+    must hash to the row's hash. Then the file is reported `imported`
+    with the message `restored from trash`, and with `move` the source
+    is deleted. On a mismatch or read error the restore stands, the
+    source is kept, and the result is an error naming the cause.
 - **Empty trash** (`trash/delete` with `all: true`) also removes regular
   files under the trash directory that no trashed row names. A rebuild
   records no row for a trash file whose content or path is live. These
